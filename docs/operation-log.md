@@ -211,3 +211,52 @@
 
 **分层定稿**：能力层（ingest / query / compaction，纯逻辑）→ 节点层（server：协议端口 +
 装配 + 路由）→ 入口（standalone / 未来按角色裁剪的分布式节点）。
+
+## 8. 设计变更：SQL 前置解析拦截（2026-09-09，v12.4，S1.6/S1.7 实施前定稿）
+
+### 8.1 用户裁决
+
+1. **所有写入都走 ingest 管线**——唯一的数据写入事实；
+2. 后期分布式/多节点时，**单个 server 提供各类协议通信（含读和写）**：
+   写由 ingest 底层能力负责，读由 query 底层能力负责；
+3. **server 做 SQL 前置解析拦截，只有 SELECT 让 DataFusion 处理**。
+
+### 8.2 设计定稿（计划书 §4.3 路由表）
+
+| 语句 | 处理 |
+|---|---|
+| SELECT / CTE | → DataFusion（query 能力，只读） |
+| SHOW TABLES | → Catalog `list_tables` |
+| INSERT INTO t VALUES ... | server 按表 schema 解析字面量 → RecordBatch → `ingest.ingest` |
+| INSERT INTO t SELECT ... | server 经 DataFusion 执行 SELECT（读），结果 cast 到表 schema → ingest |
+| CREATE TABLE [IF NOT EXISTS] | server 解析列定义 → Catalog `create_table` |
+| DROP TABLE [IF EXISTS] | → Catalog `drop_table`（**需新增 meta 能力**） |
+| 其他 | 明确拒绝 |
+
+MVP 限制：VALUES 仅字面量；列清单支持指定列（缺省填 NULL）；类型按表 schema 逐列转换；
+TIMESTAMP 字面量 ISO8601（UTC）/ 整型毫秒；`INSERT ... SELECT` 位置对齐 + cast；
+语句级幂等键（`dml-<uuid>`）。
+
+### 8.3 被否决的方案（留档防回潮）
+
+**DataFusion DML sink 方案**（曾写入计划书 v2.0.2 S1.6）：在 `YuntunTableProvider` 实现
+`insert_into` + `DmlSink` trait + `IngestSinkExec` ExecutionPlan，让 DataFusion 处理
+INSERT。**否决理由**：① DML 走 DataFusion 会让写路径穿过查询能力，边界模糊——
+INSERT 是写入请求，理应在节点层被拦截后直送 ingest；② DataFusion 会话级 DDL/DML
+副作用与持久化 Catalog 语义冲突；③ 需要把 sink 句柄穿透 cache→provider→table 三层
+plumbing。④ 用户明确要求"只有 SELECT 让 DataFusion 处理"。
+
+**同样否决**：手写 tokenizer 做前置解析——改用 **`sqlparser`**（与 DataFusion 同源
+解析器，Apache-2.0），方言兼容性（标识符引用/类型名/字面量语法）与 DataFusion 天然一致；
+版本对齐 DataFusion 55 所依赖版本，方言 MVP 用 `GenericDialect`。
+
+**状态**：设计已定稿，**S1.6/S1.7 尚未实施**（下一步编码）。实施清单：
+① catalog 新增 `drop_table`（CatalogOps + MemoryCatalog）；② server 新增 SQL 前置
+解析模块：`Parser::parse_sql(GenericDialect)` → 按 `Statement` 变体分流
+（Query→query / Insert(Values→按 schema 构造 RecordBatch、Select→query 执行后
+cast)→ingest / CreateTable(Deprecated DataType→Arrow 映射)→catalog /
+Drop→catalog / ShowTables→catalog），字面量→Arrow 类型转换含
+civil 算法时间解析；③ `FlightServer` 增加 `run_sql` 前置分发并接入三轨入口
+（简易 do_get / StatementQuery / StatementUpdate / prepared update）；
+④ FlightServer 增加 Catalog 依赖；⑤ e2e：CREATE → INSERT（VALUES/SELECT）→
+查询验证 → DROP。

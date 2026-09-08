@@ -34,6 +34,7 @@
 >   2. **阶段重排**：新增**阶段 1 Standalone 完备**（Flight SQL 标准协议 + SQL 写入 + 自有客户端）；原阶段 0.5（Chaos 压测）后移为阶段 2；**原阶段 1（Meta Raft 分离）整体后移为阶段 3** —— 除分布式外的一切能力先在 standalone 内完成
 >   3. **接口演进**：在既有自定义 ticket 模式（保留）之外，新增 **Flight SQL 标准协议**双轨接入（§3.2 / 计划书 §四）
 >   4. **【v12.3，2026-09-09】架构简化**：撤销 Hook / Gateway 间接层；协议端口统一在 **server 节点层**，`FlightServer` 直接组合 `Arc<Ingestor>` + `Arc<QueryEngine>`；两条铁律成文——**所有写入走 ingest 管线（唯一写入事实）**、**协议端口在 server 层，域 crate 纯能力**（§3.2）
+>   5. **【v12.4，2026-09-09】SQL 前置解析拦截**：server 做 SQL 前置分类——**只有 SELECT 让 DataFusion 处理**；解析基于 **`sqlparser`**（与 DataFusion 同源，AST `Statement` 变体分流）；`INSERT INTO` 由 server 按表 schema 解析为 RecordBatch 后交 ingest；DDL 由 server 拦截转调 Catalog（新增 `drop_table`）（§3.2 / 计划书 §4.3）
 
 ---
 
@@ -194,7 +195,7 @@ client → （仅依赖 arrow-flight，可独立编译，不依赖 server）
 
 `catalog` 为纯逻辑 crate，不含网络代码 —— standalone 与分布式共用同一份逻辑的关键。
 
-**协议端口归属（v12.3 澄清，简化版）**：
+**协议端口归属（v12.3 澄清，简化版；v12.4 补 SQL 前置拦截）**：
 
 - **两条铁律**：
   1. **所有写入都走 ingest 管线**——它是唯一的数据写入事实（WAL 权威，禁绕过）；
@@ -202,8 +203,14 @@ client → （仅依赖 arrow-flight，可独立编译，不依赖 server）
      （Flight SQL、InfluxDB LP、未来 MySQL/PG wire），每个协议内部把
      **写路由到 ingest 能力、读路由到 query 能力**；域 crate（ingest / query）
      保持纯能力，不含协议、不含 Hook trait 间接层。
-- `yuntun-server::flight::FlightServer` 直接持有 `Arc<Ingestor>` + `Arc<QueryEngine>`，
-  实现 FlightService：FlightSQL 标准轨（读→query / 写→ingest）+ 简易读写轨。
+- **【v12.4】SQL 前置解析拦截**：server 对 SQL 做前置分类，
+  **只有 SELECT 让 DataFusion 处理**——`INSERT INTO` 由 server 按表 schema
+  解析为 RecordBatch 后交 ingest；`CREATE/DROP TABLE` 由 server 拦截转调 Catalog
+  （meta 能力，新增 `drop_table`）；`SHOW TABLES` 走 Catalog `list_tables`
+  （详见计划书 §4.3 路由表）。
+- `yuntun-server::flight::FlightServer` 直接持有 `Arc<Ingestor>` + `Arc<QueryEngine>`
+  （+ Catalog），实现 FlightService：FlightSQL 标准轨（读→query / 写→ingest）+
+  简易读写轨。
 - 阶段 3 分布式时节点按角色裁剪装配（如查询节点只接 query 能力 + 各协议端口的读路由），
   协议端口代码不随域拆分，天然可复用。
 
@@ -1965,6 +1972,7 @@ async fn orphan_sweeper() {
 | 组件 | 选型 | 许可证 | 备注 |
 |---|---|---|---|
 | 查询引擎 | DataFusion 55.x | Apache-2.0 | 查询内核 |
+| **SQL 前置解析** | **sqlparser（与 DataFusion 同源）** | Apache-2.0 | **server 层 SQL 分类/AST 分流（v12.4），方言用 GenericDialect** |
 | 主存储格式 | Vortex | Apache-2.0 | 锁 Git Commit |
 | 兼容格式 | Parquet | Apache-2.0 | 回退备胎 |
 | **Ingestor WAL** | **自实现（segment + CRC）** | — | **v10：移除 fjall，约 500 行（§5.3）** |

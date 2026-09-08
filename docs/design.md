@@ -112,6 +112,9 @@ yuntun/
 - **【v12.3】`ingest` / `query` 是纯能力 crate**——不含协议、不含 Hook 间接层；
   所有协议端口在 `server`（每个协议把写路由到 ingest、读路由到 query）
 - **【v12.3】所有写入走 ingest 管线**——唯一的数据写入事实，任何协议入口不得绕过
+- **【v12.4】SQL 前置解析拦截**——server 对 SQL 做前置分类，**只有 SELECT 让
+  DataFusion 处理**；INSERT 由 server 按表 schema 解析为 RecordBatch 后交 ingest；
+  CREATE/DROP TABLE 转调 Catalog（计划书 §4.3 路由表）
 - `catalog` 是纯逻辑，**不含网络**（阶段 0 进程内调用，阶段 3 包一层 gRPC）
 - `wal` 不依赖 `catalog`（WAL 只管字节流与 Record）
 

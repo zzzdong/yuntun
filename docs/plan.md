@@ -124,8 +124,8 @@ yuntun/                                  # 现在 → 目标
 
 | ID | 任务 | 验收标准 |
 |---|---|---|
-| **S1.6** | `INSERT INTO ... VALUES` / `INSERT INTO ... SELECT`：`TableProvider::insert_into` 实现 `IngestSinkExec`，把批次送入既有 ingest 管线（WAL → 攒批 → flush），**不绕过 WAL** | SQL 写入的数据崩溃重启后可恢复；`SELECT` 立即可见（MemTable 直读） |
-| **S1.7** | DDL：`CREATE TABLE`（含模板选择）、`DROP TABLE`（逻辑删除）、`SHOW TABLES` | DataFusion DDL 走 Catalog；幂等/模板配置可从 SQL 传入 |
+| **S1.6** | `INSERT INTO ... VALUES / SELECT`：**server 基于 sqlparser AST 前置解析**（§4.3），按表 schema 构造 `RecordBatch` 送入 ingest 管线（**不使用 DataFusion DML**） | SQL 写入的数据崩溃重启后可恢复；与 DoPut 同等持久性 |
+| **S1.7** | DDL：server 基于 sqlparser AST 拦截 `CREATE TABLE / DROP TABLE` → Catalog（新增 `drop_table` 能力）；`SHOW TABLES` → Catalog `list_tables` | DDL 结果持久化（跨会话/重启可见） |
 | **S1.8** | 幂等键在 SQL 路径的透传：Prepared statement options 携带 `client_request_id`；INSERT 路径按语句级生成 | 幂等矩阵单测覆盖 |
 
 ### Sprint D：自有客户端 + 收尾
@@ -179,20 +179,58 @@ yuntun/                                  # 现在 → 目标
 | **标准轨** | Flight SQL（StatementQuery / PreparedStatement） | pyarrow、ADBC、JDBC、Grafana 插件生态 | 生态兼容 |
 | **简易轨** | ticket = SQL 文本（既有实现，保留） | `yuntun-cli`、自有 SDK | 零开销直查 |
 
-### 4.3 SQL 写入的统一约束
+### 4.3 SQL 前置解析拦截（v2.0.3 设计定稿，S1.6/S1.7）
 
-无论 Prepared statement `do_put`（批量 append）还是 `INSERT INTO ... VALUES`（DataFusion DML），
+**原则**：server 做 SQL 的**前置解析拦截**——只有 SELECT 查询让 DataFusion 处理。
+DataFusion 不触碰 DML / DDL（避免会话级副作用，能力边界清晰）。
+
+**技术选型：`sqlparser`**（与 DataFusion 同源的 SQL 解析器，Apache-2.0）——
+server 用 `Parser::parse_sql` 把语句解析为 AST（`sqlparser::ast::Statement`）后按变体分流，
+不手写 tokenizer。与 DataFusion 同源意味着 SQL 方言（标识符引用、类型名、字面量语法）
+天然一致；版本对齐 DataFusion 55 所依赖的 sqlparser 版本（避免双版本共存）。
+方言 MVP 用 `GenericDialect`（宽松），后续可按协议/会话配置。
+
+`FlightServer::run_sql` 按 AST `Statement` 变体分流（所有 SQL 入口统一经过：
+简易轨 do_get / FlightSQL StatementQuery / StatementUpdate / prepared update）：
+
+| AST `Statement` 变体 | 处理 |
+|---|---|
+| `Query`（SELECT / CTE） | → DataFusion（**query 能力**，只读） |
+| `ShowTables` | → Catalog `list_tables`（meta 能力） |
+| `Insert` + `SetExpr::Values` | server 按表 schema 把 AST 字面量（`Value`）构造 `RecordBatch` → `ingest.ingest`（**ingest 能力**） |
+| `Insert` + `SetExpr::Select` | server 先经 DataFusion 执行 SELECT 源（读），结果列 cast 到表 schema → ingest |
+| `CreateTable` | server 映射列定义（`ColumnDef` 的 `DataType` → Arrow DataType）→ Catalog `create_table` |
+| `Drop { object_type: Table }` | → Catalog `drop_table`（**新增 meta 能力**；数据文件转孤儿，由孤儿清理回收） |
+| 其他（`Update` / `Delete` / `Explain` / `Set` ...） | 明确拒绝（NotImplemented + 支持列表提示） |
+
+**INSERT 解析规则（MVP 限制）**：
+
+- VALUES 仅支持字面量（AST `Value`：字符串、数值、`NULL`、`TRUE/FALSE`）；
+  表达式与函数 → 明确拒绝
+- 列清单 `INSERT INTO t (a, b)` 支持指定列，缺省列填 NULL（NOT NULL 列缺失则报错）；
+  无列清单按表 schema 全列按序
+- 类型按表 schema 逐列转换（含范围检查）；`TIMESTAMP` 字面量支持 ISO8601（UTC）与整型毫秒
+- `INSERT INTO t SELECT ...` 列按位置对齐并 cast 到表 schema 类型（不支持指定列清单的 MVP）
+- 每条语句一个语句级幂等键（满足 require 表强制检查；Meta 层去重仍以 batch_id 为准）
+- 单语句：多语句输入（`;` 分隔）明确拒绝（避免部分执行的语义复杂度）
+
+**DDL 说明**：`CREATE TABLE` 的 ingest 配置使用 General 模板（强制幂等键）；
+分区列 / Vortex 格式 / 模板选择的 SQL 语法留待后续按需扩展。
+
+### 4.4 写入的统一约束
+
+无论 Prepared statement `do_put`（批量 append）还是 `INSERT INTO ... VALUES`（server 前置解析），
 最终**必须汇入同一条 ingest 管线**（WAL append → 攒批 → flush → CommitFiles）：
 
 ```
-Flight SQL do_put(prepared stmt) ─┐
-DataFusion INSERT (IngestSinkExec)┼→ mpsc → ingest 管线（WAL 权威）→ 查询可见
-Flight DoPut（既有链路）          ┘
+Flight SQL do_put(prepared stmt)   ─┐
+SQL INSERT（server 前置解析为 RB） ─┼→ ingest 管线（WAL 权威）→ 攒批后可见
+Flight DoPut（简易轨，既有链路）    ┘
 ```
 
 **禁止** SQL 写入路径直接写 S3 / 直写 Catalog —— 绕过 WAL 就绕过了崩溃恢复（C1）。
 
-### 4.4 一致性说明
+### 4.5 一致性说明
 
 SQL `INSERT` 返回成功时数据仅落 WAL（与 Flight DoPut 语义一致），攒批窗口后可见；
 如需同步可见，由 MemTable 直读路径提供"写后立即可查"（读己之写），实现方式与既有查询路径复用。
@@ -235,7 +273,8 @@ SQL `INSERT` 返回成功时数据仅落 WAL（与 Flight DoPut 语义一致）�
 | # | 风险 | 概率 | 影响 | 应对 |
 |---|---|---|---|---|
 | R-1 | arrow-flight `flight_sql` 模块 API 与目标客户端版本不匹配（protobuf 兼容性） | 中 | 高 | S1.5 第一时间做 pyarrow 冒烟；不匹配则从官方 proto 手动 codegen |
-| R-2 | DataFusion `insert_into` 与自定义 TableProvider 的 DML 集成坑（append-only sink） | 中 | 中 | S1.6 先做 PoC；不可行则 INSERT 降级为 Flight SQL do_put 的语法糖 |
+| R-1b | sqlparser 版本与 DataFusion 55 依赖不一致（双版本共存） | 低 | 低 | 对齐 Cargo.lock 中 DF 依赖的 sqlparser 版本；AST 仅用于 server 前置分流，双版本本也可共存 |
+| R-2 | ~~DataFusion `insert_into` DML 集成坑~~ | — | — | **已消除**（v2.0.3）：INSERT 改为 server 前置解析，不使用 DataFusion DML |
 | R-3 | 双轨 ticket 路由冲突（FlightSql cmd 与自定义 cmd 混淆） | 低 | 中 | cmd 头部加 1 字节轨标识；两轨各有 e2e |
 | R-4 | 结构重构引入回归 | 低 | 中 | 纯移动 + 改名，重构后立即全量回归 66 tests |
 | R-5 | 阶段 3 时 Catalog gRPC 改造面超预期 | 中 | 中 | 架构 §6.4 已同签名预留；Compaction 依赖具体类型需先抽象 `CommitCompaction`（操作日志 §2.2-5） |
