@@ -1,0 +1,20 @@
+[package]
+name = "yuntun-compaction"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+yuntun-model = { path = "../model" }
+yuntun-catalog = { path = "../catalog" }
+yuntun-store = { path = "../store" }
+yuntun-format = { path = "../format" }
+arrow = { workspace = true }
+object_store = { workspace = true }
+tokio-util = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }

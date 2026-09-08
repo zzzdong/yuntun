@@ -1,34 +1,60 @@
-[package]
-name = "yuntun"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+resolver = "2"
+members = [
+    "crates/model",
+    "crates/proto",
+    "crates/wal",
+    "crates/store",
+    "crates/format",
+    "crates/catalog",
+    "crates/ingest",
+    "crates/query",
+    "crates/compaction",
+    "crates/server",
+    "bins/all-in-one",
+    "crates/chaos",
+]
 
-[dependencies]
-arrow = "57"
-arrow-array = "57"
-arrow-schema = "57"
-arrow-flight = "57"
-datafusion = "51"
-datafusion-catalog = "51"
-datafusion-common = "51"
-datafusion-execution = "51"
-datafusion-sql = "51"
-object_store = "0.13"
-influxdb-line-protocol = "2.0.0"
-dashmap = "5.5"
-tokio = { version = "1.35", features = ["full"] }
-futures = "0.3.31"
-futures-util = "0.3.31"
-hyper = "1.8"
-parquet = "57"
-async-trait = "0.1.79"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-anyhow = "1.0"
-uuid = { version = "1.7", features = ["v4"] }
-axum = { version = "0.8.8", features = ["macros"] }
-arrow-json = "57"
-thiserror = "1.0"
-fjall = "3.0.1"
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# ---- 核心 ----
+# 注意：datafusion 55.0.0 实际依赖 arrow 59 / object_store 0.13（文档 §2.3 的
+# "arrow 55" 指 DataFusion 主版本）。统一全 workspace 用 arrow 59 避免双版本冲突。
+arrow = "59"
+arrow-flight = "59"
+datafusion = "55"
+datafusion-datasource = "55"
+datafusion-datasource-parquet = "55"
+parquet = "59"
+object_store = { version = "0.13", features = ["aws"] }
+url = "2"
+
+# ---- 运行时 ----
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 tonic = "0.14"
-prost = "0.12"
+prost = "0.14"
+
+# ---- 工具 ----
+uuid = { version = "1", features = ["v7"] }
+crc32fast = "1"
+thiserror = "2"
+tracing = "0.1"
+async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+rand = "0.8"
+
+# 阶段 1 才引入：
+# raft-rs = "0.7"
+# fjall   = "3.1.8"
+
+[profile.release]
+debug = true

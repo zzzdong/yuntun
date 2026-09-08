@@ -1,0 +1,18 @@
+[package]
+name = "yuntun-catalog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# catalog 是纯逻辑 crate，不含网络代码（详细设计 §2.2）。
+# 阶段 0 进程内调用；阶段 1 包一层 gRPC，业务代码零修改。
+
+[dependencies]
+yuntun-model = { path = "../model" }
+arrow = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }

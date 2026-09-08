@@ -1,0 +1,15 @@
+[package]
+name = "yuntun-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# model 是最底层 crate：不依赖任何 workspace 内 crate（详细设计 §2.2）
+[dependencies]
+arrow = { workspace = true }
+crc32fast = { workspace = true }
+prost = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }

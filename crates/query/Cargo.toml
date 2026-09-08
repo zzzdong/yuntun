@@ -1,0 +1,32 @@
+[package]
+name = "yuntun-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+yuntun-model = { path = "../model" }
+yuntun-catalog = { path = "../catalog" }
+yuntun-store = { path = "../store" }
+yuntun-format = { path = "../format" }
+datafusion = { workspace = true }
+datafusion-datasource = { workspace = true }
+datafusion-datasource-parquet = { workspace = true }
+arrow = { workspace = true }
+object_store = { workspace = true }
+url = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+yuntun-ingest = { path = "../ingest" }
+yuntun-wal = { path = "../wal" }
+yuntun-store = { path = "../store" }
+tokio-util = { workspace = true }
+tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

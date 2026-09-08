@@ -1,0 +1,20 @@
+[package]
+name = "yuntun-chaos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+yuntun-model = { path = "../model" }
+yuntun-wal = { path = "../wal" }
+yuntun-store = { path = "../store" }
+yuntun-format = { path = "../format" }
+yuntun-catalog = { path = "../catalog" }
+yuntun-ingest = { path = "../ingest" }
+yuntun-query = { path = "../query" }
+arrow = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }

@@ -1,0 +1,27 @@
+[package]
+name = "yuntun-format"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# ADR-1: Vortex 主格式 + Parquet 回退（FormatSwitch）。
+# Vortex API 仍在演进，依赖通过 `vortex` feature 显式开启（并锁定 Git Commit），
+# 默认使用 Parquet 回退路径，保证阶段 0 始终可用。
+[features]
+default = []
+vortex = []
+
+[dependencies]
+yuntun-model = { path = "../model" }
+yuntun-store = { path = "../store" }
+arrow = { workspace = true }
+parquet = { workspace = true }
+object_store = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+bytes = { workspace = true }

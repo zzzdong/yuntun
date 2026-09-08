@@ -1,0 +1,51 @@
+# yuntun All-in-One 配置示例（详细设计 §11）
+
+[server]
+listen = "0.0.0.0:50051"
+# MVP 单 shard（0）；多 shard 分配在阶段 1（ShardMapper）
+shards = 1
+
+[store]
+# local = 本地文件系统（开发）；memory = 内存（测试）；s3 = S3/MinIO（生产）
+type = "local"
+root = "./data/store"
+
+# [store]
+# type = "s3"
+# bucket = "yuntun-lake"
+# endpoint = "http://minio:9000"
+# access_key_id = "minioadmin"
+# secret_access_key = "minioadmin"
+# allow_http = true
+
+[wal]
+dir = "./data/wal"
+# segment 最大 64MB
+segment_max_mb = 64
+# 【v11】批次超时 → BatchAbort（30 分钟）
+batch_timeout_secs = 1800
+# 【v11】磁盘保护水位（>80% 强制 abort 最老未完成 batch）
+disk_high_watermark = 0.80
+
+[ingest]
+# ADR-1 FormatSwitch：vortex 需编译期 --features vortex 并锁定 Git Commit；
+# 当前默认 parquet 回退路径
+default_format = "parquet"
+# 攒批行数阈值（§7.2）
+rows_threshold = 10000
+# 攒批时间阈值（秒）
+time_threshold_secs = 5
+# Flush Jitter 上限（秒，ADR-10 防惊群）
+flush_jitter_secs = 60
+scan_interval_ms = 100
+# 幂等键 TTL（小时，§7.3.1）
+idempotency_ttl_hours = 24
+
+[compaction]
+# 同 shard 文件数 > min_files 触发合并
+min_files = 5
+interval_secs = 60
+
+[query]
+# 本地缓存 TTL（C7：查询无网络调用）
+cache_ttl_secs = 30
