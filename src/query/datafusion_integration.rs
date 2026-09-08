@@ -3,7 +3,7 @@ use datafusion::logical_expr::{Expr, TableType, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use arrow::datatypes::SchemaRef;
 use std::sync::Arc;
-use crate::catalog::types::TableMetadata;
+use crate::meta::types::TableMetadata;
 use crate::store::store_manager::StoreManager;
 
 #[derive(Debug)]

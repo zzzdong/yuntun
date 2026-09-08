@@ -108,6 +108,22 @@ impl MetaService {
         Ok(tables.iter().map(|table| table.name.clone()).collect())
     }
 
+    /// Add a chunk to a table
+    pub async fn add_chunk_to_table(&self, table_name: &str, chunk_meta: crate::meta::types::ChunkMeta) -> Result<()> {
+        let mut tables = self.tables.write().await;
+        if let Some(index) = tables.iter().position(|table| table.name == table_name) {
+            tables[index].chunks.push(chunk_meta.clone());
+            tables[index].updated_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            self.storage.save_table_meta(&tables[index]).await?;
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Table '{}' not found", table_name))
+        }
+    }
+
     /// Get storage metadata
     pub async fn get_storage(&self, storage_id: &str) -> Result<Option<StorageMeta>> {
         let storages = self.storages.read().await;

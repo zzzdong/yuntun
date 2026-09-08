@@ -21,6 +21,12 @@ pub struct TableMeta {
     pub updated_at: u64,
 }
 
+/// Table metadata for query execution (alias for compatibility)
+pub type TableMetadata = TableMeta;
+
+/// Chunk metadata for query execution (alias for compatibility)
+pub type ChunkMetadata = ChunkMeta;
+
 /// Table metadata for serialization
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TableMetaSerde {

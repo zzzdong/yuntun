@@ -9,28 +9,18 @@ use futures::StreamExt;
 use tonic::codegen::Bytes;
 
 use crate::query::query_service::QueryService;
-use crate::meta::service::MetaService;
-use crate::store::store_manager::StoreManager;
 
 /// Flight service implementation
 #[derive(Debug, Clone)]
 pub struct YuntunFlightService {
     query_service: Arc<QueryService>,
-    meta_service: Arc<MetaService>,
-    store_manager: Arc<StoreManager>,
 }
 
 impl YuntunFlightService {
     /// Create a new Flight service
-    pub fn new(
-        query_service: Arc<QueryService>,
-        meta_service: Arc<MetaService>,
-        store_manager: Arc<StoreManager>
-    ) -> Self {
+    pub fn new(query_service: Arc<QueryService>) -> Self {
         Self {
             query_service,
-            meta_service,
-            store_manager,
         }
     }
 }

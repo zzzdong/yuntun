@@ -5,14 +5,11 @@ use std::sync::Arc;
 
 use crate::meta::service::MetaService;
 use crate::meta::types::TableMeta;
-use crate::query::datafusion_integration::YuntunTableProvider;
-use crate::store::store_manager::StoreManager;
 
 /// SchemaProvider adapter using MetaService
 #[derive(Debug, Clone)]
 pub struct MetaSchemaProvider {
     meta_service: Arc<MetaService>,
-    store_manager: Option<Arc<StoreManager>>,
 }
 
 impl MetaSchemaProvider {
@@ -20,40 +17,11 @@ impl MetaSchemaProvider {
     pub fn new(meta_service: Arc<MetaService>) -> Self {
         Self {
             meta_service,
-            store_manager: None,
         }
     }
 
-    /// Set store manager
-    pub fn set_store_manager(&mut self, store_manager: Arc<StoreManager>) {
-        self.store_manager = Some(store_manager);
-    }
-    
-    /// Convert TableMeta to TableMetadata for compatibility
-    fn convert_to_table_metadata(&self, table_meta: TableMeta) -> crate::catalog::types::TableMetadata {
-        let chunks = table_meta.chunks.into_iter().map(|chunk| {
-            crate::catalog::types::ChunkMetadata {
-                chunk_id: chunk.chunk_id,
-                chunk_type: crate::catalog::types::ChunkType::Memory,
-                row_count: chunk.row_count,
-                size_in_bytes: chunk.size_in_bytes,
-                created_at: chunk.created_at,
-                partition_info: None,
-                index_info: None,
-            }
-        }).collect();
-        
-        crate::catalog::types::TableMetadata {
-            name: table_meta.name,
-            schema: table_meta.schema,
-            chunks,
-            created_at: table_meta.created_at,
-            updated_at: table_meta.updated_at,
-        }
-    }
-    
-    /// Get table metadata
-    pub fn get_table_metadata(&self, name: &str) -> Option<crate::catalog::types::TableMetadata> {
+    /// Get table metadata (sync wrapper)
+    pub fn get_table_metadata(&self, name: &str) -> Option<TableMeta> {
         // This is a sync method, but we need to call async method
         // We'll use a blocking approach for compatibility
         let self_clone = self.clone();
@@ -61,11 +29,7 @@ impl MetaSchemaProvider {
             .build()
             .unwrap()
             .block_on(async {
-                if let Some(table_meta) = self_clone.meta_service.get_table(name).await.unwrap() {
-                    Some(self_clone.convert_to_table_metadata(table_meta))
-                } else {
-                    None
-                }
+                self_clone.meta_service.get_table(name).await.unwrap()
             })
     }
 }
@@ -87,18 +51,12 @@ impl SchemaProvider for MetaSchemaProvider {
             })
     }
 
-    async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
-        if let Some(table_meta) = self.meta_service.get_table(name).await.unwrap() {
-            if let Some(store_manager) = &self.store_manager {
-                let table_metadata = self.convert_to_table_metadata(table_meta);
-                let table_provider = Arc::new(YuntunTableProvider::new(Arc::new(table_metadata), store_manager.clone()));
-                Ok(Some(table_provider as Arc<dyn TableProvider>))
-            } else {
-                Err(DataFusionError::Execution("Store manager not set for schema provider".to_string()))
-            }
-        } else {
-            Ok(None)
-        }
+    async fn table(&self, _name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
+        // MetaSchemaProvider should only return table metadata
+        // The actual TableProvider will be created by QueryService
+        Err(DataFusionError::Execution(
+            "MetaSchemaProvider should not directly create TableProvider. Use QueryService instead.".to_string()
+        ))
     }
 
     fn register_table(
@@ -140,15 +98,9 @@ impl SchemaProvider for MetaSchemaProvider {
             .build()
             .unwrap()
             .block_on(async {
-                if let Some(table_meta) = self_clone.meta_service.get_table(name).await.unwrap() {
+                if self_clone.meta_service.get_table(name).await.unwrap().is_some() {
                     self_clone.meta_service.delete_table(name).await.unwrap();
-                    if let Some(store_manager) = &self_clone.store_manager {
-                        let table_metadata = self_clone.convert_to_table_metadata(table_meta);
-                        let table_provider = Arc::new(YuntunTableProvider::new(Arc::new(table_metadata), store_manager.clone()));
-                        Ok(Some(table_provider as Arc<dyn TableProvider>))
-                    } else {
-                        Err(DataFusionError::Execution("Store manager not set for schema provider".to_string()))
-                    }
+                    Ok(None)
                 } else {
                     Ok(None)
                 }
