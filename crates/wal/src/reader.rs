@@ -72,7 +72,8 @@ mod tests {
     use yuntun_model::wal_record::{BatchPendingPayload, Record};
 
     fn tmpdir(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("yuntun-wal-reader-{name}-{}", std::process::id()));
+        let d =
+            std::env::temp_dir().join(format!("yuntun-wal-reader-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d

@@ -1,13 +1,13 @@
-//! 装配层：All-in-One 进程（详细设计 §2.4 / §5.7）。
+//! 装配层：Standalone 单机进程（详细设计 §2.4 / §5.7；原 all-in-one，v2.0 更名）。
 //!
 //! 组装：MemoryCatalog + ObjectStore + WAL + Ingestor + QueryEngine
 //! + Compactor + WAL 超时监控，并启动 Arrow Flight gRPC 服务。
 
 pub mod config;
-pub mod hook;
+pub mod flight;
 
 pub use config::Config;
-pub use hook::{IngestorHook, QueryHook};
+pub use flight::FlightServer;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,7 +33,7 @@ impl Lakehouse {
         Self::build_with_shutdown(cfg, CancellationToken::new()).await
     }
 
-    /// 同 build，但注入外部 shutdown（all-in-one 主循环使用）。
+    /// 同 build，但注入外部 shutdown（standalone 主循环使用）。
     pub async fn build_with_shutdown(
         cfg: &Config,
         shutdown: CancellationToken,
@@ -69,7 +69,7 @@ impl Lakehouse {
 
         // ④ Ingestor
         let ingest_cfg = IngestorConfig {
-            default_format: yuntun_format::DataFormat::from_str(&cfg.ingest.default_format),
+            default_format: yuntun_format::DataFormat::parse(&cfg.ingest.default_format),
             rows_threshold: cfg.ingest.rows_threshold,
             time_threshold_secs: cfg.ingest.time_threshold_secs,
             flush_jitter_secs: cfg.ingest.flush_jitter_secs,
@@ -116,7 +116,11 @@ impl Lakehouse {
         ));
 
         // 攒批循环
-        handles.push(self.ingestor.clone().spawn_accumulator(self.shutdown.clone()));
+        handles.push(
+            self.ingestor
+                .clone()
+                .spawn_accumulator(self.shutdown.clone()),
+        );
 
         // WAL 超时监控（§5.3.6.1：批次超时 abort + 磁盘水位 + segment 清理）
         // segment 清单来自 recovery 元信息（§4.8）：监控依据"区间相交的非终态 batch"判定可删
@@ -147,7 +151,7 @@ impl Lakehouse {
             },
             catalog: self.catalog.clone(),
             store: self.store.clone(),
-            format: yuntun_format::DataFormat::from_str(&cfg.ingest.default_format),
+            format: yuntun_format::DataFormat::parse(&cfg.ingest.default_format),
         });
         handles.push(yuntun_compaction::spawn_compaction_loop(
             compactor,
@@ -167,16 +171,15 @@ impl Lakehouse {
     }
 }
 
-/// 启动 Arrow Flight gRPC 服务（T1.3 写入 + do_get SQL 查询）。
+/// 启动 Arrow Flight gRPC 服务（单端点多轨：FlightSQL 标准轨 + 简易写入/查询轨）。
 pub async fn serve_flight(
     lakehouse: &Lakehouse,
     listen: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let hook = Arc::new(IngestorHook::new(lakehouse.ingestor.clone()));
-    let query_hook = Arc::new(QueryHook::new(lakehouse.query.clone()));
-    let svc = arrow_flight::flight_service_server::FlightServiceServer::new(
-        yuntun_ingest::flight::FlightIngestService::new(hook).with_query(query_hook),
-    );
+    let svc = arrow_flight::flight_service_server::FlightServiceServer::new(FlightServer::new(
+        lakehouse.ingestor.clone(),
+        lakehouse.query.clone(),
+    ));
     let addr = listen
         .parse::<std::net::SocketAddr>()
         .map_err(|e| format!("invalid listen addr {listen}: {e}"))?;

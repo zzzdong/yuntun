@@ -11,9 +11,6 @@ yuntun-catalog = { path = "../catalog" }
 yuntun-store = { path = "../store" }
 yuntun-format = { path = "../format" }
 arrow = { workspace = true }
-arrow-flight = { workspace = true }
-tonic = { workspace = true }
-prost = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

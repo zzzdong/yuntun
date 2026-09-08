@@ -1,17 +1,19 @@
 //! Ingestor 主流程（详细设计 §5.2 写入主流程 + §5.3 攒批循环）。
 
 use crate::accumulator::{extract_event_time_ms, now_ms, BatchAccumulator};
-use crate::flush::{commit_recovered_batch, flush_batch, flush_batch_with_id, FlushDeps, LiveBatchTracker};
+use crate::flush::{
+    commit_recovered_batch, flush_batch, flush_batch_with_id, FlushDeps, LiveBatchTracker,
+};
 use crate::schema_cache::{resolve_schema_version, SchemaCache};
 use crate::source::IngestBatch;
 use crate::source::{IngestSource, Receipt};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 use yuntun_catalog::CatalogOps;
 use yuntun_model::error::LakeError;
 use yuntun_model::wal_record::DataPayload;
 use yuntun_wal::writer::WalWriter;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio_util::sync::CancellationToken;
 
 /// Ingestor 配置（详细设计 §11 [ingest] 节）。
 #[derive(Debug, Clone)]
@@ -98,7 +100,7 @@ impl Ingestor {
         let ingest_cfg = table_meta
             .ingest_config
             .clone()
-            .unwrap_or_else(|| yuntun_model::meta::IngestConfig::standard());
+            .unwrap_or_else(yuntun_model::meta::IngestConfig::standard);
         // 幂等键开关以表配置为权威（§7.3.2；IngestConfig::standard 为缺省模板）
         let require_key = ingest_cfg.require_idempotency_key;
 
@@ -106,9 +108,13 @@ impl Ingestor {
         let _client_key = crate::resolve_idempotency(require_key, b.idempotency_key.as_deref())?;
 
         // ①-④ Schema 解析 / OCC 演进（必须在写 S3 之前，C8）
-        let schema_version =
-            resolve_schema_version(&self.catalog, &self.schema_cache, &b.table, &b.record_batch.schema())
-                .await?;
+        let schema_version = resolve_schema_version(
+            &self.catalog,
+            &self.schema_cache,
+            &b.table,
+            &b.record_batch.schema(),
+        )
+        .await?;
 
         // ⑤ 写 WAL（组提交 fsync）—— await 完成 = 已 fsync = 数据已持久化
         let event_time = extract_event_time_ms(&b.record_batch);
@@ -120,8 +126,9 @@ impl Ingestor {
         let (_wms, window) = crate::accumulator::window_of(event_time, received_ms);
         let mut ipc = Vec::new();
         {
-            let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut ipc, &b.record_batch.schema())
-                .map_err(|e| LakeError::Other(format!("ipc encode: {e}")))?;
+            let mut writer =
+                arrow::ipc::writer::StreamWriter::try_new(&mut ipc, &b.record_batch.schema())
+                    .map_err(|e| LakeError::Other(format!("ipc encode: {e}")))?;
             writer
                 .write(&b.record_batch)
                 .map_err(|e| LakeError::Other(format!("ipc write: {e}")))?;
@@ -166,12 +173,15 @@ impl Ingestor {
                 tracing::error!(error = %e, source = %source.name(), "ingest failed");
             }
         }
-        let _ = src_task;
+        let _ = src_task.await;
         Ok(())
     }
 
     /// 以 tokio task 启动攒批循环（返回 JoinHandle，供优雅关闭 join）。
-    pub fn spawn_accumulator(self: Arc<Self>, shutdown: CancellationToken) -> tokio::task::JoinHandle<()> {
+    pub fn spawn_accumulator(
+        self: Arc<Self>,
+        shutdown: CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(self.run_accumulator(shutdown))
     }
 
@@ -303,7 +313,10 @@ impl Ingestor {
     }
 
     /// 供测试/运维：手动 flush 指定组。
-    pub async fn flush_now(&self, group: crate::accumulator::WindowGroup) -> Result<crate::flush::FlushOutcome, LakeError> {
+    pub async fn flush_now(
+        &self,
+        group: crate::accumulator::WindowGroup,
+    ) -> Result<crate::flush::FlushOutcome, LakeError> {
         flush_batch(group, &self.deps()).await
     }
 }

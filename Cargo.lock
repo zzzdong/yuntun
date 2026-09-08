@@ -204,15 +204,21 @@ version = "59.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be0e6d452fff35cb4a3ef1a719d03fdfe653e590e8012b57d3057a316e295402"
 dependencies = [
+ "arrow-arith",
  "arrow-array",
  "arrow-buffer",
  "arrow-cast",
  "arrow-data",
  "arrow-ipc",
+ "arrow-ord",
+ "arrow-row",
  "arrow-schema",
+ "arrow-select",
+ "arrow-string",
  "base64 0.23.1",
  "bytes",
  "futures",
+ "once_cell",
  "prost 0.14.4",
  "prost-types 0.14.4",
  "tonic",
@@ -4084,20 +4090,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "yuntun-all-in-one"
-version = "0.1.0"
-dependencies = [
- "serde",
- "tokio",
- "tokio-util",
- "toml",
- "tracing",
- "tracing-subscriber",
- "yuntun-server",
- "yuntun-store",
-]
-
-[[package]]
 name = "yuntun-catalog"
 version = "0.1.0"
 dependencies = [
@@ -4173,12 +4165,10 @@ name = "yuntun-ingest"
 version = "0.1.0"
 dependencies = [
  "arrow",
- "arrow-flight",
  "async-trait",
  "bytes",
  "futures",
  "object_store",
- "prost 0.14.4",
  "rand 0.8.8",
  "serde",
  "serde_json",
@@ -4186,7 +4176,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
- "tonic",
  "tracing",
  "uuid",
  "yuntun-catalog",
@@ -4254,6 +4243,7 @@ dependencies = [
  "async-trait",
  "futures",
  "object_store",
+ "prost 0.14.4",
  "serde",
  "serde_json",
  "thiserror",
@@ -4274,6 +4264,20 @@ dependencies = [
  "yuntun-query",
  "yuntun-store",
  "yuntun-wal",
+]
+
+[[package]]
+name = "yuntun-standalone"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "yuntun-server",
+ "yuntun-store",
 ]
 
 [[package]]

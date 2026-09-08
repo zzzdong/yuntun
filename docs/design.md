@@ -1,9 +1,13 @@
 # 通用直写数据湖 — 详细设计文档
 
 > **依据**：《通用直写数据湖架构设计 v11》（终审通过）
-> **版本**：v1.0
-> **日期**：2026-08-31
+> **版本**：v1.1
+> **日期**：2026-08-31（v1.1 修订：2026-09-08）
 > **定位**：架构设计 → 工程实现的桥梁。定义**模块边界、接口契约、数据结构、状态机、错误码、配置项**，可直接指导编码。
+>
+> **v1.1 修订说明**：随《开发计划任务书 v2.0》（Standalone 优先路线）同步——§2.1 workspace
+> 结构更新（`bins/` 撤销、`standalone`/`client` 独立 crate）；阶段 1 新增 Flight SQL 标准
+> 协议与 SQL 写入路径（接口设计见计划任务书 §四），其余章节按计划书 v2.0 阶段映射阅读。
 >
 > **阅读对象**：实施工程师（Rust）、测试工程师
 > **与架构文档的关系**：本文不重复论证"为什么"，只定义"是什么"与"怎么做"。所有设计决策的论证见架构文档对应 ADR / 章节。
@@ -63,33 +67,38 @@
 
 ### 2.1 Workspace 结构
 
+> **【v2 更新，2026-09-08】**：以《开发计划任务书 v2.0》（Standalone 优先路线）为准。
+> 撤销 `bins/`，`all-in-one` 更名 `standalone`（bin 名 `yuntun`）独立成 crate；
+> 新增 `yuntun-client`（SDK + CLI）；`server` 新增 Flight SQL 标准协议模块。
+
 ```
-lakehouse/
+yuntun/
 ├── Cargo.toml                 # workspace 根
 ├── crates/
-│   ├── proto/                 # Protobuf 定义（Meta gRPC、WAL record）
-│   ├── model/                 # 核心数据模型（无 IO，无网络）
-│   ├── wal/                   # 自实现 WAL（segment + CRC + 组提交）
-│   ├── store/                 # 对象存储抽象（S3 / 本地 / Mock）
-│   ├── format/                # Vortex / Parquet 读写封装 + Feature Flag
-│   ├── catalog/               # Catalog 纯逻辑（表/文件/快照/删除/幂等）
-│   ├── ingest/                # 写入路径（Source → WAL → 攒批 → S3 → Meta）
-│   ├── query/                 # DataFusion 桥接（CatalogProvider/TableProvider/Adapter）
-│   ├── compaction/            # 后台作业（合并、孤儿清理、TTL、超时监控）
-│   └── server/                # 服务框架（gRPC/Flight/HTTP、健康检查、指标）
-├── bins/
-│   └── all-in-one.rs          # 阶段 0 唯一二进制
-└── tests/
-    ├── integration/           # 端到端
-    └── chaos/                 # 阶段 0.5 故障注入
+│   ├── yuntun-proto/          # 元数据 / WAL 消息（prost；阶段 3 启用 tonic-build）
+│   ├── yuntun-model/          # 核心数据模型（无 IO，无网络）
+│   ├── yuntun-wal/            # 自实现 WAL（segment + CRC + 组提交）
+│   ├── yuntun-store/          # 对象存储抽象（S3 / 本地 / Mock）
+│   ├── yuntun-format/         # Parquet（默认）/ Vortex 读写封装 + Feature Flag
+│   ├── yuntun-catalog/        # Catalog 纯逻辑（表/文件/快照/删除/幂等）
+│   ├── yuntun-ingest/         # 写入路径（Source → WAL → 攒批 → S3 → Meta）
+│   ├── yuntun-query/          # DataFusion 桥接（纯查询能力）
+│   ├── yuntun-compaction/     # 后台作业（合并、孤儿清理、TTL、超时监控）
+│   ├── yuntun-server/         # 节点层：协议端口（Flight/FlightSQL）+ 装配 + 路由
+│   ├── yuntun-chaos/          # 故障注入工具
+│   ├── yuntun-standalone/     # 单机二进制（bin 名 yuntun）
+│   └── yuntun-client/         # Rust SDK + CLI（bin 名 yuntun-cli）
+└── docs/
 ```
 
 ### 2.2 依赖方向（严格单向，禁止循环）
 
 ```
-        server
-       ╱  │  │  ╲
- ingest  query  compaction  (可独立二进制)
+            standalone ──→ client（仅 arrow-flight）
+              │
+            server          # 节点层：协议端口（Flight/FlightSQL）+ 装配 + 路由
+           ╱  │  │  ╲
+     ingest  query  compaction
        ╲  │  │  ╱
       catalog ──→ store, format
          │
@@ -100,7 +109,10 @@ lakehouse/
 
 **规则**：
 - `model` 不依赖任何 crate
-- `catalog` 是纯逻辑，**不含网络**（阶段 0 进程内调用，阶段 1 包一层 gRPC）
+- **【v12.3】`ingest` / `query` 是纯能力 crate**——不含协议、不含 Hook 间接层；
+  所有协议端口在 `server`（每个协议把写路由到 ingest、读路由到 query）
+- **【v12.3】所有写入走 ingest 管线**——唯一的数据写入事实，任何协议入口不得绕过
+- `catalog` 是纯逻辑，**不含网络**（阶段 0 进程内调用，阶段 3 包一层 gRPC）
 - `wal` 不依赖 `catalog`（WAL 只管字节流与 Record）
 
 ### 2.3 关键依赖（Cargo.toml）

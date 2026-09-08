@@ -74,7 +74,10 @@ mod tests {
         // 用 civil 算法往返验证：2026-08-31 → days
         let ms = days_from_civil(2026, 8, 31) * 86_400_000 + 14 * 3_600_000;
         assert_eq!(format_window(window_start_ms(ms)), "2026-08-31T14:00");
-        assert_eq!(format_window(window_start_ms(ms + 59_999)), "2026-08-31T14:00");
+        assert_eq!(
+            format_window(window_start_ms(ms + 59_999)),
+            "2026-08-31T14:00"
+        );
     }
 
     #[test]
@@ -84,8 +87,9 @@ mod tests {
         assert_eq!(a, b, "同一 shard+table 的 flush 时刻稳定可预测");
         assert!(a < 60);
         // 不同 shard 大概率分散
-        let set: std::collections::HashSet<u64> =
-            (0..20).map(|i| jitter_seconds(&format!("s{i}"), "tbl", 60)).collect();
+        let set: std::collections::HashSet<u64> = (0..20)
+            .map(|i| jitter_seconds(&format!("s{i}"), "tbl", 60))
+            .collect();
         assert!(set.len() > 1, "jitter 应打散不同 shard");
     }
 

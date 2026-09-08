@@ -5,13 +5,13 @@
 //! 收到 `SCHEMA_CHANGED` 后：不重试写入（数据仍在 WAL），
 //! 拉取新 schema 重新判定（§6.7），最多 3 次（§10.2）。
 
-use yuntun_catalog::CatalogOps;
-use yuntun_model::error::LakeError;
-use yuntun_model::schema::{classify, SchemaCompatibility};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
+use yuntun_catalog::CatalogOps;
+use yuntun_model::error::LakeError;
+use yuntun_model::schema::{classify, SchemaCompatibility};
 
 /// 本地缓存的表 schema。
 #[derive(Debug, Clone)]
@@ -40,18 +40,18 @@ impl SchemaCache {
             .await?
             .ok_or_else(|| LakeError::TableNotFound(table.to_string()))?;
         let c = CachedSchema { schema, version };
-        self.inner.write().await.insert(table.to_string(), c.clone());
+        self.inner
+            .write()
+            .await
+            .insert(table.to_string(), c.clone());
         Ok(c)
     }
 
     pub async fn update(&self, table: &str, schema: arrow::datatypes::SchemaRef, version: u64) {
-        self.inner.write().await.insert(
-            table.to_string(),
-            CachedSchema {
-                schema,
-                version,
-            },
-        );
+        self.inner
+            .write()
+            .await
+            .insert(table.to_string(), CachedSchema { schema, version });
     }
 }
 
@@ -117,9 +117,9 @@ pub async fn resolve_schema_version(
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc as SArc;
     use yuntun_catalog::MemoryCatalog;
     use yuntun_model::ops::CreateTableRequest;
-    use std::sync::Arc as SArc;
 
     fn sch(fields: &[(&str, DataType)]) -> arrow::datatypes::SchemaRef {
         let fs: Vec<Field> = fields
@@ -159,15 +159,16 @@ mod tests {
         // 本地缓存停在 v1（schema 也是 v1 的）→ resolve 循环应 OCC 重试并成功
         let cache = SchemaCache::default();
         {
-            let (s, v) = catalog.table_schema("t").await.unwrap().unwrap();
+            let (_s, v) = catalog.table_schema("t").await.unwrap().unwrap();
             assert_eq!(v, 2);
         }
         cache.update("t", sch(&[("a", DataType::Int64)]), 1).await; // 过期版本 + 过期 schema
-        // 传入含新列的 schema：基于过期 v1 判定 NeedsEvolve → OCC 冲突（actual=2）
-        // → 拉取新 schema 重新判定 → Compatible → 返回 2（§5.2 OCC 重试循环）
+                                                                    // 传入含新列的 schema：基于过期 v1 判定 NeedsEvolve → OCC 冲突（actual=2）
+                                                                    // → 拉取新 schema 重新判定 → Compatible → 返回 2（§5.2 OCC 重试循环）
         let incoming = sch(&[("a", DataType::Int64), ("other", DataType::Int64)]);
-        let version =
-            resolve_schema_version(&catalog, &cache, "t", &incoming).await.unwrap();
+        let version = resolve_schema_version(&catalog, &cache, "t", &incoming)
+            .await
+            .unwrap();
         assert_eq!(version, 2);
     }
 
@@ -186,8 +187,8 @@ mod tests {
             .unwrap();
         let cache = SchemaCache::default();
         // 数值 ↔ 字符串：拒绝（§8.1）
-        let res = resolve_schema_version(&catalog, &cache, "t", &sch(&[("a", DataType::Utf8)]))
-            .await;
+        let res =
+            resolve_schema_version(&catalog, &cache, "t", &sch(&[("a", DataType::Utf8)])).await;
         assert!(matches!(res, Err(LakeError::SchemaIncompatible(_))));
     }
 }

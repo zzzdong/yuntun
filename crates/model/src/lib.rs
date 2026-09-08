@@ -19,9 +19,7 @@ pub use batch::{BatchState, BatchStatus};
 pub use error::LakeError;
 pub use meta::*;
 pub use ops::*;
-pub use schema::{
-    apply_change, classify, SchemaChange, SchemaChangeKind, SchemaCompatibility,
-};
+pub use schema::{apply_change, classify, SchemaChange, SchemaChangeKind, SchemaCompatibility};
 pub use wal_record::{Record, RecordType};
 
 use std::time::SystemTime;

@@ -250,7 +250,11 @@ mod tests {
 
     #[test]
     fn file_header_bad_magic() {
-        let mut buf = FileHeader { shard_id: 1, first_seq: 1 }.encode();
+        let mut buf = FileHeader {
+            shard_id: 1,
+            first_seq: 1,
+        }
+        .encode();
         buf[0] = b'X';
         assert!(matches!(
             FileHeader::decode(&buf),

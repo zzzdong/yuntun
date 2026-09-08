@@ -9,7 +9,6 @@
 //! ADR-11：BatchState 不单独存储，由 WAL 事件流重建（顺序即因果）。
 
 pub mod accumulator;
-pub mod flight;
 pub mod flush;
 pub mod pipeline;
 pub mod schema_cache;
@@ -17,7 +16,7 @@ pub mod source;
 pub mod timeutil;
 
 pub use accumulator::{window_of, BatchAccumulator, WindowGroup};
-pub use flush::{LiveBatchTracker, FlushOutcome};
+pub use flush::{FlushOutcome, LiveBatchTracker};
 pub use pipeline::{Ingestor, IngestorConfig};
 pub use schema_cache::SchemaCache;
 pub use source::{IngestSource, Receipt};

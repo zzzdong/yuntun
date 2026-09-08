@@ -7,9 +7,9 @@
 //! - 绝对空闲超时兜底：5 分钟（防定时器 bug 导致无限滞留）
 
 use crate::timeutil::{jitter_seconds, window_start_ms, MINUTE_MS};
-use yuntun_model::wal_record::DataPayload;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use yuntun_model::wal_record::DataPayload;
 
 /// 窗口归属：数据按 event_time（缺省用 received_at）对齐到整分钟（ADR-10）。
 pub fn window_of(event_time_ms: Option<i64>, received_at_ms: i64) -> (i64, String) {
@@ -24,10 +24,18 @@ pub fn extract_event_time_ms(batch: &arrow::record_batch::RecordBatch) -> Option
     let arr = batch.column(idx);
     use arrow::array::{Array, Int64Array, TimestampMillisecondArray};
     if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
-        return if a.null_count() == arr.len() { None } else { Some(a.value(0)) };
+        return if a.null_count() == arr.len() {
+            None
+        } else {
+            Some(a.value(0))
+        };
     }
     if let Some(a) = arr.as_any().downcast_ref::<TimestampMillisecondArray>() {
-        return if a.null_count() == arr.len() { None } else { Some(a.value(0)) };
+        return if a.null_count() == arr.len() {
+            None
+        } else {
+            Some(a.value(0))
+        };
     }
     None
 }
@@ -53,7 +61,7 @@ impl WindowGroup {
     /// flush 触发判定（§5.3 任一满足即 flush）。
     pub fn should_flush(&self, now_ms: u64, cfg: &crate::pipeline::IngestorConfig) -> bool {
         // ① 行数阈值
-        if self.rows >= cfg.rows_threshold as u64 {
+        if self.rows >= cfg.rows_threshold {
             return true;
         }
         // ② 时间阈值：距窗口开始 >= time_threshold
@@ -207,7 +215,10 @@ mod tests {
             },
         );
         assert!(acc.drain_ready(now, &cfg()).is_empty());
-        let g = acc.groups.get_mut(&("t".into(), "s0".into(), "w1".into())).unwrap();
+        let g = acc
+            .groups
+            .get_mut(&("t".into(), "s0".into(), "w1".into()))
+            .unwrap();
         g.rows += 1;
         let ready = acc.drain_ready(now, &cfg());
         assert_eq!(ready.len(), 1);

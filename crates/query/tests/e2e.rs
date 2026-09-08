@@ -44,7 +44,10 @@ fn tmpdir(name: &str) -> std::path::PathBuf {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ingest_then_query_visible() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,yuntun=debug")))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,yuntun=debug")),
+        )
         .with_test_writer()
         .try_init();
     let wal_dir = tmpdir("wal");
@@ -109,12 +112,8 @@ async fn ingest_then_query_visible() {
     let _ = acc_handle.await;
 
     // ⑤ WAL 全部终态（BatchCommitted）
-    let recovery = yuntun_wal::recovery::recover(
-        &yuntun_wal::WalConfig::for_dir(&wal_dir),
-        0,
-        false,
-    )
-    .unwrap();
+    let recovery =
+        yuntun_wal::recovery::recover(&yuntun_wal::WalConfig::for_dir(&wal_dir), 0, false).unwrap();
     assert!(recovery.states.states.len() >= 2, "至少两个 batch");
 
     // ⑥ Query：缓存刷新 + SQL

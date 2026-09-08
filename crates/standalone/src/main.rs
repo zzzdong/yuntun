@@ -1,7 +1,8 @@
-//! yuntun All-in-One 进程（架构 §2.4 / 阶段 0）。
+//! yuntun Standalone 单机进程（计划任务书 v2.0 阶段 1；原 bins/all-in-one）。
 //!
 //! 单进程承载全部职责（Flight 写入 + WAL + 攒批 + S3 + Catalog + Compaction + Query 缓存），
-//! 接口层已按 gRPC / 线性一致性语义设计，阶段 1 拆分服务时零业务改动。
+//! 接口层已按 gRPC / 线性一致性语义设计，阶段 3 拆分服务时零业务改动。
+//! 本 crate 是"全组件参考装配"，分布式阶段的独立 crate 全部复用此处已验证的组件。
 //!
 //! 用法：
 //! ```text
@@ -49,7 +50,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cfg = match &config_path {
         Some(p) => yuntun_server::Config::from_path(p)?,
         None => {
-            tracing::warn!("no --config given, using defaults (local store ./data, memory catalog)");
+            tracing::warn!(
+                "no --config given, using defaults (local store ./data, memory catalog)"
+            );
             yuntun_server::Config::default()
         }
     };

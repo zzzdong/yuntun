@@ -8,6 +8,8 @@
 //! ```
 
 use crate::accumulator::WindowGroup;
+use std::sync::{Arc, Mutex};
+use uuid::Uuid;
 use yuntun_catalog::CatalogOps;
 use yuntun_model::batch::{apply_record, BatchStateMap};
 use yuntun_model::error::LakeError;
@@ -17,8 +19,6 @@ use yuntun_model::wal_record::{
     BatchAbortPayload, BatchCommittedPayload, BatchPendingPayload, BatchS3WrittenPayload, Record,
 };
 use yuntun_wal::writer::WalWriter;
-use std::sync::{Arc, Mutex};
-use uuid::Uuid;
 
 /// 运行期批次追踪器：维护 live BatchState（与 WAL 记录同步），
 /// 同时作为 WAL 超时监控的 [`BatchStateView`]。
@@ -94,10 +94,7 @@ pub struct FlushOutcome {
 /// 任何中间步骤失败：批次保持非终态（Pending / S3Written），
 /// 由 WAL 超时监控（§5.3.6.1）最终 abort；已写 S3 的文件成为孤儿，由孤儿清理回收。
 /// **绝不**在中途写 BatchCommitted。
-pub async fn flush_batch(
-    group: WindowGroup,
-    deps: &FlushDeps,
-) -> Result<FlushOutcome, LakeError> {
+pub async fn flush_batch(group: WindowGroup, deps: &FlushDeps) -> Result<FlushOutcome, LakeError> {
     flush_batch_with_id(group, deps, None).await
 }
 
@@ -256,8 +253,9 @@ fn merge_payloads(
     let mut batches = Vec::with_capacity(payloads.len());
     let mut max_version = 0u64;
     for p in payloads {
-        let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(&p.batch_ipc), None)
-            .map_err(|e| LakeError::Other(format!("wal ipc decode: {e}")))?;
+        let reader =
+            arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(&p.batch_ipc), None)
+                .map_err(|e| LakeError::Other(format!("wal ipc decode: {e}")))?;
         for b in reader {
             let b = b.map_err(|e| LakeError::Other(format!("wal ipc read: {e}")))?;
             max_version = max_version.max(p.schema_version);
@@ -363,8 +361,8 @@ mod tests {
 
     #[test]
     fn align_widens_int32_to_int64() {
-        use arrow::datatypes::{DataType, Field, Schema};
         use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
         use std::sync::Arc as SArc;
         let s32 = SArc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
         let s64 = SArc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));

@@ -46,7 +46,8 @@ impl BatchState {
 
     /// 批次级超时判断（§5.3.6.1：默认 30 分钟）
     pub fn is_timed_out(&self, now_ms: u64, timeout: Duration) -> bool {
-        !self.is_terminal() && now_ms.saturating_sub(self.created_at_ms) > timeout.as_millis() as u64
+        !self.is_terminal()
+            && now_ms.saturating_sub(self.created_at_ms) > timeout.as_millis() as u64
     }
 }
 
@@ -185,7 +186,7 @@ mod tests {
             }),
             2,
         );
-        assert!(m.states.get("b1").is_none());
+        assert!(!m.states.contains_key("b1"));
     }
 
     #[test]

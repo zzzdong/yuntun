@@ -10,7 +10,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::{FlightData, FlightDescriptor, PutResult};
 use futures::StreamExt;
-use yuntun_catalog::{CatalogOps, MemoryCatalog};
+use yuntun_catalog::CatalogOps;
 use yuntun_model::ops::CreateTableRequest;
 use yuntun_server::Lakehouse;
 
@@ -78,10 +78,8 @@ scan_interval_ms = 20
     // ② 启动 Flight 服务（随机端口）
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let hook = Arc::new(yuntun_server::IngestorHook::new(lakehouse.ingestor.clone()));
-    let query_hook = Arc::new(yuntun_server::QueryHook::new(lakehouse.query.clone()));
     let svc = arrow_flight::flight_service_server::FlightServiceServer::new(
-        yuntun_ingest::flight::FlightIngestService::new(hook).with_query(query_hook),
+        yuntun_server::FlightServer::new(lakehouse.ingestor.clone(), lakehouse.query.clone()),
     );
     let server_shutdown = shutdown.clone();
     let server = tokio::spawn(async move {
@@ -105,8 +103,7 @@ scan_interval_ms = 20
 
     // batches_to_flight_data → [schema 消息, batch 消息]
     let mut flight_msgs =
-        arrow_flight::utils::batches_to_flight_data(schema().as_ref(), vec![batch()])
-            .unwrap();
+        arrow_flight::utils::batches_to_flight_data(schema().as_ref(), vec![batch()]).unwrap();
     let mut data_flight = flight_msgs.remove(1);
     data_flight.app_metadata = br#"{"idempotency_key":"flight-key-1"}"#.to_vec().into();
 
@@ -154,7 +151,9 @@ scan_interval_ms = 20
     // ④' 外部查询通道：do_get（Ticket = SQL）
     let mut do_get_stream = client
         .do_get(arrow_flight::Ticket {
-            ticket: b"SELECT count(*) AS c FROM yuntun.public.audit".to_vec().into(),
+            ticket: b"SELECT count(*) AS c FROM yuntun.public.audit"
+                .to_vec()
+                .into(),
         })
         .await
         .unwrap()
@@ -176,7 +175,9 @@ scan_interval_ms = 20
     let info = client
         .get_flight_info(arrow_flight::FlightDescriptor {
             r#type: 2,
-            cmd: b"SELECT count(*) AS c FROM yuntun.public.audit".to_vec().into(),
+            cmd: b"SELECT count(*) AS c FROM yuntun.public.audit"
+                .to_vec()
+                .into(),
             path: vec![],
         })
         .await

@@ -1,6 +1,6 @@
 //! 配置（详细设计 §11 配置项清单）。
 //!
-//! TOML 配置文件（all-in-one 启动参数 `--config`）：
+//! TOML 配置文件（standalone 启动参数 `--config`）：
 //! ```toml
 //! [server]
 //! listen = "0.0.0.0:50051"
@@ -48,7 +48,9 @@ impl Default for ServerConfig {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StoreSection {
-    Local { root: PathBuf },
+    Local {
+        root: PathBuf,
+    },
     Memory,
     S3 {
         bucket: String,

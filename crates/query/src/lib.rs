@@ -15,8 +15,8 @@ pub use cache::{spawn_cache_refresh, CachedTable, LocalCatalogCache};
 pub use provider::{YuntunCatalogProvider, YuntunSchemaProvider};
 pub use table::YuntunTableProvider;
 
-use datafusion::prelude::SessionContext;
 use datafusion::error::DataFusionError;
+use datafusion::prelude::SessionContext;
 use yuntun_catalog::CatalogOps;
 
 /// 对象存储注册用的固定 URL（scan 路径均相对此 URL）。
@@ -44,11 +44,15 @@ impl QueryEngine {
     }
 
     /// 构造会话：注册对象存储 + yuntun catalog（每次查询新会话，会话级状态隔离）。
+    ///
+    /// information_schema 显式开启：Flight SQL GetTables / SHOW TABLES / S1.7 DDL 依赖。
     pub async fn session(&self) -> Result<SessionContext, DataFusionError> {
-        let ctx = SessionContext::new();
-        let url: url::Url = STORE_URL.parse().map_err(|e| {
-            DataFusionError::Configuration(format!("invalid store url: {e}"))
-        })?;
+        let ctx = SessionContext::new_with_config(
+            datafusion::prelude::SessionConfig::new().with_information_schema(true),
+        );
+        let url: url::Url = STORE_URL
+            .parse()
+            .map_err(|e| DataFusionError::Configuration(format!("invalid store url: {e}")))?;
         ctx.register_object_store(&url, self.store.clone());
         ctx.register_catalog(
             CATALOG_NAME,
@@ -58,10 +62,24 @@ impl QueryEngine {
     }
 
     /// 执行 SQL，返回全部批次。
-    pub async fn sql(&self, query: &str) -> Result<Vec<arrow::record_batch::RecordBatch>, DataFusionError> {
+    pub async fn sql(
+        &self,
+        query: &str,
+    ) -> Result<Vec<arrow::record_batch::RecordBatch>, DataFusionError> {
         let ctx = self.session().await?;
         let df = ctx.sql(query).await?;
         df.collect().await
+    }
+
+    /// 只取结果集 schema（逻辑计划，不执行物理计划）。
+    /// Flight SQL GetFlightInfo/GetSchema 用：避免 LIMIT 0 收集零批次的歧义。
+    pub async fn schema_of(
+        &self,
+        query: &str,
+    ) -> Result<arrow::datatypes::SchemaRef, DataFusionError> {
+        let ctx = self.session().await?;
+        let df = ctx.sql(query).await?;
+        Ok(std::sync::Arc::new(df.schema().as_arrow().clone()))
     }
 
     /// 启动缓存刷新任务（TTL 30s，§11）。

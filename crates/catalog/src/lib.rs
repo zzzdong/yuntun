@@ -9,6 +9,10 @@
 //!   阶段 0 单节点实现为自增序号，阶段 1 切换零业务改动
 
 use arrow::datatypes::SchemaRef;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 use yuntun_model::error::LakeError;
 use yuntun_model::meta::{
     compute_stats_lite, FileManifest, FileStatus, IdempotencyRecord, SchemaVersion, TableMeta,
@@ -18,10 +22,6 @@ use yuntun_model::ops::{
     EvolveSchemaRequest, EvolveSchemaResponse,
 };
 use yuntun_model::schema::{apply_change, SchemaChangeKind};
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Catalog 操作契约（详细设计 §3.3）。
 /// 阶段 1：同一 trait 由 `GrpcCatalogClient` 实现。
@@ -33,8 +33,10 @@ pub trait CatalogOps: Send + Sync {
     async fn list_tables(&self) -> Result<Vec<TableMeta>, LakeError>;
 
     /// Schema 演进（OCC）—— 唯一的乐观锁作用点（C8）
-    async fn evolve_schema(&self, req: EvolveSchemaRequest)
-        -> Result<EvolveSchemaResponse, LakeError>;
+    async fn evolve_schema(
+        &self,
+        req: EvolveSchemaRequest,
+    ) -> Result<EvolveSchemaResponse, LakeError>;
 
     /// 当前生效的表 schema（Ingestor 攒批线程缓存刷新用）。
     async fn table_schema(&self, name: &str) -> Result<Option<(SchemaRef, u64)>, LakeError>;
@@ -331,7 +333,7 @@ impl CatalogOps for MemoryCatalog {
         Ok(files
             .values()
             .filter(|f| f.table == table)
-            .filter(|f| shard_filter.map_or(true, |s| f.shard == s))
+            .filter(|f| shard_filter.is_none_or(|s| f.shard == s))
             .filter(|f| f.visible_at(snapshot))
             .cloned()
             .collect())
@@ -407,9 +409,9 @@ pub fn change_kind_value(kind: SchemaChangeKind) -> u32 {
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
-    use yuntun_model::ops::CreateTableRequest;
-    use yuntun_model::schema::{SchemaChange, SchemaCompatibility, classify};
     use std::sync::Arc;
+    use yuntun_model::ops::CreateTableRequest;
+    use yuntun_model::schema::{classify, SchemaChange, SchemaCompatibility};
 
     fn schema(fields: &[(&str, DataType)]) -> SchemaRef {
         let fs: Vec<Field> = fields
@@ -609,7 +611,10 @@ mod tests {
 
         // check_idempotency
         assert_eq!(
-            c.check_idempotency("client-key-1").await.unwrap().as_deref(),
+            c.check_idempotency("client-key-1")
+                .await
+                .unwrap()
+                .as_deref(),
             Some("b1")
         );
     }
@@ -673,10 +678,19 @@ mod tests {
 
         // 新 schema 到达（含新列）→ classify 判定 NeedsEvolve
         let table_schema = c.table_schema("audit").await.unwrap().unwrap().0;
-        let incoming = schema(&[("ts", DataType::Int64), ("user", DataType::Utf8), ("ua", DataType::Utf8)]);
+        let incoming = schema(&[
+            ("ts", DataType::Int64),
+            ("user", DataType::Utf8),
+            ("ua", DataType::Utf8),
+        ]);
         match classify(&table_schema, &incoming) {
             SchemaCompatibility::NeedsEvolve(change) => {
-                let v = c.get_table("audit").await.unwrap().unwrap().current_schema_version;
+                let v = c
+                    .get_table("audit")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .current_schema_version;
                 let resp = c
                     .evolve_schema(EvolveSchemaRequest {
                         table: "audit".into(),

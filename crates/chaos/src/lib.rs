@@ -18,25 +18,38 @@
 //! - **T6.8（查询侧多版本对齐）**：[`query_multi_version_alignment`] ——
 //!   v1/v2 文件共存，查询统一到最新 schema（缺失列 null 填充）。
 
+// 本 crate 当前只含验收测试（E2/E3/T6.4/T6.8）与压测示例；以下导入均为测试专用。
+#[cfg(test)]
 use std::sync::Arc;
+#[cfg(test)]
 use std::time::Duration;
+#[cfg(test)]
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
 use arrow::array::{Int64Array, StringArray};
+#[cfg(test)]
 use arrow::datatypes::{DataType, Field, Schema};
+#[cfg(test)]
 use yuntun_catalog::{CatalogOps, MemoryCatalog};
+#[cfg(test)]
 use yuntun_ingest::{Ingestor, IngestorConfig};
+#[cfg(test)]
 use yuntun_model::ops::CreateTableRequest;
+#[cfg(test)]
 use yuntun_model::IngestBatch;
+#[cfg(test)]
 use yuntun_query::QueryEngine;
 
 /// 一套可重建的 Lakehouse 组件（chaos 轮次间共享目录）。
+#[cfg(test)]
 struct Setup {
     catalog: Arc<MemoryCatalog>,
     ingestor: Arc<Ingestor>,
     engine: Arc<QueryEngine>,
 }
 
+#[cfg(test)]
 fn schema() -> arrow::datatypes::SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("event_time", DataType::Int64, false),
@@ -44,6 +57,7 @@ fn schema() -> arrow::datatypes::SchemaRef {
     ]))
 }
 
+#[cfg(test)]
 fn batch(rows: i64) -> arrow::record_batch::RecordBatch {
     arrow::record_batch::RecordBatch::try_new(
         schema(),
@@ -55,6 +69,7 @@ fn batch(rows: i64) -> arrow::record_batch::RecordBatch {
     .unwrap()
 }
 
+#[cfg(test)]
 fn tmpdir(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("yuntun-chaos-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -66,6 +81,7 @@ fn tmpdir(name: &str) -> std::path::PathBuf {
 ///
 /// `tables`：重启后需要恢复的表定义。阶段 1 表定义由 raft snapshot 恢复（C5/§5.4.2）；
 /// 阶段 0 chaos harness 中由调用方重放（模拟 snapshot 已含表定义）。
+#[cfg(test)]
 async fn build(
     wal_dir: &std::path::Path,
     store_root: &std::path::Path,
@@ -94,12 +110,9 @@ async fn build(
         root: store_root.to_string_lossy().to_string(),
     })
     .unwrap();
-    let wal = yuntun_wal::writer::WalWriter::open(
-        yuntun_wal::WalConfig::for_dir(wal_dir),
-        0,
-    )
-    .await
-    .unwrap();
+    let wal = yuntun_wal::writer::WalWriter::open(yuntun_wal::WalConfig::for_dir(wal_dir), 0)
+        .await
+        .unwrap();
     let ingestor = Arc::new(Ingestor::new(
         IngestorConfig {
             rows_threshold: 1,
@@ -207,7 +220,8 @@ async fn concurrent_schema_evolution() {
     let store_root = tmpdir("store-evo");
     let tables = [(
         "evo",
-        Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)])) as arrow::datatypes::SchemaRef,
+        Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]))
+            as arrow::datatypes::SchemaRef,
     )];
     let setup = build(&wal_dir, &store_root, &tables).await;
 
@@ -247,20 +261,14 @@ async fn concurrent_schema_evolution() {
 
     // 最终 schema 包含全部 N 个新列
     let (_, version) = setup.catalog.table_schema("evo").await.unwrap().unwrap();
-    let final_schema = setup
-        .catalog
-        .table_schema("evo")
-        .await
-        .unwrap()
-        .unwrap()
-        .0;
+    let final_schema = setup.catalog.table_schema("evo").await.unwrap().unwrap().0;
     for i in 0..N {
         assert!(
             final_schema.field_with_name(&format!("extra_{i}")).is_ok(),
             "列 extra_{i} 必须在最终 schema 中"
         );
     }
-    assert!(version >= N as u64 + 1);
+    assert!(version > N as u64);
     let _ = store_root;
 }
 
@@ -271,7 +279,8 @@ async fn query_multi_version_alignment() {
     let store_root = tmpdir("store-mv");
     let tables = [(
         "mv",
-        Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)])) as arrow::datatypes::SchemaRef,
+        Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]))
+            as arrow::datatypes::SchemaRef,
     )];
     let setup = build(&wal_dir, &store_root, &tables).await;
 
@@ -329,7 +338,11 @@ async fn query_multi_version_alignment() {
         .await
         .unwrap();
 
-    let batches = setup.engine.sql("SELECT count(*) FROM yuntun.public.mv").await.unwrap();
+    let batches = setup
+        .engine
+        .sql("SELECT count(*) FROM yuntun.public.mv")
+        .await
+        .unwrap();
     let got = batches[0]
         .column(0)
         .as_any()

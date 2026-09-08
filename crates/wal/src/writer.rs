@@ -15,15 +15,15 @@
 use crate::config::WalConfig;
 use crate::recovery::{self, Recovery};
 use crate::segment::{
-    atomic_write_current, list_segments, parse_segment_file_name, read_current, fsync_dir,
+    atomic_write_current, fsync_dir, list_segments, parse_segment_file_name, read_current,
     SegmentWriter,
 };
-use yuntun_model::error::{LakeError, WalError};
-use yuntun_model::wal_record::Record;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
+use yuntun_model::error::{LakeError, WalError};
+use yuntun_model::wal_record::Record;
 
 /// append 的确认句柄：resolve 即表示该记录已 fsync。
 #[derive(Debug, Clone, Copy)]
@@ -184,7 +184,11 @@ fn open_active_segment(
             let seq = parse_segment_file_name(&name)
                 .ok_or_else(|| LakeError::Wal(WalError::CorruptedCurrent(name.clone())))?;
             let p = shard_dir.join(&name);
-            if p.exists() { Some((seq, p)) } else { None }
+            if p.exists() {
+                Some((seq, p))
+            } else {
+                None
+            }
         }
         None => None,
     }

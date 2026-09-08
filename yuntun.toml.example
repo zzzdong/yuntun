@@ -1,4 +1,4 @@
-# yuntun All-in-One 配置示例（详细设计 §11）
+# yuntun Standalone 配置示例（详细设计 §11）
 
 [server]
 listen = "0.0.0.0:50051"

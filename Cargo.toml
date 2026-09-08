@@ -11,7 +11,7 @@ members = [
     "crates/query",
     "crates/compaction",
     "crates/server",
-    "bins/all-in-one",
+    "crates/standalone",
     "crates/chaos",
 ]
 
@@ -25,7 +25,7 @@ license = "Apache-2.0"
 # 注意：datafusion 55.0.0 实际依赖 arrow 59 / object_store 0.13（文档 §2.3 的
 # "arrow 55" 指 DataFusion 主版本）。统一全 workspace 用 arrow 59 避免双版本冲突。
 arrow = "59"
-arrow-flight = "59"
+arrow-flight = { version = "59", features = ["flight-sql-experimental"] }
 datafusion = "55"
 datafusion-datasource = "55"
 datafusion-datasource-parquet = "55"

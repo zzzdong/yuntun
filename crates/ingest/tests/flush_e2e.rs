@@ -48,7 +48,9 @@ async fn scan_accumulate_flush() {
     let meta = catalog.get_table("t").await.unwrap().unwrap();
     eprintln!(
         "DEBUG ingest_config: require_key={:?} ttl={:?}",
-        meta.ingest_config.as_ref().map(|c| c.require_idempotency_key),
+        meta.ingest_config
+            .as_ref()
+            .map(|c| c.require_idempotency_key),
         meta.ingest_config.as_ref().map(|c| c.idempotency_ttl_secs)
     );
     let b = arrow::record_batch::RecordBatch::try_new(
@@ -91,12 +93,15 @@ async fn scan_accumulate_flush() {
     assert_eq!(ready.len(), 1);
 
     let out = ingestor.flush_now(ready.remove(0)).await;
-    eprintln!("flush result: {:?}", out.as_ref().map(|o| o.file_path.clone()));
+    eprintln!(
+        "flush result: {:?}",
+        out.as_ref().map(|o| o.file_path.clone())
+    );
     out.unwrap();
 
     // WAL 恢复应看到 1 个 Committed 批次
-    let rec = yuntun_wal::recovery::recover(&yuntun_wal::WalConfig::for_dir(&wal_dir), 0, false)
-        .unwrap();
+    let rec =
+        yuntun_wal::recovery::recover(&yuntun_wal::WalConfig::for_dir(&wal_dir), 0, false).unwrap();
     eprintln!(
         "recovered states: {:?}",
         rec.states

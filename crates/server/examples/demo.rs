@@ -16,25 +16,37 @@ use yuntun_server::Lakehouse;
 
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
-        Field::new("event_time", DataType::Timestamp(
-            arrow::datatypes::TimeUnit::Millisecond, None), false),
+        Field::new(
+            "event_time",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+            false,
+        ),
         Field::new("user", DataType::Utf8, true),
         Field::new("endpoint", DataType::Utf8, true),
         Field::new("cost_ms", DataType::Int64, true),
     ]))
 }
 
-fn make_batch(base_ms: i64, users: &[&str], endpoint: &str, cost: i64) -> arrow::record_batch::RecordBatch {
+fn make_batch(
+    base_ms: i64,
+    users: &[&str],
+    endpoint: &str,
+    cost: i64,
+) -> arrow::record_batch::RecordBatch {
     let n = users.len();
     arrow::record_batch::RecordBatch::try_new(
         schema(),
         vec![
             Arc::new(TimestampMillisecondArray::from(
-                (0..n).map(|i| base_ms + i as i64 * 1000).collect::<Vec<_>>(),
+                (0..n)
+                    .map(|i| base_ms + i as i64 * 1000)
+                    .collect::<Vec<_>>(),
             )),
             Arc::new(StringArray::from(users.to_vec())),
             Arc::new(StringArray::from(vec![endpoint; n])),
-            Arc::new(Int64Array::from((0..n as i64).map(|i| cost + 10 * i).collect::<Vec<_>>())),
+            Arc::new(Int64Array::from(
+                (0..n as i64).map(|i| cost + 10 * i).collect::<Vec<_>>(),
+            )),
         ],
     )
     .unwrap()
@@ -46,12 +58,12 @@ fn print_batches(title: &str, batches: &[arrow::record_batch::RecordBatch]) {
         println!("(empty)");
         return;
     }
-    arrow::util::pretty::print_batches(&batches).unwrap();
+    arrow::util::pretty::print_batches(batches).unwrap();
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let _ = tracing::info!("yuntun demo starting");
+    tracing::info!("yuntun demo starting");
 
     // ---- ① 装配 Lakehouse（内存 S3 模拟 + 临时 WAL）----
     let wal_dir = format!("/tmp/yuntun-demo-wal-{}", std::process::id());
@@ -100,10 +112,8 @@ scan_interval_ms = 50
     // ---- ③ 启动 Flight gRPC 服务 ----
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    let hook = Arc::new(yuntun_server::IngestorHook::new(lakehouse.ingestor.clone()));
-    let query_hook = Arc::new(yuntun_server::QueryHook::new(lakehouse.query.clone()));
     let svc = arrow_flight::flight_service_server::FlightServiceServer::new(
-        yuntun_ingest::flight::FlightIngestService::new(hook).with_query(query_hook),
+        yuntun_server::FlightServer::new(lakehouse.ingestor.clone(), lakehouse.query.clone()),
     );
     let sd = shutdown.clone();
     tokio::spawn(async move {
@@ -129,7 +139,13 @@ scan_interval_ms = 50
         .as_millis() as i64;
 
     for (shard, users, ep, cost, key) in [
-        ("s0", vec!["alice", "bob", "carol"], "/api/login", 120, "req-001"),
+        (
+            "s0",
+            vec!["alice", "bob", "carol"],
+            "/api/login",
+            120,
+            "req-001",
+        ),
         ("s1", vec!["dave", "erin"], "/api/orders", 300, "req-002"),
     ] {
         let mut msgs = arrow_flight::utils::batches_to_flight_data(
@@ -137,7 +153,9 @@ scan_interval_ms = 50
             vec![make_batch(now_ms, &users, ep, cost)],
         )?;
         let mut data = msgs.remove(1);
-        data.app_metadata = format!(r#"{{"idempotency_key":"{key}"}}"#).into_bytes().into();
+        data.app_metadata = format!(r#"{{"idempotency_key":"{key}"}}"#)
+            .into_bytes()
+            .into();
         let schema_msg = FlightData {
             flight_descriptor: Some(FlightDescriptor {
                 r#type: 1,
@@ -163,7 +181,10 @@ scan_interval_ms = 50
     println!("[5] 等待攒批 flush（WAL → 编码 Parquet → 写对象存储 → Meta CommitFiles）...");
     tokio::time::sleep(Duration::from_millis(700)).await;
     let snap = lakehouse.catalog.current_snapshot().await;
-    let files = lakehouse.catalog.list_visible_files("api_audit", snap, None).await?;
+    let files = lakehouse
+        .catalog
+        .list_visible_files("api_audit", snap, None)
+        .await?;
     for f in &files {
         println!(
             "    committed: {} ({} rows, {} bytes, schema v{})",
@@ -197,11 +218,31 @@ scan_interval_ms = 50
         arrow_flight::utils::flight_data_to_batches(&datas).unwrap()
     }
 
-    print_batches("SQL(do_get): SELECT * FROM yuntun.public.api_audit ORDER BY cost_ms", &run(&mut client, "SELECT * FROM yuntun.public.api_audit ORDER BY cost_ms").await);
+    print_batches(
+        "SQL(do_get): SELECT * FROM yuntun.public.api_audit ORDER BY cost_ms",
+        &run(
+            &mut client,
+            "SELECT * FROM yuntun.public.api_audit ORDER BY cost_ms",
+        )
+        .await,
+    );
     print_batches("SQL(do_get): SELECT \"user\", count(*) cnt, avg(cost_ms) avg_ms FROM yuntun.public.api_audit GROUP BY \"user\" ORDER BY cnt DESC", &run(&mut client, "SELECT \"user\", count(*) cnt, avg(cost_ms) avg_ms FROM yuntun.public.api_audit GROUP BY \"user\" ORDER BY cnt DESC").await);
-    print_batches("SQL(do_get): SELECT * FROM yuntun.public.api_audit WHERE cost_ms > 130", &run(&mut client, "SELECT * FROM yuntun.public.api_audit WHERE cost_ms > 130").await);
+    print_batches(
+        "SQL(do_get): SELECT * FROM yuntun.public.api_audit WHERE cost_ms > 130",
+        &run(
+            &mut client,
+            "SELECT * FROM yuntun.public.api_audit WHERE cost_ms > 130",
+        )
+        .await,
+    );
 
     println!("\n[6] 全链路贯通（全部经由 gRPC）：DoPut 写入 → WAL(组提交 fsync) → 攒批(Jitter) → Parquet → Meta(快照隔离) → DoGet SQL 查询 ✓");
+
+    // ---- ⑦（可选）保持服务运行，供外部客户端（pyarrow / ADBC）冒烟 ----
+    if std::env::var("YUNTUN_DEMO_SERVE").as_deref() == Ok("1") {
+        println!("[7] YUNTUN_DEMO_SERVE=1 → 保持服务运行，等待 Ctrl-C（外部客户端可连接）");
+        tokio::signal::ctrl_c().await?;
+    }
 
     shutdown.cancel();
     Ok(())

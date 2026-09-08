@@ -17,6 +17,9 @@ yuntun-compaction = { path = "../compaction" }
 arrow = { workspace = true }
 arrow-flight = { workspace = true }
 tonic = { workspace = true }
+prost = { workspace = true }
+futures = { workspace = true }
+tokio-stream = "0.1"
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }
@@ -32,3 +35,4 @@ uuid = { workspace = true }
 tokio-stream = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = { workspace = true }
+prost = { workspace = true }

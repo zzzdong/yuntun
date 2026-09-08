@@ -3,9 +3,9 @@
 //! 统一封装 `object_store`，测试用 `memory`（阶段 0.5 Mock S3），
 //! 开发用 `local`（本地文件系统），生产用 `s3`（MinIO 兼容）。
 
-use yuntun_model::error::LakeError;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use std::sync::Arc;
+use yuntun_model::error::LakeError;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -97,7 +97,10 @@ pub async fn delete(store: &dyn ObjectStore, path: &str) -> Result<(), LakeError
 }
 
 /// 列举前缀下全部对象（孤儿清理用）。
-pub async fn list_all(store: &dyn ObjectStore, prefix: &str) -> Result<Vec<ObjectSummary>, LakeError> {
+pub async fn list_all(
+    store: &dyn ObjectStore,
+    prefix: &str,
+) -> Result<Vec<ObjectSummary>, LakeError> {
     use futures::TryStreamExt;
     use object_store::path::Path as OsPath;
     let p = OsPath::from(prefix);
@@ -110,7 +113,7 @@ pub async fn list_all(store: &dyn ObjectStore, prefix: &str) -> Result<Vec<Objec
     {
         out.push(ObjectSummary {
             path: meta.location.to_string(),
-            size: meta.size as u64,
+            size: meta.size,
             last_modified: meta.last_modified.timestamp_millis().max(0) as u64,
         });
     }

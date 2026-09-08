@@ -10,14 +10,14 @@ use crate::cache::CachedTable;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::datasource::object_store::ObjectStoreUrl;
-use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
-use datafusion_datasource::file_groups::FileGroup;
-use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::file::FileSource;
+use datafusion_datasource::file_groups::FileGroup;
+use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::source::DataSourceExec;
+use datafusion_datasource::PartitionedFile;
 use datafusion_datasource_parquet::source::ParquetSource;
 use std::sync::Arc;
 
@@ -76,7 +76,9 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
         if let Some(p) = projection {
             builder = builder
                 .with_projection_indices(Some(p.clone()))
-                .map_err(|e| datafusion::error::DataFusionError::Execution(format!("projection: {e}")))?;
+                .map_err(|e| {
+                    datafusion::error::DataFusionError::Execution(format!("projection: {e}"))
+                })?;
         }
         let config = builder.build();
         Ok(DataSourceExec::from_data_source(config))
@@ -88,10 +90,7 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
     ) -> datafusion::common::Result<Vec<TableProviderFilterPushDown>> {
         // MVP：谓词交给 Parquet row-group 统计在 scan 内部处理（ParquetSource 默认行为），
         // 表级先声明 Inexact —— 正确且保守。
-        Ok(vec![
-            TableProviderFilterPushDown::Inexact;
-            filters.len()
-        ])
+        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 
     /// 缓存中的文件行数（无真实统计时不承诺精确值）。

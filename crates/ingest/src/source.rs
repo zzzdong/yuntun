@@ -5,9 +5,9 @@
 //! 完全不感知协议差异。阶段 2+ 加 InfluxDB / Kafka 零重构。
 
 use async_trait::async_trait;
-use yuntun_model::error::LakeError;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use yuntun_model::error::LakeError;
 
 pub use yuntun_model::IngestBatch;
 

@@ -28,6 +28,12 @@
 >   1. **`synced_offset` 水位线**（§5.3.5.1）—— 修复组提交下攒批线程可能读到未 fsync 数据的正确性缺陷；且该水位**由 CRC 自然确定，无需单独持久化**
 >   2. **Batch 超时 + 终态含 ABORT**（§5.3.6.1）—— 修复 batch 卡死导致 segment 永不释放、磁盘写满的 P0 风险；取 30 分钟 + 80% 磁盘水位分级
 >   3. **Snapshot 异步生成**（§5.4.3.1）—— 修复同步序列化阻塞 apply 线程引发 Leader flapping；**修正评审的"克隆 Arc"建议**为持久化数据结构 O(1) 快照
+>
+> **v12 相对 v11**（2026-09-08，Standalone 优先路线，详见《开发计划任务书 v2.0》）：
+>   1. **工程结构**：撤销 `bins/`，`all-in-one` 更名 `standalone`（bin 名 `yuntun`）独立成 crate；新增 `yuntun-client`（SDK + CLI）crate
+>   2. **阶段重排**：新增**阶段 1 Standalone 完备**（Flight SQL 标准协议 + SQL 写入 + 自有客户端）；原阶段 0.5（Chaos 压测）后移为阶段 2；**原阶段 1（Meta Raft 分离）整体后移为阶段 3** —— 除分布式外的一切能力先在 standalone 内完成
+>   3. **接口演进**：在既有自定义 ticket 模式（保留）之外，新增 **Flight SQL 标准协议**双轨接入（§3.2 / 计划书 §四）
+>   4. **【v12.3，2026-09-09】架构简化**：撤销 Hook / Gateway 间接层；协议端口统一在 **server 节点层**，`FlightServer` 直接组合 `Arc<Ingestor>` + `Arc<QueryEngine>`；两条铁律成文——**所有写入走 ingest 管线（唯一写入事实）**、**协议端口在 server 层，域 crate 纯能力**（§3.2）
 
 ---
 
@@ -150,36 +156,56 @@ Meta Raft 的写入吞吐是阶段 2+ 的主要扩展性上限。若业务峰值
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.2 Crate 边界（按状态切分，非按功能）
+### 3.2 Crate 边界（按状态切分，非按功能；【v12 更新】实际结构）
 
 ```
-lakehouse/
+yuntun/
 ├── crates/
-│   ├── model/       # 核心数据模型（最底层，无依赖）
-│   ├── store/       # 对象存储抽象（S3/MinIO/本地 FS）
-│   ├── format/      # Vortex/Parquet 封装，含回退开关与 Schema 适配
-│   ├── wal/         # 自实现 WAL（segment+CRC）+ 事件流重建 BatchState
-│   ├── catalog/     # Catalog 纯逻辑（无网络）
-│   ├── ingest/      # 写入路径
-│   ├── query/       # DataFusion 桥接（CatalogProvider/TableProvider）
-│   ├── compaction/  # 后台作业
-│   ├── proto/       # gRPC / Flight 协议
-│   └── server/      # 服务框架
-└── bins/
-    ├── all-in-one.rs
-    └── meta.rs / ingestor.rs / query.rs / compactor.rs
+│   ├── yuntun-model/       # 核心数据模型（最底层，无依赖）
+│   ├── yuntun-proto/       # 元数据 / WAL 消息（prost 手写；阶段 3 启用 tonic-build）
+│   ├── yuntun-wal/         # 自实现 WAL（segment+CRC）+ 事件流重建 BatchState
+│   ├── yuntun-store/       # 对象存储抽象（S3/MinIO/本地 FS）
+│   ├── yuntun-format/      # Parquet（默认）/ Vortex（feature flag）+ Schema 适配
+│   ├── yuntun-catalog/     # Catalog 纯逻辑（无网络）
+│   ├── yuntun-ingest/       # 写入管线（RecordBatch → WAL → 攒批 → flush 状态机）
+│   ├── yuntun-query/        # DataFusion 桥接（CatalogProvider/TableProvider）
+│   ├── yuntun-compaction/  # 后台作业
+│   ├── yuntun-server/      # 节点层：协议端口（Flight/FlightSQL）+ 装配 + 路由
+│   ├── yuntun-chaos/       # 故障注入工具
+│   ├── yuntun-standalone/  # ★ 单机二进制（bin 名 yuntun）—— v12：原 bins/all-in-one
+│   └── yuntun-client/      # ★ Rust SDK + CLI（bin 名 yuntun-cli）—— v12 新增
+└── docs/
 ```
+
+> **v12 结构决策**：不再保留顶层 `bins/` 目录。每个可执行体独立成 crate
+> （standalone / client），分布式阶段（计划书阶段 3）再增 `yuntun-meta` /
+> `yuntun-ingestor` / `yuntun-queryd` / `yuntun-compactor`，全部复用同一组件，
+> `standalone` 保留为全组件参考装配。
 
 **依赖方向严格单向**：
 
 ```
-server → ingest  → wal     → model
-       → query   → catalog → model
-       → catalog → store, format
-       → compaction → catalog, store, format
+standalone → server → ingest  → wal     → model
+                    → query   → catalog → model
+                    → catalog → store, format
+                    → compaction → catalog, store, format
+client → （仅依赖 arrow-flight，可独立编译，不依赖 server）
 ```
 
-`catalog` 为纯逻辑 crate，不含网络代码 —— all-in-one 与分布式共用同一份逻辑的关键。
+`catalog` 为纯逻辑 crate，不含网络代码 —— standalone 与分布式共用同一份逻辑的关键。
+
+**协议端口归属（v12.3 澄清，简化版）**：
+
+- **两条铁律**：
+  1. **所有写入都走 ingest 管线**——它是唯一的数据写入事实（WAL 权威，禁绕过）；
+  2. **协议端口统一在 server 装配层**——一个节点上的 server 可承载多类协议端口
+     （Flight SQL、InfluxDB LP、未来 MySQL/PG wire），每个协议内部把
+     **写路由到 ingest 能力、读路由到 query 能力**；域 crate（ingest / query）
+     保持纯能力，不含协议、不含 Hook trait 间接层。
+- `yuntun-server::flight::FlightServer` 直接持有 `Arc<Ingestor>` + `Arc<QueryEngine>`，
+  实现 FlightService：FlightSQL 标准轨（读→query / 写→ingest）+ 简易读写轨。
+- 阶段 3 分布式时节点按角色裁剪装配（如查询节点只接 query 能力 + 各协议端口的读路由），
+  协议端口代码不随域拆分，天然可复用。
 
 ---
 
@@ -1766,9 +1792,24 @@ async fn orphan_sweeper() {
 
 ## 十三、分布式设计与部署演进
 
-### 13.1 阶段 0：All-in-One
+### 13.1 阶段 0：All-in-One（✅ 已完成，2026-09-08）
 
 单进程包含所有模块，Meta 用内存 HashMap 或 BoltDB，Compaction 为后台 tokio task。
+实际实现以《阶段 0 实现操作日志》为准（crate 命名 `yuntun-*`、二进制 `yuntun`、依赖版本以操作日志 §2.1 为准）。
+
+### 13.1.1 【v12 新增】阶段 1：Standalone 完备（数据库能力收敛）
+
+在进入分布式之前，standalone 先补齐"可交付数据库"能力：
+
+- **Flight SQL 标准协议**（`yuntun-server::flight::FlightServer` 直接实现，基于 arrow-flight 自带模块），
+  与既有自定义 ticket 模式双轨并存
+- **SQL 写入路径**：Prepared statement `do_put` 与 `INSERT INTO`（DataFusion DML sink）
+  全部汇入既有 ingest 管线（WAL 权威），禁止绕过 WAL 直写
+- **自有客户端**：`yuntun-client`（SDK + `yuntun-cli`）
+- 阶段 0 遗留事项清偿、Chaos 压测、Vortex 接入（详见计划任务书 v2.0 阶段 1/2）
+
+**对分布式设计的影响**：无。本阶段全部工作位于接入层（协议适配）与客户端，
+`catalog` 纯逻辑、Meta Raft 语义抽象、`IngestSource` trait 均不动，阶段 3 切换面不变。
 
 ### 13.2 阶段 1：Meta 分离（Raft 3 节点）
 
@@ -1845,6 +1886,11 @@ async fn orphan_sweeper() {
 ---
 
 ## 十五、演进路线图
+
+> **【v12 重排说明（2026-09-08）】**：本节保留 v11 原始路线作历史参考；**现行路线以
+> 《开发计划任务书 v2.0》为准**——阶段 0 已完成 → 阶段 1 Standalone 完备（Flight SQL +
+> SQL 写入 + 客户端）→ 阶段 2 质量与性能（原阶段 0.5）→ 阶段 3 分布式化（原阶段 1/1.5
+> 整体后移）→ 阶段 4 规模化（原阶段 2/3）。以下原文中"阶段 1 / 1.5"等编号均按此映射阅读。
 
 ### 阶段 0：All-in-One 起步（0–2 月）
 - 单进程：API + Ingestor + Query + Meta(内存) + 本地对象存储
@@ -1932,6 +1978,8 @@ async fn orphan_sweeper() {
 
 ### 附录 B：设计原则速查
 
+- **【v12.3】所有写入都走 ingest 管线**——唯一的数据写入事实（WAL 权威，禁绕过）
+- **【v12.3】协议端口统一在 server 节点层**，域 crate（ingest/query）纯能力、无协议无间接层
 - **按状态切分服务**，而非按功能
 - **Vortex 只做 append + 微批**
 - **batch_id 随机**，幂等由 BatchStateStore + 客户端幂等键保证

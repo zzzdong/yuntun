@@ -11,10 +11,10 @@
 //! ```
 
 use futures::TryStreamExt;
-use yuntun_model::error::LakeError;
 use object_store::path::Path as OsPath;
 use object_store::{ObjectStoreExt, PutPayload};
 use std::sync::Arc;
+use yuntun_model::error::LakeError;
 
 /// 存储格式（ADR-1 / §5.5 FormatSwitch）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -34,7 +34,8 @@ impl DataFormat {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
+    /// 从配置字符串解析（未识别值回退 Parquet，ADR-1 回退语义）。
+    pub fn parse(s: &str) -> Self {
         match s {
             "vortex" => DataFormat::Vortex,
             _ => DataFormat::Parquet,
@@ -43,19 +44,25 @@ impl DataFormat {
 }
 
 /// 构造数据文件逻辑路径（不含 store 前缀）。
-pub fn file_path(table: &str, shard: &str, time_window: &str, batch_id: &str, fmt: DataFormat) -> String {
-    format!("yuntun/{table}/dt={time_window}/shard={shard}/{batch_id}.{ext}", ext = fmt.ext())
+pub fn file_path(
+    table: &str,
+    shard: &str,
+    time_window: &str,
+    batch_id: &str,
+    fmt: DataFormat,
+) -> String {
+    format!(
+        "yuntun/{table}/dt={time_window}/shard={shard}/{batch_id}.{ext}",
+        ext = fmt.ext()
+    )
 }
 
 /// 从路径提取 batch_id（孤儿清理用，§12.2.1）。
 pub fn extract_batch_id(path: &str) -> Option<String> {
     let name = path.rsplit('/').next()?;
     let stem = name.rsplit_once('.')?.0.to_string();
-    if stem.len() == 36 && stem.chars().filter(|c| *c == '-').count() == 4 {
-        Some(stem) // UUID 形态
-    } else {
-        Some(stem)
-    }
+    // MVP：batch_id 即文件名 stem（UUID 或任意命名），统一返回
+    Some(stem)
 }
 
 /// 将 RecordBatch 编码并写入对象存储，返回 (路径, 字节数, 行数)。
@@ -72,7 +79,10 @@ pub async fn write_batch(
     let bytes = encode_batch(batch, fmt)?;
     let size = bytes.len() as u64;
     store
-        .put(&OsPath::from(path.as_str()), PutPayload::from_bytes(bytes.into()))
+        .put(
+            &OsPath::from(path.as_str()),
+            PutPayload::from_bytes(bytes.into()),
+        )
         .await
         .map_err(|e| LakeError::S3(e.to_string()))?;
     Ok((path, size, batch.num_rows() as u64))
@@ -107,7 +117,10 @@ pub fn encode_batch(
 }
 
 /// 解码数据文件。
-pub fn decode_batch(bytes: &[u8], fmt: DataFormat) -> Result<Vec<arrow::record_batch::RecordBatch>, LakeError> {
+pub fn decode_batch(
+    bytes: &[u8],
+    fmt: DataFormat,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, LakeError> {
     match fmt {
         DataFormat::Parquet => decode_parquet(bytes),
         DataFormat::Vortex => decode_vortex(bytes),
@@ -120,7 +133,9 @@ fn encode_parquet(batch: &arrow::record_batch::RecordBatch) -> Result<Vec<u8>, L
     use parquet::arrow::ArrowWriter;
     use parquet::file::properties::WriterProperties;
     let props = WriterProperties::builder()
-        .set_compression(parquet::basic::Compression::ZSTD(parquet::basic::ZstdLevel::default()))
+        .set_compression(parquet::basic::Compression::ZSTD(
+            parquet::basic::ZstdLevel::default(),
+        ))
         .build();
     let mut buf = Vec::with_capacity(1024);
     let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props))
@@ -154,13 +169,15 @@ fn encode_vortex(_batch: &arrow::record_batch::RecordBatch) -> Result<Vec<u8>, L
     //   vortex-datafusion = { git = "https://github.com/vortex-data/vortex.git", rev = "<锁定 commit>" }
     // 并在此调用 vortex 的 ArrayData encode API。
     Err(LakeError::Other(
-        "vortex format not enabled: build with --features vortex and pin a git commit (ADR-1)".into(),
+        "vortex format not enabled: build with --features vortex and pin a git commit (ADR-1)"
+            .into(),
     ))
 }
 
 fn decode_vortex(_bytes: &[u8]) -> Result<Vec<arrow::record_batch::RecordBatch>, LakeError> {
     Err(LakeError::Other(
-        "vortex format not enabled: build with --features vortex and pin a git commit (ADR-1)".into(),
+        "vortex format not enabled: build with --features vortex and pin a git commit (ADR-1)"
+            .into(),
     ))
 }
 
@@ -176,7 +193,7 @@ pub async fn list_objects(
         .await
         .map_err(|e| LakeError::S3(e.to_string()))?
     {
-        out.push((meta.location.to_string(), meta.size as u64));
+        out.push((meta.location.to_string(), meta.size));
     }
     Ok(out)
 }
@@ -205,21 +222,32 @@ mod tests {
 
     #[tokio::test]
     async fn parquet_roundtrip_via_memory_store() {
-        let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
         let batch = sample_batch();
         let (path, size, rows) = write_batch(
-            &store, "tbl", "s0", "2026-08-31T14:00", "018f0000-0000-7000-8000-000000000000", &batch,
+            &store,
+            "tbl",
+            "s0",
+            "2026-08-31T14:00",
+            "018f0000-0000-7000-8000-000000000000",
+            &batch,
             DataFormat::Parquet,
         )
         .await
         .unwrap();
         assert_eq!(rows, 3);
         assert!(size > 0);
-        assert_eq!(extract_batch_id(&path).unwrap(), "018f0000-0000-7000-8000-000000000000");
+        assert_eq!(
+            extract_batch_id(&path).unwrap(),
+            "018f0000-0000-7000-8000-000000000000"
+        );
         assert!(path.starts_with("yuntun/tbl/dt=2026-08-31T14:00/shard=s0/"));
         assert!(path.ends_with(".parquet"));
 
-        let batches = read_batch(&store, &path, DataFormat::Parquet).await.unwrap();
+        let batches = read_batch(&store, &path, DataFormat::Parquet)
+            .await
+            .unwrap();
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 3);
         // 列名保留
@@ -228,10 +256,16 @@ mod tests {
 
     #[tokio::test]
     async fn vortex_disabled_falls_back_to_error() {
-        let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
         let batch = sample_batch();
         let res = write_batch(
-            &store, "tbl", "s0", "w", "018f0000-0000-7000-8000-000000000000", &batch,
+            &store,
+            "tbl",
+            "s0",
+            "w",
+            "018f0000-0000-7000-8000-000000000000",
+            &batch,
             DataFormat::Vortex,
         )
         .await;

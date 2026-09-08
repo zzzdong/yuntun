@@ -10,27 +10,31 @@ use std::time::{Duration, Instant};
 use arrow::array::{Float64Array, Int32Array, Int64Array, StringArray, TimestampMillisecondArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use tokio_util::sync::CancellationToken;
+use yuntun_catalog::CatalogOps;
 use yuntun_catalog::MemoryCatalog;
 use yuntun_ingest::{Ingestor, IngestorConfig};
-use yuntun_catalog::CatalogOps;
 use yuntun_model::ops::CreateTableRequest;
 use yuntun_model::IngestBatch;
 
 fn schema() -> arrow::datatypes::SchemaRef {
     use DataType::*;
     Arc::new(Schema::new(vec![
-        Field::new("event_time", Timestamp(TimestampMillisecondArcUnit(), None), false),
-        Field::new("req_id", Utf8, false),         // 36B
-        Field::new("source_ip", Utf8, false),      // 15B
-        Field::new("endpoint", Utf8, false),       // 64B
-        Field::new("actor", Utf8, true),           // 64B
-        Field::new("method", Utf8, false),         // 8B
+        Field::new(
+            "event_time",
+            Timestamp(TimestampMillisecondArcUnit(), None),
+            false,
+        ),
+        Field::new("req_id", Utf8, false),    // 36B
+        Field::new("source_ip", Utf8, false), // 15B
+        Field::new("endpoint", Utf8, false),  // 64B
+        Field::new("actor", Utf8, true),      // 64B
+        Field::new("method", Utf8, false),    // 8B
         Field::new("status_code", Int32, false),
         Field::new("cost_ms", Int64, false),
         Field::new("bytes_in", Int64, false),
         Field::new("bytes_out", Int64, false),
         Field::new("score", Float64, false),
-        Field::new("payload", Utf8, false),        // ~800B 撑起 1KB 行
+        Field::new("payload", Utf8, false), // ~800B 撑起 1KB 行
     ]))
 }
 // 避免单元名冲突的小包装
@@ -42,7 +46,9 @@ fn TimestampMillisecondArcUnit() -> arrow::datatypes::TimeUnit {
 /// ~1KB 的行 payload
 fn payload(seed: usize) -> String {
     let base = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_.";
-    (0..800).map(|i| base.as_bytes()[(seed + i) % base.len()] as char).collect()
+    (0..800)
+        .map(|i| base.as_bytes()[(seed + i) % base.len()] as char)
+        .collect()
 }
 
 fn make_batch(seed: usize, rows: usize, base_ms: i64) -> arrow::record_batch::RecordBatch {
@@ -54,23 +60,37 @@ fn make_batch(seed: usize, rows: usize, base_ms: i64) -> arrow::record_batch::Re
                 (0..rows).map(|i| base_ms + i as i64).collect::<Vec<_>>(),
             )),
             Arc::new(StringArray::from(
-                (0..rows).map(|i| format!("{:032x}-{}", seed, i)).collect::<Vec<_>>(),
+                (0..rows)
+                    .map(|i| format!("{:032x}-{}", seed, i))
+                    .collect::<Vec<_>>(),
             )),
             Arc::new(StringArray::from(
-                (0..rows).map(|i| format!("10.0.{}.{}", seed % 250, i % 250)).collect::<Vec<_>>(),
+                (0..rows)
+                    .map(|i| format!("10.0.{}.{}", seed % 250, i % 250))
+                    .collect::<Vec<_>>(),
             )),
             Arc::new(StringArray::from(
-                (0..rows).map(|i| format!("/api/v1/resource/{}", i % 64)).collect::<Vec<_>>(),
+                (0..rows)
+                    .map(|i| format!("/api/v1/resource/{}", i % 64))
+                    .collect::<Vec<_>>(),
             )),
             Arc::new(StringArray::from(
-                (0..rows).map(|i| format!("user_{}", i % 1000)).collect::<Vec<_>>(),
+                (0..rows)
+                    .map(|i| format!("user_{}", i % 1000))
+                    .collect::<Vec<_>>(),
             )),
             Arc::new(StringArray::from(vec!["POST"; rows])),
             Arc::new(Int32Array::from(vec![200; rows])),
-            Arc::new(Int64Array::from((0..rows as i64).map(|i| 100 + i % 500).collect::<Vec<_>>())),
+            Arc::new(Int64Array::from(
+                (0..rows as i64).map(|i| 100 + i % 500).collect::<Vec<_>>(),
+            )),
             Arc::new(Int64Array::from(vec![1024; rows])),
             Arc::new(Int64Array::from(vec![4096; rows])),
-            Arc::new(Float64Array::from((0..rows).map(|i| (i % 100) as f64 / 10.0).collect::<Vec<_>>())),
+            Arc::new(Float64Array::from(
+                (0..rows)
+                    .map(|i| (i % 100) as f64 / 10.0)
+                    .collect::<Vec<_>>(),
+            )),
             Arc::new(StringArray::from(vec![p.as_str(); rows])),
         ],
     )
@@ -103,8 +123,11 @@ async fn main() {
         })
         .await
         .unwrap();
-    let store = yuntun_store::create_store(&yuntun_store::StoreConfig::Local { root: store_root }).unwrap();
-    let wal = yuntun_wal::writer::WalWriter::open(yuntun_wal::WalConfig::for_dir(&wal_dir), 0).await.unwrap();
+    let store =
+        yuntun_store::create_store(&yuntun_store::StoreConfig::Local { root: store_root }).unwrap();
+    let wal = yuntun_wal::writer::WalWriter::open(yuntun_wal::WalConfig::for_dir(&wal_dir), 0)
+        .await
+        .unwrap();
     let ingestor = Arc::new(Ingestor::new(
         IngestorConfig {
             rows_threshold: 10_000,
@@ -124,7 +147,10 @@ async fn main() {
 
     println!(
         "bench: workers={} batch_rows={} duration={}s (debug={} release 建议)",
-        workers, batch_rows, duration, cfg!(debug_assertions)
+        workers,
+        batch_rows,
+        duration,
+        cfg!(debug_assertions)
     );
 
     let deadline = Instant::now() + Duration::from_secs(duration);
@@ -177,18 +203,29 @@ async fn main() {
     all_lat.sort_unstable();
     let pct = |p: f64| -> u128 {
         let idx = ((all_lat.len() as f64) * p) as usize;
-        all_lat.get(idx.min(all_lat.len() - 1)).copied().unwrap_or(0)
+        all_lat
+            .get(idx.min(all_lat.len() - 1))
+            .copied()
+            .unwrap_or(0)
     };
 
     println!("---- 结果 ----");
     println!("total_rows        : {total_rows}");
     println!("elapsed           : {elapsed:.1}s");
-    println!("throughput        : {:.0} rows/s", total_rows as f64 / elapsed);
-    println!("wal ack p50/p95/p99 (µs): {} / {} / {}", pct(0.50), pct(0.95), pct(0.99));
+    println!(
+        "throughput        : {:.0} rows/s",
+        total_rows as f64 / elapsed
+    );
+    println!(
+        "wal ack p50/p95/p99 (µs): {} / {} / {}",
+        pct(0.50),
+        pct(0.95),
+        pct(0.99)
+    );
     println!("target            : 80000 rows/s (E1) —— release 模式 + Flight 并发评估为准");
 
     let _ = catalog; // catalog 保留供检查
-    // 清理
+                     // 清理
     tokio::time::sleep(Duration::from_millis(100)).await;
 }
 

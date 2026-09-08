@@ -111,3 +111,103 @@
 - demo（`cargo run -p yuntun-server --example demo`）：DoPut 写入 + do_get 查询全部走 gRPC，`SELECT *` / `GROUP BY` 聚合 / `WHERE` 过滤均正确
 - `flight_e2e` 新增断言：do_get 查到 2 行 + get_flight_info → do_get 路径可用
 - 全量回归：66 passed / 0 failed，零警告
+
+## 6. 追加：S1.1 crate 重构 + Windows fsync 修复（2026-09-08，计划任务书 v2.0）
+
+按《开发计划任务书 v2.0》（Standalone 优先路线）执行阶段 1 第一个任务 S1.1：
+
+### 6.1 结构调整（D-1）
+
+- `bins/all-in-one` → **`crates/standalone`**（包名 `yuntun-standalone`，bin 名仍为 `yuntun`），原目录删除
+- workspace members：`"bins/all-in-one"` → `"crates/standalone"`
+- 同步清理残留命名：`server/lib.rs`、`server/config.rs`、`yuntun.toml.example` 注释中 all-in-one → standalone
+- 依赖路径 `../../crates/*` → `../server` / `../store`
+
+### 6.2 重构中发现并修复的 Windows 平台 bug（与重构无关，pre-existing）
+
+**现象**：全量测试在 Windows 上 wal/chaos 大面积失败，报 `write CURRENT: 拒绝访问 (os error 5)`。
+
+**根因**：`wal/segment.rs::fsync_dir` 用 `std::fs::File::open(dir)` 打开目录——Windows 上目录句柄
+必须带 `FILE_FLAG_BACKUP_SEMANTICS`，且 `FlushFileBuffers` 要求写权限，否则一律 Access Denied。
+该 bug 会导致 WAL 在 Windows 上无法创建（二进制也起不来）；此前"66 passed"应在非 Windows 环境验证。
+
+**修复**：`fsync_dir` 按 `#[cfg]` 分平台——unix 保持原实现；windows 用
+`OpenOptions::new().read(true).write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS)` 打开目录后
+`sync_all()`；FAT/exFAT 等不支持目录 flush 时（PermissionDenied）降级为 no-op。
+
+### 6.3 验证
+
+- `cargo test --workspace`：**全部通过 / 0 failed**（含 chaos 3 个场景——此前在 Windows 从未跑绿）
+- `yuntun --version` → `yuntun 0.1.0`；非法参数处理正常
+- clippy：本次改动文件无新警告（store/catalog/wal 存量警告待专项清理）
+
+## 7. 追加：Flight SQL 标准协议 + 协议端口归属重构（2026-09-09，S1.2–S1.5）
+
+### 7.1 协议端口归属重构（架构 §3.2 v12.1，用户裁决）
+
+按用户模型调整：**协议适配跟随域，核心与端口分层**。
+
+- `yuntun-query` 新增 `flight_sql.rs`（**query 域协议端口**）：
+  `Gateway`（FlightSQL 网关）+ `FlightQueryHook`（SQL 执行，从 ingest 迁来）
+  + `SqlAppendHook`（**新增**，写入回调 ingest——query 不依赖 ingest）。
+  未来 MySQL / PG wire 端口同层；InfluxDB LP 端口属 ingest 域（阶段 2+）
+- `yuntun-ingest`：删除 flight.rs 中的 FlightService 实现与 SQL 网关，
+  只留 `FlightIngestHook` trait；核心（Ingestor / WAL / 攒批）不变
+- `yuntun-server`：新增 `flight.rs` `UnifiedFlightService`（单端点三轨路由：
+  FlightSQL 标准轨 / 简易写入轨 / 简易查询轨）；`hook.rs` 适配三个钩子
+- QueryEngine 开启 `information_schema`（GetTables / SHOW TABLES / S1.7 DDL 依赖）；
+  新增 `schema_of()`（逻辑计划取 schema，替代 "LIMIT 0 + collect"——后者空结果
+  返回零批次会丢 schema，曾致 dataset_schema 为空）
+
+### 7.2 Flight SQL 实现范围（S1.3–S1.5）
+
+- 查询：CommandStatementQuery / CommandPreparedStatementQuery（GetFlightInfo + DoGet + GetSchema）
+- 写入：CommandStatementIngest（批量装载）、CommandPreparedStatementUpdate
+  （绑定数据 + INSERT → 批量 append，语句级幂等键）、CommandStatementUpdate（DDL/非数据 SQL）
+- 元数据：Catalogs / DbSchemas / Tables（含 table_schema 列）/ TableTypes / SqlInfo（空）/ XdbcTypeInfo（空）
+- Prepared statement：CreatePreparedStatement / ClosePreparedStatement（内存映射，handle 前缀 `ps:`）
+- handshake 返回空 token（无鉴权，兼容 ADBC/JDBC 先握手行为）
+
+### 7.3 实现中发现并修复的互操作 bug（ADBC Go 驱动实测暴露）
+
+| # | 问题 | 修复 |
+|---|---|---|
+| 1 | action 请求/响应未按官方约定 **Any 包装**（`FlightSqlService` blanket 实现为准），Go 驱动报 "mismatched message type" | 请求 `Any::decode + unpack`；响应 `result.as_any().encode_to_vec()` |
+| 2 | `dataset_schema` 用裸 flatbuffer——规范要求 **IPC 封装消息格式**（0xFFFFFFFF continuation + u32 len + flatbuffer），Go 驱动报 "invalid message metadata" | `schema_ipc_bytes` 加封装前缀（GetTables.table_schema 列同） |
+| 3 | endpoint `location = [uri:""]`——pyarrow 容忍，Go 驱动把 "" 当字面地址拨号失败 | **省略 location**（空列表 = 使用当前连接） |
+| 4 | 元数据 schema 与官方定义不一致（catalog_name 可空性 / GetTables 列名） | 对齐 `arrow_flight::sql::metadata`：catalog_name NOT NULL、db_schema_name NOT NULL、GetTables 列名 `table_schema` |
+| 5 | prepared INSERT 无法规划 dataset_schema（DataFusion 不支持 DML 规划） | 回退目标表 `SELECT * FROM <t>` schema（S1.6 INSERT sink 落地后可走逻辑计划） |
+
+### 7.4 验证
+
+- `cargo test --workspace` 全部通过（含 flight_sql_e2e：语句查询 / 元数据 / prepared 写入 / 双轨合流）
+- **独立客户端冒烟**（`scripts/pyarrow_smoke.py`）：ADBC FlightSQL Go 驱动
+  （`adbc-driver-flightsql` 1.12）SELECT / GROUP BY / get_objects 元数据 ✓；
+  手写 protobuf wire + pyarrow 原始 FlightClient：CreatePreparedStatement →
+  DoPut(CommandPreparedStatementUpdate) 绑定数据 → 装载 1 行 → ADBC 复核可见 ✓
+- 冒烟脚本用法：`YUNTUN_DEMO_SERVE=1 cargo run -p yuntun-server --example demo` 后
+  `python scripts/pyarrow_smoke.py <addr>`（demo 新增 serve 模式）
+
+### 7.5 【最终裁决】协议端口简化：撤销 Hook / Gateway 间接层（架构 §3.2 v12.3）
+
+用户两条原则定稿：
+
+1. **所有写入都走 ingest 管线——唯一的数据写入事实**（WAL 权威，禁绕过）；
+2. 协议端口不按"读域/写域"拆分——**一个节点上的 server 承载全部协议端口**
+   （Flight SQL、InfluxDB LP、未来 MySQL/PG wire），每个协议内部把
+   **写路由到 ingest 能力、读路由到 query 能力**；§7.1 的"FlightSQL 归 query 域"
+   中间方案被此裁决取代（FlightSQL 同时服务读写，放任何域都别扭）。
+
+**实施（v12.3）**：
+
+- 删除 `FlightIngestHook` / `FlightQueryHook` / `SqlAppendHook` / `Gateway` /
+  `UnifiedFlightService` 五个间接概念及 `server/hook.rs`；
+  ingest / query 的 arrow-flight、tonic、prost 依赖移除（回归纯能力 crate）
+- `yuntun-server::flight::FlightServer` 直接持有 `Arc<Ingestor>` + `Arc<QueryEngine>`，
+  单文件实现 FlightService（协议解码 + 三轨路由 + 元数据批构建）
+- `QueryEngine` 错误（DataFusionError）在 server 层直接转 Status（query_status）；
+  QueryEngine 新增 `schema_of()`（逻辑计划取 schema）、开启 information_schema——保留
+- 文档同步：架构 §3.2 / §13.1.1 / 附录 B、计划书 §1.3 / §四 / S1.3、设计 §2.1
+
+**分层定稿**：能力层（ingest / query / compaction，纯逻辑）→ 节点层（server：协议端口 +
+装配 + 路由）→ 入口（standalone / 未来按角色裁剪的分布式节点）。

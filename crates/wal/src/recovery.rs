@@ -16,9 +16,9 @@
 
 use crate::config::WalConfig;
 use crate::segment::{list_segments, load_segment};
+use std::collections::HashMap;
 use yuntun_model::batch::{apply_record, BatchStateMap};
 use yuntun_model::error::{LakeError, WalError};
-use std::collections::HashMap;
 
 /// 单个 segment 的元信息（清理线程用）。
 #[derive(Debug, Clone)]
@@ -147,9 +147,7 @@ pub enum RecoveryAction {
     Discard,
 }
 
-pub fn recovery_action(
-    status: yuntun_model::batch::BatchStatus,
-) -> RecoveryAction {
+pub fn recovery_action(status: yuntun_model::batch::BatchStatus) -> RecoveryAction {
     use yuntun_model::batch::BatchStatus::*;
     match status {
         Pending => RecoveryAction::RedoS3AndCommit,
@@ -167,7 +165,9 @@ pub fn segment_batches(
 ) -> HashMap<String, Vec<String>> {
     let mut m: HashMap<String, Vec<String>> = HashMap::new();
     for seg in segments {
-        let Some((lo, hi)) = seg.seq_range else { continue };
+        let Some((lo, hi)) = seg.seq_range else {
+            continue;
+        };
         for (id, st) in &states.states {
             let (s, e) = st.wal_seq_range;
             // Pending 的 Data 区间与 segment 相交即关联
@@ -191,7 +191,8 @@ mod tests {
     };
 
     fn tmpdir(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("yuntun-wal-recovery-{name}-{}", std::process::id()));
+        let d =
+            std::env::temp_dir().join(format!("yuntun-wal-recovery-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -211,7 +212,11 @@ mod tests {
 
         let wal = WalWriter::open(cfg, 0).await.unwrap();
         let ack = wal.append(pending(100)).await.unwrap();
-        assert!(ack.seq >= 5, "seq must continue after restart, got {}", ack.seq);
+        assert!(
+            ack.seq >= 5,
+            "seq must continue after restart, got {}",
+            ack.seq
+        );
         assert_eq!(wal.synced_seq(), ack.seq);
     }
 
@@ -223,33 +228,31 @@ mod tests {
             let wal = WalWriter::open(cfg.clone(), 0).await.unwrap();
             // Data × 2
             for i in 0..2 {
-                wal.append(
-                    Record::Data(DataPayload {
-                        table: "t".into(),
-                        shard: "s0".into(),
-                        schema_version: 1,
-                        batch_ipc: vec![i as u8],
-                        client_request_id: String::new(),
-                        time_window: "w1".into(),
-                    }),
-                )
+                wal.append(Record::Data(DataPayload {
+                    table: "t".into(),
+                    shard: "s0".into(),
+                    schema_version: 1,
+                    batch_ipc: vec![i as u8],
+                    client_request_id: String::new(),
+                    time_window: "w1".into(),
+                }))
                 .await
                 .unwrap();
             }
             wal.append(pending_with_range("b1", 0, 1)).await.unwrap();
-            wal.append(
-                Record::BatchS3Written(BatchS3WrittenPayload {
-                    batch_id: "b1".into(),
-                    s3_paths: vec!["s3://yuntun/f1".into()],
-                    s3_upload_id: "u1".into(),
-                    file_size: 10,
-                }),
-            )
+            wal.append(Record::BatchS3Written(BatchS3WrittenPayload {
+                batch_id: "b1".into(),
+                s3_paths: vec!["s3://yuntun/f1".into()],
+                s3_upload_id: "u1".into(),
+                file_size: 10,
+            }))
             .await
             .unwrap();
-            wal.append(Record::BatchCommitted(BatchCommittedPayload { batch_id: "b1".into() }))
-                .await
-                .unwrap();
+            wal.append(Record::BatchCommitted(BatchCommittedPayload {
+                batch_id: "b1".into(),
+            }))
+            .await
+            .unwrap();
             wal.append(pending_with_range("b2", 0, 1)).await.unwrap(); // 停在 Pending
         }
 
@@ -260,8 +263,14 @@ mod tests {
         assert_eq!(rec.states.data_buffer[&("s0".into(), "w1".into())].len(), 2);
 
         // §5.6 分流
-        assert_eq!(recovery_action(BatchStatus::S3Written), RecoveryAction::CommitOnly);
-        assert_eq!(recovery_action(BatchStatus::Pending), RecoveryAction::RedoS3AndCommit);
+        assert_eq!(
+            recovery_action(BatchStatus::S3Written),
+            RecoveryAction::CommitOnly
+        );
+        assert_eq!(
+            recovery_action(BatchStatus::Pending),
+            RecoveryAction::RedoS3AndCommit
+        );
     }
 
     #[tokio::test]
@@ -295,12 +304,17 @@ mod tests {
         {
             let wal = WalWriter::open(cfg.clone(), 0).await.unwrap();
             wal.append(pending_with_range("b1", 0, 1)).await.unwrap();
-            wal.append(Record::BatchAbort(BatchAbortPayload { batch_id: "b1".into() }))
-                .await
-                .unwrap();
+            wal.append(Record::BatchAbort(BatchAbortPayload {
+                batch_id: "b1".into(),
+            }))
+            .await
+            .unwrap();
         }
         let rec = recover(&cfg, 0, false).unwrap();
-        assert!(rec.states.states.get("b1").is_none(), "C4: Abort 后状态移除");
+        assert!(
+            !rec.states.states.contains_key("b1"),
+            "C4: Abort 后状态移除"
+        );
     }
 
     fn pending(i: u64) -> Record {

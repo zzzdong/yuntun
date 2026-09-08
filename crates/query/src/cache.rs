@@ -5,13 +5,13 @@
 //! 查询线程只读内存 —— 任何同步读路径都不得触碰 Catalog 网络。
 
 use datafusion::error::DataFusionError;
-use yuntun_catalog::CatalogOps;
-use yuntun_model::meta::{FileManifest, TableMeta};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+use yuntun_catalog::CatalogOps;
+use yuntun_model::meta::{FileManifest, TableMeta};
 
 /// 缓存的表条目。
 #[derive(Debug, Clone)]

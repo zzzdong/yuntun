@@ -4,3 +4,9 @@
 /test_data
 /test_store
 /test_ddl
+
+# demo / 本地运行时产物
+demo.log
+demo.err
+demo.pid
+tmp_dl/

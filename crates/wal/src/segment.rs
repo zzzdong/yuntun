@@ -8,14 +8,14 @@
 //!   CURRENT.tmp          # 切换临时文件
 //! ```
 
-use yuntun_model::error::WalError;
-use yuntun_model::wal_record::{
-    record_crc, FileHeader, Record, FILE_HEADER_SIZE, RECORD_HEADER_SIZE, WAL_MAGIC,
-};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use yuntun_model::error::WalError;
+use yuntun_model::wal_record::{
+    record_crc, FileHeader, Record, FILE_HEADER_SIZE, RECORD_HEADER_SIZE, WAL_MAGIC,
+};
 
 /// segment 文件名：`{seq:020}.wal`
 pub fn segment_file_name(seg_seq: u64) -> String {
@@ -77,9 +77,32 @@ pub fn atomic_write_current(shard_dir: &Path, segment_name: &str) -> std::io::Re
 }
 
 /// 目录 fsync（Linux：O_RDONLY 打开目录后 sync_all）。
+///
+/// Windows 注意：`File::open(dir)` 会返回 Access Denied（os error 5）——
+/// 目录句柄必须带 `FILE_FLAG_BACKUP_SEMANTICS`，且 `FlushFileBuffers`
+/// 要求句柄具有写权限。个别文件系统（FAT/exFAT）不支持目录 flush，
+/// 此时降级为忽略（rename 的元数据持久性无保证，但比直接报错可用）。
+#[cfg(unix)]
 pub fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     let f = File::open(dir)?;
     f.sync_all()
+}
+
+#[cfg(windows)]
+pub fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)
+    {
+        Ok(f) => f.sync_all(),
+        // FAT/exFAT 等不支持目录 FlushFileBuffers：降级为 no-op
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// segment 追加写入器。
@@ -96,7 +119,12 @@ pub struct SegmentWriter {
 
 impl SegmentWriter {
     /// 创建新 segment 并写入 FileHeader，立即 fsync。
-    pub fn create(shard_dir: &Path, seg_seq: u64, shard_id: u64, first_record_seq: u64) -> std::io::Result<Self> {
+    pub fn create(
+        shard_dir: &Path,
+        seg_seq: u64,
+        shard_id: u64,
+        first_record_seq: u64,
+    ) -> std::io::Result<Self> {
         let path = shard_dir.join(segment_file_name(seg_seq));
         let mut f = OpenOptions::new()
             .create_new(true)
@@ -156,8 +184,14 @@ impl SegmentWriter {
         self.file.sync_all()
     }
 
-    pub fn should_rotate(&self, incoming_bytes: u64, cfg_max_size: u64, cfg_max_age: std::time::Duration) -> bool {
-        self.bytes_written + incoming_bytes > cfg_max_size || self.created_at.elapsed() > cfg_max_age
+    pub fn should_rotate(
+        &self,
+        incoming_bytes: u64,
+        cfg_max_size: u64,
+        cfg_max_age: std::time::Duration,
+    ) -> bool {
+        self.bytes_written + incoming_bytes > cfg_max_size
+            || self.created_at.elapsed() > cfg_max_age
     }
 }
 
@@ -183,10 +217,7 @@ pub fn encode_record(rec: &Record) -> Vec<u8> {
 /// - 不足一个 header → 停止
 ///
 /// 返回 `(已解出记录, 是否在文件末尾完整结束)`。
-pub fn decode_segment_records(
-    header: &FileHeader,
-    data: &[u8],
-) -> (Vec<(u64, Record)>, bool) {
+pub fn decode_segment_records(header: &FileHeader, data: &[u8]) -> (Vec<(u64, Record)>, bool) {
     let mut records = Vec::new();
     let mut seq = header.first_seq;
     let mut pos = FILE_HEADER_SIZE;
@@ -219,10 +250,13 @@ pub fn decode_segment_records(
     }
 }
 
+/// load_segment 的返回形态：文件头 + (seq, Record) 列表 + 尾部是否撕裂。
+pub type LoadedSegment = (FileHeader, Vec<(u64, Record)>, bool);
+
 /// 读入整个 segment 并解码（阶段 0 简化：segment ≤ 64MB，整读可接受）。
-pub fn load_segment(path: &Path) -> Result<(FileHeader, Vec<(u64, Record)>, bool), WalError> {
-    let mut f = File::open(path)
-        .map_err(|e| WalError::Other(format!("open {}: {e}", path.display())))?;
+pub fn load_segment(path: &Path) -> Result<LoadedSegment, WalError> {
+    let mut f =
+        File::open(path).map_err(|e| WalError::Other(format!("open {}: {e}", path.display())))?;
     let mut buf = Vec::new();
     f.read_to_end(&mut buf)
         .map_err(|e| WalError::Other(format!("read {}: {e}", path.display())))?;
@@ -331,9 +365,15 @@ mod tests {
     fn current_atomic_switch() {
         let dir = tmpdir("current");
         atomic_write_current(&dir, &segment_file_name(2)).unwrap();
-        assert_eq!(read_current(&dir).as_deref(), Some("00000000000000000002.wal"));
+        assert_eq!(
+            read_current(&dir).as_deref(),
+            Some("00000000000000000002.wal")
+        );
         atomic_write_current(&dir, &segment_file_name(3)).unwrap();
-        assert_eq!(read_current(&dir).as_deref(), Some("00000000000000000003.wal"));
+        assert_eq!(
+            read_current(&dir).as_deref(),
+            Some("00000000000000000003.wal")
+        );
         // 不存在 → None
         let empty = tmpdir("empty");
         assert!(read_current(&empty).is_none());

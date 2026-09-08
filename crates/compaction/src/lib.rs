@@ -70,8 +70,8 @@ pub async fn compact_shard(
     // 读入全部文件 → concat（MVP：单文件输出；超限拆分留给 Phase 0.5）
     let mut batches = Vec::new();
     for f in &files {
-        let fb = yuntun_format::read_batch(&compactor.store, &f.file_path, compactor.format)
-            .await?;
+        let fb =
+            yuntun_format::read_batch(&compactor.store, &f.file_path, compactor.format).await?;
         for b in fb {
             batches.push(b);
         }
@@ -117,7 +117,8 @@ pub async fn compact_shard(
         ..Default::default()
     };
     let old_ids: Vec<String> = files.iter().map(|f| f.batch_id.clone()).collect();
-    let new_snapshot = commit_compaction_files(compactor, table, shard, old_ids, new_manifest).await?;
+    let new_snapshot =
+        commit_compaction_files(compactor, table, shard, old_ids, new_manifest).await?;
 
     tracing::info!(
         table,
@@ -183,7 +184,8 @@ pub fn spawn_orphan_cleanup(
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // batch_id → 首次发现为孤儿的时刻（Unix 毫秒）
-        let mut first_seen: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        let mut first_seen: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
@@ -297,9 +299,9 @@ pub async fn list_s3_files(
 mod tests {
     use super::*;
     use arrow::array::Int64Array;
-    use yuntun_model::ops::CommitFilesRequest;
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc as SArc;
+    use yuntun_model::ops::CommitFilesRequest;
     use yuntun_model::ops::CreateTableRequest;
 
     fn batch() -> arrow::record_batch::RecordBatch {
@@ -347,10 +349,16 @@ mod tests {
 
         // 写 3 个文件并提交
         let mut batch_ids = Vec::new();
-        for i in 0..3 {
+        for _i in 0..3 {
             let bid = uuid::Uuid::now_v7().to_string();
             let (path, size, _rows) = yuntun_format::write_batch(
-                &c.store, "t", "s0", "w1", &bid, &batch(), yuntun_format::DataFormat::Parquet,
+                &c.store,
+                "t",
+                "s0",
+                "w1",
+                &bid,
+                &batch(),
+                yuntun_format::DataFormat::Parquet,
             )
             .await
             .unwrap();
@@ -380,7 +388,11 @@ mod tests {
         let snap = catalog.current_snapshot().await;
         // 合并前 3 个可见文件
         assert_eq!(
-            catalog.list_visible_files("t", snap, Some("s0")).await.unwrap().len(),
+            catalog
+                .list_visible_files("t", snap, Some("s0"))
+                .await
+                .unwrap()
+                .len(),
             3
         );
 
@@ -389,7 +401,11 @@ mod tests {
 
         // 旧快照仍见 3 个（快照隔离）；新快照只见 1 个合并文件
         assert_eq!(
-            catalog.list_visible_files("t", snap, Some("s0")).await.unwrap().len(),
+            catalog
+                .list_visible_files("t", snap, Some("s0"))
+                .await
+                .unwrap()
+                .len(),
             3
         );
         let after = catalog
@@ -415,8 +431,12 @@ mod tests {
     #[test]
     fn orphan_classification() {
         let mut s3 = HashSet::new();
-        s3.insert("yuntun/t/dt=w/shard=s0/018f0000-0000-7000-8000-000000000001.parquet".to_string());
-        s3.insert("yuntun/t/dt=w/shard=s0/018f0000-0000-7000-8000-000000000002.parquet".to_string());
+        s3.insert(
+            "yuntun/t/dt=w/shard=s0/018f0000-0000-7000-8000-000000000001.parquet".to_string(),
+        );
+        s3.insert(
+            "yuntun/t/dt=w/shard=s0/018f0000-0000-7000-8000-000000000002.parquet".to_string(),
+        );
         let mut known = HashSet::new();
         known.insert("018f0000-0000-7000-8000-000000000002".to_string());
         let orphans = classify_orphans(s3, &known, 0, Duration::from_secs(3600));

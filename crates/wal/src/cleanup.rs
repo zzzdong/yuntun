@@ -9,12 +9,12 @@
 //! 终态定义（C4）：`Committed | Abort` —— **Abort 也是终态**。
 
 use crate::writer::WalWriter;
-use yuntun_model::batch::{now_ms, BatchState};
-use yuntun_model::error::LakeError;
-use yuntun_model::wal_record::Record;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+use yuntun_model::batch::{now_ms, BatchState};
+use yuntun_model::error::LakeError;
+use yuntun_model::wal_record::Record;
 
 /// 运行期批次状态视图（由 ingest 侧的 live 状态表实现）。
 pub trait BatchStateView: Send + Sync {
@@ -95,9 +95,11 @@ pub fn spawn_timeout_monitor(
                 if st.is_timed_out(now, cfg.batch_timeout) {
                     tracing::warn!(batch_id = %st.batch_id, "batch timed out, writing BatchAbort");
                     if let Err(e) = wal
-                        .append(Record::BatchAbort(yuntun_model::wal_record::BatchAbortPayload {
-                            batch_id: st.batch_id.clone(),
-                        }))
+                        .append(Record::BatchAbort(
+                            yuntun_model::wal_record::BatchAbortPayload {
+                                batch_id: st.batch_id.clone(),
+                            },
+                        ))
                         .await
                     {
                         tracing::error!(error = %e, "failed to append BatchAbort");
@@ -172,9 +174,9 @@ pub async fn wait_until_quiet(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yuntun_model::batch::{is_terminal, BatchStatus};
     use std::collections::HashMap;
     use std::sync::Mutex;
+    use yuntun_model::batch::{is_terminal, BatchStatus};
 
     struct MapView(pub Mutex<HashMap<String, BatchState>>);
 
@@ -260,17 +262,19 @@ mod tests {
         let wal = WalWriter::open(cfg, 0).await.unwrap();
         // 先把两个 batch 的 BatchPending 写入 WAL（模拟真实流程）
         for (id, s, e) in [("old", 0u64, 1u64), ("fresh", 2, 3)] {
-            wal.append(Record::BatchPending(yuntun_model::wal_record::BatchPendingPayload {
-                batch_id: id.into(),
-                shard: "s0".into(),
-                window: "w".into(),
-                wal_seq_start: s,
-                wal_seq_end: e,
-                schema_version: 1,
-                client_request_id: String::new(),
-                created_at_ms: 0,
-                row_count: 1,
-            }))
+            wal.append(Record::BatchPending(
+                yuntun_model::wal_record::BatchPendingPayload {
+                    batch_id: id.into(),
+                    shard: "s0".into(),
+                    window: "w".into(),
+                    wal_seq_start: s,
+                    wal_seq_end: e,
+                    schema_version: 1,
+                    client_request_id: String::new(),
+                    created_at_ms: 0,
+                    row_count: 1,
+                },
+            ))
             .await
             .unwrap();
         }
@@ -293,8 +297,14 @@ mod tests {
 
         // 恢复 WAL 验证 BatchAbort 已写入
         let rec = crate::recovery::recover(wal.config(), 0, false).unwrap();
-        assert!(rec.states.states.get("old").is_none(), "old batch must be aborted");
-        assert!(rec.states.states.get("fresh").is_some(), "fresh batch must survive");
+        assert!(
+            !rec.states.states.contains_key("old"),
+            "old batch must be aborted"
+        );
+        assert!(
+            rec.states.states.contains_key("fresh"),
+            "fresh batch must survive"
+        );
     }
 
     #[tokio::test]
@@ -311,17 +321,19 @@ mod tests {
         let wal = WalWriter::open(cfg, 0).await.unwrap();
         // 先把两个 batch 的 BatchPending 写入 WAL（模拟真实流程）
         for (id, s, e) in [("oldest", 0u64, 1u64), ("newest", 2, 3)] {
-            wal.append(Record::BatchPending(yuntun_model::wal_record::BatchPendingPayload {
-                batch_id: id.into(),
-                shard: "s0".into(),
-                window: "w".into(),
-                wal_seq_start: s,
-                wal_seq_end: e,
-                schema_version: 1,
-                client_request_id: String::new(),
-                created_at_ms: 0,
-                row_count: 1,
-            }))
+            wal.append(Record::BatchPending(
+                yuntun_model::wal_record::BatchPendingPayload {
+                    batch_id: id.into(),
+                    shard: "s0".into(),
+                    window: "w".into(),
+                    wal_seq_start: s,
+                    wal_seq_end: e,
+                    schema_version: 1,
+                    client_request_id: String::new(),
+                    created_at_ms: 0,
+                    row_count: 1,
+                },
+            ))
             .await
             .unwrap();
         }
@@ -342,7 +354,13 @@ mod tests {
         let _ = handle.await;
 
         let rec = crate::recovery::recover(wal.config(), 0, false).unwrap();
-        assert!(rec.states.states.get("oldest").is_none(), "watermark aborts oldest");
-        assert!(rec.states.states.get("newest").is_some(), "newest must survive");
+        assert!(
+            !rec.states.states.contains_key("oldest"),
+            "watermark aborts oldest"
+        );
+        assert!(
+            rec.states.states.contains_key("newest"),
+            "newest must survive"
+        );
     }
 }
