@@ -10,6 +10,7 @@ members = [
     "crates/ingest",
     "crates/query",
     "crates/compaction",
+    "crates/sql",
     "crates/server",
     "crates/standalone",
     "crates/chaos",

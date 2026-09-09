@@ -18,6 +18,7 @@ arrow = { workspace = true }
 arrow-cast = "59"
 arrow-flight = { workspace = true }
 sqlparser = { workspace = true }
+yuntun-sql = { path = "../sql" }
 tonic = { workspace = true }
 prost = { workspace = true }
 futures = { workspace = true }

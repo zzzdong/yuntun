@@ -1,0 +1,17 @@
+[package]
+name = "yuntun-sql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+yuntun-model = { path = "../model" }
+yuntun-ingest = { path = "../ingest" }
+yuntun-query = { path = "../query" }
+yuntun-catalog = { path = "../catalog" }
+yuntun-format = { path = "../format" }
+arrow = { workspace = true }
+arrow-cast = "59"
+sqlparser = { workspace = true, features = ["visitor"] }
+uuid = { workspace = true }
+thiserror = { workspace = true }

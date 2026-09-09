@@ -4264,8 +4264,25 @@ dependencies = [
  "yuntun-model",
  "yuntun-proto",
  "yuntun-query",
+ "yuntun-sql",
  "yuntun-store",
  "yuntun-wal",
+]
+
+[[package]]
+name = "yuntun-sql"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "arrow-cast",
+ "sqlparser",
+ "thiserror",
+ "uuid",
+ "yuntun-catalog",
+ "yuntun-format",
+ "yuntun-ingest",
+ "yuntun-model",
+ "yuntun-query",
 ]
 
 [[package]]

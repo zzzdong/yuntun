@@ -362,3 +362,43 @@ Schema 消息为空 schema，与 GetFlightInfo 声明的查询 schema 不一致�
      落库结果断言。
 - 验证：`cargo test --workspace` 全过（flight_sql_e2e 新增空结果 schema 一致性
   断言）；clippy 0 警告；`yuntun.toml.example` 未动（server.listen 默认 50051）。
+
+## 11. 追加：SQL 访问协议实施启动（sql-access-design.md v1.1 → Q1 部分完成，2026-09-09）
+
+> **状态**：⚠️ 半成品提交（workspace 编译通过、clippy 待跑、**全量测试未跑**——时间
+> 紧迫先落盘，接手者先执行 §11.3 待办 W-0 回归基线再继续）。
+
+### 11.1 设计文档（已定稿，随本提交入库）
+
+- `docs/sql-access-design.md` v1.1：SQL 处理层（yuntun-sql 能力 crate）与协议适配层
+  （yuntun-sqlwire）分界；早期计划 = 基础能力 + Flight SQL（收尾）+ MySQL（opensrv-mysql
+  :3306 新建）两个协议端口；PG wire 设计预留 §5.5。
+
+### 11.2 本次已完成（Q1 部分完成）
+
+| 项 | 内容 |
+|---|---|
+| `crates/sql`（yuntun-sql 能力 crate）新建 | **SQL 处理层唯一实现**：`SqlEngine{ingest,query,catalog}`（裁决 S-1/S-4，引擎无状态） |
+| `sql.rs` 迁入 | server/src/sql.rs 的纯函数模块 git mv 迁入并适配（`yuntun_query::CATALOG_NAME/SCHEMA_NAME`；新增 `parse_single_with(方言)`、`insert_target_table_str` 回落函数随迁、`sql_snippet`）；**18 个既有单测随迁** |
+| `params.rs`（G3） | `SqlValue` 参数模型 + **AST 级占位符替换**（sqlparser visitor feature 的 `visit_expressions_mut`，非字符串拼接）+ `TIMESTAMP '...'`/`DATE '...'` TypedString 渲染（civil 算法，无 chrono）+ 计数/替换单测（含注入转义 `'a''b'`） |
+| `session.rs`（S-4） | `SessionCtx{dialect, default_db}` + `SqlDialect{Generic,MySql,PostgreSql}` → sqlparser 方言静态映射 |
+| `shim.rs`（G5） | MySQL 方言 shim：SET/USE/事务 no-op（含 ROLLBACK，偏差留档）、SHOW VARIABLES/Variable（canned：version=8.0.32-yuntun 等）、SHOW TABLES（MySQL 单列语义）、SHOW COLUMNS（6 列格式）、SHOW CREATE TABLE、SELECT @@var / DATABASE() 探测（无 FROM 查询） |
+| `lib.rs` | `SqlEngine::execute/prepare/execute_prepared/list_tables/describe_table/schema_of` + `WritePolicy::AllowWrite|ReadOnly`（§6.2 sqld readonly 注入点）+ `ingest_batches`/`append_ddl`（自 flight.rs 迁入，语义不变） |
+| 过渡兼容 | `server/src/sql.rs` 改为 `pub use yuntun_sql::sql::*` 薄重导出——flight.rs 行为不变，**workspace 编译通过** |
+
+### 11.3 待办（接手者按序执行；设计依据 sql-access-design.md §七 WBS）
+
+| ID | 任务 | 关键位置/要点 |
+|---|---|---|
+| **W-0** | 回归基线确认（本次提交未跑测试） | `cargo test --workspace`（预期全绿：sql crate 19+18 单测 + 既有 88） |
+| **W-1** | flight.rs 改调 SqlEngine（Q4）：删除 `run_sql`/`SqlOutcome`/`execute_update` 内嵌分流/`ingest_batches`/`append_ddl`/`sql_schema_of`/`insert_target_table`，改 `self.sql.execute(&sql, &mut SessionCtx::default())`；`FlightServer::new(ingest,query,catalog)` **内部构造** `Arc<SqlEngine>`（签名不变 → 4 个调用点与测试零改动）；`do_get` 空结果集回填 schema 用 `SqlEngine::schema_of`；prepared dataset fallback 的 `insert_target` 用 `yuntun_sql::insert_target` | crates/server/src/flight.rs；删 server/src/sql.rs 过渡文件；**回归：flight_e2e/flight_sql_e2e/sql_dml_e2e + pyarrow 冒烟全绿** |
+| **W-2** | QueryEngine G2 修复 | crates/query：`session()` 的 SessionConfig 加 `with_default_catalog_and_schema(CATALOG_NAME, SCHEMA_NAME)`——注意回归：非限定表名行为变化是修复目标，既有 e2e 用限定名不受影响 |
+| **W-3** | yuntun-sqlwire crate（Q5/Q6，裁决：opensrv-mysql） | 先 `cargo add opensrv-mysql` 查实际 API（版本间差异大），实现 `AsyncMysqlShim` 回调：on_query→SqlEngine.execute→文本行编码；on_prepare/on_execute→prepare/execute_prepared（opensrv 负责二进制参数解码则直接用，否则自解码）；auth=trust（users 空）；标准端口 :3306 |
+| **W-4** | server Config [sql.mysql] + 挂载 | config.rs 加节（enabled/listen/auth/users）；serve 流程 spawn mysql listener（sqlwire 提供 serve_mysql(engine, listen, shutdown)）；standalone yuntun.toml.example 更新 |
+| **W-5** | MySQL 冒烟（T1/T2） | pymysql 纯 python（aliyun pip 装）连 :3306：SELECT/SHOW TABLES/INSERT + prepared；DBeaver 手工 T3 清单 |
+| **W-6** | 收尾 | clippy --workspace --all-targets 0 警告；README mysql 连接示例（S1.11） |
+| **W-7** | 已知注意点 | ① shim 仅对 MySql 方言生效（Flight Generic 不拦截，保持既有 e2e 行为）；② `SELECT 1, @@x` 混合投影会退化为 DataFusion 报错（可接受）；③ ROLLBACK no-op 与设计"明确错误"有偏差（CLI 友好优先，已留档）；④ 混合写入 `USE` 后 session.default_db 记录但表名解析仍 yuntun.public（R-3） |
+
+### 11.4 未提交文件说明
+
+- `docs/ingestor-design.md`：保持未跟踪（前次指示：评审后单独提交）。
