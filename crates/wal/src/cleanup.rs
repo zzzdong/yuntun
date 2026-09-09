@@ -195,6 +195,7 @@ mod tests {
                     status: st,
                     s3_paths: vec![],
                     s3_upload_id: None,
+                    file_size: 0,
                     row_count: 1,
                     schema_version: 1,
                     created_at_ms: created_ms,

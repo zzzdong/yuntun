@@ -41,6 +41,8 @@ prost = "0.14"
 
 # ---- 工具 ----
 uuid = { version = "1", features = ["v7"] }
+# S1.6/S1.7：SQL 前置解析（与 DataFusion 55 同源解析器，版本对齐 Cargo.lock 的 0.62）
+sqlparser = "0.62"
 crc32fast = "1"
 thiserror = "2"
 tracing = "0.1"

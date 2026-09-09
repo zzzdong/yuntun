@@ -79,7 +79,11 @@ scan_interval_ms = 20
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let svc = arrow_flight::flight_service_server::FlightServiceServer::new(
-        yuntun_server::FlightServer::new(lakehouse.ingestor.clone(), lakehouse.query.clone()),
+        yuntun_server::FlightServer::new(
+            lakehouse.ingestor.clone(),
+            lakehouse.query.clone(),
+            lakehouse.catalog.clone(),
+        ),
     );
     let server_shutdown = shutdown.clone();
     let server = tokio::spawn(async move {

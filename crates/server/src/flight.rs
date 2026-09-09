@@ -2,32 +2,38 @@
 //!
 //! **设计原则**：
 //! 1. **所有写入都走 ingest 管线**——它是唯一的数据写入事实（WAL 权威，禁绕过）；
-//! 2. server 直接组合底层能力：`Arc<Ingestor>`（写）+ `Arc<QueryEngine>`（读），
-//!    不引入 trait 间接层；协议解析与路由都在本模块完成。
+//! 2. server 直接组合底层能力：`Arc<Ingestor>`（写）+ `Arc<QueryEngine>`（读）+
+//!    `Arc<dyn CatalogOps>`（meta），不引入 trait 间接层；协议解析与路由都在本模块完成。
+//! 3. **SQL 前置解析拦截（S1.6/S1.7，plan §4.3）**：所有 SQL 入口（简易轨 do_get /
+//!    FlightSQL StatementQuery / StatementUpdate）统一经 [`FlightServer::run_sql`] 按
+//!    AST 分流——只有 SELECT 交给 DataFusion；INSERT → ingest；CREATE/DROP/SHOW → catalog。
 //!
 //! 单端点承载多轨（未来单节点可扩展更多协议端口，如 InfluxDB LP / MySQL wire）：
 //! - **FlightSQL 标准轨**：cmd/ticket 为 FlightSQL protobuf Any 命令
-//!   - 读：StatementQuery / PreparedStatementQuery → `query.sql()`
+//!   - 读：StatementQuery / PreparedStatementQuery → `query.sql()`（经 run_sql 分流）
 //!   - 写：StatementIngest / PreparedStatementUpdate(INSERT+绑定数据) → `ingest.ingest()`
-//!   - 写：StatementUpdate（DDL）→ `query.sql()`
+//!   - 写：StatementUpdate（INSERT/DDL）→ run_sql 前置分流
 //! - **简易轨（写入）**：DoPut `path=[table,shard]` → `ingest.ingest()`
-//! - **简易轨（查询）**：ticket / get_flight_info cmd = 裸 UTF-8 SQL → `query.sql()`
+//! - **简易轨（查询）**：ticket / get_flight_info cmd = 裸 UTF-8 SQL → run_sql 前置分流
 //!
 //! Ticket 编码：`Any(TicketStatementQuery{ statement_handle })`；
 //! statement_handle = SQL 本体（无状态）或 `ps:<uuid>`（prepared，服务端内存映射）。
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
 
 use arrow::array::{ArrayRef, BinaryArray, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow_flight::flight_service_server::FlightService;
+use arrow_flight::sql::metadata::{
+    SqlInfoData, SqlInfoDataBuilder, XdbcTypeInfo, XdbcTypeInfoData, XdbcTypeInfoDataBuilder,
+};
 use arrow_flight::sql::{
     ActionClosePreparedStatementRequest, ActionCreatePreparedStatementRequest,
-    ActionCreatePreparedStatementResult, Any, Command, CommandGetTables, ProstMessageExt,
-    TicketStatementQuery,
+    ActionCreatePreparedStatementResult, Any, Command, CommandGetTables, Nullable, ProstMessageExt,
+    Searchable, SqlInfo, SqlSupportedTransaction, TicketStatementQuery, XdbcDataType,
 };
 use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
@@ -36,30 +42,40 @@ use arrow_flight::{
 use futures::StreamExt;
 use prost::Message;
 use tonic::{Request, Response, Status, Streaming};
+use yuntun_catalog::CatalogOps;
 use yuntun_ingest::source::{extract_table_shard, IngestBatch};
 use yuntun_ingest::Ingestor;
 use yuntun_model::error::LakeError;
+use yuntun_model::meta::serialize_schema;
+use yuntun_model::ops::CreateTableRequest;
+use yuntun_model::wal_record::{ddl_op, DdlPayload, Record};
 use yuntun_query::QueryEngine;
 
 /// 固定 catalog / schema 名（与 yuntun_query 常量一致）。
-const CATALOG_NAME: &str = yuntun_query::CATALOG_NAME;
-const SCHEMA_NAME: &str = yuntun_query::SCHEMA_NAME;
+pub(crate) const CATALOG_NAME: &str = yuntun_query::CATALOG_NAME;
+pub(crate) const SCHEMA_NAME: &str = yuntun_query::SCHEMA_NAME;
 /// prepared statement handle 前缀（区别于内嵌 SQL 的无状态 handle）。
 const PS_PREFIX: &str = "ps:";
 
-/// Flight gRPC 服务端：直接组合 ingest（写）与 query（读）底层能力。
+/// Flight gRPC 服务端：直接组合 ingest（写）/ query（读）/ catalog（meta）底层能力。
 pub struct FlightServer {
-    ingest: Arc<Ingestor>,
-    query: Arc<QueryEngine>,
+    pub(crate) ingest: Arc<Ingestor>,
+    pub(crate) query: Arc<QueryEngine>,
+    pub(crate) catalog: Arc<dyn CatalogOps>,
     /// prepared statement：handle（剥 `ps:` 前缀）→ SQL
-    prepared: Mutex<HashMap<String, String>>,
+    pub(crate) prepared: Mutex<HashMap<String, String>>,
 }
 
 impl FlightServer {
-    pub fn new(ingest: Arc<Ingestor>, query: Arc<QueryEngine>) -> Self {
+    pub fn new(
+        ingest: Arc<Ingestor>,
+        query: Arc<QueryEngine>,
+        catalog: Arc<dyn CatalogOps>,
+    ) -> Self {
         Self {
             ingest,
             query,
+            catalog,
             prepared: Mutex::new(HashMap::new()),
         }
     }
@@ -202,12 +218,216 @@ impl FlightServer {
         Ok(vec![batch])
     }
 
-    // --------------------------------------------- FlightSQL 写（→ ingest）
+    // --------------------------------------------- SQL 前置解析分流（S1.6/S1.7）
 
-    /// 执行无数据 SQL（DDL / 非数据语句）。返回受影响行数（DML 的 count 列求和）。
+    /// SQL 前置解析分流入口（plan §4.3 路由表）。所有 SQL 入口统一经过：
+    /// 简易轨 do_get / FlightSQL StatementQuery / StatementUpdate。
+    ///
+    /// | AST 变体 | 处理 |
+    /// |---|---|
+    /// | Query（SELECT/CTE） | → DataFusion（query 能力，只读） |
+    /// | ShowTables | → Catalog `list_tables`（meta 能力） |
+    /// | Insert + Values | 按表 schema 把字面量构造 RecordBatch → `ingest.ingest` |
+    /// | Insert + Select | DataFusion 执行 SELECT 源 → cast 到表 schema → ingest |
+    /// | CreateTable | ColumnDef DataType → Arrow → Catalog `create_table` |
+    /// | Drop(Table) | → Catalog `drop_table`（数据文件转孤儿） |
+    /// | 其他 | 明确拒绝（NotImplemented + 支持列表） |
+    pub(crate) async fn run_sql(&self, sql: &str) -> Result<SqlOutcome, Status> {
+        use sqlparser::ast::{Expr, ObjectType, SetExpr, Statement, TableObject};
+        match crate::sql::parse_single(sql).map_err(lake_status)? {
+            Statement::Query(_) => {
+                // 只读查询 → DataFusion
+                let batches = self.query.sql(sql).await.map_err(query_status)?;
+                Ok(SqlOutcome::Rows(batches))
+            }
+            Statement::ShowTables { .. } => {
+                let tables = self.catalog.list_tables().await.map_err(lake_status)?;
+                let names: Vec<String> = tables.into_iter().map(|t| t.name).collect();
+                Ok(SqlOutcome::Rows(vec![crate::sql::show_tables_batch(
+                    &names,
+                )]))
+            }
+            Statement::Insert(ins) => {
+                let table = match &ins.table {
+                    TableObject::TableName(name) => crate::sql::table_name_of(name),
+                    _ => {
+                        return Err(Status::unimplemented(
+                            "INSERT target must be a plain table name",
+                        ))
+                    }
+                };
+                if table.is_empty() {
+                    return Err(Status::invalid_argument("invalid INSERT target table"));
+                }
+                let Some(src) = &ins.source else {
+                    return Err(Status::invalid_argument(
+                        "INSERT requires a source (VALUES or SELECT)",
+                    ));
+                };
+                // 表 schema 来自 Catalog（写入事实以 ingest 管线校验为准，双保险）
+                let meta = self
+                    .catalog
+                    .get_table(&table)
+                    .await
+                    .map_err(lake_status)?
+                    .ok_or_else(|| Status::not_found(format!("table not found: {table}")))?;
+                let schema = meta.schema().map_err(lake_status)?;
+                // 语句级幂等键（plan §4.3：满足 require 表强制检查；S1.8 前服务端生成）
+                let stmt_key = Some(format!("dml-{}", uuid::Uuid::now_v7()));
+
+                match src.body.as_ref() {
+                    // INSERT ... VALUES：AST 字面量 → RecordBatch → ingest
+                    SetExpr::Values(values) => {
+                        let rows: Vec<Vec<Expr>> =
+                            values.rows.iter().map(|r| r.content.clone()).collect();
+                        let cols = if ins.columns.is_empty() {
+                            None
+                        } else {
+                            Some(ins.columns.clone())
+                        };
+                        let (batch, n) =
+                            crate::sql::build_values_batch(&schema, cols.as_deref(), &rows)
+                                .map_err(lake_status)?;
+                        self.ingest_batches(&table, vec![batch], stmt_key).await?;
+                        Ok(SqlOutcome::Affected(n as i64))
+                    }
+                    // INSERT ... SELECT：DataFusion 执行 SELECT 源（读）→ cast → ingest
+                    _ => {
+                        if !ins.columns.is_empty() {
+                            return Err(Status::unimplemented(
+                                "INSERT ... SELECT with column list is not supported \
+                                 (positional alignment only)",
+                            ));
+                        }
+                        let select_sql = src.body.to_string();
+                        // 读源前刷新本地缓存：尽量覆盖最近已 commit 的文件（§4.5 可见性语义）
+                        self.query
+                            .cache()
+                            .refresh(&self.catalog)
+                            .await
+                            .map_err(query_status)?;
+                        let src_batches =
+                            self.query.sql(&select_sql).await.map_err(query_status)?;
+                        let (batches, n) = crate::sql::cast_batches_to_table(&schema, &src_batches)
+                            .map_err(lake_status)?;
+                        if n > 0 {
+                            self.ingest_batches(&table, batches, stmt_key).await?;
+                        }
+                        Ok(SqlOutcome::Affected(n as i64))
+                    }
+                }
+            }
+            Statement::CreateTable(ct) => {
+                let parsed = crate::sql::parse_create_table(&ct).map_err(lake_status)?;
+                // CREATE TABLE 的 ingest 配置使用 General 模板（强制幂等键，plan §4.3）
+                let default_format = self.ingest.cfg.default_format.ext().to_string();
+                let req = CreateTableRequest {
+                    name: parsed.name.clone(),
+                    schema: parsed.schema.clone(),
+                    partition_cols: vec![],
+                    default_format: default_format.clone(),
+                    ingest_config: yuntun_model::meta::IngestConfig::standard(),
+                };
+                match self.catalog.create_table(req).await {
+                    Ok(_) => {}
+                    Err(LakeError::TableAlreadyExists(_)) if parsed.if_not_exists => {}
+                    Err(e) => return Err(lake_status(e)),
+                }
+                // DDL WAL 权威记录：崩溃重启后重放重建表清单（S1.6/S1.7 验收）
+                self.append_ddl(DdlPayload {
+                    op: ddl_op::CREATE_TABLE,
+                    table: parsed.name,
+                    arrow_schema: serialize_schema(&parsed.schema),
+                    default_format,
+                })
+                .await?;
+                // DataFusion 本地缓存立即感知新表（后续 INSERT ... SELECT 源可立即引用）
+                self.query
+                    .cache()
+                    .refresh(&self.catalog)
+                    .await
+                    .map_err(query_status)?;
+                Ok(SqlOutcome::Affected(0))
+            }
+            Statement::Drop {
+                object_type: ObjectType::Table,
+                if_exists,
+                names,
+                ..
+            } => {
+                for name in names {
+                    let table = crate::sql::table_name_of(&name);
+                    if table.is_empty() {
+                        return Err(Status::invalid_argument("invalid table name in DROP"));
+                    }
+                    match self.catalog.drop_table(&table).await {
+                        // 数据文件转孤儿，由孤儿清理回收（plan §4.3）
+                        Ok(()) => {
+                            self.append_ddl(DdlPayload {
+                                op: ddl_op::DROP_TABLE,
+                                table: table.clone(),
+                                arrow_schema: vec![],
+                                default_format: String::new(),
+                            })
+                            .await?;
+                            // DataFusion 本地缓存立即感知表移除
+                            self.query
+                                .cache()
+                                .refresh(&self.catalog)
+                                .await
+                                .map_err(query_status)?;
+                        }
+                        Err(LakeError::TableNotFound(_)) if if_exists => {}
+                        Err(e) => return Err(lake_status(e)),
+                    }
+                }
+                Ok(SqlOutcome::Affected(0))
+            }
+            other => Err(Status::unimplemented(format!(
+                "only SELECT / SHOW TABLES / INSERT / CREATE TABLE / DROP TABLE are \
+                 supported, got: {}",
+                sql_snippet(&other.to_string())
+            ))),
+        }
+    }
+
+    /// 批次序列送入 ingest 管线（WAL 权威，与 DoPut 同等持久性，§4.4）。
+    async fn ingest_batches(
+        &self,
+        table: &str,
+        batches: Vec<RecordBatch>,
+        idempotency_key: Option<String>,
+    ) -> Result<(), Status> {
+        for batch in batches {
+            let ib = IngestBatch {
+                table: table.to_string(),
+                shard_key: "default".to_string(),
+                record_batch: batch,
+                idempotency_key: idempotency_key.clone(),
+                received_at: SystemTime::now(),
+            };
+            self.ingest.ingest(ib).await.map_err(lake_status)?;
+        }
+        Ok(())
+    }
+
+    /// DDL 事件追加 WAL（Catalog apply 成功后 append，顺序即因果）。
+    async fn append_ddl(&self, p: DdlPayload) -> Result<(), Status> {
+        self.ingest
+            .wal
+            .append(Record::Ddl(p))
+            .await
+            .map_err(lake_status)?;
+        Ok(())
+    }
+
+    /// 执行无数据 SQL 更新（StatementUpdate / prepared update 的非装载分支）。
+    /// 前置分流后 INSERT / DDL 不再打 DataFusion。
     async fn execute_update(&self, sql: &str) -> Result<i64, Status> {
-        let batches = self.query.sql(sql).await.map_err(query_status)?;
-        Ok(affected_rows(&batches))
+        match self.run_sql(sql).await? {
+            SqlOutcome::Rows(_) => Ok(0),
+            SqlOutcome::Affected(n) => Ok(n),
+        }
     }
 
     /// FlightSQL 标准轨 DoPut：更新（DDL）或批量装载（数据 append → ingest 管线）。
@@ -229,7 +449,7 @@ impl FlightServer {
             }
             PutRoute::PreparedStatementUpdate(handle) => {
                 let sql = self.prepared_sql(&handle)?;
-                match insert_target_table(&sql) {
+                match crate::sql::insert_target(&sql) {
                     // INSERT prepared + 绑定数据 → 批量 append（FlightSQL 标准写入路径）
                     Some(table) => {
                         let schema = flight_schema_of(&first).ok_or_else(|| {
@@ -277,11 +497,21 @@ impl FlightServer {
             .cloned()
             .ok_or_else(|| Status::not_found(format!("unknown prepared statement: {id}")))
     }
+
+    /// SELECT 语句的结果集 schema（逻辑计划，尽力而为）。
+    /// 空结果集时用于保证 do_get 首条 Schema 消息与 GetFlightInfo 声明一致。
+    async fn sql_schema_of(&self, sql: &str) -> Option<SchemaRef> {
+        self.query
+            .schema_of(sql)
+            .await
+            .ok()
+            .filter(|s| !s.fields().is_empty())
+    }
 }
 
 /// DoPut 分流结果。
 enum PutRoute {
-    /// 无数据的 SQL 更新（DDL / INSERT DML——后者待 S1.6 sink 后生效）
+    /// 无数据的 SQL 更新（INSERT / DDL——经 run_sql 前置分流）
     StatementUpdate(String),
     /// 绑定数据 + prepared SQL：INSERT 语句 → 批量 append；其他 → 无数据执行
     PreparedStatementUpdate(Vec<u8>),
@@ -357,17 +587,37 @@ impl FlightService for FlightServer {
         let ticket = request.into_inner();
         // 标准轨：FlightSQL ticket（Any 编码）
         if let Some(command) = Self::decode_command(&ticket.ticket) {
-            let batches = match command {
+            // (batches, fallback_schema)：空结果集必须返回查询 schema——
+            // 与 GetFlightInfo 声明的 schema 一致（ADBC/JDBC 校验，0 字段空 schema
+            // 会被判 "inconsistent schema"）
+            let (batches, fallback) = match command {
                 Command::TicketStatementQuery(t) => {
+                    // S1.6/S1.7：统一经 run_sql 前置分流（INSERT/DDL 亦可通过 do_get 执行）
                     let sql = self.resolve_handle(&t.statement_handle)?;
-                    self.query.sql(&sql).await.map_err(query_status)?
+                    match self.run_sql(&sql).await? {
+                        SqlOutcome::Rows(b) if !b.is_empty() => (b, None),
+                        SqlOutcome::Rows(_) => (Vec::new(), self.sql_schema_of(&sql).await),
+                        SqlOutcome::Affected(_) => (Vec::new(), None),
+                    }
                 }
-                Command::CommandGetCatalogs(_) => vec![catalogs_batch()],
-                Command::CommandGetDbSchemas(_) => vec![schemas_batch()],
-                Command::CommandGetTableTypes(_) => vec![table_types_batch()],
-                Command::CommandGetTables(c) => self.tables_batches(&c).await?,
-                // SqlInfo / XdbcTypeInfo：MVP 返回空结果集
-                Command::CommandGetSqlInfo(_) | Command::CommandGetXdbcTypeInfo(_) => Vec::new(),
+                Command::CommandGetCatalogs(_) => (vec![catalogs_batch()], None),
+                Command::CommandGetDbSchemas(_) => (vec![schemas_batch()], None),
+                Command::CommandGetTableTypes(_) => (vec![table_types_batch()], None),
+                Command::CommandGetTables(c) => (self.tables_batches(&c).await?, None),
+                // 能力元数据（JDBC/DBeaver 兼容，S1.5 收尾）
+                Command::CommandGetSqlInfo(c) => {
+                    let batch = c
+                        .into_builder(&SQL_INFO_DATA)
+                        .build()
+                        .map_err(|e| Status::internal(format!("sql info: {e}")))?;
+                    (vec![batch], None)
+                }
+                Command::CommandGetXdbcTypeInfo(c) => {
+                    let batch = XDBC_TYPE_INFO
+                        .record_batch(c.data_type)
+                        .map_err(|e| Status::internal(format!("xdbc type info: {e}")))?;
+                    (vec![batch], None)
+                }
                 _ => {
                     return Err(Status::unimplemented(format!(
                         "do_get for {} not implemented",
@@ -375,34 +625,27 @@ impl FlightService for FlightServer {
                     )));
                 }
             };
-            let flights = encode_stream(batches)?;
+            let flights = encode_stream_with_schema(batches, fallback)?;
             return Ok(Response::new(Box::pin(tokio_stream::iter(
                 flights.into_iter().map(Ok),
             ))));
         }
-        // 简易轨：ticket = 裸 UTF-8 SQL
+        // 简易轨：ticket = 裸 UTF-8 SQL（经 run_sql 前置分流）
         let sql = String::from_utf8(ticket.ticket.to_vec())
             .map_err(|_| Status::invalid_argument("ticket must be UTF-8 SQL"))?;
         if sql.trim().is_empty() {
             return Err(Status::invalid_argument("empty SQL in ticket"));
         }
-        let batches = self.query.sql(&sql).await.map_err(query_status)?;
-
-        // IPC 流：首条 Schema 消息 + 数据消息（S1.10 改流式 chunking）
-        let mut flights: Vec<Result<FlightData, Status>> = Vec::new();
-        if batches.is_empty() {
-            // 空结果也必须给 schema（客户端依赖）
-            let schema = Arc::new(Schema::empty());
-            let options = arrow::ipc::writer::IpcWriteOptions::default();
-            let fd: FlightData = SchemaAsIpc::new(schema.as_ref(), &options).into();
-            flights.push(Ok(fd));
-        } else {
-            let schema = batches[0].schema();
-            let datas = arrow_flight::utils::batches_to_flight_data(schema.as_ref(), batches)
-                .map_err(|e| Status::internal(format!("flight encode: {e}")))?;
-            flights.extend(datas.into_iter().map(Ok));
-        }
-        Ok(Response::new(Box::pin(tokio_stream::iter(flights))))
+        let (batches, fallback) = match self.run_sql(&sql).await? {
+            SqlOutcome::Rows(b) if !b.is_empty() => (b, None),
+            SqlOutcome::Rows(_) => (Vec::new(), self.sql_schema_of(&sql).await),
+            // 写入/DDL：空结果（仅 schema）
+            SqlOutcome::Affected(_) => (Vec::new(), None),
+        };
+        let flights = encode_stream_with_schema(batches, fallback)?;
+        Ok(Response::new(Box::pin(tokio_stream::iter(
+            flights.into_iter().map(Ok),
+        ))))
     }
 
     async fn do_put(
@@ -485,6 +728,7 @@ impl FlightService for FlightServer {
                 match ingest.ingest(ib).await {
                     Ok(receipt) => {
                         let payload = serde_json::to_vec(&receipt).unwrap_or_default();
+                        tracing::debug!(rows = receipt.row_count, "simple-track ack sending");
                         if ack_stream
                             .send(Ok(PutResult {
                                 app_metadata: payload.into(),
@@ -492,6 +736,7 @@ impl FlightService for FlightServer {
                             .await
                             .is_err()
                         {
+                            tracing::debug!("simple-track ack send failed (receiver closed)");
                             break;
                         }
                     }
@@ -529,7 +774,7 @@ impl FlightService for FlightServer {
                 // dataset_schema：优先逻辑计划；INSERT 等 DML 无法规划 → 回退目标表 schema
                 let schema = match self.query.schema_of(&req.query).await.ok() {
                     Some(s) if !s.fields().is_empty() => Some(s),
-                    _ => match insert_target_table(&req.query) {
+                    _ => match crate::sql::insert_target(&req.query) {
                         Some(t) => self
                             .query
                             .schema_of(&format!("SELECT * FROM {t}"))
@@ -680,8 +925,249 @@ impl FlightService for FlightServer {
 
 // ------------------------------------------------------------- 路由辅助
 
+/// run_sql 前置分流结果。
+pub(crate) enum SqlOutcome {
+    /// 结果集（SELECT / SHOW TABLES）
+    Rows(Vec<RecordBatch>),
+    /// 受影响行数（INSERT / DDL）
+    Affected(i64),
+}
+
+// ------------------------------------------------------ SQL 能力元数据（JDBC/DBeaver 兼容）
+
+/// 服务器能力元数据（`CommandGetSqlInfo` 响应，静态构建）。
+///
+/// JDBC 驱动（flight-sql-jdbc-driver / DBeaver 自定义驱动）握手后会拉取这些
+/// 元数据决定客户端行为（是否只读 / 是否支持事务 / 超时等）。
+static SQL_INFO_DATA: LazyLock<SqlInfoData> = LazyLock::new(|| {
+    let mut b = SqlInfoDataBuilder::new();
+    b.append(SqlInfo::FlightSqlServerName, "yuntun");
+    b.append(SqlInfo::FlightSqlServerVersion, env!("CARGO_PKG_VERSION"));
+    // Arrow（arrow-rs）版本：build.rs 从 workspace Cargo.lock 编译期提取
+    // （arrow-rs 不导出版本常量；未提取到时回退 workspace 声明的主线版本）
+    b.append(
+        SqlInfo::FlightSqlServerArrowVersion,
+        option_env!("YUNTUN_ARROW_VERSION").unwrap_or("59"),
+    );
+    b.append(SqlInfo::FlightSqlServerReadOnly, false);
+    b.append(SqlInfo::FlightSqlServerSql, true);
+    b.append(SqlInfo::FlightSqlServerSubstrait, false);
+    // 无事务支持（单语句自动提交语义；JDBC 端不发起 BeginTransaction）
+    b.append(
+        SqlInfo::FlightSqlServerTransaction,
+        SqlSupportedTransaction::None as i32,
+    );
+    b.append(SqlInfo::FlightSqlServerCancel, false);
+    b.append(SqlInfo::FlightSqlServerBulkIngestion, false);
+    b.append(SqlInfo::FlightSqlServerStatementTimeout, 0i64);
+    b.append(SqlInfo::FlightSqlServerTransactionTimeout, 0i64);
+    b.build().expect("static sql info data")
+});
+
+/// 类型字典行：(name, xdbc 类型, column_size, case_sensitive, unsigned, create_params, min_scale, max_scale)
+type XdbcTypeRow = (
+    &'static str,
+    XdbcDataType,
+    Option<i32>,
+    bool,
+    Option<bool>,
+    Option<&'static str>,
+    Option<i32>,
+    Option<i32>,
+);
+
+/// 类型字典（`CommandGetXdbcTypeInfo` 响应）：对齐 `CREATE TABLE` 的类型映射。
+static XDBC_TYPE_INFO: LazyLock<XdbcTypeInfoData> = LazyLock::new(|| {
+    let mut b = XdbcTypeInfoDataBuilder::new();
+    let types: &[XdbcTypeRow] = &[
+        (
+            "BOOLEAN",
+            XdbcDataType::XdbcBit,
+            Some(1),
+            false,
+            None,
+            None,
+            None,
+            None,
+        ),
+        (
+            "TINYINT",
+            XdbcDataType::XdbcTinyint,
+            Some(8),
+            false,
+            Some(false),
+            None,
+            None,
+            None,
+        ),
+        (
+            "SMALLINT",
+            XdbcDataType::XdbcSmallint,
+            Some(16),
+            false,
+            Some(false),
+            None,
+            None,
+            None,
+        ),
+        (
+            "INTEGER",
+            XdbcDataType::XdbcInteger,
+            Some(32),
+            false,
+            Some(false),
+            None,
+            None,
+            None,
+        ),
+        (
+            "BIGINT",
+            XdbcDataType::XdbcBigint,
+            Some(64),
+            false,
+            Some(false),
+            None,
+            None,
+            None,
+        ),
+        (
+            "REAL",
+            XdbcDataType::XdbcReal,
+            Some(24),
+            false,
+            Some(false),
+            None,
+            None,
+            None,
+        ),
+        (
+            "DOUBLE",
+            XdbcDataType::XdbcDouble,
+            Some(53),
+            false,
+            Some(false),
+            None,
+            None,
+            None,
+        ),
+        (
+            "DECIMAL",
+            XdbcDataType::XdbcDecimal,
+            Some(38),
+            false,
+            Some(false),
+            Some("precision, scale"),
+            Some(0),
+            Some(38),
+        ),
+        (
+            "VARCHAR",
+            XdbcDataType::XdbcVarchar,
+            None,
+            true,
+            None,
+            None,
+            None,
+            None,
+        ),
+        (
+            "BINARY",
+            XdbcDataType::XdbcBinary,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        ),
+        (
+            "DATE",
+            XdbcDataType::XdbcDate,
+            Some(10),
+            false,
+            None,
+            None,
+            None,
+            None,
+        ),
+        (
+            "TIMESTAMP",
+            XdbcDataType::XdbcTimestamp,
+            Some(29),
+            false,
+            None,
+            None,
+            Some(0),
+            Some(9),
+        ),
+    ];
+    let quoted = |dt: &XdbcDataType| {
+        matches!(
+            dt,
+            XdbcDataType::XdbcVarchar
+                | XdbcDataType::XdbcBinary
+                | XdbcDataType::XdbcVarbinary
+                | XdbcDataType::XdbcDate
+                | XdbcDataType::XdbcTimestamp
+        )
+    };
+    for (name, dt, size, case_sensitive, unsigned, create_params, min_scale, max_scale) in types {
+        let literal = quoted(dt).then(|| "'".to_string());
+        b.append(XdbcTypeInfo {
+            type_name: (*name).into(),
+            data_type: *dt,
+            column_size: *size,
+            literal_prefix: literal.clone(),
+            literal_suffix: literal,
+            create_params: create_params.map(|s| vec![s.to_string()]),
+            nullable: Nullable::NullabilityNullable,
+            case_sensitive: *case_sensitive,
+            searchable: if *case_sensitive {
+                Searchable::Char
+            } else {
+                Searchable::Full
+            },
+            unsigned_attribute: *unsigned,
+            fixed_prec_scale: *dt == XdbcDataType::XdbcDecimal,
+            auto_increment: Some(false),
+            local_type_name: Some((*name).into()),
+            minimum_scale: *min_scale,
+            maximum_scale: *max_scale,
+            sql_data_type: *dt,
+            datetime_subcode: None,
+            num_prec_radix: matches!(
+                dt,
+                XdbcDataType::XdbcTinyint
+                    | XdbcDataType::XdbcSmallint
+                    | XdbcDataType::XdbcInteger
+                    | XdbcDataType::XdbcBigint
+                    | XdbcDataType::XdbcReal
+                    | XdbcDataType::XdbcDouble
+                    | XdbcDataType::XdbcBit
+            )
+            .then_some(2),
+            interval_precision: None,
+        });
+    }
+    b.build().expect("static xdbc type info")
+});
+
+/// 错误信息用 SQL 片段（截断防刷屏）。
+fn sql_snippet(s: &str) -> String {
+    let t = s.trim();
+    if t.chars().count() > 80 {
+        format!("{}...", t.chars().take(80).collect::<String>())
+    } else {
+        t.to_string()
+    }
+}
+
 /// INSERT 语句目标表名解析（双引号 / 反引号 / 裸名）。解析失败 → None。
-fn insert_target_table(sql: &str) -> Option<String> {
+///
+/// 仅作 [`crate::sql::insert_target`]（AST 优先）的**回落**：
+/// prepared statement 允许不完整形态 `INSERT INTO t (a, b)`（无 VALUES/SELECT 源），
+/// sqlparser 解析失败时由此字符串匹配兜底（S1.6 后保留该回落路径）。
+pub(crate) fn insert_target_table(sql: &str) -> Option<String> {
     let lower = sql.to_ascii_lowercase();
     let pos = lower.find("insert into")?;
     let rest = sql[pos + "insert into".len()..].trim_start();
@@ -712,23 +1198,6 @@ fn insert_target_table(sql: &str) -> Option<String> {
     }
 }
 
-/// SQL 更新结果的受影响行数：DataFusion DML 返回 `count` 列批次，求和；DDL → 0。
-fn affected_rows(batches: &[RecordBatch]) -> i64 {
-    let mut n: u64 = 0;
-    for b in batches {
-        if b.num_columns() > 0 {
-            if let Some(col) = b
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow::array::UInt64Array>()
-            {
-                n += (0..b.num_rows()).map(|i| col.value(i)).sum::<u64>();
-            }
-        }
-    }
-    n as i64
-}
-
 /// 从首条 FlightData 的 data_header 解析 Arrow Schema（IPC Message → Schema）。
 fn flight_schema_of(fd: &FlightData) -> Option<SchemaRef> {
     let ipc = arrow::ipc::root_as_message(&fd.data_header).ok()?;
@@ -737,9 +1206,14 @@ fn flight_schema_of(fd: &FlightData) -> Option<SchemaRef> {
 }
 
 /// 批次 → IPC 流（首条 Schema 消息 + 数据消息）。
-fn encode_stream(batches: Vec<RecordBatch>) -> Result<Vec<FlightData>, Status> {
+/// `batches` 为空且提供 `fallback` 时，用 fallback schema（查询逻辑计划）
+/// 而非 0 字段空 schema——客户端（ADBC/JDBC）会校验与 GetFlightInfo 一致性。
+fn encode_stream_with_schema(
+    batches: Vec<RecordBatch>,
+    fallback: Option<SchemaRef>,
+) -> Result<Vec<FlightData>, Status> {
     if batches.is_empty() {
-        let schema: SchemaRef = Arc::new(Schema::empty());
+        let schema = fallback.unwrap_or_else(|| Arc::new(Schema::empty()));
         let options = arrow::ipc::writer::IpcWriteOptions::default();
         let fd: FlightData = SchemaAsIpc::new(schema.as_ref(), &options).into();
         return Ok(vec![fd]);

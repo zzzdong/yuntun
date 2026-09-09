@@ -32,6 +32,9 @@ pub struct BatchState {
     pub status: BatchStatus,
     pub s3_paths: Vec<String>,
     pub s3_upload_id: Option<String>,
+    /// 已写数据文件的字节数（BatchS3Written 携带；恢复重提交 Manifest 用）。
+    /// MVP 单文件全量输出，多文件时仅首文件语义成立。
+    pub file_size: u64,
     pub row_count: u64,
     pub schema_version: u64,
     pub created_at_ms: u64,
@@ -85,6 +88,7 @@ pub fn apply_record(state: &mut BatchStateMap, rec: &Record, _seq: u64) {
                     status: BatchStatus::Pending,
                     s3_paths: Vec::new(),
                     s3_upload_id: None,
+                    file_size: 0,
                     row_count: p.row_count,
                     schema_version: p.schema_version,
                     created_at_ms: p.created_at_ms,
@@ -101,6 +105,7 @@ pub fn apply_record(state: &mut BatchStateMap, rec: &Record, _seq: u64) {
                 } else {
                     Some(p.s3_upload_id.clone())
                 };
+                s.file_size = p.file_size;
             }
         }
         Record::BatchCommitted(p) => {
@@ -112,6 +117,8 @@ pub fn apply_record(state: &mut BatchStateMap, rec: &Record, _seq: u64) {
             // 进入终态：移除 BatchState，丢弃其 Data
             state.states.remove(&p.batch_id);
         }
+        // S1.7：DDL 事件不参与批次状态机（由启动重放直接应用 Catalog）
+        Record::Ddl(_) => {}
     }
 }
 

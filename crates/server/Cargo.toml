@@ -15,7 +15,9 @@ yuntun-ingest = { path = "../ingest" }
 yuntun-query = { path = "../query" }
 yuntun-compaction = { path = "../compaction" }
 arrow = { workspace = true }
+arrow-cast = "59"
 arrow-flight = { workspace = true }
+sqlparser = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
 futures = { workspace = true }

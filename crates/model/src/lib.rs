@@ -20,10 +20,8 @@ pub use error::LakeError;
 pub use meta::*;
 pub use ops::*;
 pub use schema::{apply_change, classify, SchemaChange, SchemaChangeKind, SchemaCompatibility};
-pub use wal_record::{Record, RecordType};
-
 use std::time::SystemTime;
-
+pub use wal_record::{DdlPayload, Record, RecordType};
 /// 归一化写入单元 —— 下游完全不感知协议差异（详细设计 §3.1 / ADR-13）。
 #[derive(Debug, Clone)]
 pub struct IngestBatch {

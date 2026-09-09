@@ -5,6 +5,7 @@
 
 pub mod config;
 pub mod flight;
+pub mod sql;
 
 pub use config::Config;
 pub use flight::FlightServer;
@@ -12,8 +13,11 @@ pub use flight::FlightServer;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use yuntun_catalog::MemoryCatalog;
+use yuntun_catalog::{CatalogOps, MemoryCatalog};
 use yuntun_ingest::{Ingestor, IngestorConfig};
+use yuntun_model::meta::{deserialize_schema, IngestConfig};
+use yuntun_model::ops::CreateTableRequest;
+use yuntun_model::wal_record::{ddl_op, Record};
 use yuntun_query::QueryEngine;
 use yuntun_wal::writer::WalWriter;
 
@@ -66,6 +70,12 @@ impl Lakehouse {
         // ③ WAL（MVP 单 shard 0）
         let wal_cfg = cfg.wal_config();
         let wal = WalWriter::open(wal_cfg.clone(), 0).await?;
+
+        // ③.5 WAL DDL 重放（S1.7）：先重建表清单，再分流数据批次恢复（§5.6）。
+        // DDL 记录由 run_sql 在 Catalog apply 成功后追加（顺序即因果）；
+        // 重放幂等（create 已存在 / drop 不存在均忽略），保证 SQL 写入的数据
+        // 崩溃重启后表存在、可恢复（S1.6 验收）。
+        replay_wal_ddl(&catalog, &wal).await?;
 
         // ④ Ingestor
         let ingest_cfg = IngestorConfig {
@@ -171,14 +181,76 @@ impl Lakehouse {
     }
 }
 
+/// 启动时重放 WAL 中的 DDL 记录（S1.7）。
+///
+/// 单节点重启后 MemoryCatalog 为空（C5），SQL CREATE/DROP 的表清单由 WAL Ddl
+/// 记录重建；重放幂等（TableAlreadyExists / TableNotFound 忽略）。
+async fn replay_wal_ddl(
+    catalog: &Arc<MemoryCatalog>,
+    wal: &WalWriter,
+) -> Result<(), yuntun_model::error::LakeError> {
+    let reader = yuntun_wal::reader::WalReader::new(wal.shard_dir());
+    let records = reader.scan_from(0)?;
+    let mut created = 0usize;
+    let mut dropped = 0usize;
+    for (_, rec) in records {
+        let Record::Ddl(p) = rec else { continue };
+        let res = match p.op {
+            ddl_op::CREATE_TABLE => {
+                let schema = deserialize_schema(&p.arrow_schema)?;
+                let req = CreateTableRequest {
+                    name: p.table.clone(),
+                    schema,
+                    partition_cols: vec![],
+                    default_format: if p.default_format.is_empty() {
+                        "parquet".to_string()
+                    } else {
+                        p.default_format.clone()
+                    },
+                    ingest_config: IngestConfig::standard(),
+                };
+                match catalog.create_table(req).await {
+                    Ok(_) => {
+                        created += 1;
+                        Ok(())
+                    }
+                    Err(yuntun_model::error::LakeError::TableAlreadyExists(_)) => Ok(()),
+                    Err(e) => Err(e),
+                }
+            }
+            ddl_op::DROP_TABLE => match catalog.drop_table(&p.table).await {
+                Ok(()) => {
+                    dropped += 1;
+                    Ok(())
+                }
+                Err(yuntun_model::error::LakeError::TableNotFound(_)) => Ok(()),
+                Err(e) => Err(e),
+            },
+            other => {
+                tracing::warn!(op = other, table = %p.table, "unknown ddl op in WAL, skipping");
+                Ok(())
+            }
+        };
+        if let Err(e) = res {
+            tracing::warn!(table = %p.table, error = %e, "replay WAL DDL failed");
+        }
+    }
+    if created > 0 || dropped > 0 {
+        tracing::info!(created, dropped, "replayed WAL DDL records");
+    }
+    Ok(())
+}
+
 /// 启动 Arrow Flight gRPC 服务（单端点多轨：FlightSQL 标准轨 + 简易写入/查询轨）。
 pub async fn serve_flight(
     lakehouse: &Lakehouse,
     listen: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let catalog: Arc<dyn CatalogOps> = lakehouse.catalog.clone();
     let svc = arrow_flight::flight_service_server::FlightServiceServer::new(FlightServer::new(
         lakehouse.ingestor.clone(),
         lakehouse.query.clone(),
+        catalog,
     ));
     let addr = listen
         .parse::<std::net::SocketAddr>()

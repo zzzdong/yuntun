@@ -58,6 +58,10 @@ pub trait CatalogOps: Send + Sync {
     /// L1 分片移除：整 shard 的文件标记 deleted_at（§6.3）
     async fn drop_shard(&self, table: &str, shard: &str) -> Result<u64, LakeError>;
 
+    /// 删除表（S1.7 新增 meta 能力）：表 + Schema 版本链移除，
+    /// 文件 Manifest 移除（数据文件转孤儿，由孤儿清理回收，plan §4.3）。
+    async fn drop_table(&self, name: &str) -> Result<(), LakeError>;
+
     // ---- 幂等 ----
     async fn check_idempotency(&self, key: &str) -> Result<Option<String>, LakeError>;
     async fn record_idempotency(&self, rec: IdempotencyRecord) -> Result<(), LakeError>;
@@ -356,6 +360,23 @@ impl CatalogOps for MemoryCatalog {
         Ok(n)
     }
 
+    /// 删除表（S1.7）：表 + Schema 版本链 + 文件 Manifest 一并移除。
+    ///
+    /// 数据文件本身不动 —— Manifest 移除后 S3 对象成为孤儿，
+    /// 由孤儿清理循环（batch_id 对账 + 静置期）回收（plan §4.3）。
+    async fn drop_table(&self, name: &str) -> Result<(), LakeError> {
+        let mut tables = self.tables.write().unwrap();
+        if tables.remove(name).is_none() {
+            return Err(LakeError::TableNotFound(name.to_string()));
+        }
+        drop(tables);
+        self.schemas.write().unwrap().retain(|(t, _), _| t != name);
+        self.files.write().unwrap().retain(|_, f| f.table != name);
+        self.snapshot_version.fetch_add(1, Ordering::SeqCst);
+        self.last_applied.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
     async fn check_idempotency(&self, key: &str) -> Result<Option<String>, LakeError> {
         Ok(self
             .idempotency
@@ -565,6 +586,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(new.len(), 0);
+    }
+
+    // S1.7：drop_table —— 表/Schema 链/Manifest 移除，缺失表报 TableNotFound
+    #[tokio::test]
+    async fn drop_table_removes_table_and_files() {
+        let c = catalog_with_table().await;
+        c.commit_files(CommitFilesRequest {
+            table: "audit".into(),
+            batch_id: "b1".into(),
+            client_request_id: None,
+            shard: "s0".into(),
+            time_window: "w".into(),
+            files: vec![manifest("b1", "yuntun/audit/f1.parquet")],
+            schema_version: 1,
+            row_count: 10,
+        })
+        .await
+        .unwrap();
+
+        let snap0 = c.current_snapshot().await;
+        c.drop_table("audit").await.unwrap();
+        assert!(c.current_snapshot().await > snap0, "drop 走 apply 语义");
+
+        assert!(c.get_table("audit").await.unwrap().is_none());
+        assert!(c.table_schema("audit").await.unwrap().is_none());
+        let files = c
+            .list_visible_files("audit", c.current_snapshot().await, None)
+            .await
+            .unwrap();
+        assert!(files.is_empty(), "Manifest 已移除（数据文件转孤儿）");
+        assert!(
+            !c.known_batch_ids().contains(&"b1".to_string()),
+            "batch 不再已知 → 孤儿清理可回收"
+        );
+        assert!(matches!(
+            c.drop_table("audit").await,
+            Err(LakeError::TableNotFound(_))
+        ));
     }
 
     // T3.3：幂等键独立存储 + 去重

@@ -260,3 +260,105 @@ civil 算法时间解析；③ `FlightServer` 增加 `run_sql` 前置分发并�
 （简易 do_get / StatementQuery / StatementUpdate / prepared update）；
 ④ FlightServer 增加 Catalog 依赖；⑤ e2e：CREATE → INSERT（VALUES/SELECT）→
 查询验证 → DROP。
+
+## 9. 追加：S1.6 / S1.7 实施（2026-09-09，SQL 写入路径 + DDL）
+
+### 9.1 实现内容（按 §8.3 清单）
+
+| # | 内容 | 位置 |
+|---|---|---|
+| ① | `CatalogOps::drop_table` + MemoryCatalog 实现（表 + Schema 版本链 + 文件 Manifest 移除 → 数据文件转孤儿由孤儿清理回收；快照/apply 推进；缺失表报 TableNotFound） | catalog |
+| ② | SQL 前置解析模块（纯函数）：单语句解析（多语句拒绝）/ INSERT 目标表名（AST 优先 + 不完整形态字符串回落）/ SHOW TABLES 批次 / CREATE TABLE DataType→Arrow 映射（INT/BIGINT/VARCHAR/TIMESTAMP/DECIMAL/BLOB/DATE/整型族…，NOT NULL → nullable=false，CTAS/OR REPLACE 明确拒绝）/ VALUES 字面量→RecordBatch（列清单、NULL 填充、NOT NULL 缺失报错、范围检查）/ SELECT 结果位置对齐 cast（arrow-cast）/ ISO8601 civil 算法时间解析（epoch ns，支持 T/空格分隔、Z/±HH:MM、1-9 位小数秒） | `server/src/sql.rs`（18 单测） |
+| ③ | `FlightServer::run_sql` 前置分流，接入简易轨 do_get（ticket=SQL）、FlightSQL TicketStatementQuery、StatementUpdate(do_put)；INSERT 语句级幂等键 `dml-<uuid>`；FlightServer 增加 `catalog: Arc<dyn CatalogOps>` 依赖 | server/flight.rs |
+| ④ | prepared statement 目标表解析改 AST 优先（`insert_target`），保留字符串匹配回落（兼容 `INSERT INTO t (a,b)` 不完整形态） | server/flight.rs |
+| ⑤ | e2e `sql_dml_e2e.rs`：CREATE(IF NOT EXISTS) → INSERT VALUES（do_put StatementUpdate / do_get 两入口、列清单 + NULL 填充、TIMESTAMP ISO/整型毫秒）→ 查询验证 → INSERT SELECT（Int64→Int32 cast）→ SHOW TABLES → DROP(IF EXISTS + 缺失表报错) → UPDATE/DELETE/CTAS 拒绝 → **硬崩溃重启后 DDL + 数据均恢复** | server/tests |
+
+### 9.2 设计定稿之外的关键决策（偏差留档）
+
+1. **WAL 新增 `Ddl` 记录类型（type=5）**——§8.3 清单未含此项，但 S1.7 验收要求
+   "DDL 跨重启可见"、S1.6 要求"SQL 写入的数据崩溃重启可恢复"，而 MemoryCatalog
+   重启清零（C5）。方案：run_sql 在 Catalog apply 成功后 append `Record::Ddl
+   {op, table, arrow_schema, default_format}`（顺序即因果）；`Lakehouse::build`
+   在 resume_recovered **之前**重放（create 已存在 / drop 不存在均幂等忽略）。
+   阶段 1 切 Raft 后 DDL 走 Meta 状态机，此通道可退役。
+2. **恢复语义修正（阶段 0）**：`resume_recovered` 原对 Committed/S3Written 做
+   "重新提交"——但阶段 0 Meta 重启即空、可见性实际由**攒批线程全量重读 WAL 重做
+   flush** 提供（§2.2-6），两者叠加会产生**双份可见数据**（chaos E3 回归捕获，
+   27 vs 18）。修正：阶段 0 跳过 Committed/S3Written 重提交（debug 日志留痕）；
+   `commit_recovered_batch` 修正为携带正确 `table`（从 WAL Data 记录恢复）与
+   `file_size`，留给阶段 1 持久 Meta。
+3. **BatchState 新增 `file_size`**：恢复/重提交路径的 Manifest 原为
+   `Default::default()`（file_size=0），而查询 scan 用 Manifest 的 file_size 做
+   Parquet footer 范围读 → "file length is 0" 错误。现在 BatchS3Written 携带的
+   file_size 随状态机重建（MVP 单文件全量输出，语义成立）。
+4. **DataFusion 本地缓存感知**：缓存 TTL 30s，SQL CREATE 后立即 INSERT SELECT 会
+   "table not found"。run_sql 在 DDL 成功后、INSERT SELECT 读源前强制
+   `cache.refresh`（只读本地 Catalog，不破坏 C7）。
+5. **INSERT ... SELECT 可见性**：源数据须已 commit（§4.5 攒批窗口后可见）。
+   server 侧已尽量刷新缓存；测试/demo 中在写后等待 flush 再执行。
+6. **DROP 后的遗留 Data**：WAL 中被 DROP 表的 Data 记录在重启重读时仍会 flush
+   （commit 不检查表存在性）——Manifest 挂在不存在的表下、查询不可见；若之后
+   **重建同名表**会复活旧数据。阶段 0 已知工件，阶段 2 chaos / 阶段 3 Meta
+   状态机时收敛。
+
+### 9.3 MVP 限制（后续扩展点）
+
+- `INSERT ... SELECT` 不支持列清单（仅位置对齐）；`UPDATE` / `DELETE` / `CREATE
+  TABLE AS` / `OR REPLACE` / 多语句明确拒绝（NotImplemented + 支持列表）
+- CREATE TABLE 类型映射为 MVP 子集（不支持 ARRAY/STRUCT/MAP/UUID/带时区时间戳/
+  INTERVAL）；DECIMAL → Decimal128，未指定精度 → (38,10)
+- TIMESTAMP 字面量：ISO8601（无时区按 UTC）与整型毫秒；列必须是无时区 Timestamp
+- 幂等键由服务端按语句生成（`dml-<uuid>`）；Prepared statement options 携带
+  `client_request_id` 的透传归 S1.8
+- `SHOW TABLES` 输出对齐 DataFusion 列结构（table_catalog/table_schema/table_name）
+
+### 9.4 验证
+
+- `cargo test --workspace`：**88 passed / 0 failed**（新增 sql.rs 18 单测 +
+  sql_dml_e2e 2 用例；chaos E3 5 轮滚动崩溃回归通过）
+- `cargo clippy --workspace --all-targets`：0 警告
+- demo（`cargo run -p yuntun-server --example demo`）新增 §6b：SQL CREATE /
+  INSERT VALUES / INSERT SELECT / SHOW TABLES 全链路冒烟通过
+- 依赖：workspace 新增 `sqlparser = "0.62"`（对齐 Cargo.lock 中 DataFusion 55
+  依赖版本，无双版本共存）；server 新增 `arrow-cast = "59"`（SELECT 源 cast；注：
+  arrow 59 元 crate 无 compute feature，cast 内核在独立的 arrow-cast crate）
+
+## 10. 追加：S1.5 收尾——SQL 能力元数据（JDBC/DBeaver 兼容，2026-09-09）
+
+### 10.1 实现
+
+- **GetSqlInfo**：静态 `SqlInfoData`（arrow-flight `metadata::SqlInfoDataBuilder`）——
+  SERVER_NAME=yuntun / SERVER_VERSION=env!(CARGO_PKG_VERSION) /
+  **ARROW_VERSION=build.rs 从 workspace Cargo.lock 编译期提取**（arrow-rs 不导出
+  版本常量；`option_env!("YUNTUN_ARROW_VERSION")` 回退 "59"）/ READ_ONLY=false /
+  SQL=true / SUBSTRAIT=false / TRANSACTION=None（单语句自动提交语义）/
+  CANCEL=false / BULK_INGESTION=false / 两类 Timeout=0。按请求过滤由
+  `CommandGetSqlInfo::into_builder` 完成。
+- **GetXdbcTypeInfo**：静态 `XdbcTypeInfoData`，12 种类型对齐 CREATE TABLE 的
+  DataType 映射（BOOLEAN/TINYINT/SMALLINT/INTEGER/BIGINT/REAL/DOUBLE/DECIMAL/
+  VARCHAR/BINARY/DATE/TIMESTAMP），含 column_size（数值型按 bit 位宽惯例）、
+  literal 前后缀（引号型）、DECIMAL 的 create_params/scale、NUM_PREC_RADIX=2；
+  支持 `data_type` 过滤。
+
+### 10.2 真实客户端冒烟发现并修复的互操作 bug
+
+**空结果集返回 0 字段 schema**——`SELECT ... WHERE` 无匹配行时，do_get 首条
+Schema 消息为空 schema，与 GetFlightInfo 声明的查询 schema 不一致，ADBC 1.12
+直接报 "FlightSQL endpoint returned inconsistent schema"（JDBC/DBeaver 浏览
+空表必踩）。修复：`do_get` 空结果时用 `QueryEngine::schema_of`（逻辑计划）作为
+首条 Schema 消息（`encode_stream_with_schema` + `FlightServer::sql_schema_of`），
+标准轨与简易轨同时覆盖。
+
+### 10.3 冒烟脚本与客户端行为记录
+
+- 新增 `scripts/pyarrow_sqlinfo_smoke.py`：手写 protobuf wire + pyarrow 原始
+  FlightClient（GetSqlInfo 过滤 / GetXdbcTypeInfo 全量+过滤）+ ADBC 1.12 复核
+  （SELECT / get_objects）+ executeUpdate 落库验证。全链路 ALL OK。
+- **pyarrow C++ 客户端 quirk**（非服务端 bug，留档）：
+  1. `do_put` 的 PutResult 回执需**并发读取**——`writer.close()` 后再
+     `reader.read()` 返回 None（C++ 客户端行为；服务端已确认发送，Rust tonic
+     e2e 阻塞式读回执正常）；
+  2. 并发读回执时 `writer.close()` 可能阻塞——冒烟脚本改为不读回执、以 ADBC
+     落库结果断言。
+- 验证：`cargo test --workspace` 全过（flight_sql_e2e 新增空结果 schema 一致性
+  断言）；clippy 0 警告；`yuntun.toml.example` 未动（server.listen 默认 50051）。

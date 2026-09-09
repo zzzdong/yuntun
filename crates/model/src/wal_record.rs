@@ -24,6 +24,8 @@ pub enum RecordType {
     BatchS3Written = 2,
     BatchCommitted = 3,
     BatchAbort = 4,
+    /// S1.7：DDL 事件（CREATE/DROP TABLE），启动重放重建 Catalog 表清单
+    Ddl = 5,
 }
 
 impl RecordType {
@@ -34,6 +36,7 @@ impl RecordType {
             2 => Self::BatchS3Written,
             3 => Self::BatchCommitted,
             4 => Self::BatchAbort,
+            5 => Self::Ddl,
             _ => return None,
         })
     }
@@ -114,6 +117,31 @@ pub struct BatchAbortPayload {
     pub batch_id: String,
 }
 
+/// type=5 Ddl（S1.7）：DDL 事件，Catalog 变更的 WAL 权威记录。
+///
+/// 语义：server 在 Catalog apply 成功后 append（顺序即因果）；启动时**先重放 DDL
+/// 再分流 batch 恢复**，保证 SQL 写入的数据崩溃重启后表存在、可恢复（S1.6 验收）。
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct DdlPayload {
+    /// 0 = CreateTable, 1 = DropTable
+    #[prost(uint32, tag = "1")]
+    pub op: u32,
+    #[prost(string, tag = "2")]
+    pub table: String,
+    /// CreateTable：Arrow Schema（IPC 序列化，model::meta::serialize_schema）
+    #[prost(bytes = "vec", tag = "3")]
+    pub arrow_schema: Vec<u8>,
+    /// CreateTable：default_format（"parquet" | "vortex"）
+    #[prost(string, tag = "4")]
+    pub default_format: String,
+}
+
+/// DdlPayload.op 取值。
+pub mod ddl_op {
+    pub const CREATE_TABLE: u32 = 0;
+    pub const DROP_TABLE: u32 = 1;
+}
+
 /// WAL Record 枚举。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Record {
@@ -122,6 +150,7 @@ pub enum Record {
     BatchS3Written(BatchS3WrittenPayload),
     BatchCommitted(BatchCommittedPayload),
     BatchAbort(BatchAbortPayload),
+    Ddl(DdlPayload),
 }
 
 impl Record {
@@ -132,6 +161,7 @@ impl Record {
             Record::BatchS3Written(_) => RecordType::BatchS3Written,
             Record::BatchCommitted(_) => RecordType::BatchCommitted,
             Record::BatchAbort(_) => RecordType::BatchAbort,
+            Record::Ddl(_) => RecordType::Ddl,
         }
     }
 
@@ -142,6 +172,7 @@ impl Record {
             Record::BatchCommitted(p) => Some(&p.batch_id),
             Record::BatchAbort(p) => Some(&p.batch_id),
             Record::Data(_) => None,
+            Record::Ddl(_) => None,
         }
     }
 
@@ -154,6 +185,7 @@ impl Record {
             Record::BatchS3Written(p) => p.encode_to_vec(),
             Record::BatchCommitted(p) => p.encode_to_vec(),
             Record::BatchAbort(p) => p.encode_to_vec(),
+            Record::Ddl(p) => p.encode_to_vec(),
         }
     }
 
@@ -179,6 +211,9 @@ impl Record {
             ),
             RecordType::BatchAbort => Record::BatchAbort(
                 BatchAbortPayload::decode(payload).map_err(|e| WalError::Other(e.to_string()))?,
+            ),
+            RecordType::Ddl => Record::Ddl(
+                DdlPayload::decode(payload).map_err(|e| WalError::Other(e.to_string()))?,
             ),
         })
     }
@@ -295,6 +330,12 @@ mod tests {
             }),
             Record::BatchAbort(BatchAbortPayload {
                 batch_id: "b1".into(),
+            }),
+            Record::Ddl(DdlPayload {
+                op: ddl_op::CREATE_TABLE,
+                table: "t".into(),
+                arrow_schema: vec![9, 9],
+                default_format: "parquet".into(),
             }),
         ];
         for r in records {

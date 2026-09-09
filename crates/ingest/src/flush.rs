@@ -200,7 +200,15 @@ pub async fn flush_batch_with_id(
 pub async fn commit_recovered_batch(
     deps: &FlushDeps,
     st: &yuntun_model::batch::BatchState,
+    table: &str,
 ) -> Result<u64, LakeError> {
+    // MVP 单文件全量输出：唯一文件时可恢复真实 file_size
+    // （Manifest file_size=0 会让 Parquet scan 的 footer 范围读失败）。
+    let file_size = if st.s3_paths.len() == 1 {
+        st.file_size
+    } else {
+        0
+    };
     let files = st
         .s3_paths
         .iter()
@@ -208,13 +216,17 @@ pub async fn commit_recovered_batch(
             file_path: p.clone(),
             batch_id: st.batch_id.clone(),
             row_count: st.row_count,
+            file_size,
             ..Default::default()
         })
         .collect();
     let resp = deps
         .catalog
         .commit_files(CommitFilesRequest {
-            table: String::new(), // 恢复路径：由 Meta 端 batch_id 幂等兜底
+            // 阶段 0 重启后 MemoryCatalog 为空：重提交必须带正确表名，
+            // 否则文件 Manifest table 为空、查询永不可见（阶段 1 gRPC Meta
+            // 按 batch_id 幂等兜底后此字段仅作记录）。
+            table: table.to_string(),
             batch_id: st.batch_id.clone(),
             client_request_id: st.client_request_id.clone(),
             shard: st.shard.clone(),

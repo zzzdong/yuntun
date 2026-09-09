@@ -63,6 +63,9 @@ fn print_batches(title: &str, batches: &[arrow::record_batch::RecordBatch]) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
+        .init();
     tracing::info!("yuntun demo starting");
 
     // ---- ① 装配 Lakehouse（内存 S3 模拟 + 临时 WAL）----
@@ -113,7 +116,11 @@ scan_interval_ms = 50
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let svc = arrow_flight::flight_service_server::FlightServiceServer::new(
-        yuntun_server::FlightServer::new(lakehouse.ingestor.clone(), lakehouse.query.clone()),
+        yuntun_server::FlightServer::new(
+            lakehouse.ingestor.clone(),
+            lakehouse.query.clone(),
+            lakehouse.catalog.clone() as Arc<dyn yuntun_catalog::CatalogOps>,
+        ),
     );
     let sd = shutdown.clone();
     tokio::spawn(async move {
@@ -237,6 +244,54 @@ scan_interval_ms = 50
     );
 
     println!("\n[6] 全链路贯通（全部经由 gRPC）：DoPut 写入 → WAL(组提交 fsync) → 攒批(Jitter) → Parquet → Meta(快照隔离) → DoGet SQL 查询 ✓");
+
+    // ---- ⑥b SQL 前置解析分流（S1.6/S1.7）：CREATE / INSERT / SHOW 经 do_get ticket ----
+    println!("\n=== SQL 前置解析分流（plan §4.3：只有 SELECT 让 DataFusion 处理）===");
+    run(
+        &mut client,
+        "CREATE TABLE sql_demo (ts BIGINT NOT NULL, name VARCHAR, cost INT)",
+    )
+    .await;
+    println!("[6b] CREATE TABLE sql_demo ✓（→ Catalog，General 模板，DDL 记入 WAL）");
+    run(
+        &mut client,
+        "INSERT INTO sql_demo (ts, name, cost) VALUES \
+         (1000, 'alice', 10), (2000, 'bob', 20), (3000, NULL, NULL)",
+    )
+    .await;
+    println!("[6b] INSERT VALUES 3 行 ✓（字面量 → RecordBatch → ingest 管线，WAL 权威）");
+    // §4.5 可见性：SQL 写入先落 WAL，攒批窗口后可见 —— INSERT SELECT 读源前等 flush
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    lakehouse
+        .query
+        .cache()
+        .refresh(&(lakehouse.catalog.clone() as Arc<dyn CatalogOps>))
+        .await?;
+    run(
+        &mut client,
+        "INSERT INTO sql_demo SELECT ts, name, cost + 100 FROM yuntun.public.sql_demo WHERE cost IS NOT NULL",
+    )
+    .await;
+    println!("[6b] INSERT SELECT ✓（DataFusion 读源 → 位置对齐 cast → ingest）");
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    lakehouse
+        .query
+        .cache()
+        .refresh(&(lakehouse.catalog.clone() as Arc<dyn CatalogOps>))
+        .await?;
+    print_batches(
+        "SQL(do_get): SHOW TABLES",
+        &run(&mut client, "SHOW TABLES").await,
+    );
+    print_batches(
+        "SQL(do_get): SELECT * FROM yuntun.public.sql_demo ORDER BY ts",
+        &run(
+            &mut client,
+            "SELECT * FROM yuntun.public.sql_demo ORDER BY ts",
+        )
+        .await,
+    );
+    println!("[6b] SQL 写入数据崩溃重启不丢：DDL 重放（WAL Ddl 记录）+ WAL 权威恢复 ✓");
 
     // ---- ⑦（可选）保持服务运行，供外部客户端（pyarrow / ADBC）冒烟 ----
     if std::env::var("YUNTUN_DEMO_SERVE").as_deref() == Ok("1") {

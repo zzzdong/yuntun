@@ -1,9 +1,7 @@
 //! Ingestor 主流程（详细设计 §5.2 写入主流程 + §5.3 攒批循环）。
 
 use crate::accumulator::{extract_event_time_ms, now_ms, BatchAccumulator};
-use crate::flush::{
-    commit_recovered_batch, flush_batch, flush_batch_with_id, FlushDeps, LiveBatchTracker,
-};
+use crate::flush::{flush_batch, flush_batch_with_id, FlushDeps, LiveBatchTracker};
 use crate::schema_cache::{resolve_schema_version, SchemaCache};
 use crate::source::IngestBatch;
 use crate::source::{IngestSource, Receipt};
@@ -269,9 +267,14 @@ impl Ingestor {
             use yuntun_model::batch::BatchStatus::*;
             match st.status {
                 Committed | S3Written => {
-                    // 阶段 0 单节点：重启后 Meta 为空，Committed 也需重新提交
-                    // （Meta 按 batch_id 幂等，重复提交返回 accepted=false，无害）
-                    commit_recovered_batch(&deps, st).await?;
+                    // 【阶段 0 语义】Meta（MemoryCatalog）不持久（C5），恢复的可见性
+                    // 由攒批线程全量重读 WAL 重做 flush 提供（operation-log §2.2-6）。
+                    // 此处【不得】重提交 —— 否则与重读 flush 产生双份可见数据
+                    // （chaos E3 回归验证）。
+                    // `commit_recovered_batch`（带正确 table/file_size）留给
+                    // 阶段 1 持久 Meta 的 "Committed → 只补 Commit" 分流。
+                    tracing::debug!(batch_id = %st.batch_id, status = ?st.status,
+                        "committed/s3written batch: visibility re-provided by accumulator re-scan");
                     committed += 1;
                 }
                 Pending => {

@@ -13,8 +13,9 @@ use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::sql::{
-    ActionCreatePreparedStatementRequest, CommandGetCatalogs, CommandGetTables,
-    CommandPreparedStatementUpdate, CommandStatementQuery, DoPutUpdateResult, TicketStatementQuery,
+    ActionCreatePreparedStatementRequest, CommandGetCatalogs, CommandGetSqlInfo, CommandGetTables,
+    CommandGetXdbcTypeInfo, CommandPreparedStatementUpdate, CommandStatementQuery,
+    DoPutUpdateResult, SqlInfo, TicketStatementQuery,
 };
 use arrow_flight::{Action, FlightData, FlightDescriptor, PutResult};
 use futures::StreamExt;
@@ -100,7 +101,11 @@ scan_interval_ms = 20
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let svc = arrow_flight::flight_service_server::FlightServiceServer::new(
-        yuntun_server::FlightServer::new(lakehouse.ingestor.clone(), lakehouse.query.clone()),
+        yuntun_server::FlightServer::new(
+            lakehouse.ingestor.clone(),
+            lakehouse.query.clone(),
+            lakehouse.catalog.clone(),
+        ),
     );
     let server_shutdown = shutdown.clone();
     let server = tokio::spawn(async move {
@@ -250,7 +255,71 @@ scan_interval_ms = 20
     let s = arrow::ipc::convert::fb_to_schema(fb);
     assert!(s.field_with_name("event_time").is_ok());
 
-    // ⑥ 标准轨写入：CreatePreparedStatement(INSERT) → DoPut(CommandPreparedStatementUpdate) 绑定数据
+    // ⑥ 能力元数据：GetSqlInfo（按需过滤）+ GetXdbcTypeInfo（全量/按类型过滤）——JDBC/DBeaver 兼容
+    let icmd = command_bytes(&CommandGetSqlInfo {
+        info: vec![
+            SqlInfo::FlightSqlServerName as u32,
+            SqlInfo::FlightSqlServerReadOnly as u32,
+        ],
+    });
+    let iinfo = client
+        .get_flight_info(FlightDescriptor {
+            r#type: 2,
+            cmd: icmd.into(),
+            path: vec![],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let ib = collect_do_get(&mut client, iinfo.endpoint[0].ticket.clone().unwrap()).await;
+    assert_eq!(ib[0].num_rows(), 2, "GetSqlInfo 按请求过滤");
+    let names = ib[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::UInt32Array>()
+        .unwrap();
+    assert_eq!(names.value(0), SqlInfo::FlightSqlServerName as u32);
+    assert_eq!(names.value(1), SqlInfo::FlightSqlServerReadOnly as u32);
+
+    let tcmd = command_bytes(&CommandGetXdbcTypeInfo { data_type: None });
+    let tinfo = client
+        .get_flight_info(FlightDescriptor {
+            r#type: 2,
+            cmd: tcmd.into(),
+            path: vec![],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let tb = collect_do_get(&mut client, tinfo.endpoint[0].ticket.clone().unwrap()).await;
+    assert!(
+        tb[0].num_rows() >= 12,
+        "类型字典应覆盖 CREATE TABLE 支持的类型，got {}",
+        tb[0].num_rows()
+    );
+    // 按类型过滤：INTEGER
+    let fcmd = command_bytes(&CommandGetXdbcTypeInfo {
+        data_type: Some(arrow_flight::sql::XdbcDataType::XdbcInteger as i32),
+    });
+    let finfo = client
+        .get_flight_info(FlightDescriptor {
+            r#type: 2,
+            cmd: fcmd.into(),
+            path: vec![],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let fb = collect_do_get(&mut client, finfo.endpoint[0].ticket.clone().unwrap()).await;
+    assert_eq!(fb[0].num_rows(), 1, "XdbcInteger 过滤");
+    let tn = fb[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(tn.value(0), "INTEGER");
+
+    // ⑦ 标准轨写入：CreatePreparedStatement(INSERT) → DoPut(CommandPreparedStatementUpdate) 绑定数据
     let create_req = ActionCreatePreparedStatementRequest {
         query: "INSERT INTO audit (event_time, user)".to_string(),
         transaction_id: None,
@@ -304,7 +373,39 @@ scan_interval_ms = 20
         .await
         .unwrap();
 
-    // ⑦ 两轨数据合流可查：2（简易轨）+ 2（标准轨）= 4
+    // ⑦ 空结果集：do_get 首条 Schema 必须与查询 schema 一致（ADBC/JDBC 一致性校验）
+    {
+        let empty_q = "SELECT event_time, \"user\" FROM yuntun.public.audit WHERE event_time < 0";
+        let qcmd = command_bytes(&CommandStatementQuery {
+            query: empty_q.to_string(),
+            transaction_id: None,
+        });
+        let info = client
+            .get_flight_info(FlightDescriptor {
+                r#type: 2,
+                cmd: qcmd.into(),
+                path: vec![],
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let mut stream = client
+            .do_get(info.endpoint[0].ticket.clone().unwrap())
+            .await
+            .unwrap()
+            .into_inner();
+        let first = stream.next().await.unwrap().unwrap();
+        let ipc = arrow::ipc::root_as_message(&first.data_header).unwrap();
+        let fb = ipc.header_as_schema().unwrap();
+        let s = arrow::ipc::convert::fb_to_schema(fb);
+        assert_eq!(
+            s.fields().len(),
+            2,
+            "空结果集必须返回查询 schema（而非 0 字段）"
+        );
+    }
+
+    // ⑧ 两轨数据合流可查：2（简易轨）+ 2（标准轨）= 4
     let qcmd2 = command_bytes(&CommandStatementQuery {
         query: "SELECT count(*) AS c FROM yuntun.public.audit".to_string(),
         transaction_id: None,

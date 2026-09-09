@@ -4239,6 +4239,7 @@ name = "yuntun-server"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "arrow-cast",
  "arrow-flight",
  "async-trait",
  "futures",
@@ -4246,6 +4247,7 @@ dependencies = [
  "prost 0.14.4",
  "serde",
  "serde_json",
+ "sqlparser",
  "thiserror",
  "tokio",
  "tokio-stream",
