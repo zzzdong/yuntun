@@ -48,7 +48,11 @@ impl QueryEngine {
     /// information_schema 显式开启：Flight SQL GetTables / SHOW TABLES / S1.7 DDL 依赖。
     pub async fn session(&self) -> Result<SessionContext, DataFusionError> {
         let ctx = SessionContext::new_with_config(
-            datafusion::prelude::SessionConfig::new().with_information_schema(true),
+            datafusion::prelude::SessionConfig::new()
+                .with_information_schema(true)
+                // G2（sql-access-design §四）：非限定表名 `FROM t` 解析到默认
+                // catalog/schema（yuntun.public），wire 客户端（MySQL/PG）直接可用
+                .with_default_catalog_and_schema(CATALOG_NAME, SCHEMA_NAME),
         );
         let url: url::Url = STORE_URL
             .parse()

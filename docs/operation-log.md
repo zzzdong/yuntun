@@ -402,3 +402,21 @@ Schema 消息为空 schema，与 GetFlightInfo 声明的查询 schema 不一致�
 ### 11.4 未提交文件说明
 
 - `docs/ingestor-design.md`：保持未跟踪（前次指示：评审后单独提交）。
+
+## 12. 追加：Q4 Flight 接线完成 + G2 修复（W-1/W-2 落地，2026-09-09）
+
+### 12.1 完成内容
+
+| 项 | 内容 |
+|---|---|
+| **W-1（flight → SqlEngine）** | `FlightServer` 增加 `sql: Arc<SqlEngine>`（`new(ingest,query,catalog)` 内部构造，**签名不变** → 4 个调用点零改动）；`run_sql` 变薄委托 `SqlEngine::execute`（默认 Generic 方言，shim 仅 MySql 方言生效，Flight 轨行为不变）；删除内嵌 `run_sql` 分流体 / `SqlOutcome` / `ingest_batches` / `append_ddl` / `sql_schema_of` / `sql_snippet` / `insert_target_table`；过渡 `server/src/sql.rs` 删除；server 依赖移除 `sqlparser`/`arrow-cast` |
+| 错误映射 | 新增 `sql_status`：SqlError → Status（Parse/Unsupported/ReadOnly→invalid_argument；NotFound→not_found；TableExists→**already_exists**（较 v12 内部错误更准确）；Precondition→failed_precondition（幂等键强制）；Internal→internal） |
+| do_get 空结果集 | `SqlResult::Rows{schema}` 自带回填 schema（引擎侧完成，G7 语义），fallback 逻辑简化 |
+| **W-2（G2）** | `QueryEngine::session()` 的 SessionConfig 加 `with_default_catalog_and_schema("yuntun","public")`——非限定表名 `FROM t` 对 wire 客户端直接可用 |
+| 验证 | 全量回归 **93 测试全绿**（与 W0 基线一致：flight_e2e 3 / flight_sql_e2e 2 / sql_dml_e2e 2 / yuntun-sql 20）；clippy -p server/query/sql --all-targets **0 警告** |
+
+### 12.2 下一步（§11.3 余项）
+
+- **W-3**：yuntun-sqlwire crate + opensrv-mysql（先 `cargo add opensrv-mysql` 查实际 API）
+- **W-4**：server Config `[sql.mysql]`（enabled/listen :3306）+ 挂载
+- **W-5**：pymysql 冒烟 T1/T2 → **W-6** clippy 全 workspace / README（S1.11）

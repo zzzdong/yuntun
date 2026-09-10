@@ -239,7 +239,7 @@ mod tests {
     #[test]
     fn float_rendering() {
         assert_eq!(format_f64(3.0), "3.0");
-        assert_eq!(format_f64(3.14), "3.14");
+        assert_eq!(format_f64(123.456), "123.456");
     }
 
     #[test]

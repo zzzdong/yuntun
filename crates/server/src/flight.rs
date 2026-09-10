@@ -2,15 +2,16 @@
 //!
 //! **设计原则**：
 //! 1. **所有写入都走 ingest 管线**——它是唯一的数据写入事实（WAL 权威，禁绕过）；
-//! 2. server 直接组合底层能力：`Arc<Ingestor>`（写）+ `Arc<QueryEngine>`（读）+
-//!    `Arc<dyn CatalogOps>`（meta），不引入 trait 间接层；协议解析与路由都在本模块完成。
-//! 3. **SQL 前置解析拦截（S1.6/S1.7，plan §4.3）**：所有 SQL 入口（简易轨 do_get /
-//!    FlightSQL StatementQuery / StatementUpdate）统一经 [`FlightServer::run_sql`] 按
-//!    AST 分流——只有 SELECT 交给 DataFusion；INSERT → ingest；CREATE/DROP/SHOW → catalog。
+//! 2. **SQL 语义唯一实现（v13，sql-access-design §四）**：AST 分流逻辑在
+//!    `yuntun_sql::SqlEngine`（SELECT→DataFusion / INSERT→ingest /
+//!    CREATE/DROP/SHOW→catalog）；FlightServer 内部构造 SqlEngine，本模块
+//!    只做协议适配（FlightSQL 命令解码 / 编码 / SqlError→Status 映射）。
+//! 3. server 直接组合底层能力：`Arc<Ingestor>`（写）+ `Arc<QueryEngine>`（读）+
+//!    `Arc<dyn CatalogOps>`（meta），不引入 trait 间接层。
 //!
 //! 单端点承载多轨（未来单节点可扩展更多协议端口，如 InfluxDB LP / MySQL wire）：
 //! - **FlightSQL 标准轨**：cmd/ticket 为 FlightSQL protobuf Any 命令
-//!   - 读：StatementQuery / PreparedStatementQuery → `query.sql()`（经 run_sql 分流）
+//!   - 读：StatementQuery / PreparedStatementQuery → run_sql（SqlEngine）
 //!   - 写：StatementIngest / PreparedStatementUpdate(INSERT+绑定数据) → `ingest.ingest()`
 //!   - 写：StatementUpdate（INSERT/DDL）→ run_sql 前置分流
 //! - **简易轨（写入）**：DoPut `path=[table,shard]` → `ingest.ingest()`
@@ -46,10 +47,10 @@ use yuntun_catalog::CatalogOps;
 use yuntun_ingest::source::{extract_table_shard, IngestBatch};
 use yuntun_ingest::Ingestor;
 use yuntun_model::error::LakeError;
-use yuntun_model::meta::serialize_schema;
-use yuntun_model::ops::CreateTableRequest;
-use yuntun_model::wal_record::{ddl_op, DdlPayload, Record};
 use yuntun_query::QueryEngine;
+use yuntun_sql::session::SessionCtx;
+use yuntun_sql::sql::insert_target;
+use yuntun_sql::{SqlEngine, SqlError, SqlResult};
 
 /// 固定 catalog / schema 名（与 yuntun_query 常量一致）。
 pub(crate) const CATALOG_NAME: &str = yuntun_query::CATALOG_NAME;
@@ -61,7 +62,8 @@ const PS_PREFIX: &str = "ps:";
 pub struct FlightServer {
     pub(crate) ingest: Arc<Ingestor>,
     pub(crate) query: Arc<QueryEngine>,
-    pub(crate) catalog: Arc<dyn CatalogOps>,
+    /// SQL 处理层（v13：分流/prepare/元数据语义的唯一实现）
+    pub(crate) sql: Arc<SqlEngine>,
     /// prepared statement：handle（剥 `ps:` 前缀）→ SQL
     pub(crate) prepared: Mutex<HashMap<String, String>>,
 }
@@ -72,10 +74,15 @@ impl FlightServer {
         query: Arc<QueryEngine>,
         catalog: Arc<dyn CatalogOps>,
     ) -> Self {
+        let sql = Arc::new(SqlEngine::new(
+            ingest.clone(),
+            query.clone(),
+            catalog.clone(),
+        ));
         Self {
             ingest,
             query,
-            catalog,
+            sql,
             prepared: Mutex::new(HashMap::new()),
         }
     }
@@ -132,12 +139,7 @@ impl FlightServer {
             statement_handle: sql.clone().into_bytes().into(),
         }
         .as_any();
-        let schema = self
-            .query
-            .schema_of(&sql)
-            .await
-            .ok()
-            .filter(|s| !s.fields().is_empty());
+        let schema = self.sql.schema_of(&sql).await;
         Ok(endpoint_info(ticket.encode_to_vec(), -1, schema))
     }
 
@@ -218,215 +220,27 @@ impl FlightServer {
         Ok(vec![batch])
     }
 
-    // --------------------------------------------- SQL 前置解析分流（S1.6/S1.7）
+    // --------------------------------------------- SQL 前置分流（→ yuntun-sql v13）
 
-    /// SQL 前置解析分流入口（plan §4.3 路由表）。所有 SQL 入口统一经过：
-    /// 简易轨 do_get / FlightSQL StatementQuery / StatementUpdate。
+    /// SQL 统一入口（S1.6/S1.7 路由表）。所有 SQL 入口统一经过：
+    /// 简易轨 do_get / FlightSQL StatementQuery / StatementUpdate / prepared。
     ///
-    /// | AST 变体 | 处理 |
-    /// |---|---|
-    /// | Query（SELECT/CTE） | → DataFusion（query 能力，只读） |
-    /// | ShowTables | → Catalog `list_tables`（meta 能力） |
-    /// | Insert + Values | 按表 schema 把字面量构造 RecordBatch → `ingest.ingest` |
-    /// | Insert + Select | DataFusion 执行 SELECT 源 → cast 到表 schema → ingest |
-    /// | CreateTable | ColumnDef DataType → Arrow → Catalog `create_table` |
-    /// | Drop(Table) | → Catalog `drop_table`（数据文件转孤儿） |
-    /// | 其他 | 明确拒绝（NotImplemented + 支持列表） |
-    pub(crate) async fn run_sql(&self, sql: &str) -> Result<SqlOutcome, Status> {
-        use sqlparser::ast::{Expr, ObjectType, SetExpr, Statement, TableObject};
-        match crate::sql::parse_single(sql).map_err(lake_status)? {
-            Statement::Query(_) => {
-                // 只读查询 → DataFusion
-                let batches = self.query.sql(sql).await.map_err(query_status)?;
-                Ok(SqlOutcome::Rows(batches))
-            }
-            Statement::ShowTables { .. } => {
-                let tables = self.catalog.list_tables().await.map_err(lake_status)?;
-                let names: Vec<String> = tables.into_iter().map(|t| t.name).collect();
-                Ok(SqlOutcome::Rows(vec![crate::sql::show_tables_batch(
-                    &names,
-                )]))
-            }
-            Statement::Insert(ins) => {
-                let table = match &ins.table {
-                    TableObject::TableName(name) => crate::sql::table_name_of(name),
-                    _ => {
-                        return Err(Status::unimplemented(
-                            "INSERT target must be a plain table name",
-                        ))
-                    }
-                };
-                if table.is_empty() {
-                    return Err(Status::invalid_argument("invalid INSERT target table"));
-                }
-                let Some(src) = &ins.source else {
-                    return Err(Status::invalid_argument(
-                        "INSERT requires a source (VALUES or SELECT)",
-                    ));
-                };
-                // 表 schema 来自 Catalog（写入事实以 ingest 管线校验为准，双保险）
-                let meta = self
-                    .catalog
-                    .get_table(&table)
-                    .await
-                    .map_err(lake_status)?
-                    .ok_or_else(|| Status::not_found(format!("table not found: {table}")))?;
-                let schema = meta.schema().map_err(lake_status)?;
-                // 语句级幂等键（plan §4.3：满足 require 表强制检查；S1.8 前服务端生成）
-                let stmt_key = Some(format!("dml-{}", uuid::Uuid::now_v7()));
-
-                match src.body.as_ref() {
-                    // INSERT ... VALUES：AST 字面量 → RecordBatch → ingest
-                    SetExpr::Values(values) => {
-                        let rows: Vec<Vec<Expr>> =
-                            values.rows.iter().map(|r| r.content.clone()).collect();
-                        let cols = if ins.columns.is_empty() {
-                            None
-                        } else {
-                            Some(ins.columns.clone())
-                        };
-                        let (batch, n) =
-                            crate::sql::build_values_batch(&schema, cols.as_deref(), &rows)
-                                .map_err(lake_status)?;
-                        self.ingest_batches(&table, vec![batch], stmt_key).await?;
-                        Ok(SqlOutcome::Affected(n as i64))
-                    }
-                    // INSERT ... SELECT：DataFusion 执行 SELECT 源（读）→ cast → ingest
-                    _ => {
-                        if !ins.columns.is_empty() {
-                            return Err(Status::unimplemented(
-                                "INSERT ... SELECT with column list is not supported \
-                                 (positional alignment only)",
-                            ));
-                        }
-                        let select_sql = src.body.to_string();
-                        // 读源前刷新本地缓存：尽量覆盖最近已 commit 的文件（§4.5 可见性语义）
-                        self.query
-                            .cache()
-                            .refresh(&self.catalog)
-                            .await
-                            .map_err(query_status)?;
-                        let src_batches =
-                            self.query.sql(&select_sql).await.map_err(query_status)?;
-                        let (batches, n) = crate::sql::cast_batches_to_table(&schema, &src_batches)
-                            .map_err(lake_status)?;
-                        if n > 0 {
-                            self.ingest_batches(&table, batches, stmt_key).await?;
-                        }
-                        Ok(SqlOutcome::Affected(n as i64))
-                    }
-                }
-            }
-            Statement::CreateTable(ct) => {
-                let parsed = crate::sql::parse_create_table(&ct).map_err(lake_status)?;
-                // CREATE TABLE 的 ingest 配置使用 General 模板（强制幂等键，plan §4.3）
-                let default_format = self.ingest.cfg.default_format.ext().to_string();
-                let req = CreateTableRequest {
-                    name: parsed.name.clone(),
-                    schema: parsed.schema.clone(),
-                    partition_cols: vec![],
-                    default_format: default_format.clone(),
-                    ingest_config: yuntun_model::meta::IngestConfig::standard(),
-                };
-                match self.catalog.create_table(req).await {
-                    Ok(_) => {}
-                    Err(LakeError::TableAlreadyExists(_)) if parsed.if_not_exists => {}
-                    Err(e) => return Err(lake_status(e)),
-                }
-                // DDL WAL 权威记录：崩溃重启后重放重建表清单（S1.6/S1.7 验收）
-                self.append_ddl(DdlPayload {
-                    op: ddl_op::CREATE_TABLE,
-                    table: parsed.name,
-                    arrow_schema: serialize_schema(&parsed.schema),
-                    default_format,
-                })
-                .await?;
-                // DataFusion 本地缓存立即感知新表（后续 INSERT ... SELECT 源可立即引用）
-                self.query
-                    .cache()
-                    .refresh(&self.catalog)
-                    .await
-                    .map_err(query_status)?;
-                Ok(SqlOutcome::Affected(0))
-            }
-            Statement::Drop {
-                object_type: ObjectType::Table,
-                if_exists,
-                names,
-                ..
-            } => {
-                for name in names {
-                    let table = crate::sql::table_name_of(&name);
-                    if table.is_empty() {
-                        return Err(Status::invalid_argument("invalid table name in DROP"));
-                    }
-                    match self.catalog.drop_table(&table).await {
-                        // 数据文件转孤儿，由孤儿清理回收（plan §4.3）
-                        Ok(()) => {
-                            self.append_ddl(DdlPayload {
-                                op: ddl_op::DROP_TABLE,
-                                table: table.clone(),
-                                arrow_schema: vec![],
-                                default_format: String::new(),
-                            })
-                            .await?;
-                            // DataFusion 本地缓存立即感知表移除
-                            self.query
-                                .cache()
-                                .refresh(&self.catalog)
-                                .await
-                                .map_err(query_status)?;
-                        }
-                        Err(LakeError::TableNotFound(_)) if if_exists => {}
-                        Err(e) => return Err(lake_status(e)),
-                    }
-                }
-                Ok(SqlOutcome::Affected(0))
-            }
-            other => Err(Status::unimplemented(format!(
-                "only SELECT / SHOW TABLES / INSERT / CREATE TABLE / DROP TABLE are \
-                 supported, got: {}",
-                sql_snippet(&other.to_string())
-            ))),
-        }
-    }
-
-    /// 批次序列送入 ingest 管线（WAL 权威，与 DoPut 同等持久性，§4.4）。
-    async fn ingest_batches(
-        &self,
-        table: &str,
-        batches: Vec<RecordBatch>,
-        idempotency_key: Option<String>,
-    ) -> Result<(), Status> {
-        for batch in batches {
-            let ib = IngestBatch {
-                table: table.to_string(),
-                shard_key: "default".to_string(),
-                record_batch: batch,
-                idempotency_key: idempotency_key.clone(),
-                received_at: SystemTime::now(),
-            };
-            self.ingest.ingest(ib).await.map_err(lake_status)?;
-        }
-        Ok(())
-    }
-
-    /// DDL 事件追加 WAL（Catalog apply 成功后 append，顺序即因果）。
-    async fn append_ddl(&self, p: DdlPayload) -> Result<(), Status> {
-        self.ingest
-            .wal
-            .append(Record::Ddl(p))
+    /// v13 起分流实现 = [`yuntun_sql::SqlEngine::execute`]（SQL 语义唯一实现，
+    /// MySQL/PG wire 协议共用）；此处仅薄适配：默认 Generic 方言 + Status 映射。
+    pub(crate) async fn run_sql(&self, sql: &str) -> Result<SqlResult, Status> {
+        let mut session = SessionCtx::default();
+        self.sql
+            .execute(sql, &mut session)
             .await
-            .map_err(lake_status)?;
-        Ok(())
+            .map_err(sql_status)
     }
 
     /// 执行无数据 SQL 更新（StatementUpdate / prepared update 的非装载分支）。
     /// 前置分流后 INSERT / DDL 不再打 DataFusion。
     async fn execute_update(&self, sql: &str) -> Result<i64, Status> {
         match self.run_sql(sql).await? {
-            SqlOutcome::Rows(_) => Ok(0),
-            SqlOutcome::Affected(n) => Ok(n),
+            SqlResult::Affected(n) => Ok(n),
+            SqlResult::Rows { .. } => Ok(0),
         }
     }
 
@@ -449,7 +263,7 @@ impl FlightServer {
             }
             PutRoute::PreparedStatementUpdate(handle) => {
                 let sql = self.prepared_sql(&handle)?;
-                match crate::sql::insert_target(&sql) {
+                match insert_target(&sql) {
                     // INSERT prepared + 绑定数据 → 批量 append（FlightSQL 标准写入路径）
                     Some(table) => {
                         let schema = flight_schema_of(&first).ok_or_else(|| {
@@ -498,15 +312,6 @@ impl FlightServer {
             .ok_or_else(|| Status::not_found(format!("unknown prepared statement: {id}")))
     }
 
-    /// SELECT 语句的结果集 schema（逻辑计划，尽力而为）。
-    /// 空结果集时用于保证 do_get 首条 Schema 消息与 GetFlightInfo 声明一致。
-    async fn sql_schema_of(&self, sql: &str) -> Option<SchemaRef> {
-        self.query
-            .schema_of(sql)
-            .await
-            .ok()
-            .filter(|s| !s.fields().is_empty())
-    }
 }
 
 /// DoPut 分流结果。
@@ -554,10 +359,9 @@ impl FlightService for FlightServer {
         let desc = request.into_inner();
         if let Some(Command::CommandStatementQuery(c)) = Self::decode_command(&desc.cmd) {
             let schema = self
-                .query
+                .sql
                 .schema_of(&c.query)
                 .await
-                .ok()
                 .unwrap_or_else(|| Arc::new(Schema::empty()));
             let options = arrow::ipc::writer::IpcWriteOptions::default();
             let fd: FlightData = SchemaAsIpc::new(schema.as_ref(), &options).into();
@@ -568,10 +372,9 @@ impl FlightService for FlightServer {
         let sql = sql_from_descriptor(&desc)
             .ok_or_else(|| Status::invalid_argument("descriptor.cmd must carry SQL"))?;
         let schema = self
-            .query
+            .sql
             .schema_of(&sql)
             .await
-            .ok()
             .unwrap_or_else(|| Arc::new(Schema::empty()));
         let options = arrow::ipc::writer::IpcWriteOptions::default();
         let fd: FlightData = SchemaAsIpc::new(schema.as_ref(), &options).into();
@@ -595,9 +398,11 @@ impl FlightService for FlightServer {
                     // S1.6/S1.7：统一经 run_sql 前置分流（INSERT/DDL 亦可通过 do_get 执行）
                     let sql = self.resolve_handle(&t.statement_handle)?;
                     match self.run_sql(&sql).await? {
-                        SqlOutcome::Rows(b) if !b.is_empty() => (b, None),
-                        SqlOutcome::Rows(_) => (Vec::new(), self.sql_schema_of(&sql).await),
-                        SqlOutcome::Affected(_) => (Vec::new(), None),
+                        SqlResult::Rows { schema: _, batches } if !batches.is_empty() => {
+                            (batches, None)
+                        }
+                        SqlResult::Rows { schema, .. } => (Vec::new(), Some(schema)),
+                        SqlResult::Affected(_) => (Vec::new(), None),
                     }
                 }
                 Command::CommandGetCatalogs(_) => (vec![catalogs_batch()], None),
@@ -637,10 +442,10 @@ impl FlightService for FlightServer {
             return Err(Status::invalid_argument("empty SQL in ticket"));
         }
         let (batches, fallback) = match self.run_sql(&sql).await? {
-            SqlOutcome::Rows(b) if !b.is_empty() => (b, None),
-            SqlOutcome::Rows(_) => (Vec::new(), self.sql_schema_of(&sql).await),
+            SqlResult::Rows { schema: _, batches } if !batches.is_empty() => (batches, None),
+            SqlResult::Rows { schema, .. } => (Vec::new(), Some(schema)),
             // 写入/DDL：空结果（仅 schema）
-            SqlOutcome::Affected(_) => (Vec::new(), None),
+            SqlResult::Affected(_) => (Vec::new(), None),
         };
         let flights = encode_stream_with_schema(batches, fallback)?;
         Ok(Response::new(Box::pin(tokio_stream::iter(
@@ -772,14 +577,10 @@ impl FlightService for FlightServer {
                     })?;
                 let handle = format!("{PS_PREFIX}{}", uuid::Uuid::now_v7());
                 // dataset_schema：优先逻辑计划；INSERT 等 DML 无法规划 → 回退目标表 schema
-                let schema = match self.query.schema_of(&req.query).await.ok() {
-                    Some(s) if !s.fields().is_empty() => Some(s),
-                    _ => match crate::sql::insert_target(&req.query) {
-                        Some(t) => self
-                            .query
-                            .schema_of(&format!("SELECT * FROM {t}"))
-                            .await
-                            .ok(),
+                let schema = match self.sql.schema_of(&req.query).await {
+                    Some(s) => Some(s),
+                    None => match insert_target(&req.query) {
+                        Some(t) => self.sql.schema_of(&format!("SELECT * FROM {t}")).await,
                         None => None,
                     },
                 };
@@ -925,12 +726,16 @@ impl FlightService for FlightServer {
 
 // ------------------------------------------------------------- 路由辅助
 
-/// run_sql 前置分流结果。
-pub(crate) enum SqlOutcome {
-    /// 结果集（SELECT / SHOW TABLES）
-    Rows(Vec<RecordBatch>),
-    /// 受影响行数（INSERT / DDL）
-    Affected(i64),
+/// SqlError → tonic Status（sql-access-design §10.1 错误分类）。
+fn sql_status(e: SqlError) -> Status {
+    use yuntun_sql::SqlError as E;
+    match &e {
+        E::Parse(_) | E::Unsupported(_) | E::ReadOnly => Status::invalid_argument(e.to_string()),
+        E::NotFound(_) => Status::not_found(e.to_string()),
+        E::TableExists(_) => Status::already_exists(e.to_string()),
+        E::Precondition(_) => Status::failed_precondition(e.to_string()),
+        E::Internal(_) => Status::internal(e.to_string()),
+    }
 }
 
 // ------------------------------------------------------ SQL 能力元数据（JDBC/DBeaver 兼容）
@@ -1151,52 +956,6 @@ static XDBC_TYPE_INFO: LazyLock<XdbcTypeInfoData> = LazyLock::new(|| {
     }
     b.build().expect("static xdbc type info")
 });
-
-/// 错误信息用 SQL 片段（截断防刷屏）。
-fn sql_snippet(s: &str) -> String {
-    let t = s.trim();
-    if t.chars().count() > 80 {
-        format!("{}...", t.chars().take(80).collect::<String>())
-    } else {
-        t.to_string()
-    }
-}
-
-/// INSERT 语句目标表名解析（双引号 / 反引号 / 裸名）。解析失败 → None。
-///
-/// 仅作 [`crate::sql::insert_target`]（AST 优先）的**回落**：
-/// prepared statement 允许不完整形态 `INSERT INTO t (a, b)`（无 VALUES/SELECT 源），
-/// sqlparser 解析失败时由此字符串匹配兜底（S1.6 后保留该回落路径）。
-pub(crate) fn insert_target_table(sql: &str) -> Option<String> {
-    let lower = sql.to_ascii_lowercase();
-    let pos = lower.find("insert into")?;
-    let rest = sql[pos + "insert into".len()..].trim_start();
-    let bytes = rest.as_bytes();
-    if bytes.is_empty() {
-        return None;
-    }
-    let (name, _) = match bytes[0] {
-        b'"' => {
-            let end = rest[1..].find('"')? + 1;
-            (&rest[1..end], end + 1)
-        }
-        b'`' => {
-            let end = rest[1..].find('`')? + 1;
-            (&rest[1..end], end + 1)
-        }
-        _ => {
-            let end = rest
-                .find(|c: char| c.is_whitespace() || c == '(' || c == ';')
-                .unwrap_or(rest.len());
-            (rest[..end].trim_end(), end)
-        }
-    };
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
-    }
-}
 
 /// 从首条 FlightData 的 data_header 解析 Arrow Schema（IPC Message → Schema）。
 fn flight_schema_of(fd: &FlightData) -> Option<SchemaRef> {

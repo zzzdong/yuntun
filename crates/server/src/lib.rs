@@ -5,7 +5,6 @@
 
 pub mod config;
 pub mod flight;
-pub mod sql;
 
 pub use config::Config;
 pub use flight::FlightServer;
@@ -72,7 +71,7 @@ impl Lakehouse {
         let wal = WalWriter::open(wal_cfg.clone(), 0).await?;
 
         // ③.5 WAL DDL 重放（S1.7）：先重建表清单，再分流数据批次恢复（§5.6）。
-        // DDL 记录由 run_sql 在 Catalog apply 成功后追加（顺序即因果）；
+        // DDL 记录由 yuntun-sql::SqlEngine 在 Catalog apply 成功后追加（顺序即因果）；
         // 重放幂等（create 已存在 / drop 不存在均忽略），保证 SQL 写入的数据
         // 崩溃重启后表存在、可恢复（S1.6 验收）。
         replay_wal_ddl(&catalog, &wal).await?;
