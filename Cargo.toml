@@ -11,6 +11,7 @@ members = [
     "crates/query",
     "crates/compaction",
     "crates/sql",
+    "crates/sqlwire",
     "crates/server",
     "crates/standalone",
     "crates/chaos",

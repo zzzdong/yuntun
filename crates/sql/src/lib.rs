@@ -27,7 +27,7 @@ use yuntun_model::error::LakeError;
 use yuntun_model::meta::serialize_schema;
 use yuntun_model::ops::CreateTableRequest;
 use yuntun_model::wal_record::{ddl_op, DdlPayload};
-use params::SqlValue;
+pub use params::SqlValue;
 use yuntun_query::QueryEngine;
 
 /// SQL 执行错误（协议适配层负责映射到各自的回执：

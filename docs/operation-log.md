@@ -420,3 +420,33 @@ Schema 消息为空 schema，与 GetFlightInfo 声明的查询 schema 不一致�
 - **W-3**：yuntun-sqlwire crate + opensrv-mysql（先 `cargo add opensrv-mysql` 查实际 API）
 - **W-4**：server Config `[sql.mysql]`（enabled/listen :3306）+ 挂载
 - **W-5**：pymysql 冒烟 T1/T2 → **W-6** clippy 全 workspace / README（S1.11）
+
+## 13. 追加：W-3 yuntun-sqlwire crate 初版（WIP 提交，2026-09-10）
+
+> **状态**：⚠️ WIP——`cargo check -p yuntun-sqlwire` **0 错误**；单元测试与
+> 全量回归**未跑**（接手先跑：`cargo test -p yuntun-sqlwire && cargo test --workspace`）。
+
+### 13.1 已完成（crates/sqlwire 新建，workspace members 已加）
+
+| 文件 | 内容 |
+|---|---|
+| `lib.rs` | `MysqlBackend`（实现 `opensrv_mysql::AsyncMysqlShim`）：`on_query`→`SqlEngine::execute`（SessionCtx::mysql() 方言，shim 拦截 SET/USE/SHOW 生效）；`on_prepare`→`engine.prepare` + 参数 Column 声明（统一 VAR_STRING）+ stmt_id 缓存；`on_execute`→参数解码→`execute_prepared`；`on_close` 清缓存；`on_init`（handshake 库名/USE 转发）→ 记录 default_db + `writer.ok()`。错误路径：`query_error` 用 `results.error(ErrorKind, msg)` 回 **ERR 包**（连接不断开）——NotFound→ER_NO_SUCH_TABLE、ReadOnly→ER_OPTION_PREVENTS_STATEMENT、Parse/Unsupported→ER_SYNTAX_ERROR。`serve_mysql(engine, listen, shutdown)`：TcpListener + 每连接 spawn `AsyncMysqlIntermediary::run_on`（trust 鉴权默认）+ CancellationToken 优雅关停 |
+| `encode.rs` | Arrow→MySQL 编码：`columns_of`（schema→Column，nullable→flags）、`arrow_to_mysql_type`（同源映射 SqlEngine::arrow_to_mysql_type）、`write_row`（逐列 downcast + **write_col 同步 + end_row().await**（0.7 API 关键差异））、`format_date/format_ts/civil_from_days`（无 chrono，与 params.rs 解析互逆）、`format_decimal` |
+| 参数解码 | `param_value(ValueInner)→SqlValue`：NULL/Int/UInt/Double/Bytes（UTF-8 优先）/ **Date·Datetime·Time 二进制手动解码**（pymysql datetime 参数路径：`[len][y:u16][m][d][h][m][s][micros:u32]`；time 含负值/天数扩位） |
+
+### 13.2 opensrv-mysql 0.7 API 踩坑记录（对接手者重要）
+
+1. **行写入模式**：`RowWriter::write_col` 是**同步** fn；每行写完必须 `end_row().await`，收尾 `finish().await`；
+2. **错误回包**：`QueryResultWriter::error(kind, msg)` 只有两个参数且 `msg: Borrow<[u8]>`（传 `&format!(..).into_bytes()`）；
+3. **参数迭代**：`ParamParser` 实现 `IntoIterator<Item=ParamValue{value: Value, coltype}>`；`Value` 是私有字段 newtype，取 `ValueInner` 用 `v.value.into_inner()`（**无公开构造器** → 单测直接构造 `ValueInner`）；
+4. **on_init** 签名含 `InitWriter`，必须调用 `writer.ok()` 或 `writer.error(..)`；
+5. `process_use_statement_on_query` 默认 false → USE 走 `on_init`（不进 on_query，方言 shim 的 USE 拦截仅兜底）。
+
+### 13.3 待办（接续 §11.3）
+
+| ID | 任务 |
+|---|---|
+| **W-3.5** | `cargo test -p yuntun-sqlwire`（含 encode 日期/decimal/二进制日期单测已写未跑）+ 全量回归 |
+| **W-4** | server `Config [sql.mysql]`（enabled/listen :3306/auth users 预留）+ serve 流程挂载 `serve_mysql`（standalone yuntun.toml.example 更新） |
+| **W-5** | pymysql 冒烟 T1/T2（aliyun pip 装 pymysql）：SELECT/SHOW TABLES/INSERT + prepared |
+| **W-6** | clippy --workspace --all-targets 0 警告；README MySQL 连接示例（S1.11） |
