@@ -1,0 +1,16 @@
+# yuntun 冒烟/验证脚本 Python 依赖
+#
+# 安装（阿里云镜像）：
+#   pip install -r scripts/requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
+#
+# 使用方式见各脚本头部注释：
+#   python scripts/pyarrow_smoke.py <flight地址>
+#   python scripts/pyarrow_sqlinfo_smoke.py <flight地址>
+#   python scripts/pymysql_smoke.py <mysql地址>          # W-5（sqlwire 冒烟，待编写）
+
+# ---- Flight SQL 轨（S1.5/S1.6 冒烟：pyarrow_smoke.py / pyarrow_sqlinfo_smoke.py）----
+pyarrow>=14
+adbc-driver-flightsql>=0.11
+
+# ---- MySQL wire 轨（W-5 冒烟：pymysql_smoke.py，纯 Python 无编译依赖）----
+pymysql>=1.1
