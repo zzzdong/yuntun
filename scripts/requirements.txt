@@ -1,16 +1,22 @@
 # yuntun 冒烟/验证脚本 Python 依赖
 #
-# 安装（阿里云镜像）：
-#   pip install -r scripts/requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
+# 安装（项目内虚拟环境 scripts/.venv，已加入 .gitignore；阿里云镜像）：
+#   python3 -m venv scripts/.venv
+#   scripts/.venv/bin/pip install -r scripts/requirements.txt \
+#       -i https://mirrors.aliyun.com/pypi/simple/
+#
+# 也可激活后直接用 python（fish: source scripts/.venv/bin/activate.fish；
+# bash/zsh: source scripts/.venv/bin/activate）
 #
 # 使用方式见各脚本头部注释：
-#   python scripts/pyarrow_smoke.py <flight地址>
-#   python scripts/pyarrow_sqlinfo_smoke.py <flight地址>
-#   python scripts/pymysql_smoke.py <mysql地址>          # W-5（sqlwire 冒烟，待编写）
+#   scripts/.venv/bin/python scripts/pyarrow_smoke.py <flight地址>
+#   scripts/.venv/bin/python scripts/pyarrow_sqlinfo_smoke.py <flight地址>
+#   scripts/.venv/bin/python scripts/pymysql_smoke.py <mysql地址>
 
 # ---- Flight SQL 轨（S1.5/S1.6 冒烟：pyarrow_smoke.py / pyarrow_sqlinfo_smoke.py）----
 pyarrow>=14
 adbc-driver-flightsql>=0.11
 
-# ---- MySQL wire 轨（W-5 冒烟：pymysql_smoke.py，纯 Python 无编译依赖）----
-pymysql>=1.1
+# ---- MySQL wire 轨（W-5 冒烟：pymysql_smoke.py）----
+pymysql>=1.1                    # T1 文本协议（COM_QUERY）
+mysql-connector-python>=9.0     # T2 预编译（COM_STMT_PREPARE/EXECUTE，纯 Python 模式）

@@ -213,70 +213,65 @@ fn param_value(v: ValueInner) -> io::Result<SqlValue> {
     })
 }
 
-/// MySQL 二进制 DATE/DATETIME 解码：
-/// `[len][year:u16][month][day][hour][min][sec][micros:u32]`（len 决定字段数）。
+/// MySQL 二进制 DATE/DATETIME 解码 → ISO 文本 `YYYY-MM-DD[ HH:MM:SS[.ffffff]]`。
+///
+/// **布局（opensrv 已消费长度前缀）**：`[year:u16][month][day][hour][min][sec][micros:u32]`，
+/// 由负载长度决定字段数（0 = 零值 / 4 = 仅日期 / 7 = 秒精度 / 11 = 微秒精度）。
+/// 该错误的"首字节即长度"假设会读到年份低字节（如 2026 → 0xEA = 234）。
 fn decode_datetime(b: &[u8]) -> io::Result<String> {
-    let len = *b.first().ok_or_else(|| io::Error::other("empty date param"))?;
-    let read_u16 = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
-    let ymd = |o: usize| -> io::Result<(i64, u32, u32)> {
-        Ok((
-            i64::from(read_u16(o)),
-            u32::from(b[o + 2]),
-            u32::from(b[o + 3]),
-        ))
+    let len = b.len();
+    if !matches!(len, 0 | 4 | 7 | 11) {
+        return Err(io::Error::other(format!(
+            "invalid binary datetime payload length {len}"
+        )));
+    }
+    if len == 0 {
+        return Ok("0000-00-00 00:00:00".to_string());
+    }
+    let y = i64::from(u16::from_le_bytes([b[0], b[1]]));
+    let (m, d) = (u32::from(b[2]), u32::from(b[3]));
+    // 4 字节仅日期部分；7/11 字节含时间部分
+    let (hh, mm, ss) = if len >= 7 {
+        (u32::from(b[4]), u32::from(b[5]), u32::from(b[6]))
+    } else {
+        (0, 0, 0)
     };
-    Ok(match len {
-        0 => "0000-00-00 00:00:00".to_string(),
-        4 => {
-            let (y, m, d) = ymd(1)?;
-            format!("{y:04}-{m:02}-{d:02} 00:00:00")
-        }
-        7 => {
-            let (y, m, d) = ymd(1)?;
-            format!(
-                "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}",
-                b[5], b[6], b[7]
-            )
-        }
-        11 => {
-            let (y, m, d) = ymd(1)?;
-            let micros = u32::from_le_bytes([b[8], b[9], b[10], b[11]]);
-            format!(
-                "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}.{micros:06}",
-                b[5], b[6], b[7]
-            )
-        }
-        other => {
-            return Err(io::Error::other(format!(
-                "invalid binary datetime length {other}"
-            )))
-        }
+    let micros = if len == 11 {
+        u32::from_le_bytes([b[7], b[8], b[9], b[10]])
+    } else {
+        0
+    };
+    Ok(if micros == 0 {
+        format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}")
+    } else {
+        format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}.{micros:06}")
     })
 }
 
-/// MySQL 二进制 TIME 解码：
-/// `[len][neg][days:u32][hour][min][sec][micros:u32]` → `[-]HH:MM:SS`。
+/// MySQL 二进制 TIME 解码 → `[-]HH:MM:SS[.ffffff]`。
+///
+/// 布局（同样无长度前缀）：`[neg][days:u32][hour][min][sec][micros:u32]`；
+/// hours 含 days 扩位（可 > 24），micros 位于 sec 之后。
 fn decode_time(b: &[u8]) -> io::Result<String> {
-    let len = *b.first().ok_or_else(|| io::Error::other("empty time param"))?;
-    Ok(match len {
-        0 => "00:00:00".to_string(),
-        8 | 12 => {
-            let neg = b[1] != 0;
-            let days = u32::from_le_bytes([b[2], b[3], b[4], b[5]]);
-            let hours = days * 24 + u32::from(b[6]);
-            let sign = if neg { "-" } else { "" };
-            if len == 12 {
-                let micros = u32::from_le_bytes([b[8], b[9], b[10], b[11]]);
-                format!("{sign}{hours:02}:{:02}:{:02}.{micros:06}", b[7], b[8])
-            } else {
-                format!("{sign}{hours:02}:{:02}:{:02}", b[7], b[8])
-            }
-        }
-        other => {
-            return Err(io::Error::other(format!(
-                "invalid binary time length {other}"
-            )))
-        }
+    let len = b.len();
+    if !matches!(len, 0 | 8 | 12) {
+        return Err(io::Error::other(format!(
+            "invalid binary time payload length {len}"
+        )));
+    }
+    if len == 0 {
+        return Ok("00:00:00".to_string());
+    }
+    let neg = b[0] != 0;
+    let days = u32::from_le_bytes([b[1], b[2], b[3], b[4]]);
+    let hours = days * 24 + u32::from(b[5]);
+    let sign = if neg { "-" } else { "" };
+    let (mm, ss) = (u32::from(b[6]), u32::from(b[7]));
+    Ok(if len == 12 {
+        let micros = u32::from_le_bytes([b[8], b[9], b[10], b[11]]);
+        format!("{sign}{hours:02}:{mm:02}:{ss:02}.{micros:06}")
+    } else {
+        format!("{sign}{hours:02}:{mm:02}:{ss:02}")
     })
 }
 
@@ -290,6 +285,18 @@ pub async fn serve_mysql(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!(%listen, "mysql wire protocol listening");
+    serve_mysql_on(engine, listener, shutdown).await
+}
+
+/// 同 [`serve_mysql`]，但接管**外部已绑定**的 listener。
+///
+/// 节点层（server/standalone）先 bind 再 spawn 本函数：bind 失败（如 3306 被占）
+/// 在启动阶段即明确报错，不静默降级（设计 §6.3 端口冲突约定）。
+pub async fn serve_mysql_on(
+    engine: Arc<SqlEngine>,
+    listener: tokio::net::TcpListener,
+    shutdown: CancellationToken,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
@@ -355,32 +362,39 @@ mod tests {
 
     #[test]
     fn binary_datetime_decoding() {
+        // 注意：opensrv 的 ParamParser 已消费长度前缀，负载即字段序列
         // 零值
-        assert_eq!(decode_datetime(&[0]).unwrap(), "0000-00-00 00:00:00");
-        // 仅日期：2022-01-08
-        assert_eq!(
-            decode_datetime(&[4, 0xE6, 0x07, 1, 8]).unwrap(),
-            "2022-01-08 00:00:00"
-        );
+        assert_eq!(decode_datetime(&[]).unwrap(), "0000-00-00 00:00:00");
+        // 仅日期：2022-01-08（year = 0x07E6 → LE [E6, 07]）
+        assert_eq!(decode_datetime(&[0xE6, 0x07, 1, 8]).unwrap(), "2022-01-08 00:00:00");
         // 完整：2022-01-08 12:34:56
         assert_eq!(
-            decode_datetime(&[7, 0xE6, 0x07, 1, 8, 12, 34, 56]).unwrap(),
+            decode_datetime(&[0xE6, 0x07, 1, 8, 12, 34, 56]).unwrap(),
             "2022-01-08 12:34:56"
         );
-        // 带微秒：2022-01-08 12:34:56.000500
+        // 带微秒：2022-01-08 12:34:56.000500（micros = 0x000001F4）
         assert_eq!(
-            decode_datetime(&[11, 0xE6, 0x07, 1, 8, 12, 34, 56, 0xF4, 0x24, 0x00, 0x00]).unwrap(),
+            decode_datetime(&[0xE6, 0x07, 1, 8, 12, 34, 56, 0xF4, 0x01, 0x00, 0x00]).unwrap(),
             "2022-01-08 12:34:56.000500"
         );
-        // TIME：1 天 2 小时
-        assert_eq!(
-            decode_time(&[8, 0, 1, 0, 0, 0, 2, 0, 0]).unwrap(),
-            "26:00:00"
-        );
+        // TIME：1 天 2 小时（[neg][days:u32][h][m][s]）
+        assert_eq!(decode_time(&[0, 1, 0, 0, 0, 2, 0, 0]).unwrap(), "26:00:00");
         // TIME 负值
+        assert_eq!(decode_time(&[1, 0, 0, 0, 0, 1, 0, 0]).unwrap(), "-01:00:00");
+        // TIME 带微秒（micros 位于 sec 之后）：01:02:03.500000
         assert_eq!(
-            decode_time(&[8, 1, 0, 0, 0, 0, 1, 0, 0]).unwrap(),
-            "-01:00:00"
+            decode_time(&[0, 0, 0, 0, 0, 1, 2, 3, 0x20, 0xA1, 0x07, 0x00]).unwrap(),
+            "01:02:03.500000"
         );
+        // 零值 TIME
+        assert_eq!(decode_time(&[]).unwrap(), "00:00:00");
+    }
+
+    #[test]
+    fn malformed_binary_params_error() {
+        // 负载长度非法（非 0/4/7/11 与 0/8/12）
+        assert!(decode_datetime(&[1, 2, 3]).is_err());
+        assert!(decode_time(&[0, 0, 0]).is_err());
+        assert!(decode_datetime(&[0xE6, 0x07, 1, 8, 12]).is_err());
     }
 }

@@ -17,6 +17,7 @@ yuntun-compaction = { path = "../compaction" }
 arrow = { workspace = true }
 arrow-flight = { workspace = true }
 yuntun-sql = { path = "../sql" }
+yuntun-sqlwire = { path = "../sqlwire" }
 tonic = { workspace = true }
 prost = { workspace = true }
 futures = { workspace = true }

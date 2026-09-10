@@ -49,3 +49,11 @@ interval_secs = 60
 [query]
 # 本地缓存 TTL（C7：查询无网络调用）
 cache_ttl_secs = 30
+
+[sql.mysql]
+# MySQL wire 协议端口（sql-access-design.md §6.3；默认开启 = 标准端口 3306）
+enabled = true
+listen = "0.0.0.0:3306"
+# trust | native_password（users 非空时自动切换；当前仅实现 trust 无鉴权）
+auth = "trust"
+# users = [{ user = "yuntun", password = "..." }]

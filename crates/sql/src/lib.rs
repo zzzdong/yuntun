@@ -290,7 +290,7 @@ impl SqlEngine {
                     .query
                     .sql(&text)
                     .await
-                    .map_err(|e| SqlError::Internal(format!("query: {e}")))?;
+                    .map_err(query_error)?;
                 Ok(RawOutcome::Rows(batches))
             }
             Statement::ShowTables { .. } => {
@@ -357,9 +357,8 @@ impl SqlEngine {
                             .refresh(&self.catalog)
                             .await
                             .map_err(|e| SqlError::Internal(e.to_string()))?;
-                        let src_batches = self.query.sql(&select_sql).await.map_err(|e| {
-                            SqlError::Internal(format!("query: {e}"))
-                        })?;
+                        let src_batches =
+                            self.query.sql(&select_sql).await.map_err(query_error)?;
                         let (batches, n) =
                             sql::cast_batches_to_table(&schema, &src_batches)
                                 .map_err(SqlError::from_lake)?;
@@ -447,6 +446,24 @@ impl SqlEngine {
     }
 }
 
+/// DataFusion 查询错误 → SqlError。
+///
+/// 表不存在以**字符串**形式到达（本 crate 不直接依赖 datafusion，无法匹配
+/// `DataFusionError::Plan` 变体）：按 "not found" 归类 [`SqlError::NotFound`]，
+/// 协议层才能映射客户端错误码（MySQL 1146 / Flight NOT_FOUND），而非内部错误。
+fn query_error(e: impl std::fmt::Display) -> SqlError {
+    let msg = e.to_string();
+    if !msg.contains("not found") {
+        return SqlError::Internal(format!("query: {msg}"));
+    }
+    // 形如 `table 'yuntun.public.foo' not found` → 取引号内限定名
+    let table = msg
+        .find('\'')
+        .and_then(|s| msg[s + 1..].find('\'').map(|e| msg[s + 1..s + 1 + e].to_string()))
+        .unwrap_or(msg);
+    SqlError::NotFound(table)
+}
+
 /// dispatch 的原始产出（execute 负责补 schema / 包成 SqlResult）。
 pub(crate) enum RawOutcome {
     Rows(Vec<RecordBatch>),
@@ -468,4 +485,20 @@ pub struct TableDesc {
     pub name: String,
     pub columns: Vec<ColumnDesc>,
     pub schema: SchemaRef,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_error_classifies_missing_table() {
+        // DataFusion 规划错误（字符串形态）→ NotFound（协议层映射 1146 / NOT_FOUND）
+        let e = query_error("Error during planning: table 'yuntun.public.foo' not found");
+        assert!(matches!(&e, SqlError::NotFound(t) if t == "yuntun.public.foo"), "{e}");
+
+        // 其他查询错误仍为内部错误（客户端可重试）
+        let e = query_error("Schema error: No field named x");
+        assert!(matches!(&e, SqlError::Internal(m) if m.contains("No field named x")), "{e}");
+    }
 }

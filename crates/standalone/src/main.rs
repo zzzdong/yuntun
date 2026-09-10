@@ -73,12 +73,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let lakehouse = yuntun_server::Lakehouse::build_with_shutdown(&cfg, shutdown.clone()).await?;
     let bg = lakehouse.spawn_background(&cfg);
 
+    // ---- MySQL wire（:3306，配置 [sql.mysql]；bind 失败即启动报错）----
+    let mysql = yuntun_server::spawn_mysql(&lakehouse, &cfg.sql.mysql).await?;
+
     // ---- Flight gRPC（阻塞至 shutdown）----
     let listen = cfg.server.listen.clone();
     yuntun_server::serve_flight(&lakehouse, &listen).await?;
 
     // ---- 收尾 ----
     shutdown.cancel();
+    if let Some(h) = mysql {
+        let _ = h.await;
+    }
     for h in bg {
         let _ = h.await;
     }

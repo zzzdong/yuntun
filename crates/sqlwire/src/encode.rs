@@ -237,7 +237,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// Decimal128（未缩放值 + 小数位）→ 定点字符串。
 pub fn format_decimal(v: i128, scale: i8) -> String {
     if scale <= 0 {
-        return format!("{v}{:0>0}", "");
+        return v.to_string();
     }
     let scale = scale as u32;
     let neg = v < 0;
@@ -258,21 +258,21 @@ mod tests {
         assert_eq!(format_date(0), "1970-01-01");
         assert_eq!(format_date(19_000), "2022-01-08");
         assert_eq!(format_date(-1), "1969-12-31");
-        // 闰日：2024-02-29 = 19723 天（1970-01-01 起算）
-        assert_eq!(format_date(19_723), "2024-02-29");
+        // 闰日：2024-02-29 = 19782 天（1970-01-01 起算；19723 = 2024-01-01）
+        assert_eq!(format_date(19_782), "2024-02-29");
     }
 
     #[test]
     fn timestamp_formatting() {
         assert_eq!(format_ts(0, 0), "1970-01-01 00:00:00");
         assert_eq!(
-            format_ts(1_641_619_200, 500_000),
+            format_ts(1_641_600_000, 500_000),
             "2022-01-08 00:00:00.500000"
         );
         assert_eq!(format_ts(86_399, 0), "1970-01-01 23:59:59");
         // 闰年 2024-02-29 12:34:56
         assert_eq!(
-            format_ts(19_723 * 86_400 + 45_296, 0),
+            format_ts(19_782 * 86_400 + 45_296, 0),
             "2024-02-29 12:34:56"
         );
     }

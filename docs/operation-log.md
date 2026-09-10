@@ -440,7 +440,10 @@ Schema 消息为空 schema，与 GetFlightInfo 声明的查询 schema 不一致�
 2. **错误回包**：`QueryResultWriter::error(kind, msg)` 只有两个参数且 `msg: Borrow<[u8]>`（传 `&format!(..).into_bytes()`）；
 3. **参数迭代**：`ParamParser` 实现 `IntoIterator<Item=ParamValue{value: Value, coltype}>`；`Value` 是私有字段 newtype，取 `ValueInner` 用 `v.value.into_inner()`（**无公开构造器** → 单测直接构造 `ValueInner`）；
 4. **on_init** 签名含 `InitWriter`，必须调用 `writer.ok()` 或 `writer.error(..)`；
-5. `process_use_statement_on_query` 默认 false → USE 走 `on_init`（不进 on_query，方言 shim 的 USE 拦截仅兜底）。
+5. `process_use_statement_on_query` 默认 false → USE 走 `on_init`（不进 on_query，方言 shim 的 USE 拦截仅兜底）；
+6. **修正（§14.1）**：`ValueInner::Date/Datetime/Time` 的负载**不含**长度前缀——opensrv 在
+   `src/value/decode.rs` 里已 `read_u8()` 消费掉长度并按其截取负载。初版"首字节即长度"的
+   假设会把年份低字节当长度（2026 → 0xEA = 234）并中断连接，实测后已重写。
 
 ### 13.3 待办（接续 §11.3）
 
@@ -450,3 +453,138 @@ Schema 消息为空 schema，与 GetFlightInfo 声明的查询 schema 不一致�
 | **W-4** | server `Config [sql.mysql]`（enabled/listen :3306/auth users 预留）+ serve 流程挂载 `serve_mysql`（standalone yuntun.toml.example 更新） |
 | **W-5** | pymysql 冒烟 T1/T2（aliyun pip 装 pymysql）：SELECT/SHOW TABLES/INSERT + prepared |
 | **W-6** | clippy --workspace --all-targets 0 警告；README MySQL 连接示例（S1.11） |
+
+## 14. 追加：W-3.5 / W-4 / W-5 / W-6 完成（2026-09-11）
+
+> 至此 §13.3 待办全部收口；【W-3.5 测试】→【W-4 挂载】→【W-5 冒烟】→【W-6 收尾】
+> 全量回归 **103 测试全绿**、`clippy --workspace --all-targets` **0 警告**。
+
+### 14.1 W-3.5：sqlwire 单测修复（`cargo test -p yuntun-sqlwire` 7 全绿）
+
+| 项 | 结论 |
+|---|---|
+| `encode.rs` 日期/时间戳 | **测例常量错、实现对**：19723 天 = 2024-01-01（非 02-29，应为 **19782**）；1_641_619_200 = 2022-01-08 **05:20:00**（应为 1_641_600_000）。`civil_from_days` 仍以 19000 = 2022-01-08 为锚验证 |
+| `decode_time` 微秒偏移 | 真 bug：micros 原按 `[8..12]` 读取，实际在 sec 之后（`[9..13]`）→ 已修并补带微秒用例 |
+| **二进制日期布局** | 见 §13.2 第 6 条：opensrv 已消费长度前缀，负载长度即字段数（0/4/7/11 与 0/8/12）。重写 `decode_datetime` / `decode_time`：**无长度前缀**、按 `b.len()` 分派、畸形长度返回 `io::Error`（不再 panic 杀 worker） |
+| 新增用例 | `malformed_binary_params_error`（非法负载长度）+ TIME 带微秒；`param_decoding` / `binary_datetime_decoding` 随布局重算 |
+
+### 14.2 W-4：`[sql.mysql]` 配置与挂载
+
+| 位置 | 内容 |
+|---|---|
+| `server/src/config.rs` | 新增 `SqlSection{ mysql: MysqlSection }` / `MysqlSection{ enabled=true, listen="0.0.0.0:3306", auth="trust", users=[] }` / `MysqlUser`（设计 §6.3；R-2 标准端口）。users 非空仅 `warn`（当前只实现 trust，R-1）;单测 `mysql_section_defaults_and_override` |
+| `server/src/lib.rs` | `Lakehouse` 增 `sql: Arc<SqlEngine>`（装配第 ⑦ 步）；`FlightServer::with_sql()` 复用同一实例（`serve_flight` 已接，write_policy 单点生效）；新增 **`spawn_mysql(lakehouse, cfg) -> Result<Option<JoinHandle>>`**：`enabled=false` → `Ok(None)`，**先 bind 再 spawn**（3306 被占时启动即 `Err`，不静默降级） |
+| `sqlwire` | 新增 `serve_mysql_on(engine, listener, shutdown)`（接管外部已绑定 listener）；`serve_mysql` 保留为 bind + 转发 |
+| `standalone/src/main.rs` | 装配后 `spawn_mysql`，flight 退出（shutdown）后 await mysql 句柄 |
+| `yuntun.toml.example` | 增 `[sql.mysql]` 段（含 auth/users 注释说明） |
+
+### 14.3 W-5：MySQL wire 独立客户端冒烟（`scripts/pymysql_smoke.py`）
+
+环境：**项目内虚拟环境 `scripts/.venv`**（已 gitignore，阿里云镜像）：
+`python3 -m venv scripts/.venv` + `scripts/.venv/bin/pip install -r scripts/requirements.txt`。
+`requirements.txt` 的 MySQL 轨补齐 `mysql-connector-python`（T2 预编译依赖，此前只在临时环境里装过）。
+standalone 用 `/tmp/yuntun-smoke/yuntun.toml`（flight 50077 / mysql 33060 / 攒批 1s / 查询缓存 1s）。
+
+| # | 验证 | 结果 |
+|---|---|---|
+| T1 | pymysql（COM_QUERY 文本）：SHOW VARIABLES(`version=8.0.32-yuntun`) → CREATE TABLE → INSERT → SELECT → SHOW TABLES / SHOW COLUMNS → 错误路径 **1146**（ERR 包，连接保持，`SELECT 1` 仍可用） | 全绿 |
+| T2 | mysql-connector-python `prepared=True`（COM_STMT_PREPARE/EXECUTE）：参数绑定写入 ×2（含 **datetime 二进制参数**）→ 文本轨复核 3 行可见 | 全绿 |
+
+冒烟暴露并已修的两处实现问题：
+
+1. **表不存在被包成 1105**：`SELECT * FROM no_such` 走 DataFusion → `SqlError::Internal`。
+   `yuntun-sql` 新增 `query_error()`：消息含 "not found" 即归类 `NotFound`（取引号内限定名）
+   → MySQL 1146 / Flight NOT_FOUND（单测 `query_error_classifies_missing_table`）。
+2. **TIMESTAMP 列不接受 ISO 文本字面量**：prepared datetime 参数解码后即 `'2026-01-02 03:04:05'`，
+   `build_values_batch` 的 Timestamp 分支只收 `TimestampNs`/`Num` → 补 `L::Str` → `parse_iso8601_ns`
+   分支（同时让 `VALUES ('2026-01-02 03:04:05')` 这类常规写法可用；单测
+   `values_timestamp_accepts_iso_string`）。
+
+**已知限制（R-4 偏差，留档）**：opensrv-mysql 0.7 **没有二进制结果集编码**
+（`resultset.rs` 仅 `RowWriter` 文本行），COM_STMT_EXECUTE 的结果行以文本回写 →
+二进制协议客户端的 **prepared SELECT 取不到正确行**（冒烟 [10] 为空）。写路径走 OK 包不受影响；
+JDBC 默认 `useServerPrepStmts=false`、mysql CLI / pymysql 均走文本轨，不受影响。
+若后续必须支持 prepared 结果集，需 fork opensrv 或自写二进制行编码。
+
+### 14.4 W-6：收尾
+
+- `cargo clippy --workspace --all-targets` **0 警告**（修 `SqlSection` 手工 `Default` → `derive(Default)`）；
+  rust-analyzer 侧另有 `overflow evaluating the requirement`（`#[async_trait]` 展开 + DataFusion
+  深嵌套 future 的 `Pin<Box<dyn Future + Send>>` 强转）提示——`flight.rs:393` 同款、
+  属既有现象，非编译错误也未阻断构建；
+- `cargo test --workspace --no-fail-fast` **103 通过 / 0 失败**（基线 93 + sqlwire 7 + sql 2 + server config 1）。
+  `yuntun-wal::cleanup::tests::monitor_aborts_timed_out_batches` 为**时间敏感 flaky**
+  （全量并发跑时偶发 "fresh batch must survive"，单跑通过；与本次改动无关，未处理）；
+- 遗留：README 与 DBeaver 实测见 §15（本次一并补上）。
+
+## 15. 追加：Q7 DBeaver / JDBC 实测（T3）+ shim 补齐 + README（2026-09-11）
+
+### 15.1 实测环境
+
+| 项 | 值 |
+|---|---|
+| 客户端 | 本机 `/usr/bin/dbeaver` + `java/javac`；驱动取 DBeaver 自带 **Connector/J 8.0.29**（`~/.local/share/DBeaverData/drivers/maven/...`） |
+| 服务端 | standalone：flight `127.0.0.1:50078` + mysql `0.0.0.0:3306`（**标准端口实测可用，R-2**） |
+| 数据 | `api_audit(event_time TIMESTAMP, user TEXT, endpoint TEXT, cost_ms INT)` 3 行 |
+
+### 15.2 T3 脚本化验证：`scripts/dbeaver_jdbc_probe.java`（22 项全过）
+
+| # | 项 | 结果 |
+|---|---|---|
+| 1 | 握手（驱动识别服务端版本） | ✅ MySQL 8.0.32-yuntun |
+| 2 / 5 | `getCatalogs` / `getTables` | ✅ public / api_audit |
+| 6 | `getColumns` | ✅ 4 列（DATETIME / TEXT / TEXT / INT） |
+| 7 / 8 | `getPrimaryKeys` / `getIndexInfo` | ✅ 空结果集（无主键/索引语义正确） |
+| 10–12 | 数据预览 / count / group by | ✅ |
+| 13–22 | `@@version_comment`、`DATABASE()`、`information_schema.tables`、`SHOW FULL TABLES`、`DESCRIBE`、`SHOW COLLATION/CHARSET/ENGINES/KEYS`、`SHOW CREATE TABLE` | ✅ |
+
+> 编译/运行：`javac -cp $JAR scripts/dbeaver_jdbc_probe.java` → `java -cp "$JAR:scripts" dbeaver_jdbc_probe`。
+> 该脚本即 T3 的 CI 化替代（GUI 手工清单已在 README §2.2 给出）。
+
+### 15.3 实测暴露并补齐的 shim 缺口（`crates/sql/src/shim.rs`）
+
+| # | 现象 | 修复 |
+|---|---|---|
+| 1 | 握手即失败：`SELECT @@session.auto_increment_increment` 落 DataFusion（"variable has no type information"） | sqlparser 把 `@@var` 解析为 **Identifier / CompoundIdentifier**（非 Placeholder）→ `classify_probe_expr` 增补两种形态，变量名取末段并去 `@@`；同时支持 `ExprWithAlias`（驱动普遍带别名） |
+| 2 | JDBC 取不到部分变量 | `canned_variable` 补 `auto_increment_*`、`character_set_server`、`system_time_zone`/`time_zone`、`wait_timeout`、`net_*_timeout`、`max_connections`、`query_cache_*`、`transaction_read_only`、`have_ssl`、`version_compile_*`、`port` |
+| 3 | `getColumns` 抛 `Column 'Collation' not found` | `SHOW FULL COLUMNS` 改 **9 列**（Field/Type/Collation/Null/Key/Default/Extra/Privileges/Comment）；普通 `SHOW COLUMNS` 仍 6 列 |
+| 4 | `DESCRIBE / DESC t` 报 1149 不支持 | 拦截 `Statement::ExplainTable`（DESCRIBE 语义 = SHOW COLUMNS，6 列）；EXPLAIN 同变体，MVP 不做执行计划（留档） |
+| 5 | `getPrimaryKeys/getIndexInfo` 抛 `Column 'Key_name'/'Table' not found` | sqlparser 0.62 **无** `SHOW KEYS/INDEX/ENGINES` 变体，它们落到 `ShowVariable`，且 `SHOW KEYS FROM t` 的表名也被收进 `variable` → 按**首段**特判，返回列名齐全的**空结果集**/engines 表（原来返回 `Variable_name/Value` 两列，驱动按名取值必炸） |
+| 6 | `SHOW COLLATION / SHOW CHARSET` 报 1149 | canned 结果集（utf8mb4_general_ci / utf8mb4） |
+| 7 | Q3 遗留的 shim 单测缺失 | 新增 `shim::tests`（探测表达式形态 × canned 值、SHOW COLUMNS 列形状、SHOW KEYS 列名） |
+
+### 15.4 文档：新建 `README.md`（S1.11 / Q7 交付）
+
+仓库此前**无 README**：补齐 quickstart（构建 / 配置 / 启动）、**Flight SQL 与 MySQL
+双协议最小闭环示例**、**DBeaver 连接步骤与驱动属性**（`useServerPrepStmts=false`、
+`useSSL=false`、`allowPublicKeyRetrieval=true`）、兼容矩阵 T1–T4、已知限制、
+冒烟脚本（`scripts/.venv`）、crate 结构。
+
+### 15.5 DBeaver GUI 手工验证暴露：`information_schema` 补洞
+
+脚本化探测（§15.2）之外，DBeaver GUI 浏览时还会查一批 DataFusion
+`information_schema` **未提供**的 MySQL 元数据表，逐条弹
+
+```text
+SQL Error [1146] [42S02]: table not found: yuntun.information_schema.key_column_usage
+  （同批：referential_constraints / triggers / statistics / partitions）
+```
+
+修法（`crates/sql/src/shim.rs`）：MySql 方言下拦截 FROM 命中
+`information_schema.<缺失表>` 的查询，按 **MySQL 8 的列定义返回 0 行的空结果集**
+——yuntun 无主键/外键/索引/触发器/分区概念，空集即正确语义；关键是**列名要齐**
+（DBeaver / JDBC 按列名取值，缺列会抛 "Column not found"）。
+
+补入清单：`key_column_usage`、`referential_constraints`、`table_constraints`、
+`check_constraints`、`statistics`、`triggers`、`partitions`、`events`、
+`processlist`、`engines`（此外 `tables` / `columns` / `schemata` / `routines` 等
+DataFusion 已提供 → **不拦截**，保持原生实现）。
+单测 `shim::tests::information_schema_gaps_are_filled`；JDBC 探测脚本加 [23]–[28] 全过。
+
+### 15.6 本轮验证与遗留
+
+- `cargo test --workspace` **106 通过 / 0 失败**；`cargo clippy --workspace --all-targets` **0 警告**；
+- 遗留：`DatabaseMetaData::getSchemas` 返回 0 行（走 `information_schema.schemata` 路径未覆盖）
+  ——DBeaver 按 catalog=`public` 浏览不受影响，留档不修；
+- 遗留阶段 1 准出项：**S1.9 `yuntun-client` / `yuntun-cli`、S1.10 do_get 流式化、
+  S1.8 幂等键透传**（README 的 CLI 手册待 CLI 落地后补）。

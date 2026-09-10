@@ -534,6 +534,14 @@ fn build_column(
                 match get(i) {
                     L::Null => v.push(None),
                     L::TimestampNs(ns) => v.push(Some(ns / scale)),
+                    // ISO8601 文本（wire 二进制日期参数解码后即此形态；
+                    // 也覆盖 `VALUES ('2026-01-02 03:04:05')` 的常规写法）
+                    L::Str(s) => {
+                        let ns = parse_iso8601_ns(&s).ok_or_else(|| {
+                            LakeError::Other(format!("invalid TIMESTAMP literal: {s:?}"))
+                        })?;
+                        v.push(Some(ns / scale));
+                    }
                     // 整型字面量 = 毫秒（plan §4.3：ISO8601（UTC）与整型毫秒）
                     L::Num(s) => {
                         let ms: i64 = s.parse().map_err(|_| bad_num(&s, field))?;
@@ -916,6 +924,22 @@ mod tests {
         let expect_secs = (parse_date_days("2026-09-09").unwrap() as i64) * 86_400 + 3_723;
         assert_eq!(ts.value(0), expect_secs * 1_000_000_000 + 500_000_000);
         assert_eq!(batch.num_columns(), 5);
+    }
+
+    #[test]
+    fn values_timestamp_accepts_iso_string() {
+        // wire 二进制日期参数解码后即 ISO 文本字面量（MySQL prepared datetime 路径）
+        let t = sch();
+        let s = parse("INSERT INTO t (ts, user) VALUES ('2026-01-02 03:04:05', 'bob')");
+        let (batch, rows) = extract_values(s, &t);
+        assert_eq!(rows, 1);
+        let ts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap();
+        let expect_secs = (parse_date_days("2026-01-02").unwrap() as i64) * 86_400 + 11_045;
+        assert_eq!(ts.value(0), expect_secs * 1_000_000_000);
     }
 
     #[test]

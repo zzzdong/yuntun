@@ -23,6 +23,11 @@
 //!
 //! [query]
 //! cache_ttl_secs = 30
+//!
+//! [sql.mysql]
+//! enabled = true
+//! listen = "0.0.0.0:3306"
+//! auth = "trust"
 //! ```
 
 use std::path::PathBuf;
@@ -139,6 +144,44 @@ impl Default for QuerySection {
     }
 }
 
+/// MySQL wire 账号（设计 §6.3：users 非空 → native_password）。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct MysqlUser {
+    pub user: String,
+    pub password: String,
+}
+
+/// MySQL wire 端口（设计 §6.3 `[sql.mysql]`；R-2：默认标准端口 3306）。
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
+pub struct MysqlSection {
+    /// 关闭则不监听（默认开启）
+    pub enabled: bool,
+    /// 标准端口 3306；被占用时启动即报错（不静默降级）
+    pub listen: String,
+    /// trust | native_password（users 非空时自动切换）
+    pub auth: String,
+    pub users: Vec<MysqlUser>,
+}
+
+impl Default for MysqlSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            listen: "0.0.0.0:3306".into(),
+            auth: "trust".into(),
+            users: Vec::new(),
+        }
+    }
+}
+
+/// SQL 访问层端口配置（本期仅 mysql；PG wire 见设计 §5.5 后续扩展）。
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default)]
+pub struct SqlSection {
+    pub mysql: MysqlSection,
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -148,6 +191,7 @@ pub struct Config {
     pub ingest: IngestSection,
     pub compaction: CompactionSection,
     pub query: QuerySection,
+    pub sql: SqlSection,
 }
 
 impl Default for Config {
@@ -161,6 +205,7 @@ impl Default for Config {
             ingest: IngestSection::default(),
             compaction: CompactionSection::default(),
             query: QuerySection::default(),
+            sql: SqlSection::default(),
         }
     }
 }
@@ -229,6 +274,31 @@ cache_ttl_secs = 5
     fn parse_memory_store() {
         let cfg = Config::from_toml("[store]\ntype = \"memory\"").unwrap();
         assert!(matches!(cfg.store, StoreSection::Memory));
+    }
+
+    #[test]
+    fn mysql_section_defaults_and_override() {
+        // 默认：开启 + 标准端口（R-2）
+        let cfg = Config::from_toml("").unwrap();
+        assert!(cfg.sql.mysql.enabled);
+        assert_eq!(cfg.sql.mysql.listen, "0.0.0.0:3306");
+        assert_eq!(cfg.sql.mysql.auth, "trust");
+        assert!(cfg.sql.mysql.users.is_empty());
+
+        let cfg = Config::from_toml(
+            r#"
+[sql.mysql]
+enabled = false
+listen = "127.0.0.1:3307"
+auth = "native_password"
+users = [{ user = "yuntun", password = "secret" }]
+"#,
+        )
+        .unwrap();
+        assert!(!cfg.sql.mysql.enabled);
+        assert_eq!(cfg.sql.mysql.listen, "127.0.0.1:3307");
+        assert_eq!(cfg.sql.mysql.users.len(), 1);
+        assert_eq!(cfg.sql.mysql.users[0].user, "yuntun");
     }
 
     #[test]

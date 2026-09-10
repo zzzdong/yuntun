@@ -18,6 +18,7 @@ use yuntun_model::meta::{deserialize_schema, IngestConfig};
 use yuntun_model::ops::CreateTableRequest;
 use yuntun_model::wal_record::{ddl_op, Record};
 use yuntun_query::QueryEngine;
+use yuntun_sql::SqlEngine;
 use yuntun_wal::writer::WalWriter;
 
 /// 运行中的各组件句柄（供运维查询/测试断言）。
@@ -25,6 +26,9 @@ pub struct Lakehouse {
     pub catalog: Arc<MemoryCatalog>,
     pub ingestor: Arc<Ingestor>,
     pub query: Arc<QueryEngine>,
+    /// SQL 处理层（W-4：MySQL wire 端口与 FlightServer 各自持有句柄；
+    /// 引擎无状态，仅 write_policy 为实例级配置）
+    pub sql: Arc<SqlEngine>,
     pub wal: WalWriter,
     pub store: Arc<dyn object_store::ObjectStore>,
     pub shutdown: CancellationToken,
@@ -103,10 +107,18 @@ impl Lakehouse {
         let cache = Arc::new(yuntun_query::LocalCatalogCache::new());
         let query = Arc::new(QueryEngine::new(store.clone(), cache.clone()));
 
+        // ⑦ SqlEngine（SQL 语义唯一实现；MySQL wire / Flight 共用同一份能力句柄）
+        let sql = Arc::new(SqlEngine::new(
+            ingestor.clone(),
+            query.clone(),
+            catalog.clone(),
+        ));
+
         Ok(Self {
             catalog,
             ingestor,
             query,
+            sql,
             wal,
             store,
             shutdown,
@@ -240,17 +252,54 @@ async fn replay_wal_ddl(
     Ok(())
 }
 
+/// 启动 MySQL wire 协议监听（设计 §6.3 `[sql.mysql]`，标准端口 :3306）。
+///
+/// **bind 在本函数内同步完成**：端口被占用（如本机已有 MySQL）在启动阶段即以
+/// `Err` 返回（不静默降级）；成功后接管循环交给后台任务，随 shutdown 优雅退出。
+/// `enabled = false` → 返回 `Ok(None)`（不监听）。
+pub async fn spawn_mysql(
+    lakehouse: &Lakehouse,
+    cfg: &config::MysqlSection,
+) -> Result<Option<tokio::task::JoinHandle<()>>, Box<dyn std::error::Error + Send + Sync>> {
+    if !cfg.enabled {
+        tracing::info!("mysql wire disabled by config ([sql.mysql].enabled = false)");
+        return Ok(None);
+    }
+    if !cfg.users.is_empty() {
+        // R-1/§6.3：users 非空应切 native_password；当前仅实现 trust（无鉴权）
+        tracing::warn!(
+            users = cfg.users.len(),
+            "mysql wire auth users configured, but only trust (no auth) is implemented — \
+             connections are accepted without credential check"
+        );
+    }
+    let listener = tokio::net::TcpListener::bind(&cfg.listen)
+        .await
+        .map_err(|e| format!("mysql wire bind {}: {e}", cfg.listen))?;
+    tracing::info!(listen = %cfg.listen, "mysql wire protocol listening");
+    let engine = lakehouse.sql.clone();
+    let shutdown = lakehouse.shutdown.clone();
+    Ok(Some(tokio::spawn(async move {
+        if let Err(e) = yuntun_sqlwire::serve_mysql_on(engine, listener, shutdown).await {
+            tracing::error!(error = %e, "mysql wire server stopped with error");
+        }
+    })))
+}
+
 /// 启动 Arrow Flight gRPC 服务（单端点多轨：FlightSQL 标准轨 + 简易写入/查询轨）。
 pub async fn serve_flight(
     lakehouse: &Lakehouse,
     listen: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let catalog: Arc<dyn CatalogOps> = lakehouse.catalog.clone();
-    let svc = arrow_flight::flight_service_server::FlightServiceServer::new(FlightServer::new(
-        lakehouse.ingestor.clone(),
-        lakehouse.query.clone(),
-        catalog,
-    ));
+    let svc = arrow_flight::flight_service_server::FlightServiceServer::new(
+        FlightServer::new(
+            lakehouse.ingestor.clone(),
+            lakehouse.query.clone(),
+            catalog,
+        )
+        .with_sql(lakehouse.sql.clone()),
+    );
     let addr = listen
         .parse::<std::net::SocketAddr>()
         .map_err(|e| format!("invalid listen addr {listen}: {e}"))?;

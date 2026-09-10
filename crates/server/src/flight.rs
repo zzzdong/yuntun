@@ -87,6 +87,13 @@ impl FlightServer {
         }
     }
 
+    /// 复用外部 [`SqlEngine`]（standalone 装配：与 MySQL wire 端口共享同一实例，
+    /// write_policy 等实例级配置单点生效）。
+    pub fn with_sql(mut self, sql: Arc<SqlEngine>) -> Self {
+        self.sql = sql;
+        self
+    }
+
     // ------------------------------------------------- FlightSQL 命令解码
 
     /// 把 cmd / ticket 字节解码为 FlightSQL 命令；**非 FlightSQL 编码 → None**

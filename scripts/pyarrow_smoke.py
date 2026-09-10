@@ -8,7 +8,7 @@
 
 用法：
     YUNTUN_DEMO_SERVE=1 cargo run -p yuntun-server --example demo
-    python scripts/pyarrow_smoke.py 127.0.0.1:<port>
+    scripts/.venv/bin/python scripts/pyarrow_smoke.py 127.0.0.1:<port>
 """
 
 import sys
