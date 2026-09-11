@@ -1,0 +1,30 @@
+[package]
+name = "yuntun-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "yuntun-cli"
+path = "src/main.rs"
+
+[dependencies]
+# prettyprint = CLI 表格输出；csv/json = 导入解析
+arrow = { workspace = true, features = ["prettyprint", "csv", "json"] }
+arrow-flight = { workspace = true }
+parquet = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = "0.1"
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+yuntun-server = { path = "../server" }
+yuntun-catalog = { path = "../catalog" }
+yuntun-model = { path = "../model" }
+tokio-util = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

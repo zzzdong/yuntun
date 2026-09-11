@@ -67,6 +67,22 @@ with dbapi.connect("grpc+tcp://127.0.0.1:50051") as conn, conn.cursor() as cur:
     print(cur.fetchall())
 ```
 
+### 最小闭环（`yuntun-cli`，自有客户端）
+
+```bash
+CLI=./target/release/yuntun-cli          # --addr 默认 127.0.0.1:50051（或环境变量 YUNTUN_ADDR）
+
+$CLI query 'CREATE TABLE cpu (ts BIGINT, host TEXT, usage DOUBLE)'
+$CLI insert -t cpu -f data.csv           # 支持 .csv / .jsonl / .parquet（按列名对齐 + 类型 cast）
+$CLI insert -t cpu                       # 无 -f 时从 stdin 读 CSV（列顺序需与表一致）
+$CLI query 'SELECT host, avg(usage) FROM cpu GROUP BY host ORDER BY host'
+$CLI query 'SELECT * FROM cpu LIMIT 5' --format csv     # table（默认）| csv | json
+$CLI tables
+$CLI schema cpu
+```
+
+> 写入返回回执（行数 / WAL seq / 预计可见秒数）；SQL 入口与 DoPut 汇入同一 ingest 管线。
+
 ---
 
 ## 2. 连接方式
@@ -163,6 +179,7 @@ crates/
   sql        # SQL 语义唯一实现（分流 / 参数绑定 / 方言 shim / 元数据 API）
   sqlwire    # 协议适配层：MySQL wire（opensrv-mysql）+ Arrow→wire 编码
   server     # 节点层：协议端口 + 装配（Lakehouse）
+  client     # Rust SDK + CLI（bin: yuntun-cli）
   standalone # bin: yuntun（全组件参考装配）
   chaos      # 故障注入工具
 docs/        # 计划 / 架构 / 详细设计 / SQL 访问设计 / 操作日志

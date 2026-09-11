@@ -4751,6 +4751,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "yuntun-client"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "arrow-flight",
+ "futures",
+ "parquet",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "yuntun-catalog",
+ "yuntun-model",
+ "yuntun-server",
+]
+
+[[package]]
 name = "yuntun-compaction"
 version = "0.1.0"
 dependencies = [

@@ -588,3 +588,40 @@ DataFusion 已提供 → **不拦截**，保持原生实现）。
   ——DBeaver 按 catalog=`public` 浏览不受影响，留档不修；
 - 遗留阶段 1 准出项：**S1.9 `yuntun-client` / `yuntun-cli`、S1.10 do_get 流式化、
   S1.8 幂等键透传**（README 的 CLI 手册待 CLI 落地后补）。
+
+## 16. 追加：S1.9 `yuntun-client`（Rust SDK + CLI）落地（2026-09-11）
+
+### 16.1 交付（新 crate `crates/client`，包名 `yuntun-client`，bin `yuntun-cli`）
+
+| 文件 | 内容 |
+|---|---|
+| `src/lib.rs` | [`Client`]：`connect` / `query`（eager）/ `query_stream`（`FlightRecordBatchStream` 流式）/ `schema_of`（`get_schema` 的 IPC 解析）/ `table_schema` / `execute` / `list_tables` / `insert_batches` / `insert`；`InsertReceipt`（server `Receipt` 的 JSON 形态）；`generated_key()`——未显式给键时自动生成 `cli-<ms>-<pid>-<seq>`（表多为 `IngestConfig::standard()` **require** 幂等键，否则服务端回 FailedPrecondition） |
+| `src/input.rs` | 导入解析：CSV（`Format::infer_schema` 推断后重读）/ JSONL（按字段名） / Parquet（读后 cast）；统一**按列名对齐 + `arrow::compute::cast`**，列顺序无关、缺字段填 NULL；stdin 仅支持 CSV/JSONL |
+| `src/main.rs` | CLI：`query`（`--format table|csv|json`）、`insert`（`-t/-f/--format/--shard/--key`，无 `-f` 读 stdin）、`tables`、`schema`；`--addr` 或环境变量 `YUNTUN_ADDR`（默认 `127.0.0.1:50051`） |
+| `tests/client_e2e.rs` | in-process FlightServer + SDK 全流程：DDL → schema 探测 → `do_put` 回执 → `list_tables` → 可见性 → 一次性/流式查询 → `INSERT ... VALUES` 与 DoPut 汇入同一管线 |
+
+**协议复用（未新增协议）**：查询 `do_get(ticket = SQL)` + `get_schema(cmd = SQL)`；
+写入 `do_put`（`path = [table, shard]` + 数据消息 `app_metadata` 幂等键）——即 plan §4.2 的
+「简易轨 = 自有客户端快速通道」。
+
+### 16.2 真实服务端 CLI 冒烟（S1.9 验收句式）
+
+环境：standalone（flight `127.0.0.1:50078` / mysql `:3306`）+ `yuntun-cli`。
+
+| 步骤 | 结果 |
+|---|---|
+| `query 'CREATE TABLE cpu (ts BIGINT, host TEXT, usage DOUBLE)'` → `schema cpu` → `tables` | ✅ OK / 3 列 / cpu 列出 |
+| `insert -t cpu -f cpu.csv`（**列顺序打乱** host,usage,ts） | ✅ 2 行，按名对齐正确 |
+| `insert -t cpu -f cpu.jsonl`（缺 `usage`） | ✅ 2 行，缺字段 → NULL |
+| `insert -t cpu -f cpu.parquet`（`ts` 为 int32） | ✅ 2 行，读取时 cast 到 Int64 |
+| `query 'SELECT * FROM cpu ORDER BY ts'`（table 输出） | ✅ 6 行；`--format csv` / `json` 输出正确 |
+| `query 'INSERT INTO cpu VALUES (700, (1 + 1), 2.0)'` | ✅ 明确报错（INSERT VALUES 仅字面量，设计内限制） |
+
+### 16.3 回归与稳定化
+
+- `cargo test --workspace` **114 通过 / 0 失败**（client：6 单测 + 1 e2e + 1 doctest；基线 106）；
+  `cargo clippy --workspace --all-targets` **0 警告**；
+- e2e 原用固定 `sleep 2500ms` 等可见性，并发跑（叠加 clippy/其它 e2e）时会偶发超时
+  → 改为**轮询 `wait_count`（≤10s）**，稳定且更快（5.16s → 2.10s）；
+- 遗留：CLI/SDK 尚未入 CI 脚本；`yuntun-wal` 的 `monitor_aborts_timed_out_batches`
+  仍是时间敏感 flaky（阶段 2 卫生项，未处理）。
