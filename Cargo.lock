@@ -4740,6 +4740,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "yuntun-catalog",
  "yuntun-format",
@@ -4747,6 +4748,7 @@ dependencies = [
  "yuntun-model",
  "yuntun-query",
  "yuntun-store",
+ "yuntun-testkit",
  "yuntun-wal",
 ]
 
@@ -4770,6 +4772,7 @@ dependencies = [
  "yuntun-catalog",
  "yuntun-model",
  "yuntun-server",
+ "yuntun-testkit",
 ]
 
 [[package]]
@@ -4832,6 +4835,7 @@ dependencies = [
  "yuntun-format",
  "yuntun-model",
  "yuntun-store",
+ "yuntun-testkit",
  "yuntun-wal",
 ]
 
@@ -4881,6 +4885,7 @@ dependencies = [
  "yuntun-ingest",
  "yuntun-model",
  "yuntun-store",
+ "yuntun-testkit",
  "yuntun-wal",
 ]
 
@@ -4915,6 +4920,7 @@ dependencies = [
  "yuntun-sql",
  "yuntun-sqlwire",
  "yuntun-store",
+ "yuntun-testkit",
  "yuntun-wal",
 ]
 
@@ -4965,6 +4971,7 @@ dependencies = [
 name = "yuntun-store"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "async-trait",
  "bytes",
  "futures",
@@ -4975,6 +4982,10 @@ dependencies = [
  "tracing",
  "yuntun-model",
 ]
+
+[[package]]
+name = "yuntun-testkit"
+version = "0.1.0"
 
 [[package]]
 name = "yuntun-wal"
@@ -4990,6 +5001,7 @@ dependencies = [
  "tracing",
  "uuid",
  "yuntun-model",
+ "yuntun-testkit",
 ]
 
 [[package]]

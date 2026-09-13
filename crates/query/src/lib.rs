@@ -15,6 +15,9 @@ pub use cache::{spawn_cache_refresh, CachedTable, LocalCatalogCache};
 pub use provider::{YuntunCatalogProvider, YuntunSchemaProvider};
 pub use table::YuntunTableProvider;
 
+/// 流式结果集类型（S1.10：`do_get` 边算边发；协议层无需直接依赖 datafusion）。
+pub use datafusion::execution::SendableRecordBatchStream;
+
 use datafusion::error::DataFusionError;
 use datafusion::prelude::SessionContext;
 use yuntun_catalog::CatalogOps;
@@ -47,12 +50,21 @@ impl QueryEngine {
     ///
     /// information_schema 显式开启：Flight SQL GetTables / SHOW TABLES / S1.7 DDL 依赖。
     pub async fn session(&self) -> Result<SessionContext, DataFusionError> {
+        self.session_with_schema(SCHEMA_NAME).await
+    }
+
+    /// 按 **schema**（MySQL 的 database 概念）构造会话：
+    /// 非限定表名 `FROM t` 解析到 `${CATALOG_NAME}.${schema}`（多 schema 支持）。
+    pub async fn session_with_schema(
+        &self,
+        schema: &str,
+    ) -> Result<SessionContext, DataFusionError> {
         let ctx = SessionContext::new_with_config(
             datafusion::prelude::SessionConfig::new()
                 .with_information_schema(true)
                 // G2（sql-access-design §四）：非限定表名 `FROM t` 解析到默认
-                // catalog/schema（yuntun.public），wire 客户端（MySQL/PG）直接可用
-                .with_default_catalog_and_schema(CATALOG_NAME, SCHEMA_NAME),
+                // catalog/schema，wire 客户端（MySQL/PG）直接可用
+                .with_default_catalog_and_schema(CATALOG_NAME, schema),
         );
         let url: url::Url = STORE_URL
             .parse()
@@ -65,14 +77,55 @@ impl QueryEngine {
         Ok(ctx)
     }
 
-    /// 执行 SQL，返回全部批次。
+    /// 执行 SQL，返回全部批次（默认 schema = `public`）。
     pub async fn sql(
         &self,
         query: &str,
     ) -> Result<Vec<arrow::record_batch::RecordBatch>, DataFusionError> {
-        let ctx = self.session().await?;
+        self.sql_with_schema(query, SCHEMA_NAME).await
+    }
+
+    /// 按 schema 执行 SQL（多 schema：非限定表名解析到该 schema）。
+    pub async fn sql_with_schema(
+        &self,
+        query: &str,
+        schema: &str,
+    ) -> Result<Vec<arrow::record_batch::RecordBatch>, DataFusionError> {
+        let ctx = self.session_with_schema(schema).await?;
         let df = ctx.sql(query).await?;
         df.collect().await
+    }
+
+    /// 流式执行 SQL（S1.10）：返回 `RecordBatch` 流，**不 collect 全量**——
+    /// Flight `do_get` 用此路径边算边发，大结果集内存平稳。
+    pub async fn sql_stream(
+        &self,
+        query: &str,
+    ) -> Result<SendableRecordBatchStream, DataFusionError> {
+        self.sql_stream_with_schema(query, SCHEMA_NAME).await
+    }
+
+    /// 按 schema 流式执行（多 schema：非限定表名解析到该 schema）。
+    pub async fn sql_stream_with_schema(
+        &self,
+        query: &str,
+        schema: &str,
+    ) -> Result<SendableRecordBatchStream, DataFusionError> {
+        let ctx = self.session_with_schema(schema).await?;
+        let df = ctx.sql(query).await?;
+        df.execute_stream().await
+    }
+
+    /// 已收集批次 → 流：非 DataFusion 产出（方言 shim 的 canned 结果、SHOW TABLES
+    /// 等）在协议层统一走流式编码出口。
+    pub fn stream_from_batches(
+        schema: arrow::datatypes::SchemaRef,
+        batches: Vec<arrow::record_batch::RecordBatch>,
+    ) -> SendableRecordBatchStream {
+        Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches.into_iter().map(Ok)),
+        ))
     }
 
     /// 只取结果集 schema（逻辑计划，不执行物理计划）。
@@ -81,7 +134,16 @@ impl QueryEngine {
         &self,
         query: &str,
     ) -> Result<arrow::datatypes::SchemaRef, DataFusionError> {
-        let ctx = self.session().await?;
+        self.schema_of_with_schema(query, SCHEMA_NAME).await
+    }
+
+    /// 按 schema 取结果集 schema。
+    pub async fn schema_of_with_schema(
+        &self,
+        query: &str,
+        schema: &str,
+    ) -> Result<arrow::datatypes::SchemaRef, DataFusionError> {
+        let ctx = self.session_with_schema(schema).await?;
         let df = ctx.sql(query).await?;
         Ok(std::sync::Arc::new(df.schema().as_arrow().clone()))
     }

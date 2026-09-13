@@ -252,9 +252,9 @@ mod tests {
 
     #[tokio::test]
     async fn monitor_aborts_timed_out_batches() {
-        let dir = std::env::temp_dir().join(format!("yuntun-wal-monitor-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        // tmpfs（内存盘）+ 作用域结束自动清理
+        let dir_guard = yuntun_testkit::TestDir::tmpfs("wal-monitor");
+        let dir = dir_guard.path().to_path_buf();
         let cfg = crate::config::WalConfig {
             batch_timeout: Duration::from_millis(500),
             monitor_interval: Duration::from_millis(30),
@@ -310,9 +310,9 @@ mod tests {
 
     #[tokio::test]
     async fn monitor_force_aborts_on_disk_watermark() {
-        let dir = std::env::temp_dir().join(format!("yuntun-wal-watermark-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        // 水位判定走 DirSizeUsage（按字节计），tmpfs 上同样成立
+        let dir_guard = yuntun_testkit::TestDir::tmpfs("wal-watermark");
+        let dir = dir_guard.path().to_path_buf();
         let cfg = crate::config::WalConfig {
             batch_timeout: Duration::from_secs(3600), // 不会触发批次超时
             monitor_interval: Duration::from_millis(30),

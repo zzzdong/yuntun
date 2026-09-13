@@ -25,6 +25,12 @@ use tokio_util::sync::CancellationToken;
 use yuntun_sql::session::SessionCtx;
 use yuntun_sql::{PreparedStatement, SqlEngine, SqlResult, SqlValue};
 
+/// 日志用的 SQL 摘要（首 60 字节，压空白）。
+fn sql_snippet_short(sql: &str) -> String {
+    let collapsed: String = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.chars().take(60).collect()
+}
+
 /// 每连接后端：持有引擎句柄 + 会话 + prepared 语句表。
 pub struct MysqlBackend {
     engine: Arc<SqlEngine>,
@@ -60,6 +66,10 @@ async fn query_error<W: AsyncWrite + Send + Unpin>(
         yuntun_sql::SqlError::ReadOnly => ErrorKind::ER_OPTION_PREVENTS_STATEMENT,
         yuntun_sql::SqlError::NotFound(_) => ErrorKind::ER_NO_SUCH_TABLE,
         yuntun_sql::SqlError::TableExists(_) => ErrorKind::ER_TABLE_EXISTS_ERROR,
+        // 多 schema：unknown database / 库已存在 / 库非空（MySQL 1049 / 1007 / 1008）
+        yuntun_sql::SqlError::SchemaNotFound(_) => ErrorKind::ER_BAD_DB_ERROR,
+        yuntun_sql::SqlError::SchemaExists(_) => ErrorKind::ER_DB_CREATE_EXISTS,
+        yuntun_sql::SqlError::SchemaNotEmpty(_) => ErrorKind::ER_DB_DROP_EXISTS,
         yuntun_sql::SqlError::Parse(_) | yuntun_sql::SqlError::Unsupported(_) => {
             ErrorKind::ER_SYNTAX_ERROR
         }
@@ -124,6 +134,12 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MysqlBackend {
             .collect();
         let id = self.next_stmt_id;
         self.next_stmt_id += 1;
+        tracing::debug!(
+            stmt_id = id,
+            param_count = stmt.param_count,
+            sql = %sql_snippet_short(sql),
+            "stmt prepared"
+        );
         self.prepared.insert(id, stmt);
         info.reply(id, &params, &[]).await
     }
@@ -185,8 +201,24 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MysqlBackend {
         writer: InitWriter<'a, W>,
     ) -> io::Result<()> {
         if !database.is_empty() {
-            // MVP：任意库名接受并记录（USE 同语义，R-3 偏差留档）
-            self.session.default_db = Some(database.to_string());
+            // 多 schema：handshake 的 database 即 schema（MySQL 语义），
+            // 校验存在后**真实切换**会话；未知库回 ER_BAD_DB_ERROR(1049)
+            match self.engine.schema_exists(database).await {
+                Ok(true) => self.session.set_schema(database),
+                Ok(false) => {
+                    return writer
+                        .error(
+                            ErrorKind::ER_BAD_DB_ERROR,
+                            &format!("Unknown database '{database}'").into_bytes(),
+                        )
+                        .await;
+                }
+                Err(e) => {
+                    return writer
+                        .error(ErrorKind::ER_UNKNOWN_ERROR, &format!("{e}").into_bytes())
+                        .await;
+                }
+            }
         }
         writer.ok().await
     }

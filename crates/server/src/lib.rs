@@ -90,11 +90,14 @@ impl Lakehouse {
             idempotency_ttl: Duration::from_secs(cfg.ingest.idempotency_ttl_hours * 3600),
             ..Default::default()
         };
-        let ingestor = Arc::new(Ingestor::new(
+        // 分片存储（store 层）：内存分片（热）+ 磁盘分片（冷）；写入侧与查询侧共享同一实例
+        let shards = yuntun_store::ShardStore::local(store.clone());
+        let ingestor = Arc::new(Ingestor::with_shards(
             ingest_cfg,
             wal.clone(),
             catalog.clone(),
             store.clone(),
+            shards.clone(),
         ));
 
         // ⑤ 崩溃恢复分流（§5.6）
@@ -105,6 +108,9 @@ impl Lakehouse {
 
         // ⑥ QueryEngine（缓存刷新在 spawn_background 中启动）
         let cache = Arc::new(yuntun_query::LocalCatalogCache::new());
+        // 读己之写：查询侧接线同一份分片存储的热数据读侧
+        // （阶段 0 = 进程内内存分片；分离部署换成 `RemoteShard`，调用方零改动）
+        cache.set_hot_shards(shards.hot());
         let query = Arc::new(QueryEngine::new(store.clone(), cache.clone()));
 
         // ⑦ SqlEngine（SQL 语义唯一实现；MySQL wire / Flight 共用同一份能力句柄）
@@ -209,8 +215,11 @@ async fn replay_wal_ddl(
         let res = match p.op {
             ddl_op::CREATE_TABLE => {
                 let schema = deserialize_schema(&p.arrow_schema)?;
+                // 多 schema：WAL 中的表标识为全限定 `schema.table`
+                let (ns, bare) = yuntun_model::ops::split_qualified(&p.table);
                 let req = CreateTableRequest {
-                    name: p.table.clone(),
+                    name: bare.to_string(),
+                    namespace: ns.to_string(),
                     schema,
                     partition_cols: vec![],
                     default_format: if p.default_format.is_empty() {
@@ -235,6 +244,23 @@ async fn replay_wal_ddl(
                     Ok(())
                 }
                 Err(yuntun_model::error::LakeError::TableNotFound(_)) => Ok(()),
+                Err(e) => Err(e),
+            },
+            // 多 schema：schema 事件（`DdlPayload.table` = schema 名）
+            ddl_op::CREATE_SCHEMA => match catalog.create_schema(&p.table).await {
+                Ok(()) => {
+                    created += 1;
+                    Ok(())
+                }
+                Err(yuntun_model::error::LakeError::SchemaAlreadyExists(_)) => Ok(()),
+                Err(e) => Err(e),
+            },
+            ddl_op::DROP_SCHEMA => match catalog.drop_schema(&p.table).await {
+                Ok(()) => {
+                    dropped += 1;
+                    Ok(())
+                }
+                Err(yuntun_model::error::LakeError::SchemaNotFound(_)) => Ok(()),
                 Err(e) => Err(e),
             },
             other => {

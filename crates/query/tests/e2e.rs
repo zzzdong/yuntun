@@ -35,10 +35,8 @@ fn batch(rows: i64) -> arrow::record_batch::RecordBatch {
 }
 
 fn tmpdir(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("yuntun-e2e-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+    // 写盘测试走 tmpfs（内存盘）；真实落盘语义的用例用 TestDir::disk
+    yuntun_testkit::TestDir::tmpfs(&format!("e2e-{name}")).into_path()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -58,6 +56,7 @@ async fn ingest_then_query_visible() {
     catalog
         .create_table(CreateTableRequest {
             name: "audit".into(),
+            namespace: yuntun_model::ops::DEFAULT_SCHEMA.into(),
             schema: schema(),
             partition_cols: vec![],
             default_format: "parquet".into(),
@@ -146,9 +145,9 @@ async fn ingest_then_query_visible() {
         .unwrap();
     assert!(!batches.is_empty());
 
-    // ⑧ 表列表
+    // ⑧ 表列表（多 schema：缓存键为全限定标识 `schema.table`）
     let names = engine.cache().table_names().await;
-    assert!(names.contains(&"audit".to_string()));
+    assert!(names.contains(&"public.audit".to_string()), "{names:?}");
 }
 
 #[tokio::test]
@@ -159,6 +158,7 @@ async fn cache_ttl_keeps_queries_off_network_path() {
     catalog
         .create_table(CreateTableRequest {
             name: "t".into(),
+            namespace: yuntun_model::ops::DEFAULT_SCHEMA.into(),
             schema: schema(),
             partition_cols: vec![],
             default_format: "parquet".into(),
@@ -179,7 +179,8 @@ async fn cache_ttl_keeps_queries_off_network_path() {
     shutdown.cancel();
     let _ = handle.await;
 
-    assert!(cache.get("t").await.is_some());
-    assert!(cache.get("missing").await.is_none());
+    assert!(cache.get_in("public", "t").await.is_some());
+    assert!(cache.get("public.t").await.is_some());
+    assert!(cache.get("public.missing").await.is_none());
     let _ = store;
 }

@@ -21,6 +21,14 @@ pub enum LakeError {
     TableNotFound(String),
     #[error("table already exists: {0}")]
     TableAlreadyExists(String),
+    /// 多 schema：目标 schema 不存在（MySQL 语义 → ER_BAD_DB_ERROR / 1049）
+    #[error("schema not found: {0}")]
+    SchemaNotFound(String),
+    #[error("schema already exists: {0}")]
+    SchemaAlreadyExists(String),
+    /// DROP SCHEMA 时 schema 下仍有表（MySQL 语义 → ER_DB_DROP_EXISTS / 1008）
+    #[error("schema is not empty: {0}")]
+    SchemaNotEmpty(String),
     #[error("invalid schema change: {0}")]
     InvalidSchemaChange(String),
 

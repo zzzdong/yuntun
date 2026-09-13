@@ -123,9 +123,10 @@ pub struct BatchAbortPayload {
 /// 再分流 batch 恢复**，保证 SQL 写入的数据崩溃重启后表存在、可恢复（S1.6 验收）。
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct DdlPayload {
-    /// 0 = CreateTable, 1 = DropTable
+    /// 0 = CreateTable, 1 = DropTable, 2 = CreateSchema, 3 = DropSchema
     #[prost(uint32, tag = "1")]
     pub op: u32,
+    /// 表标识（**全限定 `schema.table`**）或 schema 名（CreateSchema/DropSchema）
     #[prost(string, tag = "2")]
     pub table: String,
     /// CreateTable：Arrow Schema（IPC 序列化，model::meta::serialize_schema）
@@ -140,6 +141,9 @@ pub struct DdlPayload {
 pub mod ddl_op {
     pub const CREATE_TABLE: u32 = 0;
     pub const DROP_TABLE: u32 = 1;
+    /// 多 schema：CREATE DATABASE / CREATE SCHEMA（`DdlPayload.table` = schema 名）
+    pub const CREATE_SCHEMA: u32 = 2;
+    pub const DROP_SCHEMA: u32 = 3;
 }
 
 /// WAL Record 枚举。

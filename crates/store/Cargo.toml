@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 yuntun-model = { path = "../model" }
+arrow = { workspace = true }
 object_store = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

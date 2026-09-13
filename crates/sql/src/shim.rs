@@ -64,7 +64,7 @@ pub(crate) async fn intercept(
         return Ok(None);
     }
     Ok(match stmt {
-        // USE db：记录会话（R-3：MVP 单 schema，校验后记录）
+        // USE db：**多 schema 真实切换**（校验存在；未知库 → ER_BAD_DB_ERROR 语义）
         Statement::Use(u) => {
             let db = match u {
                 sqlparser::ast::Use::Catalog(n)
@@ -73,12 +73,13 @@ pub(crate) async fn intercept(
                 | sqlparser::ast::Use::Object(n) => table_name_of(n),
                 _ => String::new(),
             };
-            if !db.is_empty() && db != "public" && db != "yuntun" {
-                return Err(SqlError::Internal(format!(
-                    "unknown database {db:?} (yuntun exposes a single schema: yuntun.public)"
-                )));
+            if !db.is_empty() && db != yuntun_query::CATALOG_NAME {
+                if engine.schema_exists(&db).await? {
+                    session.set_schema(&db);
+                } else {
+                    return Err(SqlError::SchemaNotFound(db));
+                }
             }
-            session.default_db = Some("public".into());
             Some(SqlResult::Affected(0))
         }
         // 事务 no-op（S-6：单语句自动提交语义；含 ROLLBACK——CLI 友好，偏差留档 operation-log）
@@ -142,13 +143,21 @@ pub(crate) async fn intercept(
                 .collect();
             strings_result(&["Variable_name", "Value"], &rows)
         }
-        Statement::ShowDatabases { .. } => strings_result(&["Database"], &[vec!["public".into()]]),
-        // SHOW TABLES：MySQL 语义单列（Tables_in_<db>）
+        // SHOW DATABASES：catalog 中的 schema 清单（多 schema）
+        Statement::ShowDatabases { .. } => {
+            let rows: Vec<Vec<String>> = engine
+                .list_schemas()
+                .await?
+                .into_iter()
+                .map(|s| vec![s])
+                .collect();
+            strings_result(&["Database"], &rows)
+        }
+        // SHOW TABLES：MySQL 语义单列（Tables_in_<db>）——**当前 schema** 的表
         Statement::ShowTables { .. } => {
-            let names = engine.list_tables().await?;
+            let names = engine.list_tables_in(session.schema()).await?;
             let rows: Vec<Vec<String>> = names.into_iter().map(|n| vec![n]).collect();
-            let col =
-                format!("Tables_in_{}", session.default_db.as_deref().unwrap_or("public"));
+            let col = format!("Tables_in_{}", session.schema());
             strings_result(&[col.as_str()], &rows)
         }
         Statement::ShowColumns {
@@ -156,7 +165,7 @@ pub(crate) async fn intercept(
             full,
             extended,
         } => {
-            let table = table_from_options(show_options)
+            let table = table_from_options(show_options, session)
                 .ok_or_else(|| SqlError::Internal("SHOW COLUMNS requires a table".into()))?;
             let desc = engine
                 .describe_table(&table)
@@ -173,7 +182,7 @@ pub(crate) async fn intercept(
         // DESCRIBE / DESC t（MySQL CLI 与 DBeaver 高频）：语义 = SHOW COLUMNS
         // （EXPLAIN 同理落此变体，MVP 不做执行计划，留档）
         Statement::ExplainTable { table_name, .. } => {
-            let table = table_name_of(table_name);
+            let table = crate::sql::resolve_table_ref(table_name, session);
             let desc = engine
                 .describe_table(&table)
                 .await?
@@ -201,7 +210,7 @@ pub(crate) async fn intercept(
             ]],
         ),
         Statement::ShowCreate { obj_name, .. } => {
-            let table = table_name_of(obj_name);
+            let table = crate::sql::resolve_table_ref(obj_name, session);
             match engine.describe_table(&table).await? {
                 Some(desc) => {
                     let cols: Vec<String> = desc
@@ -233,7 +242,7 @@ pub(crate) async fn intercept(
                 _ => return Ok(None),
             };
             if sel.from.is_empty() {
-                return canned_probe(q).await;
+                return canned_probe(q, session).await;
             }
             // information_schema 补洞：DataFusion 只提供 tables / views / columns /
             // schemata / routines / df_settings 等少数几张，而 MySQL 客户端（DBeaver）
@@ -525,15 +534,22 @@ fn show_columns_rows(desc: &crate::TableDesc, full: bool) -> Vec<Vec<String>> {
         .collect()
 }
 
-fn table_from_options(opts: &sqlparser::ast::ShowStatementOptions) -> Option<String> {
+fn table_from_options(
+    opts: &sqlparser::ast::ShowStatementOptions,
+    session: &SessionCtx,
+) -> Option<String> {
     opts.show_in
         .as_ref()
         .and_then(|i| i.parent_name.as_ref())
-        .map(table_name_of)
+        // 表引用 → 全限定标识（`SHOW COLUMNS FROM sales.orders` 支持跨 schema）
+        .map(|n| crate::sql::resolve_table_ref(n, session))
 }
 
 /// 无 FROM 的探测查询：全部投影为 @@var 或 DATABASE()/SCHEMA() 时返回 canned 行。
-async fn canned_probe(q: &sqlparser::ast::Query) -> Result<Option<SqlResult>, SqlError> {
+async fn canned_probe(
+    q: &sqlparser::ast::Query,
+    session: &SessionCtx,
+) -> Result<Option<SqlResult>, SqlError> {
     let sel = match q.body.as_ref() {
         sqlparser::ast::SetExpr::Select(sel) => sel,
         _ => return Ok(None),
@@ -556,7 +572,8 @@ async fn canned_probe(q: &sqlparser::ast::Query) -> Result<Option<SqlResult>, Sq
             }
             ProbeKind::Database(name) => {
                 names.push(alias.unwrap_or(name));
-                values.push("public".into());
+                // 当前会话 schema（USE 后可反映）
+                values.push(session.schema().to_string());
             }
             ProbeKind::Other => return Ok(None), // 混合真实列 → 交分流/DataFusion
         }

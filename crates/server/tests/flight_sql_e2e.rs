@@ -58,8 +58,9 @@ async fn collect_do_get(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn flight_sql_end_to_end() {
     // ① 装配（与 flight_e2e 相同的基础设施）
-    let wal_dir = format!("/tmp/yuntun-flightsql-e2e-wal-{}", std::process::id());
-    let _ = std::fs::remove_dir_all(&wal_dir);
+    // 写盘测试默认走 tmpfs（内存盘）；真实落盘语义的用例用 TestDir::disk
+    let wal_guard = yuntun_testkit::TestDir::tmpfs("flightsql-e2e-wal");
+    let wal_dir = wal_guard.string();
     let cfg = yuntun_server::Config::from_toml(&format!(
         r#"
 [server]
@@ -89,6 +90,7 @@ scan_interval_ms = 20
         .catalog
         .create_table(CreateTableRequest {
             name: "audit".into(),
+            namespace: yuntun_model::ops::DEFAULT_SCHEMA.into(),
             schema: schema(),
             partition_cols: vec![],
             default_format: "parquet".into(),
@@ -320,8 +322,9 @@ scan_interval_ms = 20
     assert_eq!(tn.value(0), "INTEGER");
 
     // ⑦ 标准轨写入：CreatePreparedStatement(INSERT) → DoPut(CommandPreparedStatementUpdate) 绑定数据
+    // （完整语句；bind 数据为 Arrow batch，占位符被服务端忽略）
     let create_req = ActionCreatePreparedStatementRequest {
-        query: "INSERT INTO audit (event_time, user)".to_string(),
+        query: "INSERT INTO audit (event_time, user) VALUES (?, ?)".to_string(),
         transaction_id: None,
     };
     let result = client

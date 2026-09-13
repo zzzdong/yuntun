@@ -328,6 +328,7 @@ mod tests {
         catalog
             .create_table(CreateTableRequest {
                 name: "t".into(),
+                namespace: yuntun_model::ops::DEFAULT_SCHEMA.into(),
                 schema: SArc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)])),
                 partition_cols: vec![],
                 default_format: "parquet".into(),

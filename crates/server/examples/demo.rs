@@ -69,8 +69,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!("yuntun demo starting");
 
     // ---- ① 装配 Lakehouse（内存 S3 模拟 + 临时 WAL）----
-    let wal_dir = format!("/tmp/yuntun-demo-wal-{}", std::process::id());
-    let _ = std::fs::remove_dir_all(&wal_dir);
+    // 手动运行的示例：WAL 落**真实磁盘**（可用 YUNTUN_TEST_DISKDIR 覆盖目录）
+    let demo_dir = yuntun_testkit::TestDir::disk("demo");
+    let wal_dir = demo_dir.join("wal").to_string_lossy().to_string();
     let cfg = yuntun_server::Config::from_toml(&format!(
         r#"
 [store]
@@ -96,6 +97,7 @@ scan_interval_ms = 50
         .catalog
         .create_table(CreateTableRequest {
             name: "api_audit".into(),
+            namespace: yuntun_model::ops::DEFAULT_SCHEMA.into(),
             schema: schema(),
             partition_cols: vec![],
             default_format: "parquet".into(),

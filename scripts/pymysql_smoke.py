@@ -26,11 +26,25 @@ import time
 from datetime import datetime
 
 import pymysql
-from pymysql.err import ProgrammingError
+from pymysql.err import MySQLError, ProgrammingError
 
 TABLE = "mysql_smoke"
-# 写入 → 可见：攒批 flush（ingest.time_threshold_secs=1）+ 查询缓存 TTL（query.cache_ttl_secs=1）
-VISIBLE_WAIT_SEC = 3
+# 写入 → 可见：攒批 flush（ingest.time_threshold_secs）+ 查询缓存 TTL（query.cache_ttl_secs）。
+# 固定 sleep 与攒批/commit 存在竞态 → 统一轮询等待（上限 15s）。
+VISIBLE_TIMEOUT_SEC = 15
+
+
+def wait_visible(cur, sql: str, check) -> None:
+    """轮询直到 `check(rows)` 通过或超时（写后可见性是异步窗口，固定 sleep 不可靠）。"""
+    deadline = time.monotonic() + VISIBLE_TIMEOUT_SEC
+    while True:
+        cur.execute(sql)
+        rows = cur.fetchall()
+        if check(rows):
+            return rows
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"visibility timeout after {VISIBLE_TIMEOUT_SEC}s: {sql} -> {rows}")
+        time.sleep(0.3)
 
 DDL = f"""
 CREATE TABLE {TABLE} (
@@ -71,14 +85,12 @@ def t1_text_protocol(host: str, port: int) -> None:
         )
         print("[3] INSERT (text protocol) ok, affected =", cur.rowcount)
 
-        # [4] 可见性等待
-        time.sleep(VISIBLE_WAIT_SEC)
-
-        # [5] SELECT（文本协议行编码）
-        cur.execute(f"SELECT id, name, cost_ms FROM {TABLE} ORDER BY id")
-        rows = [tuple(r) for r in cur.fetchall()]
+        # [4]/[5] SELECT（文本协议行编码）—— 轮询等写后可见
+        rows = [tuple(r) for r in wait_visible(
+            cur, f"SELECT id, name, cost_ms FROM {TABLE} ORDER BY id",
+            lambda rs: [tuple(r) for r in rs] == [(1, "alice", 10)],
+        )]
         print("[5] SELECT ->", rows)
-        assert rows == [(1, "alice", 10)], rows
 
         # [6] 元数据
         cur.execute("SHOW TABLES")
@@ -104,6 +116,61 @@ def t1_text_protocol(host: str, port: int) -> None:
         print("[8.1] connection still usable after error ->", cur.fetchall())
 
     print("\nT1 (pymysql text protocol): OK")
+
+
+def t1b_multi_schema(host: str, port: int) -> None:
+    """多 schema（MySQL 的 database）：建库 / USE 切换 / 跨库隔离 / 限定名查询 / 清理。"""
+    schema = "smoke_sales"
+    conn = pymysql.connect(host=host, port=port, user="yuntun", connect_timeout=5, autocommit=True)
+    with conn, conn.cursor() as cur:
+        # 幂等清理：上一轮失败可能残留非空库（DROP DATABASE 对非空库报 1008）
+        cur.execute(f"DROP TABLE IF EXISTS {schema}.orders")
+        cur.execute(f"DROP DATABASE IF EXISTS {schema}")
+        cur.execute(f"CREATE DATABASE {schema}")
+        # USE 切换（handshake/USE → 服务端校验存在后真实切换会话 schema）
+        cur.execute(f"USE {schema}")
+        cur.execute("SELECT DATABASE()")
+        assert cur.fetchone()[0] == schema, "USE 后 DATABASE() 应反映当前库"
+
+        cur.execute("CREATE TABLE orders (ts BIGINT, amt BIGINT)")
+        cur.execute("INSERT INTO orders VALUES (1, 100)")
+        cur.execute("SHOW TABLES")
+        assert [r[0] for r in cur.fetchall()] == ["orders"], "本库只有自己的表"
+
+        # 跨库隔离：public 下没有 orders
+        cur.execute("USE public")
+        cur.execute("SHOW TABLES")
+        assert "orders" not in [r[0] for r in cur.fetchall()], "public 不应看到 smoke_sales.orders"
+
+        # 限定名跨库查询（无需 USE）—— 轮询等写后可见
+        row = wait_visible(
+            cur, f"SELECT count(*), sum(amt) FROM {schema}.orders",
+            lambda rs: tuple(rs[0]) == (1, 100),
+        )[0]
+        assert (row[0], row[1]) == (1, 100), row
+        print(f"[8.2] multi-schema: USE/{schema} + 隔离 + 限定名查询 ok")
+
+        # 未知库：USE 报 ER_BAD_DB_ERROR = 1049（OperationalError）
+        try:
+            cur.execute("USE no_such_db")
+            raise AssertionError("expected ER_BAD_DB_ERROR")
+        except MySQLError as e:
+            assert e.args[0] == 1049, e.args
+
+        # 非空库不可删（ER_DB_DROP_EXISTS = 1008）
+        try:
+            cur.execute(f"DROP DATABASE {schema}")
+            raise AssertionError("非空库 DROP 应失败")
+        except MySQLError as e:
+            assert e.args[0] == 1008, e.args
+
+        # 清理：删表 → 删库 → 列表不含该库
+        cur.execute(f"USE {schema}")
+        cur.execute("DROP TABLE orders")
+        cur.execute(f"DROP DATABASE {schema}")
+        cur.execute("SHOW DATABASES")
+        assert schema not in [r[0] for r in cur.fetchall()], "DROP 后不应再出现"
+        print("[8.3] multi-schema: 非空库拒绝删除 / DROP DATABASE 清理 ok")
 
 
 def t2_prepared(host: str, port: int) -> None:
@@ -133,15 +200,15 @@ def t2_prepared(host: str, port: int) -> None:
     finally:
         cnx.close()
 
-    # [11] 文本轨复核 prepared 写入可见
-    time.sleep(VISIBLE_WAIT_SEC)
+    # [11] 文本轨复核 prepared 写入可见 —— 轮询等写后可见
     with pymysql.connect(
         host=host, port=port, user="yuntun", password="", database="public"
     ) as conn, conn.cursor() as cur:
-        cur.execute(f"SELECT id, name FROM {TABLE} ORDER BY id")
-        rows = cur.fetchall()
+        rows = wait_visible(
+            cur, f"SELECT id, name FROM {TABLE} ORDER BY id",
+            lambda rs: [r[0] for r in rs] == [1, 2, 3],
+        )
         print("[11] SELECT after prepared inserts ->", rows)
-        assert [r[0] for r in rows] == [1, 2, 3], rows
 
     print("\nT2 (prepared statement): OK")
 
@@ -151,6 +218,7 @@ def main() -> None:
     host, _, port = addr.rpartition(":")
     port = int(port or "3306")
     t1_text_protocol(host, port)
+    t1b_multi_schema(host, port)
     t2_prepared(host, port)
     print("\nMySQL wire independent-client smoke: ALL OK")
 

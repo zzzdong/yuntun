@@ -20,6 +20,9 @@ pub use flush::{FlushOutcome, LiveBatchTracker};
 pub use pipeline::{Ingestor, IngestorConfig};
 pub use schema_cache::SchemaCache;
 pub use source::{IngestSource, Receipt};
+/// 分片存储形态（内存分片 / 磁盘分片）在 **store 层**：`yuntun_store::{ShardStore, MemoryShard, ShardId}`。
+/// 写入侧只负责写内存分片、提交后交棒；查询侧从 store 层读取，不依赖本 crate 的进程。
+pub use yuntun_store::{MemoryShard, ShardId, ShardStore, ShardTier};
 
 use yuntun_model::error::LakeError;
 

@@ -28,6 +28,8 @@ use sqlparser::dialect::{Dialect as SqlDialect, GenericDialect};
 use sqlparser::parser::Parser;
 use yuntun_model::error::LakeError;
 
+use crate::session::SessionCtx;
+
 // ------------------------------------------------------------ 解析入口
 
 /// 单语句解析（plan §4.3：多语句 `;` 分隔明确拒绝，避免部分执行的语义复杂度）。
@@ -48,51 +50,19 @@ pub fn parse_single_with(dialect: &dyn SqlDialect, sql: &str) -> Result<Statemen
     Ok(stmts.into_iter().next().expect("len checked"))
 }
 
-/// INSERT 目标表名（AST 优先；解析失败回落简易字符串匹配——兼容 prepared
-/// statement 的不完整形态 `INSERT INTO t (a, b)`）。
+/// INSERT 目标表名（**仅 AST**）。
+///
+/// 只接受标准完整形态 `INSERT INTO t [(cols)] VALUES (...) / SELECT ...`；
+/// FlightSQL `DoPut` 轨道的 bind 数据是 Arrow batch（占位符 `?` 被忽略），
+/// 客户端约定发送完整语句。历史上曾兼容无源形态 `INSERT INTO t (a, b)`
+/// 并配字符串匹配回落，已撤销（无标准依据、徒增解析面）。
 pub fn insert_target(sql: &str) -> Option<String> {
     match parse_single(sql) {
         Ok(Statement::Insert(ins)) => match &ins.table {
             sqlparser::ast::TableObject::TableName(name) => Some(table_name_of(name)),
             _ => None,
         },
-        _ => insert_target_table_str(sql),
-    }
-}
-
-/// INSERT 目标表名解析（双引号 / 反引号 / 裸名）。解析失败 → None。
-///
-/// 仅作 [`insert_target`]（AST 优先）的**回落**：prepared statement 允许不完整
-/// 形态 `INSERT INTO t (a, b)`（无 VALUES/SELECT 源），sqlparser 解析失败时由此
-/// 字符串匹配兜底（S1.6 后保留该回落路径）。
-pub fn insert_target_table_str(sql: &str) -> Option<String> {
-    let lower = sql.to_ascii_lowercase();
-    let pos = lower.find("insert into")?;
-    let rest = sql[pos + "insert into".len()..].trim_start();
-    let bytes = rest.as_bytes();
-    if bytes.is_empty() {
-        return None;
-    }
-    let (name, _) = match bytes[0] {
-        b'"' => {
-            let end = rest[1..].find('"')? + 1;
-            (&rest[1..end], end + 1)
-        }
-        b'`' => {
-            let end = rest[1..].find('`')? + 1;
-            (&rest[1..end], end + 1)
-        }
-        _ => {
-            let end = rest
-                .find(|c: char| c.is_whitespace() || c == '(' || c == ';')
-                .unwrap_or(rest.len());
-            (rest[..end].trim_end(), end)
-        }
-    };
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
+        _ => None,
     }
 }
 
@@ -105,11 +75,60 @@ pub fn table_name_of(name: &ObjectName) -> String {
         .unwrap_or_default()
 }
 
+/// SQL 表引用 → **全限定表标识** `schema.table`（多 schema 的核心解析规则）。
+///
+/// MySQL / PG 语义：
+/// - 1 段 `t` → 会话当前 schema（[`SessionCtx::schema`]）；
+/// - 2 段 `a.b` → `a` 是 catalog 名（`yuntun`）时视作 catalog 限定，用会话 schema；
+///   否则 `a` 即 schema；
+/// - ≥3 段 `c.s.t` → 取最后两段 `s.t`（catalog 固定为 yuntun）。
+///
+/// 空引用（无 identifier）→ 空串（调用方按"非法表名"处理）。
+pub fn resolve_table_ref(name: &ObjectName, session: &SessionCtx) -> String {
+    let parts: Vec<String> = name
+        .0
+        .iter()
+        .rev()
+        .filter_map(|p| p.as_ident())
+        .map(|i| i.value.clone())
+        .collect();
+    match parts.len() {
+        0 => String::new(),
+        1 => yuntun_model::ops::qualified_name(session.schema(), &parts[0]),
+        2 => {
+            let (table, qualifier) = (&parts[0], &parts[1]);
+            if qualifier == yuntun_query::CATALOG_NAME {
+                yuntun_model::ops::qualified_name(session.schema(), table)
+            } else {
+                yuntun_model::ops::qualified_name(qualifier, table)
+            }
+        }
+        _ => yuntun_model::ops::qualified_name(&parts[1], &parts[0]),
+    }
+}
+
 // ------------------------------------------------------------ SHOW TABLES
+
+/// 多列字符串批次（元数据派生结果：SHOW DATABASES 等）。
+pub fn strings_batch(cols: &[&str], rows: &[Vec<String>]) -> RecordBatch {
+    let schema = Arc::new(Schema::new(
+        cols.iter()
+            .map(|c| Field::new((*c).to_string(), DataType::Utf8, false))
+            .collect::<Vec<_>>(),
+    ));
+    let arrays: Vec<ArrayRef> = (0..cols.len())
+        .map(|c| {
+            Arc::new(StringArray::from(
+                rows.iter().map(|r| r[c].clone()).collect::<Vec<_>>(),
+            )) as ArrayRef
+        })
+        .collect();
+    RecordBatch::try_new(schema, arrays).expect("strings batch")
+}
 
 /// SHOW TABLES → Catalog list_tables 的结果批次
 /// （列结构与 DataFusion `SHOW TABLES` 一致，客户端输出可互换）。
-pub fn show_tables_batch(tables: &[String]) -> RecordBatch {
+pub fn show_tables_batch(schema_name: &str, tables: &[String]) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
         Field::new("table_catalog", DataType::Utf8, false),
         Field::new("table_schema", DataType::Utf8, false),
@@ -122,7 +141,7 @@ pub fn show_tables_batch(tables: &[String]) -> RecordBatch {
         schema,
         vec![
             Arc::new(StringArray::from(vec![yuntun_query::CATALOG_NAME; n])) as ArrayRef,
-            Arc::new(StringArray::from(vec![yuntun_query::SCHEMA_NAME; n])) as ArrayRef,
+            Arc::new(StringArray::from(vec![schema_name.to_string(); n])) as ArrayRef,
             Arc::new(StringArray::from(names)) as ArrayRef,
         ],
     )
@@ -841,7 +860,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_target_ast_and_fallback() {
+    fn insert_target_ast_only() {
         assert_eq!(
             insert_target("INSERT INTO audit VALUES (1)"),
             Some("audit".into())
@@ -850,11 +869,13 @@ mod tests {
             insert_target("INSERT INTO yuntun.public.audit (a) VALUES (1)"),
             Some("audit".into())
         );
-        // 不完整形态（prepared 常见）：AST 失败 → 字符串回落
+        // 占位符形态（DoPut bind：数据走 Arrow batch，占位符被忽略）
         assert_eq!(
-            insert_target("INSERT INTO audit (event_time, user)"),
+            insert_target("INSERT INTO audit (event_time, user) VALUES (?, ?)"),
             Some("audit".into())
         );
+        // 无源形态（历史兼容已撤销）→ 拒绝
+        assert_eq!(insert_target("INSERT INTO audit (event_time, user)"), None);
         assert_eq!(insert_target("SELECT 1"), None);
     }
 
@@ -924,6 +945,53 @@ mod tests {
         let expect_secs = (parse_date_days("2026-09-09").unwrap() as i64) * 86_400 + 3_723;
         assert_eq!(ts.value(0), expect_secs * 1_000_000_000 + 500_000_000);
         assert_eq!(batch.num_columns(), 5);
+    }
+
+    #[test]
+    fn resolve_table_ref_rules() {
+        fn obj(name: &str) -> ObjectName {
+            ObjectName(
+                name.split('.')
+                    .map(|p| {
+                        sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(p))
+                    })
+                    .collect(),
+            )
+        }
+        let mut session = crate::session::SessionCtx::mysql();
+        // 1 段 → 会话 schema
+        assert_eq!(resolve_table_ref(&obj("t"), &session), "public.t");
+        session.set_schema("sales");
+        assert_eq!(resolve_table_ref(&obj("t"), &session), "sales.t");
+        // 2 段：非 catalog 前缀 → 显式 schema；catalog 前缀 → 会话 schema
+        assert_eq!(resolve_table_ref(&obj("other.t"), &session), "other.t");
+        assert_eq!(resolve_table_ref(&obj("yuntun.t"), &session), "sales.t");
+        // 3 段 → catalog.schema.table，取后两段
+        assert_eq!(
+            resolve_table_ref(&obj("yuntun.public.t"), &session),
+            "public.t"
+        );
+        // 空引用 → 空串
+        assert_eq!(resolve_table_ref(&ObjectName(vec![]), &session), "");
+    }
+
+    #[test]
+    fn insert_target_tolerates_comments() {
+        // 幂等键注释夹在语句中（S1.8）：sqlparser 词法原生跳过注释
+        assert_eq!(
+            insert_target("INSERT /* idempotency_key=k1 */ INTO t VALUES (1)").as_deref(),
+            Some("t")
+        );
+        assert_eq!(
+            insert_target("INSERT INTO /* idempotency_key=k2 */ t VALUES (1)").as_deref(),
+            Some("t")
+        );
+        assert_eq!(
+            insert_target("-- idempotency_key=k3\nINSERT INTO `t` VALUES (1)").as_deref(),
+            Some("t")
+        );
+        // 非 INSERT → None
+        assert!(insert_target("SELECT 1").is_none());
     }
 
     #[test]
@@ -1074,7 +1142,7 @@ mod tests {
 
     #[test]
     fn show_tables_batch_shape() {
-        let b = show_tables_batch(&["b".into(), "a".into()]);
+        let b = show_tables_batch("public", &["b".into(), "a".into()]);
         assert_eq!(b.num_rows(), 2);
         let names = b.column(2).as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(names.value(0), "a", "排序输出");

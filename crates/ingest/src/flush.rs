@@ -11,10 +11,12 @@ use crate::accumulator::WindowGroup;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 use yuntun_catalog::CatalogOps;
+use yuntun_model::arrow_util::align_batch;
 use yuntun_model::batch::{apply_record, BatchStateMap};
 use yuntun_model::error::LakeError;
 use yuntun_model::meta::compute_stats_lite;
 use yuntun_model::ops::CommitFilesRequest;
+use yuntun_store::MemoryShard;
 use yuntun_model::wal_record::{
     BatchAbortPayload, BatchCommittedPayload, BatchPendingPayload, BatchS3WrittenPayload, Record,
 };
@@ -76,6 +78,9 @@ pub struct FlushDeps {
     pub store: Arc<dyn object_store::ObjectStore>,
     pub format: yuntun_format::DataFormat,
     pub tracker: Arc<LiveBatchTracker>,
+    /// 内存分片（store 层）：提交成功后把条目转为 `Committed(snapshot)`，
+    /// 不立即删除 —— 查询缓存可能还没刷新到该快照，立即删会出现可见性空洞。
+    pub hot: Arc<MemoryShard>,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +183,12 @@ pub async fn flush_batch_with_id(
             row_count,
         })
         .await?;
+
+    // 分片交棒：内存分片条目转 Committed(snapshot)。
+    // 查询侧在 `cached_snapshot < snapshot` 期间仍从内存分片返回
+    // （避免"已提交但缓存未刷新"空洞），缓存刷新到该快照后由 sweep 回收。
+    deps.hot
+        .mark_committed(&group.shard_id(), &group.seqs, resp.snapshot);
 
     // WAL: BatchCommitted（进入终态）
     let committed = Record::BatchCommitted(BatchCommittedPayload {
@@ -287,38 +298,8 @@ fn merge_payloads(
     Ok((merged, max_version))
 }
 
-/// 列名对齐：缺失列填 null；列序重排到目标 schema；类型不一致时按提升格 cast。
-fn align_batch(
-    batch: &arrow::record_batch::RecordBatch,
-    target: &arrow::datatypes::SchemaRef,
-) -> Result<arrow::record_batch::RecordBatch, LakeError> {
-    use arrow::array::new_null_array;
-    use arrow::compute::cast;
-    let mut cols = Vec::with_capacity(target.fields().len());
-    for f in target.fields() {
-        match batch.schema().column_with_name(f.name()) {
-            Some((idx, bf)) => {
-                let arr = batch.column(idx);
-                if bf.data_type() == f.data_type() {
-                    cols.push(arr.clone());
-                } else {
-                    // 类型宽化 cast（Int32→Int64→Float64）；不兼容时 cast 报错 → 整批失败
-                    cols.push(cast(arr, f.data_type()).map_err(|e| {
-                        LakeError::Other(format!(
-                            "column {} cast {:?} -> {:?}: {e}",
-                            f.name(),
-                            bf.data_type(),
-                            f.data_type()
-                        ))
-                    })?);
-                }
-            }
-            None => cols.push(new_null_array(f.data_type(), batch.num_rows())),
-        }
-    }
-    arrow::record_batch::RecordBatch::try_new(target.clone(), cols)
-        .map_err(|e| LakeError::Other(format!("align: {e}")))
-}
+// 列名对齐（缺失列 null / 列序重排 / 类型提升格 cast）见
+// `yuntun_model::arrow_util::align_batch` —— 写入与查询内存路径共用同一实现。
 
 async fn write_group_to_s3(
     deps: &FlushDeps,

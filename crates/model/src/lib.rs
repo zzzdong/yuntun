@@ -7,7 +7,11 @@
 //! - [`schema`]: Schema 演进：类型提升格 + 变更分类（详细设计 §8）
 //! - [`ops`]: Catalog 操作的请求/响应类型（详细设计 §3.3）
 //! - [`batch`]: 攒批批次状态（BatchState，由 WAL 事件重建，详细设计 §4.6）
+//! - [`arrow_util`]: 批次 schema 对齐（写入 / 查询热数据路径共用）
+//!
+//! 注：分片存储形态（内存分片 / 磁盘分片）属于存储层，见 `yuntun-store::shard`。
 
+pub mod arrow_util;
 pub mod batch;
 pub mod error;
 pub mod meta;

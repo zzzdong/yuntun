@@ -26,7 +26,8 @@ impl SqlDialect {
 #[derive(Debug, Clone)]
 pub struct SessionCtx {
     pub dialect: SqlDialect,
-    /// 当前库（USE db / PG \c）——MVP 校验后仅记录（R-3：单 schema yuntun.public）
+    /// 当前 schema（MySQL 的 database 概念）：`USE db` / handshake database /
+    /// PG `\c db` 切换；`None` = [`yuntun_model::ops::DEFAULT_SCHEMA`]。
     pub default_db: Option<String>,
 }
 
@@ -45,6 +46,19 @@ impl SessionCtx {
             dialect: SqlDialect::MySql,
             default_db: None,
         }
+    }
+
+    /// 当前 schema（未切换 → `public`）：非限定表名解析的默认归属。
+    pub fn schema(&self) -> &str {
+        self.default_db
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(yuntun_model::ops::DEFAULT_SCHEMA)
+    }
+
+    /// 切换 schema（`USE db` / handshake）；调用方负责先校验其存在。
+    pub fn set_schema(&mut self, schema: &str) {
+        self.default_db = Some(schema.to_string());
     }
 }
 

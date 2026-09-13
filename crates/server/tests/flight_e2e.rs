@@ -35,8 +35,9 @@ fn batch() -> arrow::record_batch::RecordBatch {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn flight_doput_end_to_end() {
     // ① 装配（内存 store；WAL 目录按进程隔离，避免重跑残留数据）
-    let wal_dir = format!("/tmp/yuntun-flight-e2e-wal-{}", std::process::id());
-    let _ = std::fs::remove_dir_all(&wal_dir);
+    // 写盘测试默认走 tmpfs（内存盘，fsync 近 no-op）；需要真实落盘语义的用例改用 TestDir::disk
+    let wal_guard = yuntun_testkit::TestDir::tmpfs("flight-e2e-wal");
+    let wal_dir = wal_guard.string();
     let cfg = yuntun_server::Config::from_toml(&format!(
         r#"
 [server]
@@ -66,6 +67,7 @@ scan_interval_ms = 20
         .catalog
         .create_table(CreateTableRequest {
             name: "audit".into(),
+            namespace: yuntun_model::ops::DEFAULT_SCHEMA.into(),
             schema: schema(),
             partition_cols: vec![],
             default_format: "parquet".into(),

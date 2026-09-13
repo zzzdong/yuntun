@@ -44,6 +44,11 @@ impl DataFormat {
 }
 
 /// 构造数据文件逻辑路径（不含 store 前缀）。
+///
+/// 表标识为**全限定 `schema.table`**（[`yuntun_model::ops::qualified_name`]），
+/// 路径按 schema 分层：`yuntun/{schema}/{table}/dt=.../shard=.../{batch_id}.{ext}`。
+/// 裸表名（旧数据）等价于 `public.<table>` 的旧布局 `yuntun/{table}/...`，读取不受影响
+/// （读取以 Manifest 中的 `file_path` 为准）。
 pub fn file_path(
     table: &str,
     shard: &str,
@@ -51,6 +56,7 @@ pub fn file_path(
     batch_id: &str,
     fmt: DataFormat,
 ) -> String {
+    let table = table.replace('.', "/");
     format!(
         "yuntun/{table}/dt={time_window}/shard={shard}/{batch_id}.{ext}",
         ext = fmt.ext()
@@ -243,7 +249,16 @@ mod tests {
             "018f0000-0000-7000-8000-000000000000"
         );
         assert!(path.starts_with("yuntun/tbl/dt=2026-08-31T14:00/shard=s0/"));
+        // 多 schema：全限定表标识按 schema 分层（旧裸名布局保持兼容）
+        let layered = file_path("sales.orders", "s0", "w", "b1", DataFormat::Parquet);
+        assert_eq!(layered, "yuntun/sales/orders/dt=w/shard=s0/b1.parquet");
         assert!(path.ends_with(".parquet"));
+        // 与 store 层的"磁盘分片"目录前缀约定保持一致（两处定义不得漂移）
+        let disk = yuntun_store::DiskShard::new(store.clone());
+        assert_eq!(
+            disk.prefix(&yuntun_store::ShardId::new("sales.orders", "s0", "w")),
+            layered.rsplit_once('/').map(|(d, _)| format!("{d}/")).unwrap()
+        );
 
         let batches = read_batch(&store, &path, DataFormat::Parquet)
             .await

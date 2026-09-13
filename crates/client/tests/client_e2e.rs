@@ -40,8 +40,13 @@ async fn start_server() -> (
     CancellationToken,
     tokio::task::JoinHandle<()>,
 ) {
-    let wal_dir = format!("/tmp/yuntun-client-e2e-wal-{}", std::process::id());
-    let _ = std::fs::remove_dir_all(&wal_dir);
+    // 写盘测试默认走 tmpfs（内存盘）；真实落盘语义的用例用 TestDir::disk。
+    // 注意：本函数返回后服务仍在使用该目录 → `into_path()` 放弃 Drop 清理
+    //（目录留在 tmpfs，进程退出由系统回收）。
+    let wal_dir = yuntun_testkit::TestDir::tmpfs("client-e2e-wal")
+        .into_path()
+        .to_string_lossy()
+        .to_string();
     let cfg = yuntun_server::Config::from_toml(&format!(
         r#"
 [server]
@@ -100,19 +105,24 @@ cache_ttl_secs = 1
 
 /// 轮询等待「单值查询」返回期望值（攒批 flush + 缓存刷新窗口，抗机器负载）。
 async fn wait_count(client: &Client, sql: &str, expect: i64) {
+    let mut last: Option<String> = None;
     for _ in 0..40 {
-        if let Ok(batches) = client.query(sql).await {
-            let got = batches
-                .first()
-                .and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>())
-                .map(|a| a.value(0));
-            if got == Some(expect) {
-                return;
+        match client.query(sql).await {
+            Ok(batches) => {
+                let got = batches
+                    .first()
+                    .and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>())
+                    .map(|a| a.value(0));
+                if got == Some(expect) {
+                    return;
+                }
+                last = Some(format!("got={got:?}"));
             }
+            Err(e) => last = Some(format!("err={e}")),
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    panic!("等待 {expect} 行超时（10s）：{sql}");
+    panic!("等待 {expect} 行超时（10s）：{sql}；最后状态: {last:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

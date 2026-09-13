@@ -71,11 +71,15 @@ fn batch(rows: i64) -> arrow::record_batch::RecordBatch {
 
 #[cfg(test)]
 fn tmpdir(name: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("yuntun-chaos-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+    // 故障注入/崩溃恢复场景需要**真实落盘语义**（fsync 等待、重启后目录仍在）
+    // → 使用真实磁盘；常规 tmpfs 加速不适用于 chaos
+    yuntun_testkit::TestDir::disk(&format!("chaos-{name}")).into_path()
 }
+
+/// chaos 用例**串行执行**：重 IO（真实磁盘 fsync）+ 共享目录/水位语义，
+/// 并行会互相拖慢恢复等待窗口并放大时序噪声。
+#[cfg(test)]
+static CHAOS_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// 构建一套组件（每轮重建 = 模拟进程重启）。
 ///
@@ -94,6 +98,7 @@ async fn build(
             catalog
                 .create_table(CreateTableRequest {
                     name: name.to_string(),
+                    namespace: yuntun_model::ops::DEFAULT_SCHEMA.into(),
                     schema: schema.clone(),
                     partition_cols: vec![],
                     default_format: "parquet".into(),
@@ -144,6 +149,11 @@ async fn build(
 /// E3 / E2：crash 恢复无数据丢失（5 轮硬崩溃，同一目录滚动）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn crash_recovery_no_data_loss() {
+    let _gate = CHAOS_GATE.lock().await;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("yuntun=debug")
+        .with_test_writer()
+        .try_init();
     let wal_dir = tmpdir("wal");
     let store_root = tmpdir("store");
 
@@ -184,29 +194,44 @@ async fn crash_recovery_no_data_loss() {
         setup = Some(build(&wal_dir, &store_root, &tables).await);
         let cur = setup.as_ref().unwrap();
         let shutdown = CancellationToken::new();
+        // accumulator 必须在轮询期间保持运行（它负责重读 WAL → flush → commit）
         let _acc = cur.ingestor.clone().spawn_accumulator(shutdown.clone());
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        shutdown.cancel();
 
-        // ④ 查询计数 == 累计 acked 行数（无丢失、无重复）
-        cur.engine
-            .cache()
-            .refresh(&(cur.catalog.clone() as Arc<dyn yuntun_catalog::CatalogOps>))
-            .await
-            .unwrap();
-        let batches = cur
-            .engine
-            .sql("SELECT count(*) FROM yuntun.public.audit")
-            .await
-            .unwrap();
-        let got = batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .value(0);
+        // ④ 查询计数 == 累计 acked 行数（无丢失、无重复）。
+        // 真实磁盘上"WAL 重放 → flush → commit"可能超过固定等待 → 轮询（上限 30s）；
+        // tmpfs 上通常首轮即满足。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut got: u64;
+        loop {
+            cur.engine
+                .cache()
+                .refresh(&(cur.catalog.clone() as Arc<dyn yuntun_catalog::CatalogOps>))
+                .await
+                .unwrap();
+            let batches = cur
+                .engine
+                .sql("SELECT count(*) FROM yuntun.public.audit")
+                .await
+                .unwrap();
+            got = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0) as u64;
+            if got == acked_rows {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "round {round}: 恢复超时（acked={acked_rows}, got={got}）"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        // 恢复完成后再停 accumulator（避免中断后续 flush）
+        shutdown.cancel();
         assert_eq!(
-            got as u64, acked_rows,
+            got, acked_rows,
             "round {round}: 恢复后行数必须等于累计 acked 行数（无丢失无重复）"
         );
         tracing::info!(round, acked_rows, "crash round OK");
@@ -216,6 +241,7 @@ async fn crash_recovery_no_data_loss() {
 /// T6.4：schema 并发演进 —— N 个并发 writer 各带独立新列，OCC + 重试消化冲突。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_schema_evolution() {
+    let _gate = CHAOS_GATE.lock().await;
     let wal_dir = tmpdir("wal-evo");
     let store_root = tmpdir("store-evo");
     let tables = [(
@@ -275,6 +301,7 @@ async fn concurrent_schema_evolution() {
 /// T6.8：查询侧多版本对齐 —— v1/v2 文件共存，查询统一到最新 schema。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn query_multi_version_alignment() {
+    let _gate = CHAOS_GATE.lock().await;
     let wal_dir = tmpdir("wal-mv");
     let store_root = tmpdir("store-mv");
     let tables = [(
@@ -324,10 +351,23 @@ async fn query_multi_version_alignment() {
         .await
         .unwrap();
 
-    // flush 两个批次
+    // flush 两个批次（轮询等待落盘；真实磁盘 + 并发负载下固定 sleep 不可靠）
     let shutdown = CancellationToken::new();
     let _acc = setup.ingestor.clone().spawn_accumulator(shutdown.clone());
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let snap = setup.catalog.current_snapshot().await;
+        let n = setup
+            .catalog
+            .list_visible_files("public.mv", snap, None)
+            .await
+            .map(|f| f.len())
+            .unwrap_or(0);
+        if n >= 2 || std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     shutdown.cancel();
 
     // 查询：统一到 v2 schema；v1 文件缺失 b 列 → null 填充

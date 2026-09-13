@@ -176,9 +176,9 @@ mod tests {
     }
 
     fn tmp(name: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("yuntun-client-{}-{}", std::process::id(), name));
-        let _ = std::fs::remove_file(&p);
-        p
+        // 导入解析单测的文件读写走 tmpfs（内存盘）
+        let dir = yuntun_testkit::TestDir::tmpfs(&format!("client-input-{name}")).into_path();
+        dir.join(name)
     }
 
     #[test]

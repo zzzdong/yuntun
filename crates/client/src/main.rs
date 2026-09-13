@@ -130,7 +130,7 @@ async fn run(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error + Send +
                 receipts.len(),
                 receipts.last().map(|r| r.wal_seq).unwrap_or(0)
             );
-            println!("数据将在约 {visible} 秒后可见（攒批窗口 + 查询缓存 TTL）");
+            println!("数据约 {visible} 秒内可查（读己之写：攒批内存视图；落对象存储另有攒批窗口）");
             Ok(())
         }
         "tables" => {

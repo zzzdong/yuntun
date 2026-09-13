@@ -124,7 +124,7 @@ def main():
     client = fl.FlightClient(f"grpc+tcp://{addr}")
     print(f"[4] raw FlightClient connected to {addr}")
 
-    insert_sql = 'INSERT INTO api_audit (event_time, "user", endpoint, cost_ms)'
+    insert_sql = 'INSERT INTO api_audit (event_time, "user", endpoint, cost_ms) VALUES (?, ?, ?, ?)'
     # 【协议约定】action 请求/响应均为 Any 包装（与官方 blanket 实现一致）
     action = fl.Action(
         "CreatePreparedStatement",

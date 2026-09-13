@@ -24,3 +24,6 @@ async-trait = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
 rand = { workspace = true }
+
+[dev-dependencies]
+yuntun-testkit = { path = "../testkit" }

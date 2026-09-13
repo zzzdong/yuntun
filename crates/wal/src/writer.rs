@@ -53,6 +53,8 @@ struct ShardState {
     shard_id: u64,
     /// 已 fsync 的最高记录 seq（§5.3.5.1 水位线）
     synced_seq: AtomicU64,
+    /// 下一条待分配 seq（= 已 fsync 边界 + 1；供"本进程新写入的数据"判定用）
+    next_seq: AtomicU64,
     /// 当前 segment 的 seq（清理时跳过）
     current_segment: AtomicU64,
 }
@@ -98,7 +100,11 @@ impl WalWriter {
 
         let (tx, rx) = mpsc::channel::<CommitRequest>();
         let st = Arc::new(ShardState {
-            synced_seq: AtomicU64::new(rec.last_seq),
+            // 【修复】水位 = 实际已 fsync 的最高 seq（recovery 的 synced_seq），
+            // 不是"下一条可用 seq"（last_seq）。用 last_seq 会让 `synced_seq()` 超出
+            // 真实边界一条（C2 契约：攒批线程传的 `to` 必须 ≤ synced_seq + 1）。
+            synced_seq: AtomicU64::new(rec.synced_seq),
+            next_seq: AtomicU64::new(guard.next_seq),
             current_segment: AtomicU64::new(guard.seg_seq),
             cfg: cfg.clone(),
             shard_id,
@@ -138,9 +144,14 @@ impl WalWriter {
     /// 当前已 fsync 的水位（§5.3.5.1）。
     ///
     /// # 契约（C2）
-    /// 攒批线程传入 `scan_range` 的 `to` **必须** ≤ 此值。
+    /// 攒批线程传入 `scan_range` 的 `to` **必须** ≤ 此值 + 1（半开区间）。
     pub fn synced_seq(&self) -> u64 {
         self.state.synced_seq()
+    }
+
+    /// 下一条可用 seq。恢复/攒批用它区分"历史数据"与"本进程新写入的数据"。
+    pub fn next_seq(&self) -> u64 {
+        self.state.next_seq.load(Ordering::SeqCst)
     }
 
     pub fn shard_id(&self) -> u64 {
@@ -285,14 +296,16 @@ fn commit_loop(rx: mpsc::Receiver<CommitRequest>, st: Arc<ShardState>, mut guard
 
                 // 【关键顺序】先推进水位，再 ack 客户端（§5.3.5.1）
                 st.synced_seq.store(last_seq, Ordering::SeqCst);
+                st.next_seq.store(guard.next_seq, Ordering::SeqCst);
                 st.current_segment.store(guard.seg_seq, Ordering::SeqCst);
 
-                let ack = WalAck {
-                    seq: last_seq,
-                    synced_seq: last_seq,
-                };
-                for req in batch {
-                    let _ = req.ack_tx.send(Ok(ack));
+                // 【修复】组提交内每条记录回各自的 seq（此前整批都回 last_seq，
+                // 导致除末条外 `Receipt.wal_seq` / `next_seq` 语义错位）。
+                for (i, req) in batch.into_iter().enumerate() {
+                    let _ = req.ack_tx.send(Ok(WalAck {
+                        seq: first_seq + i as u64,
+                        synced_seq: last_seq,
+                    }));
                 }
             }
             Err(e) => {
@@ -324,5 +337,60 @@ fn rotate(guard: &mut CommitterGuard, st: &Arc<ShardState>) -> Result<(), LakeEr
 fn fail_batch(batch: &mut Vec<CommitRequest>, e: LakeError) {
     for req in batch.drain(..) {
         let _ = req.ack_tx.send(Err(e.clone()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yuntun_model::wal_record::{BatchCommittedPayload, Record};
+
+    fn tmpdir(name: &str) -> std::path::PathBuf {
+        yuntun_testkit::TestDir::tmpfs(&format!("wal-writer-{name}")).into_path()
+    }
+
+    fn rec(i: u64) -> Record {
+        Record::BatchCommitted(BatchCommittedPayload {
+            batch_id: format!("b{i}"),
+        })
+    }
+
+    /// 【回归】水位初值 = 实际已 fsync 的最高 seq（而非"下一条可用 seq"）。
+    #[tokio::test]
+    async fn reopen_water_mark_is_last_fsynced_seq() {
+        let dir = tmpdir("reopen");
+        let cfg = WalConfig::for_dir(&dir);
+        {
+            let wal = WalWriter::open(cfg.clone(), 0).await.unwrap();
+            for i in 0..5 {
+                wal.append(rec(i)).await.unwrap();
+            }
+            assert_eq!(wal.synced_seq(), 4);
+        }
+        let wal = WalWriter::open(cfg, 0).await.unwrap();
+        assert_eq!(wal.synced_seq(), 4, "水位不得超出真实已 fsync 边界");
+        assert_eq!(wal.next_seq(), 5, "下一条可用 seq");
+        let ack = wal.append(rec(99)).await.unwrap();
+        assert_eq!(ack.seq, 5);
+    }
+
+    /// 【回归】组提交内每条记录回各自的 seq（旧实现整批都回 last_seq）。
+    #[tokio::test]
+    async fn group_commit_acks_each_record_own_seq() {
+        let dir = tmpdir("acks");
+        let wal = WalWriter::open(WalConfig::for_dir(&dir), 0).await.unwrap();
+        let mut handles = Vec::new();
+        for i in 0..8u64 {
+            let w = wal.clone();
+            handles.push(tokio::spawn(async move { w.append(rec(i)).await.unwrap().seq }));
+        }
+        let mut seqs = Vec::new();
+        for h in handles {
+            seqs.push(h.await.unwrap());
+        }
+        seqs.sort_unstable();
+        assert_eq!(seqs, (0..8).collect::<Vec<u64>>(), "每条记录回执自己的 seq");
+        assert_eq!(wal.synced_seq(), 7);
+        assert_eq!(wal.next_seq(), 8);
     }
 }

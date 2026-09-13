@@ -104,15 +104,16 @@ async fn main() {
     let workers: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8);
     let batch_rows = 500; // 每批 500 行 ≈ 500KB
 
-    let wal_dir = format!("/tmp/yuntun-bench-wal-{}", std::process::id());
-    let _ = std::fs::remove_dir_all(&wal_dir);
-    let store_root = format!("/tmp/yuntun-bench-store-{}", std::process::id());
-    let _ = std::fs::remove_dir_all(&store_root);
+    // 压测需要真实磁盘 I/O（tmpfs 会把 fsync 变成 no-op，吞吐/延迟失真）
+    let bench_dir = yuntun_testkit::TestDir::disk("bench");
+    let wal_dir = bench_dir.join("wal").to_string_lossy().to_string();
+    let store_root = bench_dir.join("store").to_string_lossy().to_string();
 
     let catalog = Arc::new(MemoryCatalog::new());
     catalog
         .create_table(CreateTableRequest {
             name: "bench".into(),
+            namespace: yuntun_model::ops::DEFAULT_SCHEMA.into(),
             schema: schema(),
             partition_cols: vec![],
             default_format: "parquet".into(),

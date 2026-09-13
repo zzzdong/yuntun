@@ -72,11 +72,8 @@ mod tests {
     use yuntun_model::wal_record::{BatchPendingPayload, Record};
 
     fn tmpdir(name: &str) -> std::path::PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("yuntun-wal-reader-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+        // 写盘测试走 tmpfs（内存盘）：fsync 近 no-op，读写显著快于真实磁盘
+        yuntun_testkit::TestDir::tmpfs(&format!("wal-reader-{name}")).into_path()
     }
 
     fn pending(i: u64) -> Record {

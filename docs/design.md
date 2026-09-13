@@ -1054,15 +1054,37 @@ impl PhysicalExprAdapter for LakePhysicalExprAdapter {
 
 **验收标准**：`EXPLAIN SELECT * FROM t WHERE ts > X`，计划中**不应出现 `FilterExec`**（已被下推到 DataSourceExec）。
 
-### 7.4 热数据（阶段 2+）
+### 7.4 热数据：**分片存储的两级形态**（阶段 0 已实现内存侧）
 
-按时间窗口切分 MemTable（每 1 分钟一个），查询时按 `event_time` 路由，避免全量扫描热缓冲：
+热数据不是"某个组件的内存缓冲"，而是**分片（shard）在存储层的形态**：
 
-```rust
-hot_windows: Vec<(TimeWindow, MemTable)>   // 内存中保留最近 5 个窗口
-```
+| tier | 名称 | 内容 | 归属 |
+|---|---|---|---|
+| `ShardTier::Memory` | **内存分片** | 已 fsync WAL、尚未 flush 的"热"数据（Arrow 批次） | store 层（`yuntun-store::shard::MemoryShard`） |
+| `ShardTier::Disk` | **磁盘分片** | 已编码落对象存储（本地磁盘 / S3）、由 Manifest 索引的"冷"数据 | store 层（`DiskShard` + Catalog Manifest） |
 
-阶段 0（All-in-One）热数据可直接读 Ingestor 内存缓冲；分离后通过定向拉取（非广播）。
+一个 shard 的身份 = `(表全限定名, shard_key, time_window)`（`ShardId`），与攒批分组键、
+对象路径 `dt=<window>/shard=<shard>`、`ShardMeta` 一致。
+
+**契约**：写入侧只负责"写内存分片 → 提交后交棒磁盘分片"；
+查询侧只问 store 层"这个分片现在有哪些数据可见"，**不依赖写入组件的进程**。
+交接靠条目的 `Live → Committed(snapshot)` 状态 + 查询快照号比较完成，保证
+**无可见性空洞、无重复计数**；缓存追上该快照后由 `sweep` 回收。
+
+- **阶段 0（All-in-One）**：内存分片即进程内实现，查询直接读（写入 fsync 后 ≤ 1 个攒批扫描周期可见，
+  与 flush jitter / 查询缓存 TTL 解耦）；
+- **分离部署**：内存分片由**分片服务**承载（同形接口，定向拉取，非广播），
+  查询侧调用方零改动；按时间窗口路由 / 只保留最近 N 个窗口的策略在同一处扩展。
+
+**读侧接缝**（查询只依赖 trait，不依赖具体实现）：
+
+| 抽象 | 职责 | 实现 |
+|---|---|---|
+| `trait ShardReader` | 查询侧唯一入口：`shards_of(table)` / `read_shard(ShardId, snapshot)` / `read_table`（默认 = 枚举 + 逐分片）/ `reclaim`（本地副本回收，远端默认空实现） | ① `MemoryShard`（进程内，阶段 0）；② `RemoteShard`（远端分片服务） |
+| `trait ShardFetch` | 远端分片服务的**传输接缝**（`fetch_shards` / `fetch_shard` / `fetch_version`），只关心取数，不关心序列化与连接 | 阶段 1：gRPC / HTTP；单测：假实现 |
+
+写入侧（`MemoryShard::observe_ddl / push / mark_committed / remove`）仍是进程内实现 ——
+热缓冲天然属于写入节点；跨节点读通过 `ShardReader` 抽象解决。
 
 ### 7.5 统计信息
 

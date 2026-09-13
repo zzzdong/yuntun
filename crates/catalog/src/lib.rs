@@ -9,7 +9,7 @@
 //!   阶段 0 单节点实现为自增序号，阶段 1 切换零业务改动
 
 use arrow::datatypes::SchemaRef;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,8 +18,9 @@ use yuntun_model::meta::{
     compute_stats_lite, FileManifest, FileStatus, IdempotencyRecord, SchemaVersion, TableMeta,
 };
 use yuntun_model::ops::{
-    validate_table_name, CommitFilesRequest, CommitFilesResponse, CreateTableRequest,
-    EvolveSchemaRequest, EvolveSchemaResponse,
+    qualified_name, split_qualified, validate_schema_name, validate_table_name, CommitFilesRequest,
+    CommitFilesResponse, CreateTableRequest, EvolveSchemaRequest, EvolveSchemaResponse,
+    DEFAULT_SCHEMA,
 };
 use yuntun_model::schema::{apply_change, SchemaChangeKind};
 
@@ -27,9 +28,22 @@ use yuntun_model::schema::{apply_change, SchemaChangeKind};
 /// 阶段 1：同一 trait 由 `GrpcCatalogClient` 实现。
 #[async_trait::async_trait]
 pub trait CatalogOps: Send + Sync {
+    // ---- schema（MySQL 的 database 概念；多 schema 支持）----
+    /// 新建 schema（幂等语义：已存在 → `SchemaAlreadyExists`）。
+    async fn create_schema(&self, name: &str) -> Result<(), LakeError>;
+    /// 删除空 schema（`public` 不可删；schema 下仍有表 → `SchemaNotEmpty`）。
+    async fn drop_schema(&self, name: &str) -> Result<(), LakeError>;
+    /// 全部 schema 名（排序；至少含 `public`）。
+    async fn list_schemas(&self) -> Result<Vec<String>, LakeError>;
+    /// schema 是否存在（`USE db` / handshake 校验用）。
+    async fn schema_exists(&self, name: &str) -> Result<bool, LakeError>;
+
     // ---- 表 / Schema ----
+    /// 建表：`req.name` 为裸表名，归属 `req.schema_name()`。
     async fn create_table(&self, req: CreateTableRequest) -> Result<TableMeta, LakeError>;
+    /// 取表：`name` 为**全限定标识** `schema.table`（[`qualified_name`]）。
     async fn get_table(&self, name: &str) -> Result<Option<TableMeta>, LakeError>;
+    /// 全部表（跨 schema；`TableMeta.namespace` 标归属）。
     async fn list_tables(&self) -> Result<Vec<TableMeta>, LakeError>;
 
     /// Schema 演进（OCC）—— 唯一的乐观锁作用点（C8）
@@ -73,6 +87,12 @@ pub trait CatalogOps: Send + Sync {
     async fn read_index(&self) -> u64;
 }
 
+/// 归一化表标识：裸名 → `public.<name>`；限定名原样（兼容 v1 单 schema 数据/调用）。
+fn normalize_table(name: &str) -> String {
+    let (ns, table) = split_qualified(name);
+    qualified_name(ns, table)
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -85,8 +105,11 @@ fn now_secs() -> u64 {
 /// 即使阶段 0 单节点，写操作也走 `apply` 语义（last_applied_index 单调递增），
 /// 读操作走 `read_index` 语义，为阶段 1 切换 Raft 铺路（§13.2）。
 pub struct MemoryCatalog {
+    /// 表标识（全限定 `schema.table`）→ TableMeta
     tables: RwLock<HashMap<String, TableMeta>>,
-    /// (table, version) -> SchemaVersion（版本链）
+    /// schema（MySQL 的 database）注册表；至少含 `public`
+    namespaces: RwLock<HashSet<String>>,
+    /// (qualified_table, version) -> SchemaVersion（版本链）
     schemas: RwLock<HashMap<(String, u64), SchemaVersion>>,
     /// batch_id -> FileManifest
     files: RwLock<HashMap<String, FileManifest>>,
@@ -108,6 +131,7 @@ impl MemoryCatalog {
     pub fn new() -> Self {
         Self {
             tables: RwLock::new(HashMap::new()),
+            namespaces: RwLock::new(HashSet::from([DEFAULT_SCHEMA.to_string()])),
             schemas: RwLock::new(HashMap::new()),
             files: RwLock::new(HashMap::new()),
             idempotency: RwLock::new(HashMap::new()),
@@ -130,13 +154,24 @@ impl MemoryCatalog {
         self.files.read().unwrap().keys().cloned().collect()
     }
 
+    /// 【修复】原子推进快照号并返回新值。
+    ///
+    /// 快照号**必须严格单调**：文件可见性依赖 `valid_from <= snapshot`。
+    /// 此前 `commit_files / commit_compaction / drop_shard` 用 `load() + 1` 再 `store()`，
+    /// 与并发的 `drop_table`（`fetch_add`）交错时，晚到的 `store` 会把更大的快照号
+    /// **覆盖回小值** → 已提交文件（`valid_from > snapshot`）在中途"永久不可见"，
+    /// 直到下一次推进快照。统一改为原子的 `fetch_add`，返回各操作唯一的递增值。
+    fn next_snapshot(&self) -> u64 {
+        self.snapshot_version.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
     /// Compaction 提交：旧文件标记 deleted_at，新文件 valid_from = snapshot+1（L2，§6.3）。
     pub fn commit_compaction(
         &self,
         old_batch_ids: &[String],
         new_files: Vec<FileManifest>,
     ) -> Result<u64, LakeError> {
-        let next = self.snapshot_version.load(Ordering::SeqCst) + 1;
+        let next = self.next_snapshot();
         let mut files = self.files.write().unwrap();
         // 先确认旧文件仍可见（避免与并发 drop_shard 冲突时错误复活数据）
         for id in old_batch_ids {
@@ -152,7 +187,6 @@ impl MemoryCatalog {
             files.insert(nf.batch_id.clone(), nf);
         }
         drop(files);
-        self.snapshot_version.store(next, Ordering::SeqCst);
         self.last_applied.fetch_add(1, Ordering::SeqCst);
         Ok(next)
     }
@@ -160,14 +194,70 @@ impl MemoryCatalog {
 
 #[async_trait::async_trait]
 impl CatalogOps for MemoryCatalog {
+    // ---------------------------------------------------------- schema
+
+    async fn create_schema(&self, name: &str) -> Result<(), LakeError> {
+        validate_schema_name(name)?;
+        let mut ns = self.namespaces.write().unwrap();
+        if !ns.insert(name.to_string()) {
+            return Err(LakeError::SchemaAlreadyExists(name.to_string()));
+        }
+        drop(ns);
+        self.last_applied.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn drop_schema(&self, name: &str) -> Result<(), LakeError> {
+        if name == DEFAULT_SCHEMA {
+            return Err(LakeError::Other(format!(
+                "default schema {DEFAULT_SCHEMA:?} cannot be dropped"
+            )));
+        }
+        if !self.schema_exists(name).await? {
+            return Err(LakeError::SchemaNotFound(name.to_string()));
+        }
+        // 非空 schema 拒绝删除（MySQL ER_DB_DROP_EXISTS 语义）
+        if self
+            .tables
+            .read()
+            .unwrap()
+            .values()
+            .any(|t| t.schema_name() == name)
+        {
+            return Err(LakeError::SchemaNotEmpty(name.to_string()));
+        }
+        self.namespaces.write().unwrap().remove(name);
+        self.last_applied.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn list_schemas(&self) -> Result<Vec<String>, LakeError> {
+        let mut v: Vec<String> = self.namespaces.read().unwrap().iter().cloned().collect();
+        v.sort();
+        Ok(v)
+    }
+
+    async fn schema_exists(&self, name: &str) -> Result<bool, LakeError> {
+        Ok(self.namespaces.read().unwrap().contains(name))
+    }
+
+    // ---------------------------------------------------------- 表
+
     async fn create_table(&self, req: CreateTableRequest) -> Result<TableMeta, LakeError> {
         validate_table_name(&req.name)?;
+        let ns_name = req.schema_name().to_string();
+        validate_schema_name(&ns_name)?;
+        if !self.schema_exists(&ns_name).await? {
+            return Err(LakeError::SchemaNotFound(ns_name));
+        }
+        let qualified = req.qualified_name();
         let mut tables = self.tables.write().unwrap();
-        if tables.contains_key(&req.name) {
-            return Err(LakeError::TableAlreadyExists(req.name.clone()));
+        if tables.contains_key(&qualified) {
+            return Err(LakeError::TableAlreadyExists(qualified));
         }
         let meta = TableMeta {
             name: req.name.clone(),
+            namespace: ns_name,
             current_schema_version: 1,
             partition_cols: req.partition_cols,
             default_format: req.default_format,
@@ -177,7 +267,7 @@ impl CatalogOps for MemoryCatalog {
             table_template: 1, // General
         };
         self.schemas.write().unwrap().insert(
-            (req.name.clone(), 1),
+            (qualified.clone(), 1),
             SchemaVersion {
                 version: 1,
                 arrow_schema: meta.arrow_schema.clone(),
@@ -186,13 +276,20 @@ impl CatalogOps for MemoryCatalog {
                 change_desc: "initial schema".into(),
             },
         );
-        tables.insert(req.name.clone(), meta.clone());
+        tables.insert(qualified, meta.clone());
         self.last_applied.fetch_add(1, Ordering::SeqCst);
         Ok(meta)
     }
 
+    /// `name` = 全限定标识 `schema.table`（无 `.` 时按默认 schema 解析，兼容旧数据）。
     async fn get_table(&self, name: &str) -> Result<Option<TableMeta>, LakeError> {
-        Ok(self.tables.read().unwrap().get(name).cloned())
+        let (ns, table) = split_qualified(name);
+        Ok(self
+            .tables
+            .read()
+            .unwrap()
+            .get(&qualified_name(ns, table))
+            .cloned())
     }
 
     async fn list_tables(&self) -> Result<Vec<TableMeta>, LakeError> {
@@ -204,10 +301,11 @@ impl CatalogOps for MemoryCatalog {
         &self,
         req: EvolveSchemaRequest,
     ) -> Result<EvolveSchemaResponse, LakeError> {
+        let key = normalize_table(&req.table);
         let mut tables = self.tables.write().unwrap();
         let table = tables
-            .get_mut(&req.table)
-            .ok_or_else(|| LakeError::TableNotFound(req.table.clone()))?;
+            .get_mut(&key)
+            .ok_or_else(|| LakeError::TableNotFound(key.clone()))?;
 
         // 【唯一乐观锁点】
         if table.current_schema_version != req.expected_version {
@@ -225,7 +323,7 @@ impl CatalogOps for MemoryCatalog {
         let new_version = table.current_schema_version + 1;
 
         self.schemas.write().unwrap().insert(
-            (req.table.clone(), new_version),
+            (key.clone(), new_version),
             SchemaVersion {
                 version: new_version,
                 arrow_schema: yuntun_model::meta::serialize_schema(&new_schema),
@@ -246,7 +344,7 @@ impl CatalogOps for MemoryCatalog {
 
     async fn table_schema(&self, name: &str) -> Result<Option<(SchemaRef, u64)>, LakeError> {
         let tables = self.tables.read().unwrap();
-        Ok(match tables.get(name) {
+        Ok(match tables.get(&normalize_table(name)) {
             Some(t) => Some((t.schema()?, t.current_schema_version)),
             None => None,
         })
@@ -292,8 +390,8 @@ impl CatalogOps for MemoryCatalog {
             );
         }
 
-        // ③ 分配快照号并落 Manifest
-        let next = self.snapshot_version.load(Ordering::SeqCst) + 1;
+        // ③ 分配快照号并落 Manifest（原子推进，见 next_snapshot）
+        let next = self.next_snapshot();
         let mut files = self.files.write().unwrap();
         if files.contains_key(&req.batch_id) {
             // 并发下 batch_id 重复（写锁竞态）—— 幂等返回
@@ -310,12 +408,12 @@ impl CatalogOps for MemoryCatalog {
             f.schema_version = req.schema_version;
             f.shard = req.shard.clone();
             f.time_window = req.time_window.clone();
-            f.table = req.table.clone();
+            // 归一化为全限定表标识（多 schema：跨 schema 同名表必须区分）
+            f.table = normalize_table(&req.table);
             f.client_request_id = req.client_request_id.clone().unwrap_or_default();
             files.insert(req.batch_id.clone(), f);
         }
         drop(files);
-        self.snapshot_version.store(next, Ordering::SeqCst);
         self.last_applied.fetch_add(1, Ordering::SeqCst);
 
         Ok(CommitFilesResponse {
@@ -333,10 +431,11 @@ impl CatalogOps for MemoryCatalog {
         snapshot: u64,
         shard_filter: Option<&str>,
     ) -> Result<Vec<FileManifest>, LakeError> {
+        let key = normalize_table(table);
         let files = self.files.read().unwrap();
         Ok(files
             .values()
-            .filter(|f| f.table == table)
+            .filter(|f| normalize_table(&f.table) == key)
             .filter(|f| shard_filter.is_none_or(|s| f.shard == s))
             .filter(|f| f.visible_at(snapshot))
             .cloned()
@@ -345,17 +444,17 @@ impl CatalogOps for MemoryCatalog {
 
     /// L1 分片移除（§6.3）：整 shard 文件 deleted_at = current_snapshot + 1。
     async fn drop_shard(&self, table: &str, shard: &str) -> Result<u64, LakeError> {
-        let next = self.snapshot_version.load(Ordering::SeqCst) + 1;
+        let next = self.next_snapshot();
+        let key = normalize_table(table);
         let mut files = self.files.write().unwrap();
         let mut n = 0u64;
         for f in files.values_mut() {
-            if f.table == table && f.shard == shard && f.deleted_at == 0 {
+            if normalize_table(&f.table) == key && f.shard == shard && f.deleted_at == 0 {
                 f.deleted_at = next;
                 n += 1;
             }
         }
         drop(files);
-        self.snapshot_version.store(next, Ordering::SeqCst);
         self.last_applied.fetch_add(1, Ordering::SeqCst);
         Ok(n)
     }
@@ -365,13 +464,20 @@ impl CatalogOps for MemoryCatalog {
     /// 数据文件本身不动 —— Manifest 移除后 S3 对象成为孤儿，
     /// 由孤儿清理循环（batch_id 对账 + 静置期）回收（plan §4.3）。
     async fn drop_table(&self, name: &str) -> Result<(), LakeError> {
+        let key = normalize_table(name);
         let mut tables = self.tables.write().unwrap();
-        if tables.remove(name).is_none() {
-            return Err(LakeError::TableNotFound(name.to_string()));
+        if tables.remove(&key).is_none() {
+            return Err(LakeError::TableNotFound(key));
         }
         drop(tables);
-        self.schemas.write().unwrap().retain(|(t, _), _| t != name);
-        self.files.write().unwrap().retain(|_, f| f.table != name);
+        self.schemas
+            .write()
+            .unwrap()
+            .retain(|(t, _), _| *t != key);
+        self.files
+            .write()
+            .unwrap()
+            .retain(|_, f| normalize_table(&f.table) != key);
         self.snapshot_version.fetch_add(1, Ordering::SeqCst);
         self.last_applied.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -446,6 +552,7 @@ mod tests {
         let c = MemoryCatalog::new();
         c.create_table(CreateTableRequest {
             name: "audit".into(),
+            namespace: yuntun_model::ops::DEFAULT_SCHEMA.into(),
             schema: schema(&[("ts", DataType::Int64), ("user", DataType::Utf8)]),
             partition_cols: vec![],
             default_format: "parquet".into(),
@@ -473,11 +580,75 @@ mod tests {
         assert!(c.get_table("nope").await.unwrap().is_none());
     }
 
+    // 多 schema：建库 / 隔离 / 非空库不可删 / 默认库不可删
+    #[tokio::test]
+    async fn multi_schema_isolation_and_drop_rules() {
+        let c = MemoryCatalog::new();
+        assert_eq!(c.list_schemas().await.unwrap(), vec!["public".to_string()]);
+        c.create_schema("sales").await.unwrap();
+        assert!(c.schema_exists("sales").await.unwrap());
+        assert!(matches!(
+            c.create_schema("sales").await,
+            Err(LakeError::SchemaAlreadyExists(_))
+        ));
+        assert_eq!(
+            c.list_schemas().await.unwrap(),
+            vec!["public".to_string(), "sales".to_string()]
+        );
+
+        // 未知 schema 建表 → SchemaNotFound（不再静默落到 public）
+        let req_to = |ns: &str, name: &str| CreateTableRequest {
+            name: name.into(),
+            namespace: ns.into(),
+            schema: schema(&[("v", DataType::Int64)]),
+            partition_cols: vec![],
+            default_format: "parquet".into(),
+            ingest_config: Default::default(),
+        };
+        assert!(matches!(
+            c.create_table(req_to("nope", "t")).await,
+            Err(LakeError::SchemaNotFound(_))
+        ));
+
+        // 跨 schema 同名表：互相隔离
+        c.create_table(req_to("public", "orders")).await.unwrap();
+        c.create_table(req_to("sales", "orders")).await.unwrap();
+        assert_eq!(
+            c.get_table("public.orders")
+                .await
+                .unwrap()
+                .unwrap()
+                .schema_name(),
+            "public"
+        );
+        assert_eq!(
+            c.get_table("sales.orders")
+                .await
+                .unwrap()
+                .unwrap()
+                .schema_name(),
+            "sales"
+        );
+        assert!(c.get_table("other.orders").await.unwrap().is_none());
+
+        // 非空 schema 不可删；删表后可删
+        assert!(matches!(
+            c.drop_schema("sales").await,
+            Err(LakeError::SchemaNotEmpty(_))
+        ));
+        c.drop_table("sales.orders").await.unwrap();
+        c.drop_schema("sales").await.unwrap();
+        assert!(!c.schema_exists("sales").await.unwrap());
+        // 默认 schema 不可删
+        assert!(c.drop_schema("public").await.is_err());
+    }
+
     #[tokio::test]
     async fn create_duplicate_table_rejected() {
         let c = MemoryCatalog::new();
         let req = CreateTableRequest {
             name: "t".into(),
+            namespace: yuntun_model::ops::DEFAULT_SCHEMA.into(),
             schema: schema(&[("a", DataType::Int64)]),
             partition_cols: vec![],
             default_format: "parquet".into(),
@@ -787,5 +958,57 @@ mod tests {
         versions.sort_unstable();
         assert_eq!(versions, vec![1, 2]);
         let _ = snap0;
+    }
+
+    // 【回归】快照号严格单调：并发 commit 与 drop 交错时不得回退 ——
+    // 回退会让已提交文件（valid_from > snapshot）在中途"永久不可见"。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn snapshot_monotonic_under_concurrent_commit_and_drop() {
+        let c = Arc::new(MemoryCatalog::new());
+        let req = |name: &str| CreateTableRequest {
+            name: name.into(),
+            namespace: yuntun_model::ops::DEFAULT_SCHEMA.into(),
+            schema: schema(&[("a", DataType::Int64)]),
+            partition_cols: vec![],
+            default_format: "parquet".into(),
+            ingest_config: Default::default(),
+        };
+        c.create_table(req("keep")).await.unwrap();
+        c.create_table(req("churn")).await.unwrap();
+
+        let mut handles = Vec::new();
+        for i in 0..200u64 {
+            let c = c.clone();
+            handles.push(tokio::spawn(async move {
+                if i % 2 == 0 {
+                    c.commit_files(CommitFilesRequest {
+                        table: "keep".into(),
+                        batch_id: format!("b{i}"),
+                        client_request_id: None,
+                        shard: "s0".into(),
+                        time_window: "w".into(),
+                        files: vec![manifest(&format!("b{i}"), &format!("p{i}"))],
+                        schema_version: 1,
+                        row_count: 1,
+                    })
+                    .await
+                    .unwrap();
+                } else {
+                    let _ = c.drop_table("churn").await;
+                    let _ = c.create_table(req("churn")).await;
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let snap = c.current_snapshot().await;
+        let visible = c.list_visible_files("keep", snap, None).await.unwrap();
+        assert_eq!(
+            visible.len(),
+            100,
+            "并发 drop 不得让已提交文件因快照回退而不可见（snapshot={snap}）"
+        );
     }
 }

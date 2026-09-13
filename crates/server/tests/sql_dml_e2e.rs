@@ -142,13 +142,9 @@ async fn serve(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sql_dml_ddl_end_to_end() {
-    let base = format!(
-        "/tmp/yuntun-sqldml-e2e-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
+    // 写盘测试默认走 tmpfs（内存盘，fsync 近 no-op）；真实落盘语义的用例用 TestDir::disk
+    let base_guard = yuntun_testkit::TestDir::tmpfs("sqldml-e2e");
+    let base = base_guard.string();
     let wal_dir = format!("{base}/wal");
     let store_root = format!("{base}/store");
     let cfg = config(&wal_dir, &store_root);
@@ -356,15 +352,19 @@ async fn sql_dml_ddl_end_to_end() {
     refresh_cache(&lakehouse).await;
 
     // DDL 重放：audit_events 存在；events_copy 保持 DROP 后状态
+    // （多 schema：表标识 = 全限定 `schema.table`，裸名按 meta.name 比对）
     let tables = lakehouse.catalog.list_tables().await.unwrap();
-    let names: Vec<String> = tables.into_iter().map(|t| t.name).collect();
+    let names: Vec<String> = tables
+        .into_iter()
+        .map(|t| yuntun_model::ops::qualified_name(t.schema_name(), &t.name))
+        .collect();
     assert!(
-        names.contains(&"audit_events".to_string()),
-        "DDL 经 WAL 重放恢复"
+        names.contains(&"public.audit_events".to_string()),
+        "DDL 经 WAL 重放恢复: {names:?}"
     );
     assert!(
-        !names.contains(&"events_copy".to_string()),
-        "DROP 语义经 WAL 重放保持"
+        !names.contains(&"public.events_copy".to_string()),
+        "DROP 语义经 WAL 重放保持: {names:?}"
     );
 
     // SQL 写入的数据与 DoPut 同等持久性（WAL 权威 → 攒批/恢复后可查）
@@ -395,8 +395,8 @@ async fn sql_dml_ddl_end_to_end() {
 async fn insert_idempotency_required_on_general_table() {
     // General 表强制幂等键：run_sql 的语句级 dml-<uuid> 键必须满足检查
     // （构造：绕过 server 直接以空幂等键等价场景——此处验证 resolve 矩阵经 run_sql 生效）
-    let wal_dir = format!("/tmp/yuntun-sqldml-idem-{}", std::process::id());
-    let _ = std::fs::remove_dir_all(&wal_dir);
+    let wal_guard = yuntun_testkit::TestDir::tmpfs("sqldml-idem");
+    let wal_dir = wal_guard.string();
     let cfg = yuntun_server::Config::from_toml(&format!(
         r#"
 [store]

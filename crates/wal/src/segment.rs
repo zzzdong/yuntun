@@ -281,10 +281,8 @@ mod tests {
     use yuntun_model::wal_record::{BatchCommittedPayload, BatchPendingPayload, Record};
 
     fn tmpdir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("yuntun-wal-test-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+        // 写盘测试走 tmpfs（内存盘）
+        yuntun_testkit::TestDir::tmpfs(&format!("wal-segment-{name}")).into_path()
     }
 
     fn sample_records(n: u64) -> Vec<Record> {

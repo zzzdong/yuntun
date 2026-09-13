@@ -191,11 +191,8 @@ mod tests {
     };
 
     fn tmpdir(name: &str) -> std::path::PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("yuntun-wal-recovery-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+        // 写盘测试走 tmpfs（内存盘）；崩溃/撕裂写用例靠文件内容判定，不依赖真实 fsync
+        yuntun_testkit::TestDir::tmpfs(&format!("wal-recovery-{name}")).into_path()
     }
 
     #[tokio::test]

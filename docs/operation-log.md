@@ -300,6 +300,8 @@ civil 算法时间解析；③ `FlightServer` 增加 `run_sql` 前置分发并�
    （commit 不检查表存在性）——Manifest 挂在不存在的表下、查询不可见；若之后
    **重建同名表**会复活旧数据。阶段 0 已知工件，阶段 2 chaos / 阶段 3 Meta
    状态机时收敛。
+   > **已修复（2026-09-12，见 §21）**：攒批器按 WAL DDL 维护表存活/世代，flush 前丢弃
+   > 陈旧世代分组；恢复路径同样校验，不再产生悬挂 Manifest。
 
 ### 9.3 MVP 限制（后续扩展点）
 
@@ -625,3 +627,220 @@ DataFusion 已提供 → **不拦截**，保持原生实现）。
   → 改为**轮询 `wait_count`（≤10s）**，稳定且更快（5.16s → 2.10s）；
 - 遗留：CLI/SDK 尚未入 CI 脚本；`yuntun-wal` 的 `monitor_aborts_timed_out_batches`
   仍是时间敏感 flaky（阶段 2 卫生项，未处理）。
+
+## 17. 追加：S1.10 `do_get` 流式化 + S1.8 幂等键透传（2026-09-11）
+
+### 17.1 S1.10：结果集流式化（验收：大结果集内存平稳）
+
+| 层 | 改动 |
+|---|---|
+| `yuntun-query` | `sql_stream()`（`DataFrame::execute_stream`，不 collect）+ `stream_from_batches()`（canned/小结果集 → 流适配）；`SendableRecordBatchStream` re-export（协议层无需直接依赖 datafusion）；`futures` 复用 |
+| `yuntun-sql` | `SqlStreamResult { Rows { schema, stream }, Affected }` + `SqlEngine::execute_stream()`：与 `execute` 同一分流，SELECT 直接交物理计划流，shim/INSERT/DDL 经 `stream_from_batches` 转流（协议层单一出口） |
+| `yuntun-server` | `do_get`：标准轨 `TicketStatementQuery` 与简易轨 SQL 统一走 `do_get_sql()` → `FlightDataEncoderBuilder::with_schema(schema)` 边算边发（0 批也先发 schema，ADBC/JDBC 一致性校验）；INSERT/DDL 回空结果集；查询期错误在流中途以 `Status` 返回。元数据命令（GetTables/GetSqlInfo/XDBC）仍走批量路径 |
+
+**实测**（`scripts/flight_stream_smoke.py`，真实服务端 + ADBC）：
+
+| 规模 | 结果 |
+|---|---|
+| 100 万行写入（10×10 万，DoPut 简易轨） | 2.6s |
+| 100 万行流式读取 | 0.3s |
+| **500 万行**（列数据理论下界 ≈ 114 MB）流式读取 | 0.6s，**服务端 RSS 增量 2.2 MB**（基线 499.0 → 峰值 501.1） |
+
+> eager 路径需一次性持有整个结果集（≥114 MB）；流式路径内存与结果集规模解耦。
+
+### 17.2 S1.8：幂等键透传（验收：幂等矩阵单测覆盖）
+
+**通道**（`yuntun-sql/src/idempotency.rs` + flight 层）：
+
+| # | 通道 | 说明 |
+|---|---|---|
+| 1 | **SQL 注释**（任意协议） | `INSERT /* idempotency_key=<k> */ INTO t ...`（兼容 `-- idempotency_key=<k>` 行注释）；注释被解析器忽略，语义零影响 |
+| 2 | **prepared 语句上的键** | `PreparedStatement.idempotency_key`（prepare 时解析并随语句缓存——参数替换后的 SQL 文本已不含注释）；MySQL COM_STMT_PREPARE 与 FlightSQL `ActionCreatePreparedStatementRequest` 共用 |
+| 3 | **Flight `DoPut` 装载** | 键优先级：**每条 `FlightData.app_metadata` > prepared 上的键 > 语句级生成 `flightsql-<uuid>`**（`spawn_sql_ingest` 新增 `default_key`） |
+| 4 | 兜底 | SQL 路径未给键 → `dml-<uuid>`；require 表**缺键拒绝**不变（架构 §7.3.2） |
+
+**顺带修的真实缺陷**：`insert_target_table_str` 的前缀回落不认注释
+（`INSERT /* ... */ INTO t` 匹配不到 `insert into`）→ 装载被误判为非 INSERT 走 SQL 执行并报解析错。
+新增 `strip_comments()`（块/行注释 → 空格）+ 空白折叠后再匹配。
+
+**测试**：
+- `yuntun-sql`：`idempotency::extract` 3 组单测（形态/非法/未闭合）、`insert_target_tolerates_comments`（注释位置 ×3）、`strip_comments_keeps_word_boundaries`；
+- `crates/server/tests/sql_idempotency_e2e.rs`：三通道端到端（SQL 注释 INSERT → 1 行；prepared 注释键装载 → +2；无键兜底 → +2，require 表全程 accept）；
+- **真实协议冒烟**：CLI（`query 'INSERT /* idempotency_key=... */ ...'`）、MySQL 文本协议（pymysql）与 prepared（mysql-connector）带注释插入均成功且数据可见。
+
+### 17.3 回归
+
+- `cargo test --workspace` **120 通过 / 0 失败**（新增：sql 4 + server e2e 1）；`clippy --workspace --all-targets` **0 警告**；
+- 文档：README 新增「幂等键」小节与流式说明（原「结果集 eager」限制已更新）、冒烟脚本表增加 `flight_stream_smoke.py`；
+- 遗留：MySQL wire 轨结果集仍为 eager（逐行写）；CLI/SDK 未入 CI。
+
+## 18. 追加：测试临时目录策略（tmpfs 加速）——`yuntun-testkit`（2026-09-11）
+
+**动机**：写盘类测试（WAL / Parquet / local ObjectStore）在真实磁盘上要付 fsync +
+元数据写开销；Arch/systemd 下 `/tmp` 本身就是 **tmpfs（内存盘）**，`fsync` 近似 no-op。
+
+**本机基准**（500 × 64KB 文件 + 每文件 `fsync`）：
+
+| 位置 | 耗时 |
+|---|---|
+| tmpfs（`/tmp`） | **38 ms** |
+| 真实磁盘（`/home`，sda3） | **2422 ms**（≈64×） |
+
+### 18.1 实现：新 dev-only crate `crates/testkit`（`publish = false`）
+
+| API | 说明 |
+|---|---|
+| `tmp_root()` | 内存盘根：`YUNTUN_TEST_TMPDIR` > `$TMPDIR` > `/tmp` > `/dev/shm`（读 `/proc/mounts` 判定 tmpfs，取首个命中） |
+| `disk_root()` | 真实磁盘根：`YUNTUN_TEST_DISKDIR` > `<workspace>/target/test-disk` |
+| `is_tmpfs(path)` | 挂载点最长前缀匹配判定（非 Linux → false，保守当磁盘） |
+| `TestDir::tmpfs/disk/at(name)` | 唯一目录（pid+序号）+ **Drop 自动清理**；`.string()` 便于塞进 TOML |
+| `TestDir::into_path()` | 交出路径并放弃清理（供 `fn tmpdir() -> PathBuf` 形态的 helper） |
+
+### 18.2 接入与分工
+
+| 用例 | 位置 | 选择 |
+|---|---|---|
+| WAL 单测（segment / reader / recovery / cleanup） | `crates/wal` | **tmpfs** |
+| ingest flush、query e2e、client e2e、client 导入单测 | `crates/{ingest,query,client}` | **tmpfs** |
+| server e2e（flight / flightsql / sqldml / idempotency） | `crates/server/tests` | **tmpfs** |
+| 故障注入（重启/崩溃恢复） | `crates/chaos` | **真实磁盘**（fsync 等待与重启后目录语义必须真实） |
+| 压测 | `chaos/examples/bench` | **真实磁盘**（tmpfs 会让吞吐/延迟失真） |
+| 手动示例 | `server/examples/demo` | **真实磁盘**（数据便于观察/复用） |
+
+> 踩坑记录（值得保留）：`TestDir` 是 Drop-guard，**不能跨函数返回**——
+> `client_e2e::start_server()` 内建目录后 return 给调用方，guard 在函数返回时
+> 即删除目录，服务端后台攒批扫描报 `wal scan failed: No such file or directory`，
+> 表现为"写入成功但查询恒为 0 行"。该 helper 已改用 `into_path()`。
+> 教训：目录生命周期必须覆盖"服务/线程仍在使用"的整个区间。
+
+### 18.3 效果
+
+- `cargo test --workspace`（热态）：**124 通过 / 0 失败，约 16s**；
+  写盘较重子集（wal+ingest+server+client）约 10s；
+- 对照：同一子集把 `YUNTUN_TEST_TMPDIR` 指向真实磁盘，**首次冷跑 66s**（含大量文件
+  创建 + 冷 page cache），热跑回落到 ~10s——差异主要来自 fsync 等待与文件系统元数据；
+- 测试目录随 Drop 清理，重跑无残留（此前部分用例只删不建、或不清理）。
+
+## 19. 追加：多 schema（MySQL 的 database）支持（S1.13，R-3 提前清偿）（2026-09-11）
+
+**背景**：R-3 原定阶段 4；因阶段 2（Chaos/压测）会锁定存储路径与 WAL 格式，
+提前到阶段 1 末尾实现，避免日后迁移成本。
+
+### 19.1 核心约定
+
+**全限定表标识 `schema.table`**（`yuntun_model::ops::qualified_name`）贯穿所有层：
+Catalog 内部键、IngestBatch/WAL 的 `table` 字段、Manifest、Query 缓存键、对象路径派生；
+裸表名只在 SQL 表面与 `TableMeta.name` 出现。默认 schema = `public`（旧数据自动归属）。
+
+| 层 | 改动 |
+|---|---|
+| `yuntun-model` | `TableMeta.namespace`（protobuf tag 9，空值兼容旧数据）+ `CreateTableRequest.namespace`；`qualified_name / split_qualified / validate_schema_name`；`LakeError::Schema{NotFound,AlreadyExists,NotEmpty}` |
+| `yuntun-catalog` | `namespaces` 注册表 + `create/drop/list_schemas/schema_exists`；建表校验 schema 存在；`list_visible_files/drop_table/evolve_schema` 等对表标识做 `normalize_table` 归一（裸名兼容） |
+| `yuntun-query` | `LocalCatalogCache`（schemas 清单 + 限定名键 + `get_in`）；`YuntunCatalogProvider` 多 schema 视图；`QueryEngine::session_with_schema / sql_with_schema / sql_stream_with_schema / schema_of_with_schema` |
+| `yuntun-sql` | `resolve_table_ref`（1 段→会话 schema；2 段 catalog 前缀特判；3 段取后两段）；dispatch 全链路限定名；`CREATE/DROP DATABASE(SCHEMA)`、`SHOW DATABASES`；MySql shim 的 `USE` **真实切换**（校验存在）；`SessionCtx::schema()/set_schema` |
+| `yuntun-sqlwire` | handshake database 校验 + 切换；错误码 1049（unknown database）/ 1007 / 1008 |
+| `yuntun-server` | `GetDbSchemas` 返回真实 schema 清单（此前固定 public） |
+| `yuntun-format` | 对象路径按 schema 分层：`yuntun/<schema>/<table>/dt=.../...`（读取以 Manifest 为准，旧布局兼容） |
+| WAL | `ddl_op::CREATE_SCHEMA/DROP_SCHEMA`（`DdlPayload.table` = schema 名）；CREATE/DROP TABLE 记录**全限定名**；重放恢复 schema 与表 |
+
+### 19.2 验证
+
+| 层 | 测试 |
+|---|---|
+| 单测 | `catalog::multi_schema_isolation_and_drop_rules`（建库/隔离/非空库拒绝/默认库不可删）、`format::file_path` 分层断言、`sql::resolve_table_ref_rules`（1/2/3 段 + catalog 前缀特判） |
+| e2e | `crates/server/tests/multi_schema_e2e.rs`：建库 → 跨 schema **同名表**隔离（各查各的）→ 未知库报 404 → 非空库 DROP 拒绝 → 删表后 DROP → **崩溃重启后 schema 事件与表定义经 WAL 重放恢复** |
+| 真实客户端 | `scripts/pymysql_smoke.py` 新增 [8.2]/[8.3]：`CREATE DATABASE` → `USE`（`DATABASE()` 反映当前库）→ 跨库隔离 → 限定名查询 → `USE no_such_db` 回 **1049** → 非空库删库回 **1008** → 清理后 `SHOW DATABASES` 不再出现 —— **ALL OK** |
+
+### 19.3 回归与附带修复
+
+- `cargo test --workspace` **126 通过 / 0 失败**；`clippy --workspace --all-targets` **0 警告**；
+- 附带修复（§18 tmpfs→磁盘改造暴露）：chaos `crash_recovery_no_data_loss` 的恢复断言
+  原依赖固定 500ms 等待（tmpfs 上足够、真实磁盘上"WAL 重放→flush→commit"超时）→ 改为
+  **轮询等待（≤30s）**；并修正重排时 accumulator 被立即 cancel 的错误（它必须在轮询期间
+  保持运行）；chaos 三用例经 `CHAOS_GATE` 串行（重 IO + 共享环境，消除时序噪声）；
+- 遗留：`USE` 在 Flight/PG wire 的等价语义（`SET search_path`）未做（PG 客户端可用
+  限定名）；`SHOW TABLES FROM db` 语法未支持（可用 `SHOW TABLES` + `USE` 或限定名查询）。
+
+## 20. 协议决策：撤销无源 INSERT 形态，只支持标准完整语句（2026-09-12）
+
+**考古**：无源形态 `INSERT INTO t (a, b)`（无 VALUES/SELECT 源）源于 S1.1-S1.5 手写
+pyarrow protobuf 冒烟时的省事写法（数据反正走 Arrow 流），S1.6 实现时服务端为它
+配了字符串匹配回落（`insert_target_table_str` + `strip_comments`）。它不是任何标准
+或第三方客户端的要求：自研 SDK 批量写入走简易轨（PATH descriptor，无 SQL）；
+ADBC 冒烟仅查询。
+
+**决策**：FlightSQL `DoPut` 轨道统一约定客户端发送**标准完整语句**
+`INSERT INTO t [(cols)] VALUES (?, ?)`——bind 数据是 Arrow batch，占位符被服务端
+忽略；`insert_target` 退化为纯 AST 路径，删除字符串兜底与 `strip_comments`。
+（曾评估自定义 sqlparser Dialect 支持 bind 模板：0.62 具备 `parse_statement` 钩子
+与 `Insert.source: Option` 两个前提，技术上可行；但该形态本无标准依据，不值得
+维护包装方言的委托成本与执行路径防呆——撤。未来标准路线是 `CommandStatementIngest`
+，表名走 proto 结构化字段，零解析。）
+
+| 改动 | 文件 |
+|---|---|
+| `insert_target` 纯 AST 化；删 `strip_comments` / `insert_target_table_str` 及单测 | `crates/sql/src/sql.rs` |
+| 无源 INSERT 改完整形态（`VALUES (?, ?)`） | `flight_sql_e2e.rs` / `sql_idempotency_e2e.rs` / `pyarrow_smoke.py` |
+
+回归：全量通过；mysql/flight 既有行为不变（MySQL wire `COM_STMT_PREPARE` 一直要求
+完整语句，本决策只是把 Flight 轨道对齐到同一标准）。
+
+## 21. 修复：写后可见性（读己之写）+ DROP 语义 + WAL/Catalog 一致性（2026-09-12）
+
+### 21.1 冒烟现象与根因（先纠正归因）
+
+冒烟报"DROP TABLE + 同名 CREATE TABLE 后新写入数据查不到（15s 轮询），重启后又能查到"。
+实测（默认配置、**无 DROP、无重启、干净目录**）复现同一现象：
+
+| 观测点 | 延迟 |
+|---|---|
+| INSERT（分钟第 0 秒）→ catalog 可见（flush+commit 落盘） | **29.1s**（= `public.mysql_smoke` 的 jitter 偏移） |
+| → SQL 查询可见（走本地缓存） | **47.9s**（再叠一次缓存 TTL 落点） |
+
+根因是**两条异步窗口**，与 DROP/CREATE 无关（`pymysql_smoke.py` 每次运行都先 DROP+CREATE，
+因此被误当变量）：
+
+1. Flush 时刻 = `window_start + hash(shard+table) % flush_jitter_secs`（ADR-10 削峰），
+   默认 60s 内任意秒；写入发生在分钟前段时最长等 ≈jitter 秒；
+2. 查询走 `LocalCatalogCache`，原只在 TTL（默认 30s）到点刷新。
+   两者叠加最坏 ≈60s+30s，而回执 `expected_visible_in_secs` 写死 `time_threshold_secs`（5s）。
+
+"重启后可见"= 重启触发立即缓存刷新 + 攒批线程全量重读 WAL（`window_ms` 变为重启所在分钟，
+若已越过 jitter 秒则立即 flush）；"孤儿清理删旧文件"= DROP 后文件转孤儿，属设计语义。
+
+### 21.2 修复项
+
+| # | 修复 | 位置 |
+|---|---|---|
+| 1 | **读己之写 = store 层分片的两级形态**：`yuntun-store::shard` 定义 `ShardTier{Memory,Disk}` / `ShardId(table, shard, window)` / `MemoryShard`（内存分片，Live / Committed(snapshot) 两态）/ `DiskShard`（对象存储上的分片）/ `ShardStore` 门面。写入侧把已 fsync 未提交的批次写进内存分片、提交后交棒；`YuntunTableProvider::scan` 用 **内存分片 ∪ 磁盘分片（Parquet 文件组）**（`UnionExec`）做无空洞/无重复交接，缓存刷到该快照后 `sweep` 回收。**查询只依赖 store 层，不依赖 Ingestor 进程**；分离部署时仅替换本层实现 | `crates/store/src/{shard.rs,lib.rs}`、`crates/query/src/{table,provider,cache}.rs`、`crates/ingest/src/{pipeline,flush,accumulator}.rs`、`crates/server/src/lib.rs` |
+| 2 | 回执 `expected_visible_in_secs` 改为真实上界（扫描周期），不再写死 5s | `crates/ingest/src/pipeline.rs` |
+| 3 | **提交驱动缓存刷新**：内存分片变更计数一变即刷新（200ms 轮询），TTL 仅兜底 | `crates/query/src/cache.rs` |
+| 4 | **DROP 语义**：攒批器按 WAL DDL 维护表存活/世代（epoch 进分组键），flush 前丢弃陈旧世代分组；恢复路径（Pending 批次重做）用 DDL 时间线校验世代，陈旧则 `BatchAbort` —— 不再产生悬挂 Manifest / 旧数据复活 | `crates/ingest/src/{accumulator,pipeline}.rs` |
+| 5 | **`snapshot_version` 严格单调**：`commit_files/commit_compaction/drop_shard` 由 `load()+1`+`store()` 改为原子 `fetch_add`（原实现与 `drop_table` 交错时会把快照号**回退**，让已提交文件永久不可见） | `crates/catalog/src/lib.rs` |
+| 6 | **WAL 水位/回执**：`WalWriter::open` 水位初值由 `last_seq` 改为 `synced_seq`（不再超出真实 fsync 边界）；组提交内每条记录回各自的 seq（此前整批都回 `last_seq`）；新增 `next_seq()` 用于区分"历史数据/本进程新写入" | `crates/wal/src/writer.rs` |
+
+### 21.3 读侧接缝（`ShardReader` / `ShardFetch`）
+
+为避免"热数据 = Ingestor 的进程内缓冲"这一错误耦合，读侧抽成 trait：
+
+| 抽象 | 位置 | 实现 |
+|---|---|---|
+| `ShardReader`（`shards_of / read_shard / read_table / reclaim`） | `crates/store/src/shard.rs` | ① `MemoryShard`（进程内，阶段 0）；② `RemoteShard`（远端分片服务，传输由 `ShardFetch` 注入） |
+| `ShardFetch`（`fetch_shards / fetch_shard / fetch_version`） | 同上 | 阶段 1：gRPC / HTTP；单测：假实现 |
+
+查询侧只持有 `Arc<dyn ShardReader>`（`LocalCatalogCache::set_hot_shards` / `TableProvider.hot`），
+`crates/query` 对 `crates/ingest` **无（非 dev）依赖**；分离部署只需把 `ShardStore::local(...)`
+换成分片服务的 `RemoteShard`，SQL 侧零改动（验证见 `crates/query/tests/hot_shard_reader.rs`）。
+
+### 21.4 验证
+
+- 新增回归：`crates/server/tests/write_then_read.rs`（读己之写 latency < 1s 且此时 **零个已提交文件**；
+  DROP + 重启 + 同名重建 → `count(*) = 0` 且无悬挂 Manifest）、
+  `crates/ingest/tests/recovery_guard_e2e.rs`（陈旧世代 Pending 批次被 abort）、
+  `crates/query/tests/hot_shard_reader.rs`（经 `ShardReader` 的**远端**实现读热数据，接缝可替换）、
+  `catalog::snapshot_monotonic_under_concurrent_commit_and_drop`、`wal::writer::tests`（水位/逐条 ack）、
+  `store::shard::tests`（分片隔离 / 世代 / prefix 对齐 / 两个 `ShardReader` 实现）；
+- `cargo test --workspace` 全绿；`cargo clippy --workspace --all-targets` 0 警告；
+- README「已知限制」与「最小闭环」的可见性描述同步更新；
+- 副作用：接管了 `chaos::query_multi_version_alignment` 的固定 `sleep(500ms)`（改轮询 ≤30s，
+  真实磁盘 + 并发负载下固定等待会偶发超时）。

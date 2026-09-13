@@ -24,6 +24,7 @@ futures = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+yuntun-testkit = { path = "../testkit" }
 yuntun-ingest = { path = "../ingest" }
 yuntun-wal = { path = "../wal" }
 yuntun-store = { path = "../store" }

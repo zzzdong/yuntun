@@ -40,7 +40,10 @@ pub fn extract_event_time_ms(batch: &arrow::record_batch::RecordBatch) -> Option
     None
 }
 
-/// 一个 (table, shard, window) 分组的攒批缓冲。
+/// 一个 (table, shard, window, epoch) 分组的攒批缓冲。
+///
+/// `epoch` = 表世代（见 `yuntun_store::shard`）：DROP 后重建同名表会产生**新的 epoch**，
+/// 老世代的分组在 flush 前被判定为陈旧并丢弃 —— 这是"DROPPED 表数据不得复活"的关键。
 #[derive(Debug, Default)]
 pub struct WindowGroup {
     pub table: String,
@@ -50,14 +53,23 @@ pub struct WindowGroup {
     pub window: String,
     /// 累积的 WAL Data 记录（按到达顺序）
     pub payloads: Vec<DataPayload>,
+    /// 各组 payload 的 WAL seq（与 `payloads` 等长；未落盘内存视图的提交标记/回收用）
+    pub seqs: Vec<u64>,
     /// 该组第一个 payload 的 WAL seq（BatchPending.wal_seq_range 起点用）
     pub first_seq: u64,
     /// 累积行数
     pub rows: u64,
     pub created_at_ms: u64,
+    /// 表世代（分组键的一部分）
+    pub epoch: u64,
 }
 
 impl WindowGroup {
+    /// 该组对应的分片标识（内存分片 / 磁盘分片共用同一 key）。
+    pub fn shard_id(&self) -> yuntun_store::ShardId {
+        yuntun_store::ShardId::new(self.table.clone(), self.shard.clone(), self.window.clone())
+    }
+
     /// flush 触发判定（§5.3 任一满足即 flush）。
     pub fn should_flush(&self, now_ms: u64, cfg: &crate::pipeline::IngestorConfig) -> bool {
         // ① 行数阈值
@@ -84,10 +96,10 @@ impl WindowGroup {
     }
 }
 
-/// 攒批缓冲集合：key = (table, shard, window)。
+/// 攒批缓冲集合：key = (table, shard, window, epoch)。
 #[derive(Debug, Default)]
 pub struct BatchAccumulator {
-    groups: HashMap<(String, String, String), WindowGroup>,
+    groups: HashMap<(String, String, String, u64), WindowGroup>,
 }
 
 impl BatchAccumulator {
@@ -95,11 +107,25 @@ impl BatchAccumulator {
         Self::default()
     }
 
+    /// 入账（epoch = 0：不经 WAL DDL 建表的调用方 / 单测）。
     pub fn push(&mut self, payload: DataPayload, seq: u64, rows: u64, now_ms: u64) {
+        self.push_with_epoch(payload, seq, rows, now_ms, 0);
+    }
+
+    /// 入账并指定表世代（epoch 进分组键：老世代数据不会与新世代混在同一组）。
+    pub fn push_with_epoch(
+        &mut self,
+        payload: DataPayload,
+        seq: u64,
+        rows: u64,
+        now_ms: u64,
+        epoch: u64,
+    ) {
         let key = (
             payload.table.clone(),
             payload.shard.clone(),
             payload.time_window.clone(),
+            epoch,
         );
         let entry = self.groups.entry(key).or_insert_with(|| WindowGroup {
             table: payload.table.clone(),
@@ -107,11 +133,14 @@ impl BatchAccumulator {
             window_ms: window_start_ms(now_ms as i64),
             window: payload.time_window.clone(),
             payloads: Vec::new(),
+            seqs: Vec::new(),
             first_seq: seq,
             rows: 0,
             created_at_ms: now_ms,
+            epoch,
         });
         entry.payloads.push(payload);
+        entry.seqs.push(seq);
         entry.rows += rows;
     }
 
@@ -202,22 +231,24 @@ mod tests {
         // 未来窗口：时间阈值不会触发，纯行数阈值判定
         let future_window_ms = (now as i64) + 3_600_000;
         acc.groups.insert(
-            ("t".into(), "s0".into(), "w1".into()),
+            ("t".into(), "s0".into(), "w1".into(), 0),
             WindowGroup {
                 table: "t".into(),
                 shard: "s0".into(),
                 window_ms: future_window_ms,
                 window: "w1".into(),
                 payloads: Vec::new(),
+                seqs: Vec::new(),
                 first_seq: 0,
                 rows: 9_999,
                 created_at_ms: now,
+                epoch: 0,
             },
         );
         assert!(acc.drain_ready(now, &cfg()).is_empty());
         let g = acc
             .groups
-            .get_mut(&("t".into(), "s0".into(), "w1".into()))
+            .get_mut(&("t".into(), "s0".into(), "w1".into(), 0))
             .unwrap();
         g.rows += 1;
         let ready = acc.drain_ready(now, &cfg());

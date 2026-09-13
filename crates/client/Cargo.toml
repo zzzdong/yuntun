@@ -23,6 +23,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+yuntun-testkit = { path = "../testkit" }
 yuntun-server = { path = "../server" }
 yuntun-catalog = { path = "../catalog" }
 yuntun-model = { path = "../model" }

@@ -52,7 +52,7 @@ conn = pymysql.connect(host="127.0.0.1", port=3306, user="yuntun", database="pub
 with conn, conn.cursor() as cur:
     cur.execute("CREATE TABLE api_audit (event_time TIMESTAMP, user TEXT, endpoint TEXT, cost_ms INT)")
     cur.execute("INSERT INTO api_audit VALUES (TIMESTAMP '2026-09-11 01:00:00', 'alice', '/v1/put', 12)")
-    # 写入先落 WAL，攒批后可见（默认 5s / 1 万行，可按 [ingest] 调小）
+    # 写入先落 WAL；攒批线程在一个扫描周期内把它放进 store 层"内存分片" → 立即可查（读己之写，默认 ≤1s）
     cur.execute("SELECT user, count(*) AS cnt FROM api_audit GROUP BY user")
     print(cur.fetchall())          # [('alice', 1)]
 ```
@@ -143,13 +143,49 @@ java -cp "$JAR:scripts" dbeaver_jdbc_probe
 
 - **无事务**：单语句自动提交，`BEGIN/COMMIT/ROLLBACK` 为 no-op；
 - **trust 鉴权**：`[sql.mysql].users` 非空仅告警，当前不做口令校验——请按网络隔离部署；
-- **单 schema**：`yuntun.public`，`USE db` 仅记录不切换（设计 R-3）；
-- **写后可见有延迟**：INSERT 成功即落 WAL，攒批窗口（默认 5s / 1 万行）后可见——
-  冒烟/演示可在配置里把 `[ingest].time_threshold_secs` 与 `[query].cache_ttl_secs` 调小；
+- **写后可查（读己之写）**：`INSERT` 成功即落 WAL；攒批线程在一个扫描周期（`[ingest].scan_interval_ms`，
+  默认 100ms）内把该批数据发布到 store 层的**内存分片**，查询立即可见 —— **不再受 Flush Jitter（≤60s）
+  与查询缓存 TTL（默认 30s）影响**（`docs/plan.md` §4.5 / `docs/design.md` §7.4）；
+  数据落对象存储（Parquet + Manifest）仍按攒批窗口进行，落盘后进入快照隔离 / Compaction 语义；
+  回执的 `expected_visible_in_secs` = 该扫描周期上界；
 - **prepared SELECT 取不到结果行**：opensrv-mysql 0.7 只提供文本结果集编码，
   COM_STMT_EXECUTE 的结果行按文本回写 → 二进制协议客户端需关闭服务端预编译
   （JDBC `useServerPrepStmts=false`）；**写路径（OK 包）不受影响**；
-- **结果集为 eager**（G7）：大结果集全量缓冲，流式化随 S1.10 清偿。
+- **结果集**：Flight 轨（`do_get`）**已流式**（S1.10：边算边发，500 万行 / 114 MB 级
+  结果集服务端 RSS 增量 ≈ 2 MB）；MySQL wire 轨仍为逐行写但结果先收集（后续按需优化）。
+
+### 多 schema（MySQL 的 database）
+
+一个 catalog（`yuntun`）下支持任意多个 schema，MySQL 客户端的 `database` 即 schema：
+
+```sql
+CREATE DATABASE sales;                        -- 也可 CREATE SCHEMA
+USE sales;                                    -- 切换会话默认 schema（MySQL wire）
+CREATE TABLE orders (ts BIGINT, amt BIGINT);  -- 归属 sales
+INSERT INTO orders VALUES (1, 100);
+SELECT * FROM sales.orders;                   -- 任意会话可用限定名跨库查询
+SHOW DATABASES;                               -- Flight/MySQL 均返回真实清单
+DROP DATABASE sales;                          -- 仅空库可删（非空报 1008）
+```
+
+- 同名表跨 schema 隔离（表标识 = 全限定 `schema.table`，Catalog/WAL/对象路径统一）；
+- 对象路径按 schema 分层：`yuntun/<schema>/<table>/dt=.../shard=.../<batch>.<ext>`；
+- `USE` 不存在的库 / 未知库建表 → MySQL 1049；非空库删除 → 1008；重复建库 → 1007；
+- 崩溃重启：schema 事件与表定义均由 WAL DDL 重放恢复；
+- 旧数据（v1 单 schema）自动归属默认库 `public`。
+
+### 幂等键（写入去重通道）
+
+`require` 表（`CREATE TABLE` 默认模板）必须携带幂等键，右侧三种通道任选：
+
+| 通道 | 用法 |
+|---|---|
+| SQL 注释（任意协议） | `INSERT /* idempotency_key=<k> */ INTO t VALUES (...)`（也支持 `-- idempotency_key=<k>` 行注释） |
+| `yuntun-cli` | `yuntun-cli insert -t t -f data.csv --key <k>`（不传则客户端自动生成） |
+| Flight `DoPut` | `FlightData.app_metadata = {"idempotency_key": "<k>"}` |
+
+未提供键时：SQL 路径按语句级生成（`dml-<uuid>`），FlightSQL prepared/装载按
+`app_metadata > prepared 语句上的注释键 > flightsql-<uuid>` 优先级取值。
 
 ---
 
@@ -167,6 +203,7 @@ scripts/.venv/bin/pip install -r scripts/requirements.txt -i https://mirrors.ali
 | `scripts/pyarrow_smoke.py <flight地址>` | Flight SQL：ADBC 查询 + 元数据 + 原始 Flight prepared 写入 |
 | `scripts/pyarrow_sqlinfo_smoke.py <flight地址>` | Flight SQL：`GetSqlInfo` 信息项 |
 | `scripts/pymysql_smoke.py <mysql地址>` | MySQL wire：T1 文本协议（DDL/INSERT/SELECT/SHOW/错误码 1146）+ T2 预编译 |
+| `scripts/flight_stream_smoke.py <flight地址> <表> [批数 行数]` | Flight `do_get` 流式（S1.10）：灌数 + ADBC 流式读取 + 服务端 RSS 采样（`0 0` = 只读模式） |
 | `scripts/dbeaver_jdbc_probe.java` | DBeaver / JDBC：T3 元数据与预览（需 `javac` + Connector/J） |
 
 ---
@@ -191,8 +228,27 @@ scripts/     # 独立客户端冒烟脚本
 ## 7. 开发
 
 ```bash
-cargo test --workspace              # 全量回归
+cargo test --workspace              # 全量回归（默认落在 tmpfs，热态 ~16s）
 cargo clippy --workspace --all-targets
+```
+
+### 测试临时目录策略（`crates/testkit`）
+
+写盘类测试（WAL / Parquet / local ObjectStore）都是"写文件 + 读回"形态，默认落在
+**tmpfs（内存盘）**：Arch/systemd 下 `/tmp` 即 tmpfs，`fsync` 近似 no-op。
+本机基准（500 个 64KB 文件 + `fsync`）：**tmpfs 38ms vs 真实磁盘 2422ms（≈64×）**。
+
+需要**真实落盘语义**（fsync 等待、磁盘水位、崩溃注入、大文件压测）的用例显式使用
+`TestDir::disk`——`chaos`、`chaos/examples/bench`、`server/examples/demo` 已如此。
+
+| 环境变量 | 作用 | 默认 |
+|---|---|---|
+| `YUNTUN_TEST_TMPDIR` | 覆盖内存盘根 | `$TMPDIR` → `/tmp` → `/dev/shm`（取首个 tmpfs） |
+| `YUNTUN_TEST_DISKDIR` | 覆盖真实磁盘根 | `<workspace>/target/test-disk` |
+
+```rust
+let dir = yuntun_testkit::TestDir::tmpfs("wal-e2e");   // 自动创建 + Drop 清理
+let wal_dir = dir.string();                            // 直接塞进 TOML 配置
 ```
 
 文档与阶段进度：`docs/operation-log.md`（最新进展在文末章节）。

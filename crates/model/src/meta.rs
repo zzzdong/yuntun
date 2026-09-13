@@ -44,9 +44,27 @@ pub struct TableMeta {
     /// v1 扩展：表模板（0=Audit 1=General 2=Metrics 3=Traces）
     #[prost(uint32, tag = "8")]
     pub table_template: u32,
+    /// **多 schema 扩展**：所属 schema（MySQL 的 database 概念）；空字符串视作
+    /// [`crate::ops::DEFAULT_SCHEMA`]（向后兼容 v1 单 schema 数据）。
+    #[prost(string, tag = "9")]
+    pub namespace: String,
 }
 
 impl TableMeta {
+    /// 表所属 schema（空值 → 默认 `public`，兼容旧数据）。
+    pub fn schema_name(&self) -> &str {
+        if self.namespace.is_empty() {
+            crate::ops::DEFAULT_SCHEMA
+        } else {
+            &self.namespace
+        }
+    }
+
+    /// 全限定表标识 `schema.table`（跨层唯一表标识：Catalog / Ingest / WAL / 对象路径）。
+    pub fn qualified_name(&self) -> String {
+        crate::ops::qualified_name(self.schema_name(), &self.name)
+    }
+
     pub fn schema(&self) -> Result<SchemaRef, crate::error::LakeError> {
         deserialize_schema(&self.arrow_schema)
     }

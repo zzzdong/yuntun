@@ -12,15 +12,16 @@ use yuntun_model::IngestBatch;
 
 #[tokio::test]
 async fn scan_accumulate_flush() {
-    let wal_dir = std::env::temp_dir().join(format!("yuntun-flush-dbg-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&wal_dir);
-    std::fs::create_dir_all(&wal_dir).unwrap();
+    // 写盘测试默认走 tmpfs（内存盘）；真实落盘语义的用例用 TestDir::disk
+    let wal_guard = yuntun_testkit::TestDir::tmpfs("flush-e2e-wal");
+    let wal_dir = wal_guard.path().to_path_buf();
 
     let catalog: Arc<dyn yuntun_catalog::CatalogOps> = Arc::new(MemoryCatalog::new());
     let store = yuntun_store::create_store(&yuntun_store::StoreConfig::Memory).unwrap();
     catalog
         .create_table(CreateTableRequest {
             name: "t".into(),
+            namespace: yuntun_model::ops::DEFAULT_SCHEMA.into(),
             schema: Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)])),
             partition_cols: vec![],
             default_format: "parquet".into(),

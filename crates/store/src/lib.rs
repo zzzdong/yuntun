@@ -1,7 +1,17 @@
-//! 对象存储抽象（详细设计 §2：S3 / 本地 / Mock）。
+//! 存储层：对象存储抽象（详细设计 §2：S3 / 本地 / Mock）+ **分片存储形态**（[`shard`]）。
 //!
-//! 统一封装 `object_store`，测试用 `memory`（阶段 0.5 Mock S3），
-//! 开发用 `local`（本地文件系统），生产用 `s3`（MinIO 兼容）。
+//! - 对象存储：统一封装 `object_store`，测试用 `memory`（阶段 0.5 Mock S3），
+//!   开发用 `local`（本地文件系统），生产用 `s3`（MinIO 兼容）；
+//! - 分片存储（[`shard`]）：同一 shard 的两种形态 —— **内存分片**（已 fsync、未落盘的热数据）
+//!   与 **磁盘分片**（对象存储上由 Manifest 索引的冷数据）。"写后立即可查（读己之写）"
+//!   属于本层语义，查询侧只依赖 store 层，不依赖 Ingestor 进程。
+
+pub mod shard;
+
+pub use shard::{
+    DiskShard, HotBatch, MemoryShard, MemoryState, RemoteShard, ShardFetch, ShardId, ShardReader,
+    ShardStore, ShardTier, TableLiveness,
+};
 
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use std::sync::Arc;

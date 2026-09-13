@@ -136,6 +136,7 @@ mod tests {
         catalog
             .create_table(CreateTableRequest {
                 name: "t".into(),
+                namespace: yuntun_model::ops::DEFAULT_SCHEMA.into(),
                 schema: sch(&[("a", DataType::Int64)]),
                 partition_cols: vec![],
                 default_format: "parquet".into(),
@@ -178,6 +179,7 @@ mod tests {
         catalog
             .create_table(CreateTableRequest {
                 name: "t".into(),
+                namespace: yuntun_model::ops::DEFAULT_SCHEMA.into(),
                 schema: sch(&[("a", DataType::Int64)]),
                 partition_cols: vec![],
                 default_format: "parquet".into(),

@@ -37,8 +37,9 @@ use arrow_flight::sql::{
     Searchable, SqlInfo, SqlSupportedTransaction, TicketStatementQuery, XdbcDataType,
 };
 use arrow_flight::{
-    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
-    HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaAsIpc, SchemaResult, Ticket,
+    encode::FlightDataEncoderBuilder, error::FlightError, Action, ActionType, Criteria, Empty,
+    FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse,
+    PollInfo, PutResult, SchemaAsIpc, SchemaResult, Ticket,
 };
 use futures::StreamExt;
 use prost::Message;
@@ -50,13 +51,16 @@ use yuntun_model::error::LakeError;
 use yuntun_query::QueryEngine;
 use yuntun_sql::session::SessionCtx;
 use yuntun_sql::sql::insert_target;
-use yuntun_sql::{SqlEngine, SqlError, SqlResult};
+use yuntun_sql::{SqlEngine, SqlError, SqlResult, SqlStreamResult};
 
-/// 固定 catalog / schema 名（与 yuntun_query 常量一致）。
+/// 固定 catalog 名（与 yuntun_query 常量一致；schema 已支持多个）。
 pub(crate) const CATALOG_NAME: &str = yuntun_query::CATALOG_NAME;
-pub(crate) const SCHEMA_NAME: &str = yuntun_query::SCHEMA_NAME;
 /// prepared statement handle 前缀（区别于内嵌 SQL 的无状态 handle）。
 const PS_PREFIX: &str = "ps:";
+
+/// `do_get` 响应流类型（与 `FlightService::DoGetStream` 同构；inherent impl 内引用）。
+type DoGetStream =
+    std::pin::Pin<Box<dyn futures::Stream<Item = Result<FlightData, Status>> + Send + 'static>>;
 
 /// Flight gRPC 服务端：直接组合 ingest（写）/ query（读）/ catalog（meta）底层能力。
 pub struct FlightServer {
@@ -64,8 +68,19 @@ pub struct FlightServer {
     pub(crate) query: Arc<QueryEngine>,
     /// SQL 处理层（v13：分流/prepare/元数据语义的唯一实现）
     pub(crate) sql: Arc<SqlEngine>,
-    /// prepared statement：handle（剥 `ps:` 前缀）→ SQL
-    pub(crate) prepared: Mutex<HashMap<String, String>>,
+    /// prepared statement：handle（剥 `ps:` 前缀）→ （SQL + 幂等键）
+    pub(crate) prepared: Mutex<HashMap<String, PreparedEntry>>,
+}
+
+/// prepared 语句缓存条目。
+///
+/// S1.8：幂等键随语句保存——客户端可在创建 prepared 的 SQL 里用注释携带
+/// （`/* idempotency_key=... */`），装载时作为默认键（参数替换后的 SQL 文本
+/// 已不含注释，不能再从文本解析）。
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedEntry {
+    sql: String,
+    idempotency_key: Option<String>,
 }
 
 impl FlightServer {
@@ -118,7 +133,7 @@ impl FlightServer {
                 .lock()
                 .expect("prepared lock poisoned")
                 .get(id)
-                .cloned()
+                .map(|e| e.sql.clone())
                 .ok_or_else(|| Status::not_found(format!("unknown prepared statement: {id}")));
         }
         // 无状态 handle = SQL 本体（标准轨/简易轨共享无状态查询）
@@ -242,6 +257,36 @@ impl FlightServer {
             .map_err(sql_status)
     }
 
+    /// SQL → `do_get` 流（S1.10：**流式编码**，不再 collect 全量）。
+    ///
+    /// - SELECT：DataFusion 物理计划流经 `FlightDataEncoderBuilder` 边算边发；
+    ///   `with_schema` 保证 0 批也先发 schema（ADBC/JDBC 一致性校验）；
+    /// - INSERT / DDL（Affected）：空结果集（仅 schema 消息）；
+    /// - 查询期错误在流中途以 `Status` 返回（已发批次不回收，与 Flight 语义一致）。
+    async fn do_get_sql(&self, sql: &str) -> Result<Response<DoGetStream>, Status> {
+        let mut session = SessionCtx::default();
+        match self
+            .sql
+            .execute_stream(sql, &mut session)
+            .await
+            .map_err(sql_status)?
+        {
+            SqlStreamResult::Rows { schema, stream } => {
+                let flights = FlightDataEncoderBuilder::new()
+                    .with_schema(schema)
+                    .build(stream.map(|r| r.map_err(|e| FlightError::ExternalError(Box::new(e)))))
+                    .map(|r| r.map_err(|e| Status::internal(format!("flight encode: {e}"))));
+                Ok(Response::new(Box::pin(flights)))
+            }
+            SqlStreamResult::Affected(_) => {
+                let flights = encode_stream_with_schema(Vec::new(), None)?;
+                Ok(Response::new(Box::pin(tokio_stream::iter(
+                    flights.into_iter().map(Ok),
+                ))))
+            }
+        }
+    }
+
     /// 执行无数据 SQL 更新（StatementUpdate / prepared update 的非装载分支）。
     /// 前置分流后 INSERT / DDL 不再打 DataFusion。
     async fn execute_update(&self, sql: &str) -> Result<i64, Status> {
@@ -269,14 +314,23 @@ impl FlightServer {
                 let _ = tx.send(Ok(update_put_result(count))).await;
             }
             PutRoute::PreparedStatementUpdate(handle) => {
-                let sql = self.prepared_sql(&handle)?;
+                let entry = self.prepared_entry(&handle)?;
+                let sql = entry.sql.clone();
                 match insert_target(&sql) {
                     // INSERT prepared + 绑定数据 → 批量 append（FlightSQL 标准写入路径）
                     Some(table) => {
                         let schema = flight_schema_of(&first).ok_or_else(|| {
                             Status::invalid_argument("first FlightData must carry schema")
                         })?;
-                        spawn_sql_ingest(self.ingest.clone(), table, schema, stream, tx);
+                        // S1.8：键优先级 = 每条 FlightData 的 app_metadata > prepared 语句上的键 > 生成
+                        spawn_sql_ingest(
+                            self.ingest.clone(),
+                            table,
+                            schema,
+                            stream,
+                            tx,
+                            entry.idempotency_key.clone(),
+                        );
                     }
                     // 非 INSERT（DDL）：排空流后执行
                     None => {
@@ -297,7 +351,7 @@ impl FlightServer {
                 let schema = flight_schema_of(&first).ok_or_else(|| {
                     Status::invalid_argument("first FlightData must carry schema")
                 })?;
-                spawn_sql_ingest(self.ingest.clone(), table, schema, stream, tx);
+                spawn_sql_ingest(self.ingest.clone(), table, schema, stream, tx, None);
             }
         }
         Ok(())
@@ -305,7 +359,7 @@ impl FlightServer {
 
     // ------------------------------------------------------ prepared 管理
 
-    fn prepared_sql(&self, handle: &[u8]) -> Result<String, Status> {
+    fn prepared_entry(&self, handle: &[u8]) -> Result<PreparedEntry, Status> {
         let s = std::str::from_utf8(handle)
             .map_err(|_| Status::invalid_argument("prepared_statement_handle must be UTF-8"))?;
         let id = s
@@ -397,23 +451,23 @@ impl FlightService for FlightServer {
         let ticket = request.into_inner();
         // 标准轨：FlightSQL ticket（Any 编码）
         if let Some(command) = Self::decode_command(&ticket.ticket) {
-            // (batches, fallback_schema)：空结果集必须返回查询 schema——
-            // 与 GetFlightInfo 声明的 schema 一致（ADBC/JDBC 校验，0 字段空 schema
+            // 语句查询（FlightSQL 标准轨）：走流式编码（S1.10），先于批量分支返回
+            if let Command::TicketStatementQuery(t) = &command {
+                // S1.6/S1.7：统一经 run_sql 前置分流（INSERT/DDL 亦可通过 do_get 执行）
+                let sql = self.resolve_handle(&t.statement_handle)?;
+                return self.do_get_sql(&sql).await;
+            }
+            // 其余命令为小体量元数据：(batches, fallback_schema)——空结果集必须返回
+            // 查询 schema，与 GetFlightInfo 声明一致（ADBC/JDBC 校验，0 字段空 schema
             // 会被判 "inconsistent schema"）
             let (batches, fallback) = match command {
-                Command::TicketStatementQuery(t) => {
-                    // S1.6/S1.7：统一经 run_sql 前置分流（INSERT/DDL 亦可通过 do_get 执行）
-                    let sql = self.resolve_handle(&t.statement_handle)?;
-                    match self.run_sql(&sql).await? {
-                        SqlResult::Rows { schema: _, batches } if !batches.is_empty() => {
-                            (batches, None)
-                        }
-                        SqlResult::Rows { schema, .. } => (Vec::new(), Some(schema)),
-                        SqlResult::Affected(_) => (Vec::new(), None),
-                    }
-                }
+                Command::TicketStatementQuery(_) => unreachable!("handled above"),
                 Command::CommandGetCatalogs(_) => (vec![catalogs_batch()], None),
-                Command::CommandGetDbSchemas(_) => (vec![schemas_batch()], None),
+                // 多 schema：列出 catalog 中全部 schema（此前固定返回 public）
+                Command::CommandGetDbSchemas(_) => {
+                    let schemas = self.sql.list_schemas().await.map_err(sql_status)?;
+                    (vec![schemas_batch(&schemas)], None)
+                }
                 Command::CommandGetTableTypes(_) => (vec![table_types_batch()], None),
                 Command::CommandGetTables(c) => (self.tables_batches(&c).await?, None),
                 // 能力元数据（JDBC/DBeaver 兼容，S1.5 收尾）
@@ -448,16 +502,7 @@ impl FlightService for FlightServer {
         if sql.trim().is_empty() {
             return Err(Status::invalid_argument("empty SQL in ticket"));
         }
-        let (batches, fallback) = match self.run_sql(&sql).await? {
-            SqlResult::Rows { schema: _, batches } if !batches.is_empty() => (batches, None),
-            SqlResult::Rows { schema, .. } => (Vec::new(), Some(schema)),
-            // 写入/DDL：空结果（仅 schema）
-            SqlResult::Affected(_) => (Vec::new(), None),
-        };
-        let flights = encode_stream_with_schema(batches, fallback)?;
-        Ok(Response::new(Box::pin(tokio_stream::iter(
-            flights.into_iter().map(Ok),
-        ))))
+        self.do_get_sql(&sql).await
     }
 
     async fn do_put(
@@ -599,10 +644,14 @@ impl FlightService for FlightServer {
                     dataset_schema: dataset_schema.into(),
                     parameter_schema: Vec::new().into(), // MVP 不支持绑定参数
                 };
-                self.prepared
-                    .lock()
-                    .expect("prepared lock poisoned")
-                    .insert(handle.trim_start_matches(PS_PREFIX).to_string(), req.query);
+                self.prepared.lock().expect("prepared lock poisoned").insert(
+                    handle.trim_start_matches(PS_PREFIX).to_string(),
+                    PreparedEntry {
+                        // S1.8：prepared 语句可携带幂等键（SQL 注释通道）
+                        idempotency_key: yuntun_sql::idempotency::extract(&req.query),
+                        sql: req.query,
+                    },
+                );
                 return Ok(Response::new(Box::pin(tokio_stream::iter(vec![Ok(
                     arrow_flight::Result {
                         body: result.as_any().encode_to_vec().into(),
@@ -738,8 +787,9 @@ fn sql_status(e: SqlError) -> Status {
     use yuntun_sql::SqlError as E;
     match &e {
         E::Parse(_) | E::Unsupported(_) | E::ReadOnly => Status::invalid_argument(e.to_string()),
-        E::NotFound(_) => Status::not_found(e.to_string()),
-        E::TableExists(_) => Status::already_exists(e.to_string()),
+        E::NotFound(_) | E::SchemaNotFound(_) => Status::not_found(e.to_string()),
+        E::TableExists(_) | E::SchemaExists(_) => Status::already_exists(e.to_string()),
+        E::SchemaNotEmpty(_) => Status::failed_precondition(e.to_string()),
         E::Precondition(_) => Status::failed_precondition(e.to_string()),
         E::Internal(_) => Status::internal(e.to_string()),
     }
@@ -1074,19 +1124,22 @@ fn query_status(e: impl std::fmt::Display) -> Status {
 }
 
 /// FlightSQL 装载任务：解码剩余数据流逐批 append（ingest 管线），结束返回累计行数。
+///
+/// `default_key`：prepared 语句上携带的幂等键（S1.8；`None` 表示无）。
+/// 键优先级：**每条 `FlightData` 的 `app_metadata` > `default_key` > 语句级生成**
+/// （同一 `do_put` 的所有批次共享生成的键，满足 require 表强制检查，架构 §7.3.2）。
 fn spawn_sql_ingest(
     ingest: Arc<Ingestor>,
     table: String,
     schema: SchemaRef,
     mut stream: Streaming<FlightData>,
     tx: tokio::sync::mpsc::Sender<Result<PutResult, Status>>,
+    default_key: Option<String>,
 ) {
     tokio::spawn(async move {
         let dict_ids: HashMap<i64, ArrayRef> = HashMap::new();
         let mut rows: i64 = 0;
-        // 语句级幂等键：同一次 do_put 的批次共享一个键（满足 require 表的强制检查；
-        // Meta 层去重仍以 batch_id 为准，S1.8 再做客户端透传）
-        let stmt_key = Some(format!("flightsql-{}", uuid::Uuid::now_v7()));
+        let generated = format!("flightsql-{}", uuid::Uuid::now_v7());
         loop {
             let fd = tokio::select! {
                 f = stream.next() => match f {
@@ -1113,11 +1166,15 @@ fn spawn_sql_ingest(
                 }
             };
             rows += batch.num_rows() as i64;
+            // S1.8 键优先级：app_metadata（逐条）> prepared 上的键 > 语句级生成
+            let key = parse_idempotency_key(&fd.app_metadata)
+                .or_else(|| default_key.clone())
+                .unwrap_or_else(|| generated.clone());
             let ib = IngestBatch {
                 table: table.clone(),
                 shard_key: "default".into(),
                 record_batch: batch,
-                idempotency_key: stmt_key.clone(),
+                idempotency_key: Some(key),
                 received_at: SystemTime::now(),
             };
             if let Err(e) = ingest.ingest(ib).await {
@@ -1170,20 +1227,22 @@ fn catalogs_batch() -> RecordBatch {
     .expect("static metadata batch")
 }
 
-fn schemas_batch() -> RecordBatch {
+/// `GetDbSchemas` 响应（多 schema：每行一个 schema）。
+fn schemas_batch(names: &[String]) -> RecordBatch {
     // 【官方 schema】catalog_name nullable / db_schema_name NOT NULL（metadata/db_schemas.rs）
     let schema = Arc::new(Schema::new(vec![
         Field::new("catalog_name", DataType::Utf8, true),
         Field::new("db_schema_name", DataType::Utf8, false),
     ]));
+    let n = names.len();
     RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(StringArray::from(vec![Some(CATALOG_NAME)])) as ArrayRef,
-            Arc::new(StringArray::from(vec![SCHEMA_NAME])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some(CATALOG_NAME); n])) as ArrayRef,
+            Arc::new(StringArray::from(names.to_vec())) as ArrayRef,
         ],
     )
-    .expect("static metadata batch")
+    .expect("schemas batch")
 }
 
 fn table_types_batch() -> RecordBatch {

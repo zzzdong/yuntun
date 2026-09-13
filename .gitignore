@@ -11,3 +11,5 @@ demo.log
 demo.err
 demo.pid
 tmp_dl/
+/data
+__pycache__/

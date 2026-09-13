@@ -11,6 +11,7 @@
 //! **边界**：无 listener、无 wire 格式、无连接概念——会话（方言 / prepared
 //! 语句表）由协议适配层持有，以 [`SessionCtx`] 显式传入（裁决 S-2/S-4）。
 
+pub mod idempotency;
 pub mod params;
 pub mod session;
 pub mod shim;
@@ -43,6 +44,14 @@ pub enum SqlError {
     NotFound(String),
     #[error("table already exists: {0}")]
     TableExists(String),
+    /// 多 schema：目标 schema 不存在（MySQL 1049 / unknown database）
+    #[error("schema not found: {0}")]
+    SchemaNotFound(String),
+    #[error("schema already exists: {0}")]
+    SchemaExists(String),
+    /// DROP DATABASE 时 schema 下仍有表（MySQL 1008）
+    #[error("schema is not empty: {0}")]
+    SchemaNotEmpty(String),
     /// 前置条件不满足（如强制幂等键缺失）
     #[error("{0}")]
     Precondition(String),
@@ -60,6 +69,9 @@ impl SqlError {
         match e {
             LakeError::TableNotFound(t) => SqlError::NotFound(t),
             LakeError::TableAlreadyExists(t) => SqlError::TableExists(t),
+            LakeError::SchemaNotFound(s) => SqlError::SchemaNotFound(s),
+            LakeError::SchemaAlreadyExists(s) => SqlError::SchemaExists(s),
+            LakeError::SchemaNotEmpty(s) => SqlError::SchemaNotEmpty(s),
             LakeError::IdempotencyKeyRequired => {
                 SqlError::Precondition("idempotency key is required for this table".into())
             }
@@ -79,6 +91,18 @@ pub enum SqlResult {
     Affected(i64),
 }
 
+/// 流式执行结果（S1.10）：`Rows` 的主体为 DataFusion 流（边算边发），
+/// 供 `do_get` 等大结果集路径使用；MySQL wire 走 [`SqlResult`] 的 eager 路径。
+pub enum SqlStreamResult {
+    /// 结果集：schema 恒有值；空结果集时流不产出批次但 schema 可用
+    Rows {
+        schema: SchemaRef,
+        stream: yuntun_query::SendableRecordBatchStream,
+    },
+    /// 受影响行数（INSERT / DDL / shim no-op）
+    Affected(i64),
+}
+
 /// 节点写策略（§6.2：sqld readonly 注入 ReadOnly；分流命中写语句即拒绝）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WritePolicy {
@@ -93,6 +117,9 @@ pub struct PreparedStatement {
     pub statement: sqlparser::ast::Statement,
     pub param_count: usize,
     pub dialect: SqlDialect,
+    /// S1.8：prepare 时从 SQL 注释解析的幂等键（参数替换后的 SQL 文本不再含注释，
+    /// 因此必须随语句缓存，在 execute_prepared 时显式传入分流）。
+    pub idempotency_key: Option<String>,
 }
 
 /// SQL 执行引擎：编排 query / ingest / catalog 三项能力（无自身状态）。
@@ -125,14 +152,130 @@ impl SqlEngine {
     /// 一次性执行（简单协议：MySQL COM_QUERY 文本 / PG simple Query /
     /// Flight 简易轨与 StatementUpdate）。
     pub async fn execute(&self, sql: &str, session: &mut SessionCtx) -> Result<SqlResult, SqlError> {
+        // S1.8：幂等键透传（SQL 注释 `/* idempotency_key=... */`）
+        let key = idempotency::extract(sql);
+        self.execute_with_key(sql, session, key).await
+    }
+
+    /// 带显式幂等键执行（prepared 路径：键在 prepare 时解析并随语句缓存，
+    /// 参数替换后的 SQL 文本已不含注释）。
+    pub async fn execute_with_key(
+        &self,
+        sql: &str,
+        session: &mut SessionCtx,
+        key: Option<String>,
+    ) -> Result<SqlResult, SqlError> {
         let stmt = sql::parse_single_with(session.dialect.parser_dialect(), sql)
             .map_err(|e| SqlError::Parse(e.to_string()))?;
         // 方言 shim：wire 客户端的非数据语句（SHOW/SET/USE/@@var/事务 no-op）
         if let Some(res) = shim::intercept(&stmt, session, self).await? {
             return Ok(res);
         }
-        let outcome = self.dispatch(stmt).await?;
-        Ok(self.finish(outcome, sql).await)
+        let outcome = self.dispatch(stmt, session, key).await?;
+        Ok(self.finish(outcome, sql, session.schema()).await)
+    }
+
+    // ---------------------------------------------------------------- schema（多库）
+
+    /// schema 清单（`SHOW DATABASES` / FlightSQL `GetDbSchemas`）。
+    pub async fn list_schemas(&self) -> Result<Vec<String>, SqlError> {
+        self.catalog.list_schemas().await.map_err(SqlError::from_lake)
+    }
+
+    /// schema 是否存在（`USE db` / handshake 校验）。
+    pub async fn schema_exists(&self, name: &str) -> Result<bool, SqlError> {
+        self.catalog
+            .schema_exists(name)
+            .await
+            .map_err(SqlError::from_lake)
+    }
+
+    /// 新建 schema（`CREATE DATABASE` / `CREATE SCHEMA`）。
+    pub async fn create_schema(&self, name: &str) -> Result<(), SqlError> {
+        self.check_write()?;
+        self.catalog
+            .create_schema(name)
+            .await
+            .map_err(SqlError::from_lake)?;
+        // DDL WAL 权威记录（重启后重放重建 schema；`DdlPayload.table` = schema 名）
+        self.append_ddl(DdlPayload {
+            op: ddl_op::CREATE_SCHEMA,
+            table: name.to_string(),
+            arrow_schema: vec![],
+            default_format: String::new(),
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// 删除空 schema（`DROP DATABASE` / `DROP SCHEMA`）。
+    pub async fn drop_schema(&self, name: &str) -> Result<(), SqlError> {
+        self.check_write()?;
+        self.catalog
+            .drop_schema(name)
+            .await
+            .map_err(SqlError::from_lake)?;
+        self.append_ddl(DdlPayload {
+            op: ddl_op::DROP_SCHEMA,
+            table: name.to_string(),
+            arrow_schema: vec![],
+            default_format: String::new(),
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// 某 schema 下的表名（裸名，已排序）——`SHOW TABLES`。
+    pub async fn list_tables_in(&self, schema: &str) -> Result<Vec<String>, SqlError> {
+        let all = self.catalog.list_tables().await.map_err(SqlError::from_lake)?;
+        let mut names: Vec<String> = all
+            .into_iter()
+            .filter(|t| t.schema_name() == schema)
+            .map(|t| t.name)
+            .collect();
+        names.sort();
+        Ok(names)
+    }
+
+    /// 流式执行（S1.10）：与 [`SqlEngine::execute`] 同一分流，但 SELECT 分支
+    /// **不 collect**——直接把 DataFusion 物理计划流交给协议层编码。
+    ///
+    /// 非查询语句（shim canned / SHOW TABLES / INSERT / DDL）产出批量很小，
+    /// 统一经 `stream_from_batches` 转流，协议层只有一个出口。
+    pub async fn execute_stream(
+        &self,
+        sql: &str,
+        session: &mut SessionCtx,
+    ) -> Result<SqlStreamResult, SqlError> {
+        let stmt = sql::parse_single_with(session.dialect.parser_dialect(), sql)
+            .map_err(|e| SqlError::Parse(e.to_string()))?;
+        // 方言 shim：canned 结果（SHOW/SET/USE/@@var 探测）体量小，转流即可
+        if let Some(res) = shim::intercept(&stmt, session, self).await? {
+            return Ok(eager_to_stream(res));
+        }
+        // 只读查询 → DataFusion 物理计划流（真正的流式；非限定表名按会话 schema 解析）
+        if let sqlparser::ast::Statement::Query(q) = &stmt {
+            let text = q.to_string();
+            let stream = self
+                .query
+                .sql_stream_with_schema(&text, session.schema())
+                .await
+                .map_err(query_error)?;
+            let schema = stream.schema();
+            return Ok(SqlStreamResult::Rows { schema, stream });
+        }
+        // INSERT / DDL / SHOW TABLES：走既有 eager 分流（结果集小）
+        let key = idempotency::extract(sql);
+        match self.dispatch(stmt, session, key).await? {
+            RawOutcome::Rows(b) => Ok(eager_to_stream(SqlResult::Rows {
+                schema: b
+                    .first()
+                    .map(|b| b.schema())
+                    .unwrap_or_else(|| Arc::new(Schema::empty())),
+                batches: b,
+            })),
+            RawOutcome::Affected(n) => Ok(SqlStreamResult::Affected(n)),
+        }
     }
 
     /// 预编译：方言感知解析 + 占位符计数 + 列 schema（尽力而为）。
@@ -145,6 +288,7 @@ impl SqlEngine {
             statement: stmt,
             param_count,
             dialect: session.dialect,
+            idempotency_key: idempotency::extract(sql),
         })
     }
 
@@ -158,18 +302,21 @@ impl SqlEngine {
         let mut ast = stmt.statement.clone();
         params::substitute(&mut ast, params).map_err(SqlError::from_lake)?;
         let rendered = ast.to_string();
-        self.execute(&rendered, session).await
+        self.execute_with_key(&rendered, session, stmt.idempotency_key.clone())
+            .await
     }
 
-    /// 元数据 API：表名清单（SHOW TABLES / wire 元数据探测的数据出口）。
+    /// 元数据 API：全部表的**全限定标识**（跨 schema；调试/内部用）。
     pub async fn list_tables(&self) -> Result<Vec<String>, SqlError> {
         let tables = self.catalog.list_tables().await.map_err(SqlError::from_lake)?;
-        let mut names: Vec<String> = tables.into_iter().map(|t| t.name).collect();
+        let mut names: Vec<String> = tables.into_iter().map(|t| t.qualified_name()).collect();
         names.sort();
         Ok(names)
     }
 
     /// 元数据 API：表列描述（SHOW COLUMNS / DESCRIBE / wire RowDescription）。
+    ///
+    /// `name` 为全限定标识 `schema.table`（[`sql::resolve_table_ref`] 解析而来）。
     pub async fn describe_table(&self, name: &str) -> Result<Option<TableDesc>, SqlError> {
         let Some(meta) = self.catalog.get_table(name).await.map_err(SqlError::from_lake)? else {
             return Ok(None);
@@ -191,17 +338,22 @@ impl SqlEngine {
         }))
     }
 
-    /// 逻辑计划 schema（S1.5 一致性语义：空结果集也返回查询 schema）。
+    /// 逻辑计划 schema（S1.5 一致性语义：空结果集也返回查询 schema，默认 schema）。
     pub async fn schema_of(&self, sql: &str) -> Option<SchemaRef> {
+        self.schema_of_in(sql, yuntun_model::ops::DEFAULT_SCHEMA).await
+    }
+
+    /// 逻辑计划 schema（指定会话 schema：非限定表名按该 schema 解析）。
+    pub async fn schema_of_in(&self, sql: &str, schema: &str) -> Option<SchemaRef> {
         self.query
-            .schema_of(sql)
+            .schema_of_with_schema(sql, schema)
             .await
             .ok()
             .filter(|s| !s.fields().is_empty())
     }
 
     /// 结果集收尾：空批次时回填查询 schema（G7 兼容：与 GetFlightInfo 一致）。
-    async fn finish(&self, outcome: RawOutcome, sql: &str) -> SqlResult {
+    async fn finish(&self, outcome: RawOutcome, sql: &str, schema: &str) -> SqlResult {
         match outcome {
             RawOutcome::Rows(b) if !b.is_empty() => SqlResult::Rows {
                 schema: b[0].schema(),
@@ -209,7 +361,7 @@ impl SqlEngine {
             },
             RawOutcome::Rows(_) => SqlResult::Rows {
                 schema: self
-                    .schema_of(sql)
+                    .schema_of_in(sql, schema)
                     .await
                     .unwrap_or_else(|| Arc::new(Schema::empty())),
                 batches: Vec::new(),
@@ -279,28 +431,66 @@ impl SqlEngine {
         }
     }
 
-    /// CREATE TABLE / INSERT / DROP / SHOW TABLES 分流（S1.6 语义，自 server 迁入）。
-    async fn dispatch(&self, stmt: sqlparser::ast::Statement) -> Result<RawOutcome, SqlError> {
+    /// CREATE/DROP DATABASE · CREATE TABLE / INSERT / DROP / SHOW 分流（S1.6 语义 + 多 schema）。
+    async fn dispatch(
+        &self,
+        stmt: sqlparser::ast::Statement,
+        session: &SessionCtx,
+        stmt_key: Option<String>,
+    ) -> Result<RawOutcome, SqlError> {
         use sqlparser::ast::{Expr, ObjectType, SetExpr, Statement, TableObject};
         match stmt {
             Statement::Query(q) => {
-                // 只读查询 → DataFusion（默认 catalog/schema = yuntun/public，G2）
+                // 只读查询 → DataFusion（非限定表名按会话 schema 解析，G2 + 多 schema）
                 let text = q.to_string();
                 let batches = self
                     .query
-                    .sql(&text)
+                    .sql_with_schema(&text, session.schema())
                     .await
                     .map_err(query_error)?;
                 Ok(RawOutcome::Rows(batches))
             }
             Statement::ShowTables { .. } => {
-                let names = self.list_tables().await?;
-                Ok(RawOutcome::Rows(vec![sql::show_tables_batch(&names)]))
+                let names = self.list_tables_in(session.schema()).await?;
+                Ok(RawOutcome::Rows(vec![sql::show_tables_batch(
+                    session.schema(),
+                    &names,
+                )]))
+            }
+            Statement::ShowDatabases { .. } => {
+                let rows: Vec<Vec<String>> = self
+                    .list_schemas()
+                    .await?
+                    .into_iter()
+                    .map(|s| vec![s])
+                    .collect();
+                Ok(RawOutcome::Rows(vec![sql::strings_batch(
+                    &["Database"],
+                    &rows,
+                )]))
+            }
+            // CREATE DATABASE / CREATE SCHEMA（多 schema）
+            Statement::CreateDatabase {
+                db_name,
+                if_not_exists,
+                ..
+            } => {
+                self.check_write()?;
+                let name = sql::table_name_of(&db_name);
+                if name.is_empty() {
+                    return Err(SqlError::Unsupported("invalid database name".into()));
+                }
+                match self.create_schema(&name).await {
+                    Ok(()) => Ok(RawOutcome::Affected(0)),
+                    Err(SqlError::SchemaExists(_)) if if_not_exists => Ok(RawOutcome::Affected(0)),
+                    Err(e) => Err(e),
+                }
             }
             Statement::Insert(ins) => {
                 self.check_write()?;
+                // 目标表 → 全限定标识（`sales.orders` / 非限定名取会话 schema）
                 let table = match &ins.table {
-                    TableObject::TableName(name) => sql::table_name_of(name),
+                    TableObject::TableName(name) => sql::resolve_table_ref(name, session),
                     _ => {
                         return Err(SqlError::Unsupported(
                             "INSERT target must be a plain table name".into(),
@@ -323,8 +513,10 @@ impl SqlEngine {
                     .map_err(SqlError::from_lake)?
                     .ok_or_else(|| SqlError::NotFound(table.clone()))?;
                 let schema = meta.schema().map_err(SqlError::from_lake)?;
-                // 语句级幂等键（plan §4.3：满足 require 表强制检查；S1.8 前服务端生成）
-                let stmt_key = Some(format!("dml-{}", uuid::Uuid::now_v7()));
+                // 幂等键（S1.8 透传）：客户端 SQL 注释提供 > 服务端语句级生成
+                // （plan §4.3：满足 require 表强制检查）
+                let stmt_key =
+                    Some(stmt_key.unwrap_or_else(|| format!("dml-{}", uuid::Uuid::now_v7())));
 
                 match src.body.as_ref() {
                     // INSERT ... VALUES：AST 字面量 → RecordBatch → ingest
@@ -357,8 +549,11 @@ impl SqlEngine {
                             .refresh(&self.catalog)
                             .await
                             .map_err(|e| SqlError::Internal(e.to_string()))?;
-                        let src_batches =
-                            self.query.sql(&select_sql).await.map_err(query_error)?;
+                        let src_batches = self
+                            .query
+                            .sql_with_schema(&select_sql, session.schema())
+                            .await
+                            .map_err(query_error)?;
                         let (batches, n) =
                             sql::cast_batches_to_table(&schema, &src_batches)
                                 .map_err(SqlError::from_lake)?;
@@ -372,10 +567,20 @@ impl SqlEngine {
             Statement::CreateTable(ct) => {
                 self.check_write()?;
                 let parsed = sql::parse_create_table(&ct).map_err(SqlError::from_lake)?;
+                // 归属 schema：`CREATE TABLE sales.orders` → sales；非限定名 → 会话 schema
+                let qualified = sql::resolve_table_ref(&ct.name, session);
+                let (ns, bare) = yuntun_model::ops::split_qualified(&qualified);
+                if bare.is_empty() {
+                    return Err(SqlError::Unsupported("invalid table name".into()));
+                }
+                if !self.schema_exists(ns).await? {
+                    return Err(SqlError::SchemaNotFound(ns.to_string()));
+                }
                 // CREATE TABLE 的 ingest 配置使用 General 模板（强制幂等键，plan §4.3）
                 let default_format = self.ingest.cfg.default_format.ext().to_string();
                 let req = CreateTableRequest {
-                    name: parsed.name.clone(),
+                    name: bare.to_string(),
+                    namespace: ns.to_string(),
                     schema: parsed.schema.clone(),
                     partition_cols: vec![],
                     default_format: default_format.clone(),
@@ -386,10 +591,10 @@ impl SqlEngine {
                     Err(LakeError::TableAlreadyExists(_)) if parsed.if_not_exists => {}
                     Err(e) => return Err(SqlError::from_lake(e)),
                 }
-                // DDL WAL 权威记录：崩溃重启后重放重建表清单（S1.6/S1.7 验收）
+                // DDL WAL 权威记录（**全限定名**）：崩溃重启后重放重建表清单（S1.6/S1.7）
                 self.append_ddl(DdlPayload {
                     op: ddl_op::CREATE_TABLE,
-                    table: parsed.name,
+                    table: qualified,
                     arrow_schema: serialize_schema(&parsed.schema),
                     default_format,
                 })
@@ -403,43 +608,71 @@ impl SqlEngine {
                 Ok(RawOutcome::Affected(0))
             }
             Statement::Drop {
-                object_type: ObjectType::Table,
+                object_type,
                 if_exists,
                 names,
                 ..
             } => {
                 self.check_write()?;
-                for name in names {
-                    let table = sql::table_name_of(&name);
-                    if table.is_empty() {
-                        return Err(SqlError::Unsupported("invalid table name in DROP".into()));
-                    }
-                    match self.catalog.drop_table(&table).await {
-                        // 数据文件转孤儿，由孤儿清理回收（plan §4.3）
-                        Ok(()) => {
-                            self.append_ddl(DdlPayload {
-                                op: ddl_op::DROP_TABLE,
-                                table,
-                                arrow_schema: vec![],
-                                default_format: String::new(),
-                            })
-                            .await?;
-                            // DataFusion 本地缓存立即感知表移除
-                            self.query
-                                .cache()
-                                .refresh(&self.catalog)
-                                .await
-                                .map_err(|e| SqlError::Internal(e.to_string()))?;
+                match object_type {
+                    ObjectType::Table => {
+                        for name in names {
+                            // 全限定标识（`sales.orders` / 非限定名取会话 schema）
+                            let table = sql::resolve_table_ref(&name, session);
+                            if table.is_empty() {
+                                return Err(SqlError::Unsupported(
+                                    "invalid table name in DROP".into(),
+                                ));
+                            }
+                            match self.catalog.drop_table(&table).await {
+                                // 数据文件转孤儿，由孤儿清理回收（plan §4.3）
+                                Ok(()) => {
+                                    self.append_ddl(DdlPayload {
+                                        op: ddl_op::DROP_TABLE,
+                                        table,
+                                        arrow_schema: vec![],
+                                        default_format: String::new(),
+                                    })
+                                    .await?;
+                                    // DataFusion 本地缓存立即感知表移除
+                                    self.query
+                                        .cache()
+                                        .refresh(&self.catalog)
+                                        .await
+                                        .map_err(|e| SqlError::Internal(e.to_string()))?;
+                                }
+                                Err(LakeError::TableNotFound(_)) if if_exists => {}
+                                Err(e) => return Err(SqlError::from_lake(e)),
+                            }
                         }
-                        Err(LakeError::TableNotFound(_)) if if_exists => {}
-                        Err(e) => return Err(SqlError::from_lake(e)),
+                    }
+                    // DROP DATABASE / DROP SCHEMA（空 schema 才允许删除）
+                    ObjectType::Database | ObjectType::Schema => {
+                        for name in names {
+                            let schema = sql::table_name_of(&name);
+                            if schema.is_empty() {
+                                return Err(SqlError::Unsupported(
+                                    "invalid database name in DROP".into(),
+                                ));
+                            }
+                            match self.drop_schema(&schema).await {
+                                Ok(()) => {}
+                                Err(SqlError::SchemaNotFound(_)) if if_exists => {}
+                                Err(e) => return Err(e),
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(SqlError::Unsupported(format!(
+                            "DROP {other} is not supported (only TABLE / DATABASE)"
+                        )))
                     }
                 }
                 Ok(RawOutcome::Affected(0))
             }
             other => Err(SqlError::Unsupported(format!(
-                "only SELECT / SHOW TABLES / INSERT / CREATE TABLE / DROP TABLE are \
-                 supported, got: {}",
+                "only SELECT / SHOW TABLES / SHOW DATABASES / INSERT / CREATE TABLE / \
+                 DROP TABLE / CREATE DATABASE / DROP DATABASE are supported, got: {}",
                 crate::sql::sql_snippet(&other.to_string())
             ))),
         }
@@ -462,6 +695,17 @@ fn query_error(e: impl std::fmt::Display) -> SqlError {
         .and_then(|s| msg[s + 1..].find('\'').map(|e| msg[s + 1..s + 1 + e].to_string()))
         .unwrap_or(msg);
     SqlError::NotFound(table)
+}
+
+/// eager 结果 → 流式结果（shim canned / SHOW TABLES / 小结果集的统一出口）。
+fn eager_to_stream(res: SqlResult) -> SqlStreamResult {
+    match res {
+        SqlResult::Rows { schema, batches } => SqlStreamResult::Rows {
+            stream: QueryEngine::stream_from_batches(schema.clone(), batches),
+            schema,
+        },
+        SqlResult::Affected(n) => SqlStreamResult::Affected(n),
+    }
 }
 
 /// dispatch 的原始产出（execute 负责补 schema / 包成 SqlResult）。
