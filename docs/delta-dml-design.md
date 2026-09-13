@@ -376,7 +376,7 @@ DV 过滤依赖"到达过滤层的行序 == 文件原始行序"。**M1：带 DV 
 
 | 里程碑 | 内容 | 量级 |
 |---|---|---|
-| **M0a** | `wal_seq_end` 精确化 + 半开口径四处消费点 + `resume_recovered` 重提交（payload 增补 table、epoch 闸门、s3_paths 反解回退、不追加 WAL） | 中（可独立验证：重启零新文件 + 不复活） |
+| **M0a** ✅ 已落地（2026-09-13，`recommit_into_catalog` / 认领集 `ReplaySkip` / 区间精确化 + 半开口径四处消费点 + 交错过滤） | `wal_seq_end` 精确化 + 半开口径四处消费点 + `resume_recovered` 重提交（payload 增补 table、epoch 闸门、s3_paths 反解回退、不追加 WAL）。**落地注记**：重提交必须伴随攒批跳过集（组键 + epoch + 半开区间），否则与重放 flush 产生双份数据——因此认领集随 M0a 一并落地；M0b 剩余 = `replay_wal_dml` + segment 清理闸门 + abort 区间保留（`apply_record`） | 中（可独立验证：重启零新文件 + 不复活） |
 | **M0b** | S 二维判定（组键 + 半开区间，含 abort 区间保留）+ accumulator 注入 + `replay_wal_dml` 四段顺序 + segment 清理闸门 | 大（风险最高，独立暴露） |
 | M1 | DV 存储/事件表 + `apply_deletions`（lease 内）+ `DELETE`（provenance scan PoC → 全量）+ **逐文件 DV 应用（无 DV 合并单 child）** + force_flush + lease + 增量刷新 | 一个完整迭代；PoC 先行 |
 | M2 | compaction 消费 DV（解耦触发 + 下界 + 原子重写）；DV→RowSelection；单活跃 DV RMW | 中 |

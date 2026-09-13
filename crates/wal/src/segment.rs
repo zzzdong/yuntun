@@ -290,6 +290,7 @@ mod tests {
             .map(|i| {
                 Record::BatchPending(BatchPendingPayload {
                     batch_id: format!("b{i}"),
+                    table: "public.t".into(),
                     shard: "s0".into(),
                     window: "w".into(),
                     wal_seq_start: i,

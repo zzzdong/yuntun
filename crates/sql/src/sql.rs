@@ -402,7 +402,7 @@ fn literal_of(expr: &Expr) -> Result<Literal, LakeError> {
             }
             let mut pairs = Vec::with_capacity(exprs.len() / 2);
             for kv in exprs.chunks(2) {
-                pairs.push((literal_of(&kv[0])?, literal_of(&kv[1])?));
+                pairs.push((literal_of(kv[0])?, literal_of(kv[1])?));
             }
             Ok(Literal::Map(pairs))
         }
@@ -731,7 +731,7 @@ fn build_column(field: &Field, n: usize, get: &dyn Fn(usize) -> Literal) -> Resu
             let value_arr = build_column(value_field, vals.len(), &|i| {
                 vals.get(i).cloned().unwrap_or(Literal::Null)
             })?;
-            let entry_struct = StructArray::new(entry_fields.into(), vec![key_arr, value_arr], None);
+            let entry_struct = StructArray::new(entry_fields, vec![key_arr, value_arr], None);
             let arr = MapArray::new(
                 entries_field.clone(),
                 OffsetBuffer::new(offsets.into()),

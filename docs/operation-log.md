@@ -977,3 +977,41 @@ SQL DDL 逐类型实测（pymysql → MySQL wire，`CREATE TABLE` 11 列全类�
 - 回归：`crates/query/tests/json_functions.rs`（路径/miss/Union 行为固化）、
   `crates/sql` 数组映射与字面量单测；`cargo test --workspace` 全绿、clippy 0 警告。
 - 遗留：`STRUCT` 列、Variant（DF #16116，等生态成熟）不在 0.1。
+
+## 24. M0a 落地：恢复语义改造（delta-dml-design §1.1 前置项，2026-09-13）
+
+依 delta 设计五轮评审定稿的 M0a 开工，清偿"重启重写全部历史数据"的既有债务，
+为 DV（行位删除向量）建立 batch_id 稳定性前提。
+
+### 24.1 改动
+
+1. **`BatchPendingPayload` 增补 `table`**（prost tag 10，向后兼容）→ `BatchState.table`；
+   老 WAL 为空时从 `s3_paths[0]` 反解（`table_from_object_path`，R18 回退）。
+2. **`wal_seq_end` 精确化（R8）**：`flush_batch` 改为 `*group.seqs.last() + 1`
+   （旧 `first_seq + len` 在交错写入下少算右界）；全链路统一半开 `[start, end)`：
+   - `resume_recovered` Pending 重做 `scan_range(s, e+1)` → `(s, e)`（R16 清单）；
+   - `segment_batches` 相交判定改半开（`e > lo`）；
+   - Pending 重做**按表过滤** payload（组内空洞属于别的表，旧行为会跨表串数据）
+     —— `BatchState.table` 可用后顺手修复；
+3. **重提交（R9/R12）**：`resume_recovered` 对 `Committed | S3Written` 走新增的
+   `recommit_into_catalog`：复用原 batch_id 与既有对象**只重建内存 Catalog、不追加 WAL**
+   （原 BatchCommitted 已表达终态）；**世代闸门** `liveness_at(start) vs liveness_at(EOF)`
+   （与 Pending 分支同款）——DROP/同名重建的旧世代批次 abort，不挂新表。
+4. **攒批重放跳过集 `ReplaySkip`**（组键 table/shard/window/epoch + 半开区间，
+   二维判定）：`resume_recovered` 建立、`run_accumulator` 消费——认领命中的 Data
+   不再重放入账（重提交已让原文件可见，重放 flush 会双份）。epoch 进组键用于区分
+   DROP/重建前后同名同窗口批次（评审五 R15 的二维判定落地）。
+
+### 24.2 验证
+
+- 新增 `crates/ingest/tests/m0a_recommit.rs`：
+  ① 终态批次重提交（committed=1/redone=0）+ **对象存储零新增** + 文件可见 + 认领集就位；
+  ② 世代闸门：DROP→同名重建→重启，旧世代数据不挂新表（R9）；
+  ③ 交错写入 Pending 重做按表过滤（R8）：t2 的交错行不混入 t1 批文件，row_count=2。
+- `cargo test --workspace` 全绿、clippy 0 警告（顺带修掉 ARRAY/MAP 遗留的 3 处）。
+
+### 24.3 M0b 待办（不含在本批）
+
+`replay_wal_dml`（重建 DeletionEntry，四段顺序之 ③）、segment 清理闸门（R21）、
+abort 区间保留（`apply_record` 对 BatchAbort 保留区间进跳过集，修复"显式放弃数据
+重启后复活"的既有行为）。

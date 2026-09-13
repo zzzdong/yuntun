@@ -65,6 +65,7 @@ async fn pending_batch_of_dropped_table_is_aborted_not_committed() {
         .seq;
     wal.append(Record::BatchPending(BatchPendingPayload {
         batch_id: "b-pending".into(),
+        table: "public.t".into(),
         shard: "default".into(),
         window: "2026-09-12T00:00".into(),
         wal_seq_start: data_seq,

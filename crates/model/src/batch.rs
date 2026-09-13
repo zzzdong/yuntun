@@ -27,6 +27,8 @@ pub fn is_terminal(s: BatchStatus) -> bool {
 pub struct BatchState {
     pub batch_id: String,
     pub client_request_id: Option<String>,
+    /// 所属表（全限定名；v1 扩展，老 WAL 缺省为空 → 恢复时从 s3_paths 反解）
+    pub table: String,
     pub shard: String,
     pub time_window: String,
     pub status: BatchStatus,
@@ -83,6 +85,7 @@ pub fn apply_record(state: &mut BatchStateMap, rec: &Record, _seq: u64) {
                     } else {
                         Some(p.client_request_id.clone())
                     },
+                    table: p.table.clone(),
                     shard: p.shard.clone(),
                     time_window: p.window.clone(),
                     status: BatchStatus::Pending,
@@ -141,6 +144,7 @@ mod tests {
     fn pending(id: &str) -> Record {
         Record::BatchPending(BatchPendingPayload {
             batch_id: id.into(),
+            table: "public.t".into(),
             shard: "s0".into(),
             window: "w1".into(),
             wal_seq_start: 0,

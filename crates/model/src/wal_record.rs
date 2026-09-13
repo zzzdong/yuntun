@@ -87,6 +87,10 @@ pub struct BatchPendingPayload {
     pub created_at_ms: u64,
     #[prost(uint64, tag = "9")]
     pub row_count: u64,
+    /// v1 扩展：所属表（全限定名，如 "public.t"）。老 segment 缺省为空 ——
+    /// 恢复重提交时回退为从 s3_paths[0] 反解（delta-dml-design §1.1）。
+    #[prost(string, tag = "10")]
+    pub table: String,
 }
 
 /// type=2 BatchS3Written
@@ -314,6 +318,7 @@ mod tests {
             }),
             Record::BatchPending(BatchPendingPayload {
                 batch_id: "b1".into(),
+                table: "public.t".into(),
                 shard: "s0".into(),
                 window: "w".into(),
                 wal_seq_start: 1,

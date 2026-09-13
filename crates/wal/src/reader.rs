@@ -79,6 +79,7 @@ mod tests {
     fn pending(i: u64) -> Record {
         Record::BatchPending(BatchPendingPayload {
             batch_id: format!("b{i}"),
+            table: "public.t".into(),
             shard: "s0".into(),
             window: "w".into(),
             wal_seq_start: i,

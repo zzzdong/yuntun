@@ -123,12 +123,18 @@ pub async fn flush_batch_with_id(
     let now = crate::accumulator::now_ms();
 
     // WAL: BatchPending
+    // ⚠️ wal_seq_end 必须是**精确 exclusive 右界**（= 该组最后一条 Data 的 seq + 1）：
+    // 攒批按 (table, shard, window) 分组，组内 seq 因交错写入存在空洞，
+    // `first_seq + payloads.len()` 会把右界算小 → Pending 重做 `scan_range` 少读
+    // 尾部 Data（既有缺陷，delta-dml-design §1.1 R8）。全链路统一半开 [start, end)。
+    let wal_seq_end = group.seqs.last().unwrap_or(&group.first_seq) + 1;
     let pending = Record::BatchPending(BatchPendingPayload {
         batch_id: batch_id.clone(),
+        table: group.table.clone(),
         shard: group.shard.clone(),
         window: group.window.clone(),
         wal_seq_start: group.first_seq,
-        wal_seq_end: group.first_seq + group.payloads.len() as u64,
+        wal_seq_end,
         schema_version,
         client_request_id: String::new(),
         created_at_ms: now,
@@ -207,8 +213,13 @@ pub async fn flush_batch_with_id(
     })
 }
 
-/// 恢复场景：S3Written 状态的批次只重新 Commit（Meta 按 batch_id 幂等，§5.6）。
-pub async fn commit_recovered_batch(
+/// 恢复场景（M0）：终态批次按**原 batch_id 与既有对象**重建内存 Catalog（§5.6）。
+///
+/// 与旧 `commit_recovered_batch` 的区别：**不追加 WAL** —— 原 `BatchCommitted` 记录
+/// 已表达终态，重提交只是重建内存 Catalog（C5）；每次重启都重复 append 会让 WAL
+/// 随历史线性膨胀（delta-dml-design §1.1 R12）。幂等：Meta 按 batch_id 幂等；
+/// IdempotencyRecord 由 commit_files 按 client_request_id 重新登记（受 TTL 约束）。
+pub async fn recommit_into_catalog(
     deps: &FlushDeps,
     st: &yuntun_model::batch::BatchState,
     table: &str,
@@ -247,11 +258,6 @@ pub async fn commit_recovered_batch(
             row_count: st.row_count,
         })
         .await?;
-    let rec = Record::BatchCommitted(BatchCommittedPayload {
-        batch_id: st.batch_id.clone(),
-    });
-    deps.wal.append(rec.clone()).await?;
-    deps.tracker.observe(&rec);
     Ok(resp.snapshot)
 }
 

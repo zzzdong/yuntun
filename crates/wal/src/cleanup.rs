@@ -190,6 +190,7 @@ mod tests {
                 BatchState {
                     batch_id: id.into(),
                     client_request_id: None,
+                    table: "public.t".into(),
                     shard: "s0".into(),
                     time_window: "w".into(),
                     status: st,
@@ -266,6 +267,7 @@ mod tests {
             wal.append(Record::BatchPending(
                 yuntun_model::wal_record::BatchPendingPayload {
                     batch_id: id.into(),
+                    table: "public.t".into(),
                     shard: "s0".into(),
                     window: "w".into(),
                     wal_seq_start: s,
@@ -325,6 +327,7 @@ mod tests {
             wal.append(Record::BatchPending(
                 yuntun_model::wal_record::BatchPendingPayload {
                     batch_id: id.into(),
+                    table: "public.t".into(),
                     shard: "s0".into(),
                     window: "w".into(),
                     wal_seq_start: s,

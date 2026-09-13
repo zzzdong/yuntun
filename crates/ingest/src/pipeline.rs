@@ -1,11 +1,13 @@
 //! Ingestor 主流程（详细设计 §5.2 写入主流程 + §5.3 攒批循环）。
 
 use crate::accumulator::{extract_event_time_ms, now_ms, BatchAccumulator};
-use crate::flush::{flush_batch, flush_batch_with_id, FlushDeps, LiveBatchTracker};
+use crate::flush::{
+    flush_batch, flush_batch_with_id, recommit_into_catalog, FlushDeps, LiveBatchTracker,
+};
 use crate::schema_cache::{resolve_schema_version, SchemaCache};
 use crate::source::IngestBatch;
 use crate::source::{IngestSource, Receipt};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use yuntun_catalog::CatalogOps;
@@ -61,6 +63,35 @@ pub struct Ingestor {
     /// 分片存储门面（store 层）：写入侧把"已 fsync、未落盘"的热数据放进**内存分片**，
     /// 提交后交棒给**磁盘分片**。查询侧共享同一实例（读己之写）。
     pub shards: Arc<ShardStore>,
+    /// M0：攒批重放跳过集——已被终态批次"认领"的 (组键, 半开区间)。
+    /// `resume_recovered` 填充，`run_accumulator` 消费（取走后清空）。
+    /// 认领命中的 Data 不再重放入账（重提交已让原文件对查询可见）。
+    pub replay_skip: Mutex<Vec<ReplaySkip>>,
+}
+
+/// 攒批重放的跳过声明：一个已重提交/重做的批次对其 Data 区间的"认领"。
+/// 判定为二维（组键 + 半开区间）——纯整数区间会把别的组落在组内空洞里的
+/// 未成批 Data 误判为已覆盖（丢数，delta-dml-design §1.1 R15）。
+#[derive(Debug, Clone)]
+pub struct ReplaySkip {
+    pub table: String,
+    pub shard: String,
+    pub time_window: String,
+    pub epoch: u64,
+    /// 半开 [start, end)：end = 该组最后一条 Data 的 seq + 1
+    pub start: u64,
+    pub end: u64,
+}
+
+impl ReplaySkip {
+    fn claims(&self, table: &str, shard: &str, window: &str, epoch: u64, seq: u64) -> bool {
+        self.table == table
+            && self.shard == shard
+            && self.time_window == window
+            && self.epoch == epoch
+            && self.start <= seq
+            && seq < self.end
+    }
 }
 
 impl Ingestor {
@@ -91,6 +122,7 @@ impl Ingestor {
             tracker: Arc::new(LiveBatchTracker::new()),
             schema_cache: Arc::new(SchemaCache::default()),
             shards,
+            replay_skip: Mutex::new(Vec::new()),
         }
     }
 
@@ -216,6 +248,8 @@ impl Ingestor {
     /// 【C2】严格只读已 fsync 的数据：`to = wal.synced_seq() + 1`。
     pub async fn run_accumulator(self: Arc<Self>, shutdown: CancellationToken) {
         let reader = yuntun_wal::reader::WalReader::new(self.wal.shard_dir());
+        // M0：取走恢复阶段建立的"重放跳过集"（已被终态批次认领的 Data 不再重放入账）
+        let replay_skip = std::mem::take(&mut *self.replay_skip.lock().unwrap());
         let mut last_read: u64 = 0;
         let mut acc = BatchAccumulator::new();
         let mut interval = tokio::time::interval(self.cfg.scan_interval);
@@ -244,25 +278,32 @@ impl Ingestor {
                                 // 否则重启重放会把已 DROP 表的数据"复活"到新表里。
                                 Record::Ddl(d) => self.shards.memory().observe_ddl(d.op, &d.table),
                                 Record::Data(p) => {
-                                    let batches = decode_batches(&p);
-                                    let rows: u64 =
-                                        batches.iter().map(|b| b.num_rows() as u64).sum();
                                     let epoch = self.shards.memory().liveness(&p.table).epoch;
-                                    // 读己之写：已 fsync 的实时数据放进 store 层内存分片，立刻可查
-                                    // （不等 flush/jitter/缓存 TTL）
-                                    if seq >= live_from_seq {
-                                        self.shards.memory().push(
-                                            &ShardId::new(
-                                                p.table.clone(),
-                                                p.shard.clone(),
-                                                p.time_window.clone(),
-                                            ),
-                                            seq,
-                                            epoch,
-                                            batches,
-                                        );
+                                    // M0：已被终态批次认领（组键 + 半开区间）的 Data 跳过——
+                                    // 恢复重提交已让原文件对查询可见，重放 flush 会产生双份数据
+                                    let claimed = replay_skip.iter().any(|c| {
+                                        c.claims(&p.table, &p.shard, &p.time_window, epoch, seq)
+                                    });
+                                    if !claimed {
+                                        let batches = decode_batches(&p);
+                                        let rows: u64 =
+                                            batches.iter().map(|b| b.num_rows() as u64).sum();
+                                        // 读己之写：已 fsync 的实时数据放进 store 层内存分片，立刻可查
+                                        // （不等 flush/jitter/缓存 TTL）
+                                        if seq >= live_from_seq {
+                                            self.shards.memory().push(
+                                                &ShardId::new(
+                                                    p.table.clone(),
+                                                    p.shard.clone(),
+                                                    p.time_window.clone(),
+                                                ),
+                                                seq,
+                                                epoch,
+                                                batches,
+                                            );
+                                        }
+                                        acc.push_with_epoch(p, seq, rows, now_ms(), epoch);
                                     }
-                                    acc.push_with_epoch(p, seq, rows, now_ms(), epoch);
                                 }
                                 _ => {}
                             }
@@ -330,6 +371,8 @@ impl Ingestor {
         let reader = yuntun_wal::reader::WalReader::new(self.wal.shard_dir());
         let mut redone = 0usize;
         let mut committed = 0usize;
+        // 攒批重放跳过集（M0）：被终态批次认领的 (组键, 半开区间)。
+        let mut claims: Vec<ReplaySkip> = Vec::new();
         // DDL 时间线：(seq, op, table)。Pending 批次重做前必须确认其 Data 属于**当前**表世代，
         // 否则"崩溃前已 DROP 的表"的重做数据会挂到不存在的表上（悬挂 Manifest），
         // 之后重建同名表即复活旧数据。
@@ -349,25 +392,69 @@ impl Ingestor {
             use yuntun_model::batch::BatchStatus::*;
             match st.status {
                 Committed | S3Written => {
-                    // 【阶段 0 语义】Meta（MemoryCatalog）不持久（C5），恢复的可见性
-                    // 由攒批线程全量重读 WAL 重做 flush 提供（operation-log §2.2-6）。
-                    // 此处【不得】重提交 —— 否则与重读 flush 产生双份可见数据
-                    // （chaos E3 回归验证）。
-                    // `commit_recovered_batch`（带正确 table/file_size）留给
-                    // 阶段 1 持久 Meta 的 "Committed → 只补 Commit" 分流。
-                    tracing::debug!(batch_id = %st.batch_id, status = ?st.status,
-                        "committed/s3written batch: visibility re-provided by accumulator re-scan");
+                    // 【M0 恢复改造】终态批次按原 batch_id 与既有对象重提交内存 Catalog
+                    //（不追加 WAL、不重写文件）——恢复"Meta 已记录"状态，替代旧语义的
+                    // "攒批全量重放重写全部历史"（每次重启产生全量新文件，delta-dml-design §1.1）。
+                    let (s, e) = st.wal_seq_range;
+                    // 表名：payload 增补字段优先；老 WAL 为空 → 从对象路径反解（R18 回退）
+                    let table = if !st.table.is_empty() {
+                        st.table.clone()
+                    } else {
+                        match st.s3_paths.first().and_then(|p| table_from_object_path(p)) {
+                            Some(t) => {
+                                tracing::warn!(batch_id = %st.batch_id, table = %t,
+                                    "legacy WAL without table field: table resolved from object path");
+                                t
+                            }
+                            None => {
+                                tracing::error!(batch_id = %st.batch_id,
+                                    "cannot resolve table for terminal batch, skipping re-commit");
+                                continue;
+                            }
+                        }
+                    };
+                    // 世代闸门（与 Pending 分支同款）：批次属于已 DROP / DROP 后重建的
+                    // 表世代 → 不重提交（其文件转孤儿，由孤儿清理回收；
+                    // 旧世代数据不得静默挂到重建的同名表上，R9）
+                    let (alive_at, epoch_at) = liveness_at(&timeline, s, &table);
+                    let (alive_now, epoch_now) = liveness_at(&timeline, u64::MAX, &table);
+                    if !alive_at || !alive_now || epoch_at != epoch_now {
+                        tracing::warn!(
+                            batch_id = %st.batch_id,
+                            table = %table,
+                            "committed batch belongs to a dropped/re-created table era, skipping re-commit"
+                        );
+                        crate::flush::abort_batch(&deps, &st.batch_id).await?;
+                        continue;
+                    }
+                    recommit_into_catalog(&deps, st, &table).await?;
                     committed += 1;
+                    claims.push(ReplaySkip {
+                        table,
+                        shard: st.shard.clone(),
+                        time_window: st.time_window.clone(),
+                        epoch: epoch_now,
+                        start: s,
+                        end: e,
+                    });
                 }
                 Pending => {
-                    // 从 WAL 重读 Data → 复用原 batch_id 重做 S3 + Commit
+                    // 从 WAL 重读 Data → 复用原 batch_id 重做 S3 + Commit。
+                    // 区间为半开 [s, e)（M0 口径），且必须按表过滤——交错写入下
+                    // 组内 seq 空洞属于别的组，混入会把别的表的行写进本批文件。
                     let (s, e) = st.wal_seq_range;
-                    let records = reader.scan_range(s, e + 1)?;
+                    let records = reader.scan_range(s, e)?;
                     let mut payloads = Vec::new();
+                    let mut seqs = Vec::new();
                     let mut rows = 0u64;
-                    for (_, rec) in records {
+                    for (seq, rec) in records {
                         if let yuntun_model::wal_record::Record::Data(p) = rec {
+                            if !st.table.is_empty() && p.table != st.table {
+                                // 组内空洞里其他组（别的表）的 Data：不属于本批次
+                                continue;
+                            }
                             rows += decode_row_count(&p);
+                            seqs.push(seq);
                             payloads.push(p);
                         }
                     }
@@ -377,8 +464,11 @@ impl Ingestor {
                         crate::flush::abort_batch(&deps, &st.batch_id).await?;
                         continue;
                     }
-                    let table = payloads[0].table.clone();
-                    let n_payloads = payloads.len() as u64;
+                    let table = if !st.table.is_empty() {
+                        st.table.clone()
+                    } else {
+                        payloads[0].table.clone()
+                    };
                     // 世代校验：批次 Data 写入时刻 vs WAL 末尾的最终状态
                     let (alive_at, epoch_at) = liveness_at(&timeline, s, &table);
                     let (alive_now, epoch_now) = liveness_at(&timeline, u64::MAX, &table);
@@ -392,12 +482,12 @@ impl Ingestor {
                         continue;
                     }
                     let group = crate::accumulator::WindowGroup {
-                        table,
+                        table: table.clone(),
                         shard: st.shard.clone(),
                         window_ms: 0, // 仅 flush 时用于触发判定；恢复路径直接 flush
                         window: st.time_window.clone(),
                         payloads,
-                        seqs: (s..s + n_payloads).collect(),
+                        seqs: seqs.clone(),
                         first_seq: s,
                         rows,
                         created_at_ms: st.created_at_ms,
@@ -405,11 +495,22 @@ impl Ingestor {
                     };
                     flush_batch_with_id(group, &deps, Some(st.batch_id.clone())).await?;
                     redone += 1;
+                    claims.push(ReplaySkip {
+                        table,
+                        shard: st.shard.clone(),
+                        time_window: st.time_window.clone(),
+                        epoch: epoch_now,
+                        start: s,
+                        end: e,
+                    });
                 }
                 Abort => {}
             }
         }
         tracing::info!(redone, committed, "resume_recovered done");
+        // 认领集交给攒批循环：重放时跳过已认领的 Data（重提交已让原文件可见，
+        // 重放 flush 会产生双份数据）
+        *self.replay_skip.lock().unwrap() = claims;
         Ok((redone, committed))
     }
 
@@ -461,6 +562,19 @@ fn liveness_at(timeline: &[(u64, u32, String)], seq: u64, table: &str) -> (bool,
     (exists, epoch)
 }
 
+/// 从对象存储路径反解全限定表名（M0 升级回退：老 WAL 的 BatchPendingPayload
+/// 无 `table` 字段时使用）。路径形如 `yuntun/<schema>/<table>/dt=.../...`。
+fn table_from_object_path(path: &str) -> Option<String> {
+    let rest = path.strip_prefix("yuntun/")?;
+    let mut it = rest.split('/');
+    let schema = it.next()?;
+    let table = it.next()?;
+    if schema.is_empty() || table.is_empty() {
+        return None;
+    }
+    Some(format!("{schema}.{table}"))
+}
+
 /// 编译期引用占位（resume Pending 路径在阶段 0.5 chaos 扩展时使用）。
 #[allow(unused_imports)]
-use crate::flush::{abort_batch as _abort_batch, commit_recovered_batch as _commit_recovered};
+use crate::flush::{abort_batch as _abort_batch, recommit_into_catalog as _recommit_into_catalog};

@@ -170,8 +170,9 @@ pub fn segment_batches(
         };
         for (id, st) in &states.states {
             let (s, e) = st.wal_seq_range;
-            // Pending 的 Data 区间与 segment 相交即关联
-            if s <= hi && e >= lo {
+            // 批次区间为半开 [s, e)（M0 统一口径），segment 为闭 [lo, hi]：
+            // 相交 ⟺ s ≤ hi 且 e > lo（e 已是 exclusive 右界，不再是闭端点）
+            if s <= hi && e > lo {
                 m.entry(seg.name.clone()).or_default().push(id.clone());
             }
         }
@@ -321,6 +322,7 @@ mod tests {
     fn pending_with_range(id: &str, s: u64, e: u64) -> Record {
         Record::BatchPending(BatchPendingPayload {
             batch_id: id.into(),
+            table: "public.t".into(),
             shard: "s0".into(),
             window: "w".into(),
             wal_seq_start: s,
