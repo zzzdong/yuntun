@@ -502,11 +502,12 @@ standalone 用 `/tmp/yuntun-smoke/yuntun.toml`（flight 50077 / mysql 33060 / �
    分支（同时让 `VALUES ('2026-01-02 03:04:05')` 这类常规写法可用；单测
    `values_timestamp_accepts_iso_string`）。
 
-**已知限制（R-4 偏差，留档）**：opensrv-mysql 0.7 **没有二进制结果集编码**
-（`resultset.rs` 仅 `RowWriter` 文本行），COM_STMT_EXECUTE 的结果行以文本回写 →
-二进制协议客户端的 **prepared SELECT 取不到正确行**（冒烟 [10] 为空）。写路径走 OK 包不受影响；
-JDBC 默认 `useServerPrepStmts=false`、mysql CLI / pymysql 均走文本轨，不受影响。
-若后续必须支持 prepared 结果集，需 fork opensrv 或自写二进制行编码。
+**已知限制（R-4 偏差，留档；→ 已在 §16.4 修正定位并修复）**：当时误判为
+"opensrv-mysql 0.7 没有二进制结果集编码"。实际 `COM_STMT_EXECUTE` 走的就是二进制行
+（`QueryResultWriter::new(..., is_bin = true)`）；prepared SELECT 取不到行的真因是
+opensrv 0.7 `PacketReader::next_async` 的释放后使用（上游 #66/#67，仅修在 git、
+未随 crates.io 的 0.7.0 发布），详见 §16.4。JDBC 默认 `useServerPrepStmts=false`、
+mysql CLI / pymysql 走文本轨，均不受影响。
 
 ### 14.4 W-6：收尾
 
@@ -844,3 +845,135 @@ ADBC 冒烟仅查询。
 - README「已知限制」与「最小闭环」的可见性描述同步更新；
 - 副作用：接管了 `chaos::query_multi_version_alignment` 的固定 `sleep(500ms)`（改轮询 ≤30s，
   真实磁盘 + 并发负载下固定等待会偶发超时）。
+
+## 22. 修复：prepared SELECT 取不到行（0.7.0 UAF 触发条件）+ 握手版本串（2026-09-13）
+
+### 22.1 现象与误判
+
+release 冒烟里 prepared 路径间歇故障：`1210 Incorrect number of arguments executing
+prepared statement`、垃圾 stmt_id（`RESET(0)` / 随机 id）、`MySQL server has gone away`、
+prepared SELECT `fetch` 为空——单次运行 0~100% 失败，被日志/代理"修好"（改变分配时序）。
+此前记录的已知限制把它归因为"opensrv-mysql 0.7 没有二进制结果集编码"，**有误**：
+`lib.rs:654` 的 `QueryResultWriter::new(..., is_bin = true)` 表明 COM_STMT_EXECUTE
+本就走二进制行，元数据块收尾（DEPRECATE_EOF 下不写 EOF）也符合官方协议文档。
+
+### 22.2 真因（两层）
+
+1. **上游**：opensrv-mysql **0.7.0** 的 `PacketReader::next_async`
+   （`packet_reader.rs:137-140`）：一次读缓冲带回剩余字节时
+   `self.bytes = rest.to_vec()` 释放旧分配，而返回的 `Packet` 仍指向旧内存
+   （上游 #66 / PR #67 修复，**仅存在于 git，crates.io 最新发布仍是 2024-02 的 0.7.0**）。
+   后果：客户端把多条命令压进同一 TCP 段（libmysql 常态）→ 命令字节被错解 →
+   opensrv 兜底分支回**裸 OK 包** → 客户端响应流错位（上游 #71 仍开放：
+   `PacketWriter` 不公开，适配层无法自救）。
+2. **我方适配器**：`PacketFramedReader` 虽"每次只交付一个包"，但交付量按
+   `min(buf.len(), out.remaining())` 截断——底层一次 read 带回多条命令时，
+   第二个包的字节被顺带交付，opensrv 内部缓冲仍出现剩余 → 重新踩 UAF 分支。
+   **分帧必须按包边界截断，只做到①不等价于修好。**
+
+### 22.3 修复（均在 sqlwire，不改 opensrv）
+
+- `PacketFramedReader::poll_read`：交付量按 `queued_packet_len()`（包边界）截断，
+  绝不混入下一个包的字节；探针日志移到整包交付点（消除旧实现"多包一次读时丢日志"）。
+- 握手版本串单一事实源：`yuntun-sql::shim::MYSQL_VERSION`（`8.0.32-yuntun`），
+  `MysqlBackend::version()` 覆写之（原先回 opensrv 默认 `5.1.10-alpha-msql-proxy`，
+  与 `SHOW VARIABLES` 不一致，且 5.1.x 会让按版本分支的驱动/ORM 误判能力）。
+- `on_execute` 增加"参数解码值 + 结果行数"debug 日志：区分"服务端拿到错误绑定值"
+  与"服务端正确、客户端解码失败"（本次定位的关键一步）。
+- 冒烟脚本：T2 [10] 从"只验证不崩"改为**真实断言**（轮询可见性后比对
+  `[(2, "bob")]`）；T1 新增 [1.1] 握手版本一致性；修正错误注释。
+
+### 22.4 验证
+
+- mysql-connector **C 扩展**（libmysqlclient 二进制协议栈）连续 3×10 + 30 次迭代
+  prepared INSERT+SELECT 全部通过（修复前同口径 10/10 失败）；纯 Python 栈 30 次通过。
+- `scripts/pymysql_smoke.py` 全绿（含新的 T2 [10] 行内容断言）。
+- Flight 冒烟（pyarrow_smoke / pyarrow_sqlinfo_smoke / flight_stream_smoke 50 万行）
+  在当前构建全绿；standalone `kill -9` → 重启 → `resume_recovered`（30 批重提交）
+  → t+0s 数据全量可见。
+
+### 22.5 顺带发现（遗留，已记入 README §4）
+
+1. **SQL DDL 时间精度**：`TIMESTAMP(3)` 不产生 `Timestamp(ms)` schema（一律 ns）——
+   SQL 建的表无法满足 pyarrow_smoke prepared 绑定要求的 ms 精度，脚本只能跑在
+   demo 种子实例上；DDL 精度透传待办。
+2. **chaos 用例并行 flake**：`crash_recovery_no_data_loss` 全量并行时偶发失败
+   （85s vs 单跑 1.1s，真实磁盘 I/O 竞争），单跑稳定；断言固定等待待改轮询。
+3. **opensrv 依赖决策**：上游修复仅在 git（crates.io 停更于 0.7.0），后续切 git
+   固定 rev 后可移除 `PacketFramedReader`；`vendor/opensrv-mysql/` 为分析用拷贝，
+   是否保留待定。
+
+### 22.6 建表能力盘点（应评审追问补做，发现并修复一个缺口）
+
+SQL DDL 逐类型实测（pymysql → MySQL wire，`CREATE TABLE` 11 列全类型 + INSERT + 回读）：
+
+- `TINYINT/INT/BIGINT/VARCHAR(n)/DOUBLE/BOOLEAN/DATE/TIMESTAMP/TEXT/BLOB` 全链路 ✅；
+- **DECIMAL(p,s)：建表 ✅ 但 `INSERT VALUES` 报 "unsupported type"** —— VALUES 构造器
+  缺 `Decimal128` 分支。已补（`crates/sql/src/sql.rs`）：
+  - 字面量按**精确缩放**解析（`parse_decimal_unscaled`，不走 f64，避免 12.34 × 10^scale
+    二进制舍入）；小数位超出 scale 拒绝（不静默截断）；
+  - 数组必须按列声明的 precision/scale 构建（`with_precision_and_scale`；
+    `Decimal128Array::from` 默认 (38,10)，会被批次类型校验拒绝——第一版踩到）；
+  - 回读 `Decimal(12.34)` ✓，DataFusion 计算（`i * 100` → `Decimal(1234.00)`）✓。
+- 拒绝边界复核（均明确报错而非静默）：`ALTER TABLE` / `CREATE TABLE AS SELECT` /
+  `CREATE OR REPLACE` / `ARRAY<INT>` 复杂类型 ✅；
+- `_BINARY ab` 字面量不支持（INSERT VALUES 仅普通字面量；BLOB 列以字符串字面量写入）；
+- README §2.1「SQL 支持面」表同步补齐：DDL 类型清单、`CREATE/DROP DATABASE`、
+  不支持行补 `ALTER TABLE` / CTAS / `CREATE OR REPLACE` / 复杂类型。
+
+- 类型面补测（应评审追问）：`JSON` / `JSONB` 建列 ✅（`sql.rs` 映射 `Utf8` 文本存储）——
+  实测**不校验 JSON 合法性**（`not-json-at-all` 照存）、客户端 SHOW COLUMNS 显示为 `text`、
+  `->`/`->>`/`json_extract`/`from_json` 等全部明确拒绝（DataFusion 55 默认函数集无 JSON 能力，
+  社区 `datafusion-functions-json` 未引入）→ JSON 仅"可存可查原文"，半结构化访问不在 0.1 范围。
+  README §2.1 类型清单与不支持行已同步。
+
+## 23. 新增：ARRAY / MAP 列 + JSON 查询函数（0.1 追加，2026-09-13）
+
+### 23.1 落地内容
+
+- **DDL 映射**（`crates/sql/src/sql.rs::map_column_type`）：
+  - `ARRAY<T>` / `T[]` → Arrow List（元素递归映射，支持 `ARRAY<ARRAY<INT>>`）；
+  - `Map(K, V)`（ClickHouse 形态）→ Arrow Map（key 不可空）；
+  - **方言坑**：MySQL wire 会话用 `MySqlDialect`，sqlparser 的 MAP 关键字分支只对
+    ClickHouse/Generic 开放 → `MAP(K,V)` 落为 `Custom`。`map_column_type` 识别之：
+    重组为 Generic 可解析形态二次解析，复用同一映射（`map_type_map`）。
+- **INSERT 字面量**：
+  - `[1, 2, 3]`（`Expr::Array`，全方言可解析）；
+  - `MAP("k", 1, ...)` 函数形态（`MAP {..}` 花括号字面量仅 DuckDB/Generic，
+    MySQL 方言不解析）——`literal_of` 识别 `ARRAY(...)`/`MAP(...)` 函数调用，
+    元素仍须为字面量（G3 无注入面）；
+  - `build_column` 新增 List/Map 分支：子元素走同一构造器递归
+    （签名改 `&dyn Fn`，避免递归单态化爆炸）；`Decimal128Array::from` 默认 (38,10)
+    的教训同理适用于按列声明构建。
+- **JSON 查询函数**：引入 `datafusion-functions-json = 0.55`（与 DF 55 一一对应），
+  `session_with_schema` 注册 `register_all`。函数集：`json_get / json_get_{str,int,
+  float,bool,json,array} / json_as_text / json_contains / json_length /
+  json_object_keys / json_from_scalar`（**没有 `json_extract`**，0.55 已改名）。
+- **wire 编码**（`crates/sqlwire/src/encode.rs`）：新增 Union 分支——`json_get`
+  返回 Arrow Union（JSON 变体联合），取选中变体的底层值按文本输出（arrow 的
+  Union display 会带 `{变体名=}` 包装）。List/Map 列走既有文本兜底
+  （`[10, 20, 30]` / `{a: 1, b: 2}`）。
+
+### 23.2 关键约定（踩坑留档）
+
+1. **JSON 路径不带 `$`**：`json_get_int(doc, "n")` ✓；`"$.n"` 是 miss
+   （返回 NULL/空列）；`json_length(doc)` 不带 path 所以不受影响——这让我们一度
+   误判函数注册失败。miss 语义：类型不匹配/未命中返回 NULL 列
+   （可能为 `DataType::Null` 或默认类型），不报错。
+2. `json_get_int` 命中返回 **UInt64**，miss 可能是 Int64/Null——类型不跨行稳定。
+3. 方言矩阵（Generic/MySQL 下可解析性）：`ARRAY<T>` ✓、`T[]` ✓、`Array(T)` ✗、
+   `Map(K,V)` ✓、`MAP<K,V>` ✗（仅 DuckDB）、`MAP {..}` 字面量 ✗（仅 DuckDB）、
+   `[..]` ✓、`STRUCT` ✗（明确拒绝）。
+
+### 23.3 验证（端到端，MySQL wire 轨）
+
+- `CREATE TABLE (id INT NOT NULL, tags ARRAY<INT>, props MAP(VARCHAR, INT), doc JSON)`
+  + INSERT `[10,20,30]` / `MAP("a",1,"b",2)` / JSON 文本 →
+  回读 `[10, 20, 30]`、`{a: 1, b: 2}`、原文 JSON ✓；
+- 查询：`tags[1]` → 10、`unnest(tags)` → 3 行、`props["a"]` → 1 ✓；
+- JSON：`json_get_int(doc,"n")=7`、`json_get_str(doc,"k")="v"`、
+  `json_length=2`、`json_contains=1`、`json_get(doc,"k")` 经 wire Union 分支 → "v" ✓；
+- **Parquet round-trip**：flush/commit 后全量回读无损，JSON 函数照常可用 ✓；
+- 回归：`crates/query/tests/json_functions.rs`（路径/miss/Union 行为固化）、
+  `crates/sql` 数组映射与字面量单测；`cargo test --workspace` 全绿、clippy 0 警告。
+- 遗留：`STRUCT` 列、Variant（DF #16116，等生态成熟）不在 0.1。

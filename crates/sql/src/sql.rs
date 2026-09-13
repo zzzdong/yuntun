@@ -12,16 +12,18 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BinaryArray, BooleanArray, Date32Array, Float32Array, Float64Array, Int16Array,
-    Int32Array, Int64Array, Int8Array, StringArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
-    UInt32Array, UInt64Array, UInt8Array,
+    ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+    Int16Array, Int32Array, Int64Array, Int8Array, ListArray, MapArray, StringArray,
+    StructArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
+use arrow::buffer::{NullBuffer, OffsetBuffer};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use arrow_cast::cast;
 use sqlparser::ast::{
-    ColumnDef, CreateTable, DataType as SqlDataType, Expr, ObjectName, Statement,
+    ArrayElemTypeDef, ColumnDef, CreateTable, DataType as SqlDataType, Expr, FunctionArg,
+    FunctionArgExpr, FunctionArguments, ObjectName, Statement,
 };
 use sqlparser::ast::{ExactNumberInfo, TimezoneInfo, Value};
 use sqlparser::dialect::{Dialect as SqlDialect, GenericDialect};
@@ -201,6 +203,13 @@ fn column_def_to_field(col: &ColumnDef) -> Result<Field, LakeError> {
     Ok(Field::new(col.name.value.clone(), dt, !not_null))
 }
 
+/// Arrow List 列的子元素字段名（与 arrow-rs / DataFusion 默认约定一致）。
+pub const LIST_ITEM_FIELD_NAME: &str = "item";
+/// Arrow Map 列的 entries / key / value 字段名（Parquet round-trip 保持一致）。
+pub const MAP_ENTRIES_FIELD_NAME: &str = "entries";
+pub const MAP_KEY_FIELD_NAME: &str = "key";
+pub const MAP_VALUE_FIELD_NAME: &str = "value";
+
 /// sqlparser DataType → Arrow DataType（MVP 映射表；不支持类型明确拒绝）。
 pub fn map_column_type(dt: &SqlDataType) -> Result<DataType, LakeError> {
     let t = match dt {
@@ -243,6 +252,40 @@ pub fn map_column_type(dt: &SqlDataType) -> Result<DataType, LakeError> {
         },
         SqlDataType::Datetime(_) => DataType::Timestamp(TimeUnit::Nanosecond, None),
         SqlDataType::Decimal(info) => decimal_type(info)?,
+        SqlDataType::Array(elem) => {
+            // `ARRAY<T>` / `T[]` / `Array(T)` → Arrow List；元素类型递归映射（支持嵌套）
+            let inner = match elem {
+                ArrayElemTypeDef::AngleBracket(t)
+                | ArrayElemTypeDef::SquareBracket(t, _)
+                | ArrayElemTypeDef::Parenthesis(t) => map_column_type(t)?,
+                ArrayElemTypeDef::None => {
+                    return Err(LakeError::Other(
+                        "ARRAY requires an element type, e.g. ARRAY<INT>".into(),
+                    ))
+                }
+            };
+            DataType::List(Arc::new(Field::new(LIST_ITEM_FIELD_NAME, inner, true)))
+        }
+        SqlDataType::Map(k, v) => map_type_map(k, v)?,
+        SqlDataType::Custom(name, modifiers) => {
+            // MySQL 等方言把 `MAP(K, V)` 解析为 Custom（MAP 关键字分支只对
+            // ClickHouse/Generic 方言开放）：重组为 Generic 可解析的形态二次解析，
+            // 复用同一映射（键/值类型可继续嵌套）
+            let kw = table_name_of(name);
+            if !kw.eq_ignore_ascii_case("MAP") || modifiers.len() != 2 {
+                return Err(LakeError::Other(format!(
+                    "unsupported column type in CREATE TABLE: {name}({modifiers:?})"
+                )));
+            }
+            let probe = format!("CREATE TABLE __t (m Map({}, {}))", modifiers[0], modifiers[1]);
+            let Statement::CreateTable(ct) = parse_single(&probe)? else {
+                return Err(LakeError::Other("internal: map re-parse failed".into()));
+            };
+            let SqlDataType::Map(k, v) = &ct.columns[0].data_type else {
+                return Err(LakeError::Other("internal: map re-parse mismatch".into()));
+            };
+            map_type_map(k, v)?
+        }
         other => {
             return Err(LakeError::Other(format!(
                 "unsupported column type in CREATE TABLE: {other}"
@@ -250,6 +293,21 @@ pub fn map_column_type(dt: &SqlDataType) -> Result<DataType, LakeError> {
         }
     };
     Ok(t)
+}
+
+/// `Map(K, V)` → Arrow Map（key 不可空，Arrow 约定）。
+fn map_type_map(k: &SqlDataType, v: &SqlDataType) -> Result<DataType, LakeError> {
+    let entries = DataType::Struct(
+        vec![
+            Field::new(MAP_KEY_FIELD_NAME, map_column_type(k)?, false),
+            Field::new(MAP_VALUE_FIELD_NAME, map_column_type(v)?, true),
+        ]
+        .into(),
+    );
+    Ok(DataType::Map(
+        Arc::new(Field::new(MAP_ENTRIES_FIELD_NAME, entries, false)),
+        false, // keys_sorted
+    ))
 }
 
 /// DECIMAL → Decimal128(p, s)；未指定精度 → (38, 10)。
@@ -281,10 +339,73 @@ enum Literal {
     TimestampNs(i64),
     /// DATE '...' 的 ISO 原文
     Date(String),
+    /// 数组字面量 `[1, 2, 3]` / `ARRAY[1, 2, 3]`（元素须为字面量，递归）
+    List(Vec<Literal>),
+    /// MAP 字面量 `MAP {'k': v, ...}`（DuckDB 形态，键值须为字面量）
+    Map(Vec<(Literal, Literal)>),
 }
 
 fn literal_of(expr: &Expr) -> Result<Literal, LakeError> {
     match expr {
+        Expr::Array(arr) => Ok(Literal::List(
+            arr.elem
+                .iter()
+                .map(literal_of)
+                .collect::<Result<Vec<_>, LakeError>>()?,
+        )),
+        Expr::Map(m) => Ok(Literal::Map(
+            m.entries
+                .iter()
+                .map(|e| Ok((literal_of(&e.key)?, literal_of(&e.value)?)))
+                .collect::<Result<Vec<_>, LakeError>>()?,
+        )),
+        Expr::Function(f) => {
+            // `ARRAY(1, 2, 3)` / `MAP('k', 1, ...)` 函数形态：
+            // MySQL 方言没有数组/映射字面量语法（`MAP {..}` 仅 DuckDB/Generic），
+            // 以函数调用形态承载；元素仍须为字面量（拒绝表达式，保持 G3 无注入面）
+            let name = table_name_of(&f.name);
+            if !name.eq_ignore_ascii_case("ARRAY") && !name.eq_ignore_ascii_case("MAP") {
+                return Err(LakeError::Other(format!(
+                    "only literals are supported in INSERT VALUES, got expression: {}",
+                    expr_snippet(expr)
+                )));
+            }
+            let FunctionArguments::List(l) = &f.args else {
+                return Err(LakeError::Other(format!(
+                    "only literals are supported in INSERT VALUES, got expression: {}",
+                    expr_snippet(expr)
+                )));
+            };
+            let exprs = l
+                .args
+                .iter()
+                .map(|a| match a {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Ok(e),
+                    _ => Err(LakeError::Other(format!(
+                        "only literals are supported in INSERT VALUES, got function arg in: {}",
+                        expr_snippet(expr)
+                    ))),
+                })
+                .collect::<Result<Vec<_>, LakeError>>()?;
+            if name.eq_ignore_ascii_case("ARRAY") {
+                return Ok(Literal::List(
+                    exprs
+                        .iter()
+                        .map(|e| literal_of(e))
+                        .collect::<Result<Vec<_>, LakeError>>()?,
+                ));
+            }
+            if exprs.len() % 2 != 0 {
+                return Err(LakeError::Other(
+                    "MAP(key, value, ...) expects an even number of arguments".into(),
+                ));
+            }
+            let mut pairs = Vec::with_capacity(exprs.len() / 2);
+            for kv in exprs.chunks(2) {
+                pairs.push((literal_of(&kv[0])?, literal_of(&kv[1])?));
+            }
+            Ok(Literal::Map(pairs))
+        }
         Expr::Value(v) => match &v.value {
             Value::Null => Ok(Literal::Null),
             Value::Boolean(b) => Ok(Literal::Bool(*b)),
@@ -400,7 +521,7 @@ pub fn build_values_batch(
     let mut cols: Vec<ArrayRef> = Vec::with_capacity(all_fields.len());
     for (fi, field) in all_fields.iter().enumerate() {
         match field_indices.iter().position(|&i| i == fi) {
-            Some(pos) => cols.push(build_column(field, n_rows, |r| selected[r][pos].clone())?),
+            Some(pos) => cols.push(build_column(field, n_rows, &|r| selected[r][pos].clone())?),
             None => {
                 if !field.is_nullable() {
                     return Err(LakeError::Other(format!(
@@ -418,11 +539,7 @@ pub fn build_values_batch(
 }
 
 /// 按列类型把字面量流转换为 Arrow 数组（范围检查内联完成）。
-fn build_column(
-    field: &Field,
-    n: usize,
-    get: impl Fn(usize) -> Literal,
-) -> Result<ArrayRef, LakeError> {
+fn build_column(field: &Field, n: usize, get: &dyn Fn(usize) -> Literal) -> Result<ArrayRef, LakeError> {
     use Literal as L;
 
     macro_rules! int_col {
@@ -501,6 +618,128 @@ fn build_column(
                 }
             }
             Arc::new(Float64Array::from(v))
+        }
+        DataType::Decimal128(precision, scale) => {
+            // DECIMAL 列的 SQL 字面量写入（`VALUES (12.34)` / 文本参数）：精确解析，
+            // 不走 f64（避免 12.34 × 10^scale 的二进制舍入）
+            let (precision, scale_i8) = (*precision, *scale);
+            if scale_i8 < 0 {
+                return Err(LakeError::Other(format!(
+                    "column {}: negative DECIMAL scale is not supported",
+                    field.name()
+                )));
+            }
+            let scale = scale_i8 as u32;
+            let mut v: Vec<Option<i128>> = Vec::with_capacity(n);
+            for i in 0..n {
+                match get(i) {
+                    L::Null => v.push(None),
+                    L::Num(s) | L::Str(s) => v.push(Some(
+                        parse_decimal_unscaled(&s, scale).ok_or_else(|| bad_num(&s, field))?,
+                    )),
+                    other => return Err(bad_lit(&other, field)),
+                }
+            }
+            // 必须按列声明的 precision/scale 构建数组（`Decimal128Array::from` 默认
+            // (38, 10)，与表 schema 不一致会被批次校验拒绝）
+            let arr = Decimal128Array::from(v)
+                .with_precision_and_scale(precision, scale_i8)
+                .map_err(|e| {
+                    LakeError::Other(format!(
+                        "column {}: DECIMAL value out of range or invalid: {e}",
+                        field.name()
+                    ))
+                })?;
+            Arc::new(arr)
+        }
+        DataType::List(child) => {
+            // 数组字面量 → ListArray：子元素走同一构造器递归（天然支持嵌套 List/Map）
+            let mut offsets: Vec<i32> = Vec::with_capacity(n + 1);
+            offsets.push(0);
+            let mut elems: Vec<Literal> = Vec::with_capacity(n);
+            let mut valid: Vec<bool> = Vec::with_capacity(n);
+            for i in 0..n {
+                match get(i) {
+                    L::Null => {
+                        offsets.push(*offsets.last().expect("offsets seeded"));
+                        valid.push(false);
+                    }
+                    L::List(items) => {
+                        elems.extend(items);
+                        offsets.push(elems.len() as i32);
+                        valid.push(true);
+                    }
+                    other => return Err(bad_lit(&other, field)),
+                }
+            }
+            let values = build_column(child.as_ref(), elems.len(), &|i| {
+                elems.get(i).cloned().unwrap_or(Literal::Null)
+            })?;
+            let arr = ListArray::new(
+                child.clone(),
+                OffsetBuffer::new(offsets.into()),
+                values,
+                Some(NullBuffer::from(valid)),
+            );
+            Arc::new(arr)
+        }
+        DataType::Map(entries_field, _) => {
+            // MAP 字面量 → MapArray：key/value 分别走同一构造器递归
+            let entry_fields = match entries_field.data_type() {
+                DataType::Struct(fs) => fs.clone(),
+                other => {
+                    return Err(LakeError::Other(format!(
+                        "column {}: invalid MAP entries type: {other}",
+                        field.name()
+                    )))
+                }
+            };
+            let (key_field, value_field) = match (entry_fields.first(), entry_fields.get(1)) {
+                (Some(k), Some(v)) => (k, v),
+                _ => {
+                    return Err(LakeError::Other(format!(
+                        "column {}: MAP entries must have key/value fields",
+                        field.name()
+                    )))
+                }
+            };
+            let mut offsets: Vec<i32> = Vec::with_capacity(n + 1);
+            offsets.push(0);
+            let mut keys: Vec<Literal> = Vec::with_capacity(n);
+            let mut vals: Vec<Literal> = Vec::with_capacity(n);
+            let mut valid: Vec<bool> = Vec::with_capacity(n);
+            for i in 0..n {
+                match get(i) {
+                    L::Null => {
+                        offsets.push(*offsets.last().expect("offsets seeded"));
+                        valid.push(false);
+                    }
+                    L::Map(pairs) => {
+                        for (k, v) in pairs {
+                            keys.push(k);
+                            vals.push(v);
+                        }
+                        offsets.push(keys.len() as i32);
+                        valid.push(true);
+                    }
+                    other => return Err(bad_lit(&other, field)),
+                }
+            }
+            let key_arr = build_column(key_field, keys.len(), &|i| {
+                keys.get(i).cloned().unwrap_or(Literal::Null)
+            })?;
+            let value_arr = build_column(value_field, vals.len(), &|i| {
+                vals.get(i).cloned().unwrap_or(Literal::Null)
+            })?;
+            let entry_struct = StructArray::new(entry_fields.into(), vec![key_arr, value_arr], None);
+            let arr = MapArray::new(
+                entries_field.clone(),
+                OffsetBuffer::new(offsets.into()),
+                entry_struct,
+                Some(NullBuffer::from(valid)),
+                false,
+            );
+            Arc::new(arr)
         }
         DataType::Utf8 | DataType::LargeUtf8 => {
             let mut v: Vec<Option<String>> = Vec::with_capacity(n);
@@ -584,6 +823,48 @@ fn build_column(
         }
     };
     Ok(arr)
+}
+
+/// 十进制字面量 → 按 `scale` 缩放的未缩放 i128（精确解析，不走 float）。
+///
+/// 接受 `[-+]digits[.digits]`（整数/小数部分可缺省一侧）；小数位数超过 `scale`
+/// 时拒绝（宁报错也不静默截断精度）。
+fn parse_decimal_unscaled(s: &str, scale: u32) -> Option<i128> {
+    let s = s.trim();
+    let (neg, s) = match s.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let (int_part, frac_part) = match s.split_once('.') {
+        Some((a, b)) => (a, b),
+        None => (s, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    if !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    if frac_part.len() as u32 > scale {
+        return None;
+    }
+    let int_val: i128 = if int_part.is_empty() {
+        0
+    } else {
+        int_part.parse().ok()?
+    };
+    let mut frac_val: i128 = if frac_part.is_empty() {
+        0
+    } else {
+        frac_part.parse().ok()?
+    };
+    for _ in frac_part.len()..scale as usize {
+        frac_val *= 10;
+    }
+    let unscaled = int_val * 10i128.pow(scale) + frac_val;
+    Some(if neg { -unscaled } else { unscaled })
 }
 
 fn bad_num(s: &str, field: &Field) -> LakeError {
@@ -782,7 +1063,7 @@ pub fn sql_snippet(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::TimestampNanosecondArray;
+    use arrow::array::{Array, TimestampNanosecondArray};
     use sqlparser::ast::{SetExpr, TableObject};
 
     fn parse(sql: &str) -> Statement {
@@ -919,11 +1200,117 @@ mod tests {
         };
         assert!(parse_create_table(ct).is_err(), "CTAS 拒绝");
 
-        let s2 = parse("CREATE TABLE t (a ARRAY<INT>)");
+        // 带时区时间戳：能解析但映射层明确拒绝
+        let s2 = parse("CREATE TABLE t (a TIMESTAMPTZ)");
         let Statement::CreateTable(ct2) = &s2 else {
             panic!()
         };
-        assert!(parse_create_table(ct2).is_err(), "不支持类型拒绝");
+        assert!(parse_create_table(ct2).is_err(), "TSTZ 拒绝");
+    }
+
+    #[test]
+    fn create_table_array_and_map_mapping() {
+        // Generic 方言下的数组形态：ARRAY<T> / T[]（`Array(T)` 圆括号形态不解析）
+        for sql in ["CREATE TABLE t (a ARRAY<INT>)", "CREATE TABLE t (a INT[])"] {
+            let p = parse_create_table(&match parse(sql) {
+                Statement::CreateTable(ct) => ct,
+                other => panic!("{other}"),
+            })
+            .unwrap();
+            assert_eq!(
+                p.schema.field(0).data_type(),
+                &DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                "{sql}"
+            );
+        }
+        // Map(K, V)（ClickHouse 圆括号形态）→ Arrow Map（key 不可空）；嵌套元素递归映射
+        let p = parse_create_table(&match parse(
+            "CREATE TABLE t (m MAP(VARCHAR, INT), nested ARRAY<ARRAY<INT>>)",
+        ) {
+            Statement::CreateTable(ct) => ct,
+            other => panic!("{other}"),
+        })
+        .unwrap();
+        let map_ty = p.schema.field(0).data_type();
+        let DataType::Map(entries, sorted) = map_ty else {
+            panic!("{map_ty}")
+        };
+        assert!(!*sorted);
+        let DataType::Struct(fs) = entries.data_type() else {
+            panic!("{entries:?}")
+        };
+        assert_eq!(fs.len(), 2);
+        assert_eq!(fs[0].data_type(), &DataType::Utf8);
+        assert!(!fs[0].is_nullable(), "MAP key 不可空");
+        assert_eq!(fs[1].data_type(), &DataType::Int32);
+        assert_eq!(
+            p.schema.field(1).data_type(),
+            &DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                true
+            )))
+        );
+    }
+
+    #[test]
+    fn values_array_and_map_literals() {
+        // `[1,2]` / `MAP {'k': 7}` 字面量（Generic 方言）→ List/Map 数组
+        let t: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                true,
+            ),
+            Field::new(
+                "props",
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(
+                            vec![
+                                Field::new("key", DataType::Utf8, false),
+                                Field::new("value", DataType::Int64, true),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+                true,
+            ),
+        ]));
+        let s = parse("INSERT INTO t VALUES ([1, 2], MAP {'k': 7}), (NULL, NULL)");
+        let (batch, n) = extract_values(s, &t);
+        assert_eq!(n, 2);
+
+        let list = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert!(list.is_null(1), "NULL 行");
+        assert_eq!(list.value_length(0), 2);
+        let row0 = list.value(0);
+        let vals = row0.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!((vals.value(0), vals.value(1)), (1, 2));
+
+        let map = batch.column(1).as_any().downcast_ref::<MapArray>().unwrap();
+        assert!(map.is_null(1), "NULL 行");
+        assert_eq!(map.value_length(0), 1);
+        let entries = map.value(0);
+        let ks = entries
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let vs = entries
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!((ks.value(0), vs.value(0)), ("k", 7));
     }
 
     // ---- INSERT VALUES 构造 ----
@@ -1008,6 +1395,22 @@ mod tests {
             .unwrap();
         let expect_secs = (parse_date_days("2026-01-02").unwrap() as i64) * 86_400 + 11_045;
         assert_eq!(ts.value(0), expect_secs * 1_000_000_000);
+    }
+
+    #[test]
+    fn decimal_literal_exact_scaling() {
+        // 精确缩放（不走 f64：12.34 × 100 在二进制浮点下是 1233.99…）
+        assert_eq!(parse_decimal_unscaled("12.34", 2), Some(1234));
+        assert_eq!(parse_decimal_unscaled("-12.34", 2), Some(-1234));
+        assert_eq!(parse_decimal_unscaled("+0.5", 6), Some(500_000));
+        assert_eq!(parse_decimal_unscaled("1", 2), Some(100));
+        assert_eq!(parse_decimal_unscaled("1.", 2), Some(100));
+        assert_eq!(parse_decimal_unscaled(".5", 2), Some(50));
+        assert_eq!(parse_decimal_unscaled("0", 0), Some(0));
+        // 小数位超出 scale → 拒绝（不静默截断）
+        assert_eq!(parse_decimal_unscaled("1.234", 2), None);
+        assert_eq!(parse_decimal_unscaled("abc", 2), None);
+        assert_eq!(parse_decimal_unscaled("", 2), None);
     }
 
     #[test]

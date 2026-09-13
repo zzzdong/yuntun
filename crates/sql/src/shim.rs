@@ -16,13 +16,23 @@ use crate::session::{SessionCtx, SqlDialect};
 use crate::sql::table_name_of;
 use crate::{SqlEngine, SqlError, SqlResult};
 
+/// 对客户端自报的 MySQL 版本串（**单一事实源**）。
+///
+/// 两处消费方必须一致，否则客户端会出现"握手一个版本、查询另一个版本"的怪象：
+/// - MySQL wire 握手（[`yuntun_sqlwire::MysqlBackend::version`]）；
+/// - `SELECT @@version` / `SHOW VARIABLES LIKE 'version'`（本模块 canned 响应）。
+///
+/// 声明 8.0.x 而非 5.x 还会影响驱动的能力分支：部分 ORM（如 ActiveRecord）按
+/// 版本降级功能；5.1.10 会让现代驱动走老路径。
+pub const MYSQL_VERSION: &str = "8.0.32-yuntun";
+
 /// canned 系统变量（MySQL 客户端握手/元数据探测高频项）。
 ///
 /// 未收录项返回 `""`（与 MySQL 未知变量行为不同，但对驱动更友好：
 /// 驱动多只做字符串读取）。JDBC/DBeaver 握手必需的项已在此列全。
 fn canned_variable(name: &str) -> &'static str {
     match name {
-        "version" => "8.0.32-yuntun",
+        "version" => MYSQL_VERSION,
         "version_comment" => "yuntun",
         "autocommit" => "1",
         "max_allowed_packet" => "67108864",

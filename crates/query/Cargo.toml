@@ -10,6 +10,8 @@ yuntun-catalog = { path = "../catalog" }
 yuntun-store = { path = "../store" }
 yuntun-format = { path = "../format" }
 datafusion = { workspace = true }
+# JSON SQL 函数（json_extract / json_get / json_is_valid 等；版本与 datafusion 对齐）
+datafusion-functions-json = "0.55"
 datafusion-datasource = { workspace = true }
 datafusion-datasource-parquet = { workspace = true }
 arrow = { workspace = true }

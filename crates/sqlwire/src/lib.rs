@@ -82,12 +82,23 @@ async fn query_error<W: AsyncWrite + Send + Unpin>(
 impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MysqlBackend {
     type Error = io::Error;
 
+    /// 握手自报版本串。
+    ///
+    /// opensrv 默认回 `5.1.10-alpha-msql-proxy`，与 SQL 层 canned 的
+    /// `SELECT @@version`（8.0.32-yuntun）**不一致**：客户端会拿到两个"版本"，
+    /// 且 5.1.10 会让按版本分支的驱动/ORM 走老路径（如降级功能探测）。
+    /// 统一取 [`yuntun_sql::shim::MYSQL_VERSION`]（单一事实源）。
+    fn version(&self) -> String {
+        yuntun_sql::shim::MYSQL_VERSION.to_string()
+    }
+
     /// COM_QUERY：文本协议（CLI / 手工客户端 / 简单驱动）。
     async fn on_query<'a>(
         &'a mut self,
         sql: &'a str,
         results: QueryResultWriter<'a, W>,
     ) -> io::Result<()> {
+        tracing::debug!(sql = %sql_snippet_short(sql), "wire cmd: COM_QUERY");
         match self.engine.execute(sql, &mut self.session).await {
             Ok(SqlResult::Rows { schema, batches }) => {
                 let cols = encode::columns_of(&schema);
@@ -132,16 +143,30 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MysqlBackend {
                 colflags: ColumnFlags::empty(),
             })
             .collect();
+        // 结果列 schema（MySQL 语义）：非查询语句（INSERT/DDL）无结果集 → num_columns = 0；
+        // SELECT **必须**回真实列数与列定义。
+        //
+        // 【关键】libmysql 系客户端（mysql-connector C 扩展 / JDBC 二进制轨）依据 prepare
+        // 响应里的 num_columns 决定 `COM_STMT_EXECUTE` 是否期待**二进制结果集**：
+        // 报 0 会让它不消费随后的结果集 → 结果集包残留 → 错位到下一次 prepare 的响应
+        // （表现为间歇 `1210 Incorrect number of arguments executing prepared statement`，
+        // 且 `fetch*` 取不到行）。注：opensrv 对 execute 路径本就发二进制行
+        // （`QueryResultWriter::new(..., is_bin = true)`），无需也不能在此做文本化处理。
+        let columns: Vec<Column> = match self.engine.schema_of_in(sql, self.session.schema()).await {
+            Some(schema) => encode::columns_of(&schema),
+            None => Vec::new(),
+        };
         let id = self.next_stmt_id;
         self.next_stmt_id += 1;
         tracing::debug!(
             stmt_id = id,
             param_count = stmt.param_count,
+            result_columns = columns.len(),
             sql = %sql_snippet_short(sql),
             "stmt prepared"
         );
         self.prepared.insert(id, stmt);
-        info.reply(id, &params, &[]).await
+        info.reply(id, &params, &columns).await
     }
 
     /// COM_STMT_EXECUTE：参数解码 → SqlValue → execute_prepared。
@@ -151,6 +176,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MysqlBackend {
         params: ParamParser<'a>,
         results: QueryResultWriter<'a, W>,
     ) -> io::Result<()> {
+        tracing::debug!(stmt_id = id, "wire cmd: COM_STMT_EXECUTE");
         // clone 避免 prepared 表与 session 的借用冲突（PreparedStatement: Clone）
         let Some(stmt) = self.prepared.get(&id).cloned() else {
             return Err(io::Error::other(format!(
@@ -161,12 +187,17 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MysqlBackend {
             .into_iter()
             .map(|v| param_value(v.value.into_inner()))
             .collect::<io::Result<Vec<_>>>()?;
+        // 参数解码结果可见化：prepared 路径"查不到自己刚写的数据"时，第一个要区分的是
+        // "服务端拿到错误的绑定值 → 查询本就为空" 与 "服务端结果正确、客户端解码失败"。
+        tracing::debug!(stmt_id = id, params = ?vals, "stmt execute params decoded");
         match self
             .engine
             .execute_prepared(&stmt, &vals, &mut self.session)
             .await
         {
             Ok(SqlResult::Rows { schema, batches }) => {
+                let n: usize = batches.iter().map(|b| b.num_rows()).sum();
+                tracing::debug!(stmt_id = id, rows = n, "stmt execute result rows");
                 let cols = encode::columns_of(&schema);
                 let mut rw = results.start(&cols).await?;
                 for batch in &batches {
@@ -190,6 +221,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MysqlBackend {
 
     /// COM_STMT_CLOSE：清理语句缓存。
     async fn on_close<'a>(&'a mut self, id: u32) {
+        tracing::debug!(stmt_id = id, "wire cmd: COM_STMT_CLOSE（规范：不回包）");
         self.prepared.remove(&id);
     }
 
@@ -200,6 +232,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MysqlBackend {
         database: &'a str,
         writer: InitWriter<'a, W>,
     ) -> io::Result<()> {
+        tracing::debug!(database = %database, "wire cmd: COM_INIT_DB / handshake db");
         if !database.is_empty() {
             // 多 schema：handshake 的 database 即 schema（MySQL 语义），
             // 校验存在后**真实切换**会话；未知库回 ER_BAD_DB_ERROR(1049)
@@ -307,6 +340,203 @@ fn decode_time(b: &[u8]) -> io::Result<String> {
     })
 }
 
+/// 调试用写入侧探针：把服务端**真正写到 socket 的字节**逐次记录（分帧由 MySQL
+/// 长度前缀天然给出），再原样转发。用于排查 wire 协议层的包错位问题：
+/// 客户端可见流与 `stmt prepared` 之类的回调日志无法直接对齐时，这里能给出
+/// "服务端到底发了哪些包"的权威记录。
+///
+/// 仅当环境变量 `YUNTUN_WIRE_TRACE` 存在时启用（默认零开销直通）。
+struct WireTee<W> {
+    inner: W,
+    enabled: bool,
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for WireTee<W> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        let enabled = self.enabled;
+        let head: String = buf
+            .iter()
+            .take(32)
+            .map(|b| format!("{b:02x} "))
+            .collect();
+        let offered = buf.len();
+        let res = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if enabled {
+            let accepted = match &res {
+                std::task::Poll::Ready(Ok(n)) => format!("ok({n})"),
+                std::task::Poll::Ready(Err(e)) => format!("err({e})"),
+                std::task::Poll::Pending => "pending".to_string(),
+            };
+            tracing::debug!(offered, accepted = %accepted, head = %head.trim(), "wire write");
+        }
+        res
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> std::task::Poll<io::Result<usize>> {
+        let enabled = self.enabled;
+        let offered: usize = bufs.iter().map(|b| b.len()).sum();
+        let head: String = bufs
+            .iter()
+            .flat_map(|b| b.iter())
+            .take(32)
+            .map(|b| format!("{b:02x} "))
+            .collect();
+        let res = std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        if enabled {
+            let accepted = match &res {
+                std::task::Poll::Ready(Ok(n)) => format!("ok({n})"),
+                std::task::Poll::Ready(Err(e)) => format!("err({e})"),
+                std::task::Poll::Pending => "pending".to_string(),
+            };
+            tracing::debug!(offered, accepted = %accepted, head = %head.trim(), "wire write_vectored");
+        }
+        res
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// **MySQL 包级读取适配器**（必须包在 opensrv 读取侧）。
+///
+/// # 为什么必需：opensrv 0.7 的释放后使用（UAF）
+/// `opensrv-mysql 0.7.0` 的 `packet_reader.rs::PacketReader::next_async` 在
+/// **同一读缓冲里还有剩余字节**时的处理有缺陷：
+///
+/// ```text
+/// Ok((rest, p)) => {
+///     self.remaining = rest.len();
+///     if self.remaining > 0 {
+///         self.bytes = rest.to_vec();   // ← 旧 buffer 在这里被释放
+///     }
+///     return Ok(Some(p));               // ← 但 p（Packet）仍指向旧 buffer
+/// }
+/// ```
+/// `Packet` 是 `&[u8]`（+ 可选 Vec），`p` 借的是旧 `Vec<u8>` 的分配；赋值后旧分配被
+/// 释放 → `commands::parse(&packet)` 读到**已释放内存** → 解析失败（或解析出随机命令）
+/// → 走 opensrv 的兜底分支 `Err(_) => write_ok_packet(default)` 回一个**裸 OK 包** →
+/// 客户端可见流多一个包 → 后续响应错位。
+///
+/// 触发条件：客户端把多条命令写进同一个 TCP 段（libmysql 的 `COM_STMT_CLOSE` 紧跟
+/// `COM_STMT_PREPARE` 正是如此）。是否真的解析失败取决于释放内存是否已被复用 ——
+/// 这就是该 bug 表现为"间歇（60~100%）"、且被代理/日志掩盖（改变分配时序）的原因；
+/// 客户端一侧的症状是 `1210 Incorrect number of arguments executing prepared statement`。
+///
+/// # 修法
+/// 本适配器**每次 `poll_read` 最多交付一个 MySQL 包**（按长度前缀分帧）。于是 opensrv
+/// 的内部缓冲在成功解析后必然为空（`remaining == 0`），不会走到上面那条分支；
+/// 同时保证"一个包一次解析"，不会再出现 phantom/兜底包。
+///
+/// ⚠️ 两个都做到才算数（踩过一次坑）：
+/// 1. 一次只交付**一个**包；
+/// 2. 交付时**按包边界截断**，而不是按调用方缓冲区剩余容量截断（`min(buf.len(),
+///    out.remaining())` 是不够的）——否则底层一次 read 带回多条命令时，第二个包的
+///    字节会被顺带交付，opensrv 内部又出现剩余字节，等于没修。
+///
+/// 它同时充当 wire 探针：`YUNTUN_WIRE_TRACE=1` 时按包记录客户端命令（不设时零开销）。
+struct PacketFramedReader<R> {
+    inner: R,
+    buf: Vec<u8>,
+    traced: bool,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> PacketFramedReader<R> {
+    fn new(inner: R, traced: bool) -> Self {
+        Self {
+            inner,
+            buf: Vec::new(),
+            traced,
+        }
+    }
+
+    /// 缓冲里是否已有**一个完整 MySQL 包**；返回其总字节数（4 头 + payload）。
+    fn queued_packet_len(&self) -> Option<usize> {
+        if self.buf.len() < 4 {
+            return None;
+        }
+        let len = u32::from_le_bytes([self.buf[0], self.buf[1], self.buf[2], 0]) as usize;
+        let total = 4 + len;
+        (self.buf.len() >= total).then_some(total)
+    }
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PacketFramedReader<R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        out: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        use std::task::Poll;
+        let this = self.get_mut();
+
+        // ① 先攒够一个完整包（或读到 EOF）
+        while this.queued_packet_len().is_none() {
+            let mut tmp = [0u8; 8192];
+            let mut rb = tokio::io::ReadBuf::new(&mut tmp);
+            match std::pin::Pin::new(&mut this.inner).poll_read(cx, &mut rb) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(())) => {
+                    let n = rb.filled().len();
+                    if n == 0 {
+                        break; // 对端关闭：把已有字节交付完（AsyncRead 语义）
+                    }
+                    this.buf.extend_from_slice(rb.filled());
+                }
+            }
+        }
+
+        // ② 只交付**一个包**（按包边界截断，绝不在同一次交付里混入下一个包的字节）
+        //
+        // ★ 这里必须按包边界而不是按 `out.remaining()` 截断：底层一次 `read` 带回多条
+        // 命令时（libmysql 常把 `COM_STMT_CLOSE` / `COM_STMT_RESET` / 下一条 `PREPARE`
+        // 压进同一个 TCP 段），若把第二个包的字节一并交付，opensrv 内部缓冲在解析完
+        // 第一个包后仍有剩余字节 → 又走回 `packet_reader.rs` 的 UAF 分支（`self.bytes =
+        // rest.to_vec()`）→ 兜底裸 OK 包 → 客户端流错位。**分帧只有分到包边界才算数。**
+        let want = this.queued_packet_len().unwrap_or(this.buf.len());
+        let n = want.min(out.remaining());
+        if n > 0 {
+            // 探针：整包交付完成时记录一次（分包交付只在最后一片记录，避免重复）
+            if this.traced && n == want && this.buf.len() >= 4 {
+                let seq = this.buf[3];
+                let head: String = this.buf[4..]
+                    .iter()
+                    .take(32)
+                    .map(|b| format!("{b:02x} "))
+                    .collect();
+                tracing::debug!(
+                    seq,
+                    len = want - 4,
+                    head = %head.trim(),
+                    "wire recv (client → server)"
+                );
+            }
+            out.put_slice(&this.buf[..n]);
+            this.buf.drain(0..n);
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
 /// 启动 MySQL wire 监听（:3306 标准端口，R-2）。
 ///
 /// 每连接 spawn 一个 `AsyncMysqlIntermediary`（trust 鉴权，无 TLS——MVP 网络层隔离）。
@@ -351,6 +581,14 @@ pub async fn serve_mysql_on(
                     }
                     tracing::debug!(%peer, "mysql connection accepted");
                     let (r, w) = stream.into_split();
+                    // 读取侧必须包 `PacketFramedReader`（规避 opensrv 0.7 的 UAF，见其文档）；
+                    // 写入侧探针仅诊断用（YUNTUN_WIRE_TRACE=1 时记录服务端发出的包）。
+                    let trace = std::env::var_os("YUNTUN_WIRE_TRACE").is_some();
+                    let r = PacketFramedReader::new(r, trace);
+                    let w = WireTee {
+                        inner: w,
+                        enabled: trace,
+                    };
                     let backend = MysqlBackend::new(engine);
                     if let Err(e) = AsyncMysqlIntermediary::run_on(backend, r, w).await {
                         tracing::debug!(%peer, error = %e, "mysql connection ended");

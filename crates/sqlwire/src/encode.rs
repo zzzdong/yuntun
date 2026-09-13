@@ -9,7 +9,7 @@ use arrow::array::{
     Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
     LargeStringArray, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
     TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
-    UInt64Array,
+    UInt64Array, UnionArray,
 };
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use opensrv_mysql::{Column, ColumnFlags, ColumnType, RowWriter};
@@ -145,6 +145,16 @@ pub async fn write_row<W: tokio::io::AsyncWrite + Send + Unpin>(
             DataType::Decimal128(_, scale) => {
                 let v = col.as_any().downcast_ref::<Decimal128Array>().unwrap();
                 rw.write_col(format_decimal(v.value(row), *scale))?;
+            }
+            DataType::Union(_, _) => {
+                // JSON 变体联合（datafusion-functions-json 的 json_get 返回）：
+                // 取选中变体的底层值按文本输出（arrow 的 Union display 会带
+                // `{变体名=}` 包装，直接展示对客户端不友好）
+                let u = col.as_any().downcast_ref::<UnionArray>().unwrap();
+                let child = u.child(u.type_id(row));
+                let s = arrow::util::display::array_value_to_string(child.as_ref(), u.value_offset(row))
+                    .unwrap_or_default();
+                rw.write_col(s)?;
             }
             // 兜底：Display 转字符串（与 SHOW COLUMNS 的 text 回退一致）
             _ => {

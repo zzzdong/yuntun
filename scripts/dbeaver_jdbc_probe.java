@@ -21,8 +21,8 @@ import java.sql.Statement;
  *   java -cp "$JAR:scripts" dbeaver_jdbc_probe [jdbc-url]
  * </pre>
  *
- * 默认 URL 与 DBeaver 建连一致：useServerPrepStmts=false（opensrv-mysql 0.7
- * 无二进制结果集编码，见 operation-log §14.3）、useSSL=false、trust 鉴权。
+ * 默认 URL 与 DBeaver 建连一致：useServerPrepStmts=false（文本轨最稳；服务端预编译
+ * 已可用并覆盖 pymysql_smoke T2）、useSSL=false、trust 鉴权。
  */
 public class dbeaver_jdbc_probe {
     public static void main(String[] args) throws Exception {

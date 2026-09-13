@@ -101,17 +101,19 @@ SQL 支持面（详见 `docs/sql-access-design.md` §4）：
 |---|---|
 | 查询 | `SELECT`（含 CTE / 聚合 / `information_schema.*`），非限定表名 `FROM t` 直接可用 |
 | 写入 | `INSERT ... VALUES` / `INSERT ... SELECT` |
-| DDL | `CREATE TABLE` / `DROP TABLE`（WAL 权威，重启可恢复） |
+| DDL | `CREATE TABLE`（`IF NOT EXISTS` / `NOT NULL`；类型：`TINYINT/SMALLINT/INT/BIGINT`（含无符号）、`FLOAT/DOUBLE`、`BOOLEAN`、`DATE`、`DATETIME/TIMESTAMP`、`DECIMAL(p,s)`、`CHAR/VARCHAR(n)/TEXT/STRING`、`JSON/JSONB`（→ UTF8 文本存储）、`BINARY/VARBINARY/BLOB`、`ARRAY<T>` / `T[]`、`MAP(K,V)`（嵌套元素递归支持，Parquet round-trip 无损）/ `DROP TABLE`（`IF EXISTS`）/ `CREATE DATABASE` / `DROP DATABASE`（均 WAL 权威，重启可恢复） |
 | 元数据 | `SHOW TABLES/FULL TABLES`、`SHOW COLUMNS/FULL COLUMNS`、`DESCRIBE`、`SHOW CREATE TABLE`、`SHOW DATABASES`、`SHOW VARIABLES`、`SHOW COLLATION/CHARSET/ENGINES/KEYS` |
 | 方言兼容 | `SET` / `USE` / `BEGIN` / `COMMIT` / `ROLLBACK` = no-op（单语句自动提交） |
-| 不支持 | `UPDATE` / `DELETE` / 视图 / 存储过程 / 事务语义 → 明确报错（绝不静默返回错误结果） |
+| 不支持 | `UPDATE` / `DELETE` / `ALTER TABLE` / `CREATE TABLE AS SELECT` / `CREATE OR REPLACE` / 复杂类型（`STRUCT` 等）/ `_BINARY` 字面量 / MySQL JSON 路径操作符 `->` `->>`（用 JSON 函数替代）/ 视图 / 存储过程 / 事务语义 → 明确报错（绝不静默返回错误结果）；加列走写入侧 schema 演化（ingest / Flight DoPut），无 SQL `ALTER` |
+| JSON 函数 | `json_get / json_get_{str,int,float,bool,json,array}` / `json_as_text` / `json_contains` / `json_length` / `json_object_keys` / `json_from_scalar`（`datafusion-functions-json` 0.55）。**路径不带 `$`**：`json_get_int(doc, 'a.b')`；`json_get` 返回 JSON 变体联合（wire 按文本回传） |
 
 ### 2.2 DBeaver（MySQL）连接
 
 1. `数据库` → `新建连接` → 选择 **MySQL** → 下一步；
 2. **常规**：主机 `127.0.0.1`、端口 `3306`、数据库 `public`、用户名 `yuntun`、密码留空；
 3. **驱动属性**（右键连接 → 编辑连接 → 驱动属性）：
-   - `useServerPrepStmts` = **false**（yuntun 当前为文本结果集，见 §4 已知限制）
+   - `useServerPrepStmts` = **false**（文本轨最稳；服务端预编译已可用并覆盖 T2，
+     见 §3 兼容矩阵）
    - `useSSL` = `false`、`allowPublicKeyRetrieval` = `true`
 4. `测试连接` → 应看到 `MySQL 8.0.32-yuntun`；展开 `public` 即可浏览表 / 列、预览数据。
 
@@ -133,7 +135,7 @@ java -cp "$JAR:scripts" dbeaver_jdbc_probe
 | 级别 | 目标 | 状态 |
 |---|---|---|
 | **T1** | mysql CLI / 文本协议：SELECT、SHOW TABLES、INSERT | ✅（`scripts/pymysql_smoke.py`） |
-| **T2** | 驱动预编译（COM_STMT_PREPARE/EXECUTE）写入，含 datetime 二进制参数 | ✅（写入路径；`scripts/pymysql_smoke.py` T2） |
+| **T2** | 驱动预编译（COM_STMT_PREPARE/EXECUTE）：写入 + **prepared SELECT 取回真实行** | ✅（mysql-connector C 扩展 / libmysqlclient 二进制协议栈；`scripts/pymysql_smoke.py` T2） |
 | **T3** | DBeaver 连接 / 表·列浏览 / 数据预览 | ✅（`scripts/dbeaver_jdbc_probe.java` + 手工清单，见 `docs/operation-log.md` §15） |
 | **T4**（非目标） | 事务、权限、视图、存储过程、PG wire | ❌ 明确报错或 no-op |
 
@@ -148,11 +150,23 @@ java -cp "$JAR:scripts" dbeaver_jdbc_probe
   与查询缓存 TTL（默认 30s）影响**（`docs/plan.md` §4.5 / `docs/design.md` §7.4）；
   数据落对象存储（Parquet + Manifest）仍按攒批窗口进行，落盘后进入快照隔离 / Compaction 语义；
   回执的 `expected_visible_in_secs` = 该扫描周期上界；
-- **prepared SELECT 取不到结果行**：opensrv-mysql 0.7 只提供文本结果集编码，
-  COM_STMT_EXECUTE 的结果行按文本回写 → 二进制协议客户端需关闭服务端预编译
-  （JDBC `useServerPrepStmts=false`）；**写路径（OK 包）不受影响**；
+- **服务端预编译（prepared）**：已可用（写入 + prepared SELECT 二进制结果集，见 T2）。
+  历史故障根因是 opensrv-mysql **0.7.0** 的 `PacketReader::next_async` 释放后使用
+  （上游 #66/#67，仅修在 git、未随 crates.io 发布）→ 已由 sqlwire 的
+  `PacketFramedReader`（按包边界分帧）在协议层规避；上游发新版后可移除该适配器。
+  握手版本串与 `SHOW VARIABLES` 同源（`8.0.32-yuntun`）；
 - **结果集**：Flight 轨（`do_get`）**已流式**（S1.10：边算边发，500 万行 / 114 MB 级
-  结果集服务端 RSS 增量 ≈ 2 MB）；MySQL wire 轨仍为逐行写但结果先收集（后续按需优化）。
+  结果集服务端 RSS 增量 ≈ 2 MB）；MySQL wire 轨仍为逐行写但结果先收集（后续按需优化）；
+- **SQL DDL 时间精度**：`TIMESTAMP(p)` 的精度 `p` 目前不落入 schema（一律 `Timestamp(ns)`）。
+  需要毫秒精度的场景（如 `scripts/pyarrow_smoke.py` 的 prepared 绑定写入要求表的
+  `event_time` 为 `Timestamp(ms)`）请用 demo 种子（Rust API）建表——该脚本因此
+  **依赖 demo 种子实例**（`YUNTUN_DEMO_SERVE=1 cargo run -p yuntun-server --example demo`）；
+- **opensrv-mysql 依赖**：crates.io 停在 **0.7.0**（2024-02），上游后续修复
+  （UAF #66/#67、OK 包合规 #75/#78 等）仅存在于 git。0.1 以 sqlwire 的
+  `PacketFramedReader`（按包边界分帧）规避 UAF；后续建议把依赖切到上游 git 固定 rev，
+  届时可移除该适配器（`vendor/opensrv-mysql/` 仅为分析用拷贝，未接入构建）；
+- **测试稳定性**：`chaos::crash_recovery_no_data_loss` 在全量并行（真实磁盘 I/O 竞争）
+  下偶发失败，单独运行稳定；断言的固定等待后续改轮询。
 
 ### 多 schema（MySQL 的 database）
 
@@ -200,7 +214,7 @@ scripts/.venv/bin/pip install -r scripts/requirements.txt -i https://mirrors.ali
 
 | 脚本 | 用途 |
 |---|---|
-| `scripts/pyarrow_smoke.py <flight地址>` | Flight SQL：ADBC 查询 + 元数据 + 原始 Flight prepared 写入 |
+| `scripts/pyarrow_smoke.py <flight地址>` | Flight SQL：ADBC 查询 + 元数据 + 原始 Flight prepared 写入（**需 demo 种子实例**，见 §4 时间精度条目） |
 | `scripts/pyarrow_sqlinfo_smoke.py <flight地址>` | Flight SQL：`GetSqlInfo` 信息项 |
 | `scripts/pymysql_smoke.py <mysql地址>` | MySQL wire：T1 文本协议（DDL/INSERT/SELECT/SHOW/错误码 1146）+ T2 预编译 |
 | `scripts/flight_stream_smoke.py <flight地址> <表> [批数 行数]` | Flight `do_get` 流式（S1.10）：灌数 + ADBC 流式读取 + 服务端 RSS 采样（`0 0` = 只读模式） |

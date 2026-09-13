@@ -4,12 +4,16 @@ T1 **文本协议**（pymysql 纯 Python，COM_QUERY）：
     版本探测 → DDL → INSERT → SELECT → SHOW TABLES/COLUMNS → 错误路径
     （表不存在 → ER_NO_SUCH_TABLE / 1146，且连接不断开）。
 
-T2 **预编译**（mysql-connector-python prepared cursor，COM_STMT_PREPARE/EXECUTE）：
-    参数绑定写入（含 datetime 二进制参数解码）→ 文本轨复核可见。
+T2 **预编译**（mysql-connector-python prepared cursor，COM_STMT_PREPARE/EXECUTE，
+   含 C 扩展/libmysqlclient 二进制协议栈）：
+    参数绑定写入（含 datetime 二进制参数解码）→ prepared SELECT 取回**真实行**（[10]）。
 
-已知限制：opensrv-mysql 0.7 **没有二进制结果集编码**，COM_STMT_EXECUTE 的结果行
-以文本行回写 → prepared SELECT 在二进制协议客户端侧拿不到正确行（本脚本 [10]
-仅验证不崩，数据正确性由 [11] 文本轨复核）。写路径（OK 包）不受影响。
+注：opensrv-mysql 0.7 的 `COM_STMT_EXECUTE` **是二进制结果集**（`QueryResultWriter::
+new(..., is_bin = true)`）——此前"无二进制行编码"的说法有误。当时 prepared SELECT 取不到
+行的真因是 opensrv 0.7 `PacketReader::next_async` 的释放后使用（上游 #66/#67，仅修在
+git、未随 crates.io 的 0.7.0 发布）：一次 read 带回多条命令时旧缓冲被释放，命令被错解
+→ opensrv 兜底回一个裸 OK 包 → 客户端流错位（`1210 Incorrect number of arguments`）。
+sqlwire 侧的 `PacketFramedReader` 按**包边界**分帧即堵住该分支（见 crates/sqlwire/src/lib.rs）。
 
 依赖（项目内虚拟环境 `scripts/.venv`，已 gitignore）：
     python3 -m venv scripts/.venv
@@ -72,6 +76,12 @@ def t1_text_protocol(host: str, port: int) -> None:
         rows = cur.fetchall()
         print("[1] SHOW VARIABLES LIKE 'version' ->", rows)
         assert any(r[0] == "version" and "8.0.32" in r[1] for r in rows), rows
+
+        # [1.1] 握手自报版本必须与 SHOW VARIABLES 同源（否则客户端看到两个版本串，
+        # 且按版本分支的驱动/ORM 会误判能力）
+        server_info = conn.get_server_info()
+        print("[1.1] handshake server version ->", server_info)
+        assert "8.0.32" in server_info, server_info
 
         # [2] DDL（文本协议）
         cur.execute(f"DROP TABLE IF EXISTS {TABLE}")
@@ -193,10 +203,20 @@ def t2_prepared(host: str, port: int) -> None:
         print("[9] prepared INSERT x2 ok (params bind via COM_STMT_EXECUTE)")
         cnx.commit()  # 服务端单语句自动提交；COMMIT 由方言 shim no-op
 
-        # 已知限制（opensrv-mysql 0.7 无二进制结果集编码）：prepared 结果行以文本行
-        # 回写，二进制协议客户端侧为空/错行 → 此处只验证不崩；数据正确性由 [11] 复核
-        cur.execute(f"SELECT id, name FROM {TABLE} WHERE id = %s", (2,))
-        print("[10] prepared SELECT ->", cur.fetchall(), "(text-only resultset: known gap)")
+        # [10] prepared SELECT 必须取回**真实行**（二进制结果集 + 读己之写）。
+        # 与 T1 同理：写入→可见是异步窗口（数据由 Ingestor 内存分片补上），单次 fetch
+        # 可能为空 → 轮询到出现为止。
+        select = f"SELECT id, name FROM {TABLE} WHERE id = %s"
+        deadline = time.monotonic() + VISIBLE_TIMEOUT_SEC
+        while True:
+            cur.execute(select, (2,))
+            rows = [tuple(r) for r in cur.fetchall()]
+            if rows == [(2, "bob")]:
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError(f"[10] prepared SELECT 超时：{rows}")
+            time.sleep(0.3)
+        print("[10] prepared SELECT ->", rows)
     finally:
         cnx.close()
 

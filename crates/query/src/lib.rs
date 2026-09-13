@@ -59,13 +59,16 @@ impl QueryEngine {
         &self,
         schema: &str,
     ) -> Result<SessionContext, DataFusionError> {
-        let ctx = SessionContext::new_with_config(
+        let mut ctx = SessionContext::new_with_config(
             datafusion::prelude::SessionConfig::new()
                 .with_information_schema(true)
                 // G2（sql-access-design §四）：非限定表名 `FROM t` 解析到默认
                 // catalog/schema，wire 客户端（MySQL/PG）直接可用
                 .with_default_catalog_and_schema(CATALOG_NAME, schema),
         );
+        // JSON SQL 函数（json_extract / json_get / json_is_valid ...）：
+        // JSON 列以 Utf8 文本存储，查询能力由本函数集提供（0.1 支持 ARRAY/MAP 的同时补齐）
+        datafusion_functions_json::register_all(&mut ctx)?;
         let url: url::Url = STORE_URL
             .parse()
             .map_err(|e| DataFusionError::Configuration(format!("invalid store url: {e}")))?;

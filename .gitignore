@@ -13,3 +13,4 @@ demo.pid
 tmp_dl/
 /data
 __pycache__/
+/vendor/

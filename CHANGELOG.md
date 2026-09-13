@@ -21,8 +21,9 @@
   对象路径按 schema 分层；schema 与表定义均由 WAL DDL 重放恢复。
 - **协议端口**：
   - FlightSQL 标准轨：查询 / DDL / `INSERT ... VALUES` / DoPut 批量写入 / prepared statement；
-  - MySQL wire（`:3306`）：文本协议、预编译写入（COM_STMT_PREPARE/EXECUTE）、
-    DBeaver 全兼容元数据（DatabaseMetaData + `SHOW ...` + `information_schema` 补全）。
+  - MySQL wire（`:3306`）：文本协议、预编译写入与查询（COM_STMT_PREPARE/EXECUTE，
+    二进制参数与二进制结果集）、DBeaver 全兼容元数据（DatabaseMetaData +
+    `SHOW ...` + `information_schema` 补全）。
 - **客户端**：`yuntun-client` SDK（Rust，简易轨批量写入 + 查询）与 `yuntun-cli`
   （`query` / `insert` / `tables` / `schema` 子命令）。
 - **运维**：`yuntun.toml` 配置、写后可见性窗口可调、孤儿文件清理、WAL 磁盘水位保护。
@@ -37,5 +38,7 @@
 ### Known limitations
 
 详见 README §4：无事务（单语句自动提交）；trust 鉴权（需网络隔离部署）；
-MySQL 预编译查询为文本结果集（写路径不受影响）；MySQL wire 结果集先收集后逐行写
-（Flight 轨已流式）。
+MySQL wire 结果集先收集后逐行写（Flight 轨已流式）。
+（更正：早期版本此处曾写"预编译查询为文本结果集"——有误，opensrv 的
+COM_STMT_EXECUTE 本就走二进制行；当时 prepared SELECT 取不到行的真因是
+opensrv 0.7 PacketReader 的 UAF 触发条件，见 docs/operation-log.md §22。）
