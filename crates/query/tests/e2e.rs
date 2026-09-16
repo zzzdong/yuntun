@@ -65,13 +65,15 @@ async fn ingest_then_query_visible() {
         .await
         .unwrap();
 
-    // ② Ingestor：行数阈值=1 → 首次扫描即 flush；jitter=0
+    // ② Ingestor：行数阈值=1 → 首次扫描即 seal；flush 上界 0 → 同轮落盘
+    //（架构 §5.3：flush 到期时间 = seal_time + max_flush_delay + 相位，不再是随机 jitter）
     let cfg = IngestorConfig {
         rows_threshold: 1,
-        time_threshold_secs: 5,
-        idle_timeout: Duration::from_secs(60),
-        flush_jitter_secs: 0,
+        time_threshold_secs: 0,
+        max_flush_delay_secs: 0,
+        flush_phase_spread_secs: 0,
         scan_interval: Duration::from_millis(20),
+        spill_dir: wal_dir.join("spill"),
         ..Default::default()
     };
     let wal = yuntun_wal::writer::WalWriter::open(yuntun_wal::WalConfig::for_dir(&wal_dir), 0)

@@ -5,6 +5,7 @@ members = [
     "crates/proto",
     "crates/wal",
     "crates/store",
+    "crates/chunk",
     "crates/format",
     "crates/catalog",
     "crates/ingest",
@@ -28,7 +29,10 @@ license = "MIT OR Apache-2.0"
 # ---- 核心 ----
 # 注意：datafusion 55.0.0 实际依赖 arrow 59 / object_store 0.13（文档 §2.3 的
 # "arrow 55" 指 DataFusion 主版本）。统一全 workspace 用 arrow 59 避免双版本冲突。
-arrow = "59"
+# 注意：`ipc_compression` 是 spill 通道的硬需求 —— 架构 §2.1 规定 spill 落盘用
+# **Arrow IPC(LZ4)**（落盘/读回近乎零成本，flush 只付一次必需的编码）。默认 feature
+# 不含压缩编解码，故在此显式打开（只增加编解码器，不改变语义）。
+arrow = { version = "59", features = ["ipc_compression"] }
 arrow-flight = { version = "59", features = ["flight-sql-experimental"] }
 datafusion = "55"
 datafusion-datasource = "55"
@@ -63,4 +67,7 @@ rand = "0.8"
 # fjall   = "3.1.8"
 
 [profile.release]
-debug = true
+# 0.1 发布产物瘦身：完整调试信息会让二进制达到 2.3GB。
+# line-tables-only 保留崩溃回溯的文件/行号，体积小一个量级；
+# 需要完整符号做性能分析时用 CARGO_PROFILE_RELEASE_DEBUG=2 覆盖。
+debug = "line-tables-only"

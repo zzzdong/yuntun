@@ -100,7 +100,8 @@ dir = "{wal_dir}"
 [ingest]
 rows_threshold = 1
 time_threshold_secs = 5
-flush_jitter_secs = 0
+max_flush_delay_secs = 1
+flush_phase_spread_secs = 0
 scan_interval_ms = 20
 "#
     ))
@@ -408,7 +409,8 @@ dir = "{wal_dir}"
 [ingest]
 rows_threshold = 1
 time_threshold_secs = 5
-flush_jitter_secs = 0
+max_flush_delay_secs = 1
+flush_phase_spread_secs = 0
 scan_interval_ms = 20
 "#
     ))

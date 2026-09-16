@@ -9,6 +9,7 @@ yuntun-model = { path = "../model" }
 yuntun-proto = { path = "../proto" }
 yuntun-wal = { path = "../wal" }
 yuntun-store = { path = "../store" }
+yuntun-chunk = { path = "../chunk" }
 yuntun-format = { path = "../format" }
 yuntun-catalog = { path = "../catalog" }
 yuntun-ingest = { path = "../ingest" }

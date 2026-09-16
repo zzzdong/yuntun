@@ -78,6 +78,10 @@ impl SqlError {
             LakeError::IdempotencyKeyTooLong => {
                 SqlError::Internal("idempotency key too long".into())
             }
+            // 背压阶梯第三级（架构 §2.7）：瞬时错误，客户端退避后重试（非语义错误）
+            LakeError::ResourceExhausted(msg) => SqlError::Internal(format!(
+                "server is under memory pressure ({msg}); retry after backoff"
+            )),
             other => SqlError::Internal(other.to_string()),
         }
     }

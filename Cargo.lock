@@ -4858,6 +4858,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "yuntun-chunk"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "crc32fast",
+ "futures",
+ "tracing",
+ "uuid",
+ "yuntun-model",
+ "yuntun-store",
+ "yuntun-testkit",
+]
+
+[[package]]
 name = "yuntun-client"
 version = "0.1.0"
 dependencies = [
@@ -4937,6 +4952,7 @@ dependencies = [
  "tracing",
  "uuid",
  "yuntun-catalog",
+ "yuntun-chunk",
  "yuntun-format",
  "yuntun-model",
  "yuntun-store",
@@ -5017,6 +5033,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "yuntun-catalog",
+ "yuntun-chunk",
  "yuntun-compaction",
  "yuntun-format",
  "yuntun-ingest",

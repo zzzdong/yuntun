@@ -1,4 +1,4 @@
-# yuntun Standalone 配置示例（详细设计 §11）
+# yuntun Standalone 配置示例（详细设计 §11 + 架构 §2.7/§2.8/§5.2/§5.3）
 
 [server]
 listen = "0.0.0.0:50051"
@@ -27,16 +27,51 @@ batch_timeout_secs = 1800
 # 【v11】磁盘保护水位（>80% 强制 abort 最老未完成 batch）
 disk_high_watermark = 0.80
 
+# chunk 层（架构 §2）：热数据缓冲 + spill + 内存背压。
+[chunk]
+# spill 目录：**必须在本地磁盘**（架构 §2.5）——spill 是节点私有状态，
+# 卸载内存压力若走网络会比不卸载更慢。
+spill_dir = "./data/spill"
+# 实例标识：确定性 flush 相位的 hash 输入，同时写入 FileManifest.source_instance
+# （架构 §4.4：冷热边界按实例切分；分布式阶段每个 datanode 必须唯一）。
+instance_id = "standalone"
+# 内存硬分区（架构 §2.8）：两块预算**互不抢占**。
+# chunk 区必须保底，否则一个大基数 GROUP BY 就能把写入压垮。
+mem_budget_mb = 512
+# query 执行区：超限直接返回错误，绝不抢占 chunk 区。
+query_mem_budget_mb = 512
+# 背压阶梯（架构 §2.7）：>= 60% 后台 spill 最老 sealed chunk；
+# >= 80% 强制 seal 并 spill；>= 95% 拒绝写入（RESOURCE_EXHAUSTED + 退避重试）。
+soft_pct = 60
+hard_pct = 80
+reject_pct = 95
+
 [ingest]
 # ADR-1 FormatSwitch：vortex 需编译期 --features vortex 并锁定 Git Commit；
 # 当前默认 parquet 回退路径
 default_format = "parquet"
-# 攒批行数阈值（§7.2）
-rows_threshold = 10000
-# 攒批时间阈值（秒）
+
+# ---- seal 触发（架构 §2.2 / §5.4 / ADR-10）----
+# 行数阈值：让 RowGroup 一次成型（S1-10 建议 50–100 万行量级）
+rows_threshold = 500000
+# 字节阈值（MB，内存口径）
+bytes_threshold_mb = 128
+# 最短驻留地板（秒）：创建后至少这么久才允许因"窗口关闭"而 seal。
+# 【不是 seal 时刻】时间维度的 seal 触发是**到达分钟窗口关闭**（ADR-10 整分钟对齐）；
+# ADR-10 明文否决"达到阈值后 N 秒"——那会让低吞吐表在一个窗口内产出十余个小文件。
 time_threshold_secs = 5
-# Flush Jitter 上限（秒，ADR-10 防惊群）
-flush_jitter_secs = 60
+
+# ---- 持久化上界（架构 §5.2：**不得与可见性混为一谈**）----
+# flush_at = seal_time + max_flush_delay (+ 确定性相位偏移)
+# 可见性上界绑 WAL fsync（约一个 scan_interval），持久化上界绑本值。
+# 低吞吐表实际持久化上界 ≈ 窗口关闭(≤60s) + max_flush_delay + 相位(≤spread)。
+max_flush_delay_secs = 30
+# 强制 seal + flush 的最大驻留秒数：防慢写入流把 WAL 撑爆（S1-9）
+chunk_max_resident_secs = 60
+# 确定性相位偏移上限（秒）：flush 到期时间确定，各实例仍分散以防惊群（S2-9）
+# 【已移除】flush_jitter_secs：随机 jitter 会让持久化上界不可预测。
+flush_phase_spread_secs = 5
+
 scan_interval_ms = 100
 # 幂等键 TTL（小时，§7.3.1）
 idempotency_ttl_hours = 24

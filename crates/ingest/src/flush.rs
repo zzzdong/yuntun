@@ -1,24 +1,31 @@
-//! Flush 全流程：三级状态机（详细设计 §5.4）。
+//! Flush 全流程：三级状态机（详细设计 §5.4）+ chunk 层衔接（架构 §5）。
 //!
 //! ```text
 //! ③ 生成 batch_id（C1：随机 UUIDv7，不是内容哈希 —— ADR-4）
 //!    → WAL: BatchPending
-//! ④ 写 S3 → WAL: BatchS3Written
+//! ④ 写对象存储 → WAL: BatchS3Written
 //! ⑤ 提交 Meta（幂等）→ WAL: BatchCommitted（进入终态）
 //! ```
+//!
+//! ## 与 chunk 层的边界
+//! flush **不碰 chunk 状态**：入参是 [`ChunkFlushInput`]（chunk 的数据快照），
+//! 成功与否由调用方（攒批循环）决定是否 `mark_committed`。
+//! 这样单次 flush 失败**无需回滚** chunk 状态 —— 批次保持非终态、chunk 仍可查，
+//! 排除了短暂"数据不可见"的窗口（架构 §4.5 无空洞）。
 
-use crate::accumulator::WindowGroup;
+use crate::accumulator::now_ms;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 use yuntun_catalog::CatalogOps;
+use yuntun_chunk::store::ChunkFlushInput;
 use yuntun_model::arrow_util::align_batch;
 use yuntun_model::batch::{apply_record, BatchStateMap};
 use yuntun_model::error::LakeError;
 use yuntun_model::meta::compute_stats_lite;
 use yuntun_model::ops::CommitFilesRequest;
-use yuntun_store::MemoryShard;
 use yuntun_model::wal_record::{
-    BatchAbortPayload, BatchCommittedPayload, BatchPendingPayload, BatchS3WrittenPayload, Record,
+    BatchAbortPayload, BatchCommittedPayload, BatchPendingPayload, BatchS3WrittenPayload, DataPayload,
+    Record,
 };
 use yuntun_wal::writer::WalWriter;
 
@@ -71,16 +78,15 @@ impl yuntun_wal::cleanup::BatchStateView for LiveBatchTracker {
     }
 }
 
-/// flush 依赖集合。
+/// flush 依赖集合（**只含外部资源**：WAL / Catalog / 对象存储 / 批次追踪器）。
 pub struct FlushDeps {
     pub wal: WalWriter,
     pub catalog: Arc<dyn CatalogOps>,
     pub store: Arc<dyn object_store::ObjectStore>,
     pub format: yuntun_format::DataFormat,
     pub tracker: Arc<LiveBatchTracker>,
-    /// 内存分片（store 层）：提交成功后把条目转为 `Committed(snapshot)`，
-    /// 不立即删除 —— 查询缓存可能还没刷新到该快照，立即删会出现可见性空洞。
-    pub hot: Arc<MemoryShard>,
+    /// 本实例标识：写入 `FileManifest.source_instance`（架构 §4.4 冷热边界按实例切分）
+    pub instance_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -91,22 +97,27 @@ pub struct FlushOutcome {
     pub row_count: u64,
     pub schema_version: u64,
     pub snapshot: u64,
+    /// 该文件覆盖的 WAL seq 半开区间（WAL 回收点语义，S1-8）
+    pub wal_seq_range: std::ops::Range<u64>,
 }
 
-/// flush 一个攒批组（详细设计 §5.4）。
+/// flush 一个 chunk（详细设计 §5.4）。
 ///
 /// # 失败语义
 /// 任何中间步骤失败：批次保持非终态（Pending / S3Written），
 /// 由 WAL 超时监控（§5.3.6.1）最终 abort；已写 S3 的文件成为孤儿，由孤儿清理回收。
 /// **绝不**在中途写 BatchCommitted。
-pub async fn flush_batch(group: WindowGroup, deps: &FlushDeps) -> Result<FlushOutcome, LakeError> {
-    flush_batch_with_id(group, deps, None).await
+pub async fn flush_chunk(
+    input: &ChunkFlushInput,
+    deps: &FlushDeps,
+) -> Result<FlushOutcome, LakeError> {
+    flush_chunk_with_id(input, deps, None).await
 }
 
-/// 同 [`flush_batch`]，但允许指定 batch_id（恢复场景：§5.6 复用原 batch_id，
+/// 同 [`flush_chunk`]，但允许指定 batch_id（恢复场景：§5.6 复用原 batch_id，
 /// Meta 按 batch_id 幂等，保证重放安全）。正常路径必须传 None（ADR-4 随机 UUIDv7）。
-pub async fn flush_batch_with_id(
-    group: WindowGroup,
+pub async fn flush_chunk_with_id(
+    input: &ChunkFlushInput,
     deps: &FlushDeps,
     reuse_batch_id: Option<String>,
 ) -> Result<FlushOutcome, LakeError> {
@@ -117,25 +128,23 @@ pub async fn flush_batch_with_id(
     // 例外：恢复路径（§5.6）复用原 batch_id —— Meta 幂等保证重放安全。
     let batch_id = reuse_batch_id.unwrap_or_else(|| Uuid::now_v7().to_string());
 
-    // 合并 payload（WAL 内 Arrow IPC 解码 + schema 对齐 + 排序留给查询层/Compaction）
-    let (merged, schema_version) = merge_payloads(&group.payloads)?;
+    let merged = merge_batches(&input.batches, &input.schema)?;
     let row_count = merged.num_rows() as u64;
-    let now = crate::accumulator::now_ms();
+    let now = now_ms();
 
     // WAL: BatchPending
-    // ⚠️ wal_seq_end 必须是**精确 exclusive 右界**（= 该组最后一条 Data 的 seq + 1）：
-    // 攒批按 (table, shard, window) 分组，组内 seq 因交错写入存在空洞，
-    // `first_seq + payloads.len()` 会把右界算小 → Pending 重做 `scan_range` 少读
-    // 尾部 Data（既有缺陷，delta-dml-design §1.1 R8）。全链路统一半开 [start, end)。
-    let wal_seq_end = group.seqs.last().unwrap_or(&group.first_seq) + 1;
+    // ⚠️ wal_seq_end 必须是**精确 exclusive 右界**（= 该 chunk 最后一条 Data 的 seq + 1）：
+    // chunk 内 seq 因交错写入存在空洞，`first_seq + payloads.len()` 会把右界算小
+    // → Pending 重做 `scan_range` 少读尾部 Data。全链路统一半开 [start, end)。
+    let wal_seq_range = input.wal_seq_range.clone();
     let pending = Record::BatchPending(BatchPendingPayload {
         batch_id: batch_id.clone(),
-        table: group.table.clone(),
-        shard: group.shard.clone(),
-        window: group.window.clone(),
-        wal_seq_start: group.first_seq,
-        wal_seq_end,
-        schema_version,
+        table: input.shard.table.clone(),
+        shard: input.shard.shard.clone(),
+        window: input.shard.window.clone(),
+        wal_seq_start: wal_seq_range.start,
+        wal_seq_end: wal_seq_range.end,
+        schema_version: input.schema_version,
         client_request_id: String::new(),
         created_at_ms: now,
         row_count,
@@ -143,13 +152,12 @@ pub async fn flush_batch_with_id(
     deps.wal.append(pending.clone()).await?;
     deps.tracker.observe(&pending);
 
-    // ④ 编码写 S3
-    let s3_res = write_group_to_s3(deps, &group, &batch_id, &merged, schema_version).await;
-    let (file_path, file_size) = match s3_res {
+    // ④ 编码写对象存储
+    let (file_path, file_size) = match write_to_object_store(deps, input, &batch_id, &merged).await {
         Ok(x) => x,
         Err(e) => {
             // 保持非终态，等超时监控 abort（幂等重试场景见 §5.6）
-            tracing::error!(batch_id = %batch_id, error = %e, "s3 write failed, batch left pending");
+            tracing::error!(batch_id = %batch_id, error = %e, "object store write failed, batch left pending");
             return Err(e);
         }
     };
@@ -170,6 +178,14 @@ pub async fn flush_batch_with_id(
         batch_id: batch_id.clone(),
         row_count,
         file_size,
+        schema_version: input.schema_version,
+        table: input.shard.table.clone(),
+        shard: input.shard.shard.clone(),
+        time_window: input.shard.window.clone(),
+        // 逻辑分区身份与物理文件身份**分开记录**（架构 §2.3）
+        partition_key: input.shard.window.clone(),
+        // 冷热边界按实例切分（架构 §4.4）
+        source_instance: deps.instance_id.clone(),
         stats: Some(compute_stats_lite(
             &merged,
             &yuntun_model::meta::default_sort_columns(&merged.schema()),
@@ -179,22 +195,16 @@ pub async fn flush_batch_with_id(
     let resp = deps
         .catalog
         .commit_files(CommitFilesRequest {
-            table: group.table.clone(),
+            table: input.shard.table.clone(),
             batch_id: batch_id.clone(),
             client_request_id: None,
-            shard: group.shard.clone(),
-            time_window: group.window.clone(),
+            shard: input.shard.shard.clone(),
+            time_window: input.shard.window.clone(),
             files,
-            schema_version,
+            schema_version: input.schema_version,
             row_count,
         })
         .await?;
-
-    // 分片交棒：内存分片条目转 Committed(snapshot)。
-    // 查询侧在 `cached_snapshot < snapshot` 期间仍从内存分片返回
-    // （避免"已提交但缓存未刷新"空洞），缓存刷新到该快照后由 sweep 回收。
-    deps.hot
-        .mark_committed(&group.shard_id(), &group.seqs, resp.snapshot);
 
     // WAL: BatchCommitted（进入终态）
     let committed = Record::BatchCommitted(BatchCommittedPayload {
@@ -208,8 +218,9 @@ pub async fn flush_batch_with_id(
         file_path,
         file_size,
         row_count,
-        schema_version,
+        schema_version: input.schema_version,
         snapshot: resp.snapshot,
+        wal_seq_range,
     })
 }
 
@@ -239,6 +250,12 @@ pub async fn recommit_into_catalog(
             batch_id: st.batch_id.clone(),
             row_count: st.row_count,
             file_size,
+            schema_version: st.schema_version,
+            table: table.to_string(),
+            shard: st.shard.clone(),
+            time_window: st.time_window.clone(),
+            partition_key: st.time_window.clone(),
+            source_instance: deps.instance_id.clone(),
             ..Default::default()
         })
         .collect();
@@ -271,55 +288,74 @@ pub async fn abort_batch(deps: &FlushDeps, batch_id: &str) -> Result<(), LakeErr
     Ok(())
 }
 
-/// 合并一组 WAL Data payload → 单个 RecordBatch。
-/// 不同 schema_version 的 payload：按列名对齐，缺失列填 null（§6.8 的查询侧同理）。
-fn merge_payloads(
-    payloads: &[yuntun_model::wal_record::DataPayload],
-) -> Result<(arrow::record_batch::RecordBatch, u64), LakeError> {
+/// 合并一组批次为单个文件内容（对齐到 chunk schema 后 concat）。
+///
+/// chunk 内**只有一个 schema 版本**（架构 §2.4 / I5：版本变化强制 seal 开新文件），
+/// 因此这里对齐到 `input.schema` 是恒等变换；保留对齐是为了防御性兜底
+/// （如 chunk 内被外部注入异构批次）。
+pub fn merge_batches(
+    batches: &[arrow::record_batch::RecordBatch],
+    schema: &arrow::datatypes::SchemaRef,
+) -> Result<arrow::record_batch::RecordBatch, LakeError> {
+    if batches.is_empty() {
+        return Err(LakeError::Other("empty chunk".into()));
+    }
+    let aligned: Vec<arrow::record_batch::RecordBatch> = batches
+        .iter()
+        .map(|b| align_batch(b, schema))
+        .collect::<Result<Vec<_>, _>>()?;
+    arrow::compute::concat_batches(schema, &aligned)
+        .map_err(|e| LakeError::Other(format!("concat: {e}")))
+}
+
+/// WAL Data payloads → 批次 + 目标 schema（**恢复路径专用**：数据不在 chunk 里，只能解码 WAL）。
+///
+/// 不同 schema_version 的 payload：按列名对齐到最高版本的 schema（缺失列填 null），
+/// 与 §6.8 的查询侧兜底语义一致。
+pub fn payloads_to_batches(
+    payloads: &[DataPayload],
+) -> Result<(Vec<arrow::record_batch::RecordBatch>, u64), LakeError> {
     if payloads.is_empty() {
         return Err(LakeError::Other("empty batch group".into()));
     }
-    let mut batches = Vec::with_capacity(payloads.len());
-    let mut max_version = 0u64;
+    let mut batches: Vec<(u64, arrow::record_batch::RecordBatch)> = Vec::new();
     for p in payloads {
         let reader =
             arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(&p.batch_ipc), None)
                 .map_err(|e| LakeError::Other(format!("wal ipc decode: {e}")))?;
         for b in reader {
             let b = b.map_err(|e| LakeError::Other(format!("wal ipc read: {e}")))?;
-            max_version = max_version.max(p.schema_version);
             batches.push((p.schema_version, b));
         }
     }
-    // 目标 schema：取最高版本的 schema
     batches.sort_by_key(|(v, _)| *v);
+    let max_version = batches.last().map(|(v, _)| *v).unwrap_or(0);
     let target_schema = batches.last().unwrap().1.schema();
     let aligned: Vec<arrow::record_batch::RecordBatch> = batches
         .into_iter()
         .map(|(_, b)| align_batch(&b, &target_schema))
         .collect::<Result<Vec<_>, _>>()?;
-
-    let merged = arrow::compute::concat_batches(&target_schema, &aligned)
-        .map_err(|e| LakeError::Other(format!("concat: {e}")))?;
-    Ok((merged, max_version))
+    Ok((aligned, max_version))
 }
 
-// 列名对齐（缺失列 null / 列序重排 / 类型提升格 cast）见
-// `yuntun_model::arrow_util::align_batch` —— 写入与查询内存路径共用同一实现。
+/// WAL Data payload 的行数（不落地即可统计）。
+pub fn payload_row_count(p: &DataPayload) -> u64 {
+    arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(&p.batch_ipc), None)
+        .map(|r| r.filter_map(|b| b.ok()).map(|b| b.num_rows() as u64).sum())
+        .unwrap_or(0)
+}
 
-async fn write_group_to_s3(
+async fn write_to_object_store(
     deps: &FlushDeps,
-    group: &WindowGroup,
+    input: &ChunkFlushInput,
     batch_id: &str,
     merged: &arrow::record_batch::RecordBatch,
-    schema_version: u64,
 ) -> Result<(String, u64), LakeError> {
-    let _ = schema_version;
     let (path, size, _rows) = yuntun_format::write_batch(
         &deps.store,
-        &group.table,
-        &group.shard,
-        &group.window,
+        &input.shard.table,
+        &input.shard.shard,
+        &input.shard.window,
         batch_id,
         merged,
         deps.format,
@@ -331,46 +367,43 @@ async fn write_group_to_s3(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc as SArc;
 
-    fn batch(schema: &arrow::datatypes::SchemaRef, rows: i64) -> arrow::record_batch::RecordBatch {
-        use arrow::array::Int64Array;
+    fn schema() -> arrow::datatypes::SchemaRef {
+        SArc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]))
+    }
+
+    fn batch(rows: usize) -> arrow::record_batch::RecordBatch {
         arrow::record_batch::RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int64Array::from(vec![rows; 2]))],
+            schema(),
+            vec![SArc::new(Int64Array::from(vec![1i64; rows]))],
         )
         .unwrap()
     }
 
     #[test]
-    fn align_fills_missing_columns_with_null() {
-        use arrow::datatypes::{DataType, Field, Schema};
-        use std::sync::Arc as SArc;
-        let v1 = SArc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
-        let v2 = SArc::new(Schema::new(vec![
-            Field::new("a", DataType::Int64, true),
-            Field::new("b", DataType::Utf8, true),
-        ]));
-        let b1 = batch(&v1, 1);
-        let merged_schema = v2.clone();
-        let out = align_batch(&b1, &merged_schema).unwrap();
-        assert_eq!(out.num_columns(), 2);
-        use arrow::array::Array;
-        assert_eq!(out.column(1).null_count(), out.num_rows()); // 新列全 null
+    fn merge_batches_concatenates_in_order() {
+        let batches = vec![batch(2), batch(3)];
+        let merged = merge_batches(&batches, &schema()).unwrap();
+        assert_eq!(merged.num_rows(), 5);
     }
 
     #[test]
-    fn align_widens_int32_to_int64() {
-        use arrow::array::Int32Array;
-        use arrow::datatypes::{DataType, Field, Schema};
-        use std::sync::Arc as SArc;
-        let s32 = SArc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
-        let s64 = SArc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
-        let b = arrow::record_batch::RecordBatch::try_new(
-            s32,
-            vec![Arc::new(Int32Array::from(vec![1, 2]))],
-        )
-        .unwrap();
-        let out = align_batch(&b, &s64).unwrap();
-        assert!(out.column(0).data_type() == &DataType::Int64);
+    fn merge_batches_aligns_missing_columns() {
+        use arrow::datatypes::Schema;
+        let wider = SArc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Utf8, true),
+        ]));
+        let merged = merge_batches(&[batch(1)], &wider).unwrap();
+        assert_eq!(merged.num_columns(), 2);
+        assert_eq!(merged.column(1).null_count(), 1);
+    }
+
+    #[test]
+    fn merge_batches_rejects_empty_chunk() {
+        assert!(merge_batches(&[], &schema()).is_err());
     }
 }

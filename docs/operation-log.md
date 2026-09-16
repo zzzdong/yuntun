@@ -1015,3 +1015,200 @@ SQL DDL 逐类型实测（pymysql → MySQL wire，`CREATE TABLE` 11 列全类�
 `replay_wal_dml`（重建 DeletionEntry，四段顺序之 ③）、segment 清理闸门（R21）、
 abort 区间保留（`apply_record` 对 BatchAbort 保留区间进跳过集，修复"显式放弃数据
 重启后复活"的既有行为）。
+
+## 25. 架构调整：chunk 层（数据平面地基）+ 与既有设计的对照审查（2026-09-15）
+
+> 依据：`architecture.md`（架构设计 v11）、`design.md`（详细设计 v1.0）、
+> `docs/architecture-with-chunk.md`（架构设计含 chunk 层，下文简称 **chunk 版架构**）、
+> `docs/refactor.md`（重构路线 S0–S6）。
+>
+> 本节记录 **S1（chunk 层）** 的落地、**与既有设计的逐条对照结论**、
+> **审查中发现并回改的偏差**，以及由此对 `plan.md` 的调整。
+>
+> 一句话结论：**方向正确（数据平面先行的次序判断是对的），但按 chunk 版架构 §5.3 字面实现会
+> 与既有 ADR-10 冲突；已按"两者取并集"回改，该文档需补一句限定语。**
+
+### 25.1 落地内容（对应 refactor.md 的 S1-1 ~ S1-10）
+
+| 项 | 内容 | 落点 |
+|---|---|---|
+| S1-1 | 新 crate `yuntun-chunk`（`Chunk` = 尚未成型的 RowGroup；内存直接持 `RecordBatch`，**不转 RowGroup 布局**） | `crates/chunk/src/{chunk,stats}.rs` |
+| S1-2 | 五态机 `Open → Sealed → Spilled → Flushed → Released`，非法转移**报错**而非静默 | `chunk.rs` |
+| S1-3 | seal 策略单点：行数 / 字节 / **窗口关闭** / `schema_version` 变化 | `store.rs::SealPolicy` |
+| S1-4 | spill = **本地磁盘** + Arrow IPC(LZ4) + 自描述头（`wal_segment`/`seq_range`/`crc32`/schema） | `spill.rs` |
+| S1-5 | 内存账本 + 60/80/95 三级背压（spill → 强制 seal → 拒写） | `budget.rs` |
+| S1-6 | 内存硬分区：chunk 区与 query 区两块独立预算（query 侧接 DataFusion 内存池） | `budget.rs`、`query/src/lib.rs` |
+| S1-7 | 读侧接缝：`ChunkStore` 实现 `store::ShardReader`（查询侧零改动，"读己之写"保住） | `store.rs` |
+| S1-8 | WAL 回收点语义：chunk 记录 `[seq_start, seq_end)` 半开区间 + spill 头写 WAL 引用 | `chunk.rs`、`spill.rs` |
+| S1-9 | 强制 seal **且 flush** 的最大驻留（防慢写入流撑爆 WAL），取代旧 `idle_timeout` | `store.rs::plan_flush` |
+| S1-10 | `rows_threshold` 10 000 → **500 000**（让 RowGroup 一次成型） | `config.rs`、`yuntun.toml.example` |
+| 附带 | `FileManifest` 增 `partition_key` / `source_instance`（架构 §2.3 / §4.4） | `model/src/meta.rs` |
+
+### 25.2 对照既有设计：逐条结论
+
+| 维度 | 既有设计出处 | 本次做法 | 判定 |
+|---|---|---|---|
+| 铁律①"所有写入走 ingest" | §3.2 | chunk 只是 WAL 与对象存储之间的**驻留层**，仍无第二条写入路径 | ✅ 保持 |
+| 铁律②"协议端口在 server" | §3.2 | 未动（chunk 无协议面） | ✅ 保持 |
+| 依赖方向 | §3.2 | 新增 `model → store → chunk → ingest → server`，`query → store` 不变，无环 | ✅ 保持（**§3.2 图需补 chunk 一行**） |
+| 读侧接缝 `ShardReader`/`ShardFetch` | §21.3（本日志） | trait 仍留在 `yuntun-store`；**实现**从 `store::MemoryShard` 下移到 `chunk::ChunkStore` | ✅ **继承**（"查询不依赖 Ingestor 进程"更强：`query` 对 `ingest`/`chunk` 均无依赖） |
+| C1「WAL 是唯一事实」 | 详设 §4 | spill 头记 WAL 引用 + CRC，校验失败即判定副本不可信（丢弃重来） | ✅ **强化**（多了一个可丢弃副本，未新增权威） |
+| C8「OCC 先于写 S3」 | 详设 §5.2 | 未动（仍在写对象存储之前演进 schema） | ✅ 保持 |
+| ADR-3「Ingestor 互不感知 / WAL 本地独占」 | §4 | **新增一类节点私有状态：spill 目录** | ⚠️ 需在文档中显式列出（见 25.4） |
+| ADR-4「batch_id 随机 UUIDv7」 | §4 | 未动（仍随机；文件名即 batch_id，全局唯一） | ✅ 保持 |
+| ADR-9「SLA 分级」 | §4 | `best_effort` 的 RPO 从"≤jitter(60s)"变为"窗口关闭 + max_flush_delay" | ⚠️ 量级变化，需在 README/文档同步（见 25.4） |
+| **ADR-10「整分钟对齐 + jitter」** | §4 | 首版实现**违例**（见 25.3-1），已回改为窗口对齐；jitter 锚点/量级待 S2 正式修订 | ❌→✅ **发现冲突并回改** |
+| §7.2 攒批阈值 + 5min 空闲兜底 | §7.2 | `time_threshold` 降级为**地板**（seal 时刻由窗口关闭决定）；5min 兜底收紧为 `chunk_max_resident_secs`(60s，且强制 seal+flush) | ✅ 语义澄清 + 收紧（旧实现"每秒 1 条也会 flush"仍成立） |
+| §8.6/8.7 热数据 = 按分钟切分的 MemTable + `UnionExec` | §8.6/8.7 | chunk 即"按时间窗口切分的 MemTable"；scan 仍 `UnionExec(热 ∪ 冷)` | ✅ **等价替换**（且补齐了内存账本/背压/spill，旧设计未覆盖） |
+| 详设 §11 配置项 | §11 | 新增 `[chunk]` 段；移除 `flush_jitter_secs`（随机 → 确定性相位） | ⚠️ 破坏性配置变更（旧 TOML 仍可解析，未知键忽略） |
+
+**结论**：本次调整属于**同一架构内的"补齐与收敛"**，不是换架构——
+它把既有设计里"应该有但没写"的一层（内存热数据如何有界、如何卸载、flush 时刻如何确定）
+补上，并把散在两处的分组语义收敛成一处。**没有推翻任何一条既有铁律**；
+唯一真正冲突的是 ADR-10 的实现方式（且是本次首版自己引入的）。
+
+### 25.3 审查中发现的问题（4 项已回改 + 3 项留观）
+
+#### 1.【严重｜已回改】首版实现违反 ADR-10："创建后 N 秒"取代了窗口对齐
+
+`architecture.md` §ADR-10 明文：
+
+> 攒批窗口按**整分钟对齐**（**而非**"达到阈值后 5 秒"）……同时保持
+> **每窗口每 shard 最多 1 个文件**的小文件控制目标。
+
+而 S1 首版把时间维度的 seal 触发写成 `now - created_at >= time_threshold(5s)`——
+正是 ADR-10 否决的那一种。后果（低吞吐表，如告警/审计：1 条/秒）：
+
+| 方案 | 一个窗口（分钟）产出的文件数 |
+|---|---|
+| ADR-10 窗口对齐（旧实现 `window_start + jitter`） | 1 |
+| S1 首版"创建后 5 秒" | **≤12** |
+
+即：把 ADR-10 专门用来防的"小文件 / Meta 条目爆炸"重新引入，且**功能测试全绿**——
+只有对照 ADR 原文才能发现。
+
+**回改**：`Chunk::window_end_ms`（**到达分钟**窗口结束，与旧实现锚点同源）+ `SealPolicy::min_resident`
+只作地板；新增 `SealReason::WindowClosed`。回归用例
+`chunk::store::tests::time_seal_is_window_aligned_not_creation_offset`
+（同窗口 5 次 append → 仍 1 个 chunk；创建后 5s 但窗口未关 → 不 seal）。
+
+> 📌 **对 chunk 版架构的修订建议**：§5.3 写 `flush_deadline = seal_time + max_flush_delay`
+> 时，必须补一句"**seal 触发是窗口对齐的**"，否则读者（包括本实现）会自然地
+> 退回"创建后 N 秒"，与 ADR-10 冲突。这是该文档的**表述缺陷**，不是决策错误。
+
+#### 2.【已修】写入侧与查询侧的表标识不一致（**被本次改造暴露的既有隐患**）
+
+`do_put` 简易轨用**裸表名**（`cpu`）写 WAL 与内存视图，查询侧用**全限定名**
+（`public.cpu`，`TableMeta::qualified_name()`）读热数据——两者永不匹配，于是
+"读己之写"实际一直靠 **flush 落盘**兜底：
+
+| 时期 | 持久化上界 | 表现 |
+|---|---|---|
+| 旧实现 | `window_start + jitter`（默认 ≤60s，冒烟实测 29.1s） | 掩盖了标识不一致（写后 ~30s 仍能查到） |
+| S1 首版 | `seal + max_flush_delay`(30s) | 暴露为**可见性回归**：`client_e2e` 等 10s 超时（`got=Some(0)`） |
+
+`yuntun_model::ops` 本就写明"**跨层唯一表标识**：Catalog 内部键、Ingest/WAL 的 `table`
+字段、对象存储路径派生、Query 缓存键全部使用它；裸表名只在 SQL 表面与 `TableMeta.name`
+出现"——实现没跟上文档。
+
+**回改**：ingest 边界一次归一化（`qualify_table`），WAL / chunk / Manifest / 查询键同身份；
+恢复路径同样归一化（老 WAL 的裸名不再被世代闸门误判）。副作用是裸名写入的对象路径
+由 `yuntun/<table>/…` 变为 `yuntun/<schema>/<table>/…`，**与 `DiskShard::prefix` 的既有约定
+终于一致**（此前两处对裸名的处理不同，是同一根因的另一面）。已有数据以 Manifest 的
+`file_path` 为准，读取不受影响。
+
+#### 3.【已修】spill 目录跨重启泄漏
+
+spill 是**进程内**热数据的落盘副本，重启后 registry 为空 → 残留文件永远不会被引用，
+而崩溃重启循环会让它们无限堆积。原实现只在 `release`/`discard` 时删除。
+
+**回改**：`ChunkStore::new` 启动即 `purge_leftover_spills()`（只清 `*.ipc.lz4`/`*.tmp`）。
+架构 §2.6 的"校验 WAL 引用一致则**复用**副本"是**后续优化**（需把 chunk 与 WAL 区间重新配对）：
+当前选择"丢弃重来"，正确性不受影响，代价是重启后重新编码；已在代码注释与本日志留档。
+
+#### 4.【已修】"强制 seal + flush"只做了一半
+
+`plan_flush` 原先把"超 `max_resident`"只当作 seal 条件：chunk 被强制 seal 后，
+还要再等 `max_flush_delay` 才落盘——**WAL 仍被拖住**，S1-9 的目的（防慢写入流撑爆 WAL）
+没有达成。**回改**：超驻留时同一轮既 seal 又 flush（`plan_flush` 的 `due` 并入
+`open_too_long`，调用方顺序 seal → spill → flush 保证可行）；用例断言"强制 seal 必须同轮 flush"。
+
+#### 5.【已修】驻留硬兜底会静默绕过相位分散（→ 惊群复活）
+
+`flush_due_at` 原先锚定 `sealed_at.unwrap_or(created_at)`。窗口对齐后 chunk 在**窗口关闭时**
+才封口，此时"按创建时刻算的到期"早已过去 → **封口即到期** → 所有实例又回到同一秒 flush，
+相位分散形同虚设。**回改**：锚点固定为 `sealed_at`（未 seal 返回 `u64::MAX`），
+并明确不变量 `max_resident > max_flush_delay + phase_spread`
+（后者由 `Config::warnings()` 自检并在启动时告警——这类问题**功能测试全绿**，
+只能靠不变量守护）。这是 ADR-10 惊群约束在"窗口对齐 + 确定性到期"下的**新失效模式**。
+
+#### 6.【留观】chunk 区内存可越限（有意为之，需可观测）
+
+`append` 的记账是**无条件**的（`reserve`，可见性承诺优先于预算，I1）：
+真正的硬闸门在 `ingest()` 入口的 95% 拒写。中间态（WAL 已 fsync、攒批尚未吸收完）由
+**WAL 积压**吸收。风险是"吸收慢 → 内存短时超预算"，需要把
+`ledger.used / WAL 积压字节 / 背压水位` 三个量纳入观测（→ refactor 的 S1-11 验收）。
+**未改**：改成硬拒绝会把已 fsync 的数据退回给客户端，语义更糟。
+
+#### 7.【按设计保留】墓碑期不跳过、多文件粒度
+
+- 触达 95% 时**不**强制释放 `Flushed` chunk（架构 §4.6 允许"内存压力时跳过墓碑期"）：
+  跳过会出现最长一个缓存刷新周期（~200ms）的可见性空洞，当前选择不跳；
+- 高吞吐表由 `rows_threshold` 决定文件粒度（可 >1 文件/窗口）——这是 ADR-10
+  在小文件控制上的**既有边界**（旧实现同样如此），由 compaction 兜底。
+
+#### 8.【待定｜P2】相位分散的量级需要实测定案
+
+窗口对齐后，低吞吐表的 flush 时刻 = `窗口关闭 + max_flush_delay + phase(≤spread)`。
+ADR-10 的削峰是"60 秒内均匀分散"，而 `spread` 默认 5s → **分散面收窄 12 倍**；
+若把 spread 提到 60s（= 一个窗口）则恢复 ADR-10 的分散度，但持久化上界变为
+`60 + max_flush_delay + 60`（≈2 分钟，该文档允许"放宽到分钟级"）。
+
+两者都要实测（S0 baseline 的文件数与 P99 写入延迟）才能定案，**不在本批拍板**：
+`max_flush_delay_secs` 与 `flush_phase_spread_secs` 的默认值列入 P2 定案清单
+（并受 25.3-5 的不变量约束）。详见 `plan.md` §2.2 / `refactor.md` 的 P2。
+
+### 25.4 文档层面待同步（本次未改：需求是"先分析再改计划"）
+
+1. `architecture.md` §3.2 crate 图补 `yuntun-chunk`（`model → store → chunk → ingest`）；
+2. `architecture.md` §ADR-10 需正式修订（jitter 锚点：`window_start` → `seal_time`；
+   量级：待 25.3-8 定案），并在 §"节点私有状态"中列明 **WAL 目录 + spill 目录**（ADR-3 边界）；
+3. `architecture.md` §ADR-9 / README「已知限制」同步新的 RPO 量级
+   （`best_effort`：窗口关闭 + `max_flush_delay`，不再是 ≤jitter 60s）；
+4. `architecture-with-chunk.md` §5.3 补"seal 触发窗口对齐"限定语（见 25.3-1 的 📌）；
+5. `design.md` §11 配置清单同步 `[chunk]` 段与移除的 `flush_jitter_secs`/`idle_timeout`；
+6. `CHANGELOG.md` 不逐条记改造过程（本次曾误记后撤回）——发布时从本日志汇总。
+
+### 25.5 验证
+
+- `cargo test --workspace`：**189 passed / 0 failed**；`cargo clippy --workspace --all-targets` **0 警告**；
+- 新增用例（按语义分组）：
+  - chunk：窗口对齐 seal（同窗口 1 chunk / 创建后 5s 但窗口未关不 seal）、
+    五态机非法转移报错、spill 往返 + CRC 篡改/截断/魔数拒绝、spill 后账本归零且数据仍可读、
+    `commit → 缓存追上 → 回收`（I4 无空洞）、陈旧世代隐藏与回收、背压三级阶梯、
+    相位偏移确定且跨实例分散、强制 seal 同轮 flush、启动清理残留 spill；
+  - ingest：表标识归一化、`config → SealPolicy` 映射（含"地板必须短于一个窗口"）、
+    flush e2e 驱动真实攒批循环（Manifest 出现 1 文件 + WAL 终态 Committed + 未落盘即可读）；
+  - server：`[chunk]` 配置解析/水位退化、示例配置与解析器同步、
+    不变量自检告警（`max_resident` 绕过相位分散 / 零预算）；
+- 既有回归全绿（含 `write_then_read`（读己之写 latency + 零已提交文件、DROP 不复活）、
+  `hot_shard_reader`（远端 `ShardReader` 可替换）、`m0a_recommit`、chaos 3 场景）。
+
+### 25.6 遗留与后续（已同步到 plan.md）
+
+> 同步位置：`plan.md §2.2`（待定决策登记表）、`plan.md §2.3`（文档同步项）、
+> `plan.md §五`（分布式就绪度基线：记分卡 / 接缝现状 / 四类静默错数据）、
+> `plan.md §七`（R2–R6 WBS）、`plan.md §八`（关键路径与里程碑）。
+
+| # | 项 | 归属 |
+|---|---|---|
+| 1 | 相位分散量级 + `max_flush_delay` 默认值实测定案（25.3-8） | P0（阶段 2 首轮） |
+| 2 | spill 复用（校验 WAL 引用一致则沿用副本，替代"丢弃重来"） | S1 收尾 / P2 |
+| 3 | 三个内存/积压指标接入观测（25.3-6） | S1-11（阶段 2 T6.12） |
+| 4 | `architecture.md` 的 ADR-10 / §3.2 / 节点私有状态修订（25.4） | 阶段 2 末（阶段 3 准入） |
+| 5 | chunk 级 ZoneMap 剪枝接入 query（`ColumnStats` 已就绪，尚未用于跳过） | R5（T13.2） |
+| 6 | query 区内存池的**可观测性**（当前只在上限处失败，无水位指标） | S1-11（阶段 2 T6.12） |
+| 7 | **规划缺口（本轮核查新发现）**：`Compactor` / 孤儿清理绑具体 `MemoryCatalog`（R2 必补 `CommitCompaction`）；`source_instance` 只写不读（R4）；孤儿 GC 非多写者安全（R6） | `plan.md §5.1`/`§7` |
+
+---
+

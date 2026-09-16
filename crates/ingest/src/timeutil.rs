@@ -1,4 +1,9 @@
 //! 时间窗口工具：整分钟对齐（ADR-10）+ 无 chrono 依赖的 epoch 格式化。
+//!
+//! > **随机 flush jitter 已移除**（架构 §5.3 / S2-9）。旧实现
+//! > `time_threshold(5s) + jitter(0..60s)` 让 flush 时刻在 ~65s 内不可预测，
+//! > 会污染持久化上界。改为**确定性相位偏移** `hash(instance, key) % spread`，
+//! > 实现位于 `yuntun_chunk::ChunkStore::flush_due_at`（到期时间确定、各实例仍分散）。
 
 /// 分钟毫秒。
 pub const MINUTE_MS: i64 = 60_000;
@@ -12,23 +17,6 @@ pub fn window_start_ms(event_time_ms: i64) -> i64 {
 pub fn format_window(window_start_ms: i64) -> String {
     let (y, mo, d, h, mi) = civil_from_epoch_ms(window_start_ms);
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}")
-}
-
-/// Flush Jitter（ADR-10 / v8 修正）：
-/// `flush_moment = window_start + (hash(shard+table) % jitter_secs) 秒`。
-/// Jitter 打散的是 flush 动作发生的时刻，不改变 time_window 的数据归属。
-pub fn jitter_seconds(shard: &str, table: &str, jitter_secs: u64) -> u64 {
-    // FNV-1a 64
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in shard.as_bytes().iter().chain(table.as_bytes().iter()) {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    if jitter_secs == 0 {
-        0
-    } else {
-        h % jitter_secs
-    }
 }
 
 /// epoch 毫秒 → (year, month, day, hour, minute)（UTC，Howard Hinnant civil 算法）。
@@ -78,19 +66,6 @@ mod tests {
             format_window(window_start_ms(ms + 59_999)),
             "2026-08-31T14:00"
         );
-    }
-
-    #[test]
-    fn jitter_is_stable_and_bounded() {
-        let a = jitter_seconds("s0", "tbl", 60);
-        let b = jitter_seconds("s0", "tbl", 60);
-        assert_eq!(a, b, "同一 shard+table 的 flush 时刻稳定可预测");
-        assert!(a < 60);
-        // 不同 shard 大概率分散
-        let set: std::collections::HashSet<u64> = (0..20)
-            .map(|i| jitter_seconds(&format!("s{i}"), "tbl", 60))
-            .collect();
-        assert!(set.len() > 1, "jitter 应打散不同 shard");
     }
 
     fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {

@@ -1,11 +1,12 @@
 //! 写后可见性回归（本文件覆盖两个 0.1 blocker）：
 //!
-//! 1. **读己之写**：默认攒批 jitter（≤60s）与查询缓存 TTL（30s）下，写入 fsync 后
-//!    应立刻可从内存视图查到 —— 而不是等 flush/缓存刷新（此前最坏 ~48s "写了查不到"）。
-//! 2. **DROP 语义**：DROP 掉的数据不得在"重启重放 + 重建同名表"后复活（此前会复活）。
+//! 1. **读己之写**：持久化上界（`max_flush_delay_secs`）与查询缓存 TTL 都很长时，
+//!    写入 fsync 后应立刻可从 chunk 读到 —— 而不是等 flush / 缓存刷新
+//!    （架构 §5.2：**可见性上界绑 WAL fsync，与持久化上界分离**）。
+//! 2. **DROP 语义**：DROP 掉的数据不得在"重启重放 + 重建同名表"后复活。
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use arrow::array::Int64Array;
@@ -13,14 +14,6 @@ use yuntun_catalog::CatalogOps;
 use yuntun_server::Lakehouse;
 use yuntun_sql::session::SessionCtx;
 use yuntun_sql::SqlResult;
-
-fn sec_of_minute() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        % 60
-}
 
 fn config(base: &str, rows_threshold: u64, cache_ttl_secs: u64) -> yuntun_server::Config {
     yuntun_server::Config::from_toml(&format!(
@@ -38,7 +31,9 @@ cache_ttl_secs = {cache_ttl_secs}
 [ingest]
 rows_threshold = {rows_threshold}
 time_threshold_secs = 5
-flush_jitter_secs = 60
+# 持久化上界设为 1 小时：本文件的两个用例都要求"flush 尚未发生"，
+# 从而证明可见性来自 chunk 而非落盘文件（架构 §5.2 双阈值分离）
+max_flush_delay_secs = 3600
 scan_interval_ms = 20
 "#
     ))
@@ -83,8 +78,8 @@ async fn committed_files(lakehouse: &Lakehouse, table: &str) -> usize {
 async fn read_your_writes_visible_before_flush() {
     let base_guard = yuntun_testkit::TestDir::tmpfs("write-then-read-ryw");
     let base = base_guard.string();
-    // rows_threshold 默认（不触发行数阈值）+ jitter 60s + **缓存 TTL 默认 30s**：
-    // 数据只可能来自"未落盘内存视图"
+    // rows_threshold 10_000（不触发行数阈值）+ max_flush_delay 1h + 缓存 TTL 30s：
+    // 数据只可能来自 chunk（未落盘热数据），不可能是 Manifest
     let cfg = config(&base, 10_000, 30);
     let shutdown = CancellationToken::new();
     let lh = Arc::new(
@@ -95,11 +90,8 @@ async fn read_your_writes_visible_before_flush() {
     let bg = lh.spawn_background(&cfg);
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // 表名 f：`public.f` 的 jitter 偏移 = 59s，给测试留足"flush 尚未发生"的窗口
+    // 无需再等 jitter 窗口：持久化上界已是 1h，本用例期间 flush 不会发生
     exec(&lh, "CREATE TABLE f (a BIGINT)").await;
-    while sec_of_minute() >= 52 {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
     let t0 = std::time::Instant::now();
     exec(&lh, "INSERT INTO f VALUES (1)").await;
 

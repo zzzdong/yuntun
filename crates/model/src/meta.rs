@@ -176,6 +176,16 @@ pub struct FileManifest {
     /// v1 扩展：时间窗口（整分钟对齐，ADR-10）
     #[prost(string, tag = "13")]
     pub time_window: String,
+    /// **逻辑分区键 `dt`**（架构 §2.3）：partition 是逻辑身份，file 是物理身份，**不得等同** ——
+    /// compaction 会合并文件，若两者等同则每次合并后 partition 集合都变化。
+    #[prost(string, tag = "14")]
+    pub partition_key: String,
+    /// **写入该文件的 datanode 实例**（架构 §4.4）：多个 datanode 各自 flush，
+    /// "已 flush 到哪"是**每实例各自的版本**；冷热边界必须按实例二维切分，
+    /// 否则会出现"同一批数据被读两次"的重复计数（极难排查）。**此字段必须提前加**，
+    /// 事后再加需要回填历史 manifest。
+    #[prost(string, tag = "15")]
+    pub source_instance: String,
 }
 
 impl FileManifest {

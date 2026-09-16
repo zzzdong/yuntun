@@ -1,21 +1,18 @@
-//! 攒批器：按 (table, shard, window) 分组（详细设计 §5.3）。
+//! 攒批工具：窗口归属与批次工具函数（详细设计 §5.3）。
 //!
-//! 触发条件（任一满足即 flush，§5.3）：
-//! - 行数 >= `rows_threshold`（表配置，默认 10000）
-//! - 距窗口开始 >= `time_threshold`（默认 5s）
-//! - 整分钟对齐 + Jitter：`flush_at = window_start + hash(shard+table) % 60s`（ADR-10）
-//! - 绝对空闲超时兜底：5 分钟（防定时器 bug 导致无限滞留）
+//! > **分组与 seal / flush 决策已收敛到 chunk 层**（`yuntun_chunk::ChunkStore`）。
+//! > 旧实现里"攒批分组（`WindowGroup`）"与"内存分片（`MemoryShard`）"各算一套，
+//! > 语义会漂移；现在 chunk 就是那个分组单元，seal / spill / flush 计划全在
+//! > `SealPolicy` 一处（架构 §2.2 / §2.7 / §5.3）。本模块只剩纯函数工具。
 
-use crate::timeutil::{jitter_seconds, window_start_ms, MINUTE_MS};
-use std::collections::HashMap;
+use crate::timeutil::{format_window, window_start_ms};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use yuntun_model::wal_record::DataPayload;
 
 /// 窗口归属：数据按 event_time（缺省用 received_at）对齐到整分钟（ADR-10）。
 pub fn window_of(event_time_ms: Option<i64>, received_at_ms: i64) -> (i64, String) {
     let t = event_time_ms.unwrap_or(received_at_ms);
     let w = window_start_ms(t);
-    (w, crate::timeutil::format_window(w))
+    (w, format_window(w))
 }
 
 /// 从 RecordBatch 提取 event_time 列（i64 毫秒，列名 event_time；缺省 None）。
@@ -38,137 +35,6 @@ pub fn extract_event_time_ms(batch: &arrow::record_batch::RecordBatch) -> Option
         };
     }
     None
-}
-
-/// 一个 (table, shard, window, epoch) 分组的攒批缓冲。
-///
-/// `epoch` = 表世代（见 `yuntun_store::shard`）：DROP 后重建同名表会产生**新的 epoch**，
-/// 老世代的分组在 flush 前被判定为陈旧并丢弃 —— 这是"DROPPED 表数据不得复活"的关键。
-#[derive(Debug, Default)]
-pub struct WindowGroup {
-    pub table: String,
-    pub shard: String,
-    /// 窗口起点毫秒
-    pub window_ms: i64,
-    pub window: String,
-    /// 累积的 WAL Data 记录（按到达顺序）
-    pub payloads: Vec<DataPayload>,
-    /// 各组 payload 的 WAL seq（与 `payloads` 等长；未落盘内存视图的提交标记/回收用）
-    pub seqs: Vec<u64>,
-    /// 该组第一个 payload 的 WAL seq（BatchPending.wal_seq_range 起点用）
-    pub first_seq: u64,
-    /// 累积行数
-    pub rows: u64,
-    pub created_at_ms: u64,
-    /// 表世代（分组键的一部分）
-    pub epoch: u64,
-}
-
-impl WindowGroup {
-    /// 该组对应的分片标识（内存分片 / 磁盘分片共用同一 key）。
-    pub fn shard_id(&self) -> yuntun_store::ShardId {
-        yuntun_store::ShardId::new(self.table.clone(), self.shard.clone(), self.window.clone())
-    }
-
-    /// flush 触发判定（§5.3 任一满足即 flush）。
-    pub fn should_flush(&self, now_ms: u64, cfg: &crate::pipeline::IngestorConfig) -> bool {
-        // ① 行数阈值
-        if self.rows >= cfg.rows_threshold {
-            return true;
-        }
-        // ② 时间阈值：距窗口开始 >= time_threshold
-        let now_wall = now_ms as i64;
-        if now_wall - self.window_ms >= cfg.time_threshold_secs as i64 * 1000 {
-            // ③ Jitter 削峰（ADR-10）：flush 时刻 = window_start + jitter；
-            //    窗口已关闭（超过窗口末尾）则无视 jitter 立即 flush
-            let jitter = jitter_seconds(&self.shard, &self.table, cfg.flush_jitter_secs);
-            let flush_at = self.window_ms + (jitter as i64) * 1000;
-            let window_end = self.window_ms + MINUTE_MS;
-            if now_wall >= flush_at || now_wall >= window_end {
-                return true;
-            }
-        }
-        // ④ 绝对空闲超时兜底（v7 评审 A 建议）
-        if now_ms.saturating_sub(self.created_at_ms) >= cfg.idle_timeout.as_millis() as u64 {
-            return true;
-        }
-        false
-    }
-}
-
-/// 攒批缓冲集合：key = (table, shard, window, epoch)。
-#[derive(Debug, Default)]
-pub struct BatchAccumulator {
-    groups: HashMap<(String, String, String, u64), WindowGroup>,
-}
-
-impl BatchAccumulator {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// 入账（epoch = 0：不经 WAL DDL 建表的调用方 / 单测）。
-    pub fn push(&mut self, payload: DataPayload, seq: u64, rows: u64, now_ms: u64) {
-        self.push_with_epoch(payload, seq, rows, now_ms, 0);
-    }
-
-    /// 入账并指定表世代（epoch 进分组键：老世代数据不会与新世代混在同一组）。
-    pub fn push_with_epoch(
-        &mut self,
-        payload: DataPayload,
-        seq: u64,
-        rows: u64,
-        now_ms: u64,
-        epoch: u64,
-    ) {
-        let key = (
-            payload.table.clone(),
-            payload.shard.clone(),
-            payload.time_window.clone(),
-            epoch,
-        );
-        let entry = self.groups.entry(key).or_insert_with(|| WindowGroup {
-            table: payload.table.clone(),
-            shard: payload.shard.clone(),
-            window_ms: window_start_ms(now_ms as i64),
-            window: payload.time_window.clone(),
-            payloads: Vec::new(),
-            seqs: Vec::new(),
-            first_seq: seq,
-            rows: 0,
-            created_at_ms: now_ms,
-            epoch,
-        });
-        entry.payloads.push(payload);
-        entry.seqs.push(seq);
-        entry.rows += rows;
-    }
-
-    /// 检查并弹出满足 flush 条件的组。
-    pub fn drain_ready(
-        &mut self,
-        now_ms: u64,
-        cfg: &crate::pipeline::IngestorConfig,
-    ) -> Vec<WindowGroup> {
-        let mut ready = Vec::new();
-        let keys: Vec<_> = self.groups.keys().cloned().collect();
-        for k in keys {
-            if let Some(g) = self.groups.get(&k) {
-                if g.should_flush(now_ms, cfg) {
-                    ready.push(self.groups.remove(&k).unwrap());
-                }
-            }
-        }
-        ready
-    }
-
-    pub fn len(&self) -> usize {
-        self.groups.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.groups.is_empty()
-    }
 }
 
 pub fn now_ms() -> u64 {
@@ -202,104 +68,64 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc as SArc;
 
-    fn payload(table: &str, shard: &str, window: &str, rows_hint: u64) -> DataPayload {
-        DataPayload {
-            table: table.into(),
-            shard: shard.into(),
-            schema_version: 1,
-            batch_ipc: vec![0; rows_hint as usize],
-            client_request_id: String::new(),
-            time_window: window.into(),
-        }
-    }
+    #[test]
+    fn window_alignment_is_minute_bucketed() {
+        let ts = 1_788_166_527_000i64;
+        let (w, s) = window_of(Some(ts), 0);
+        assert_eq!(w % crate::timeutil::MINUTE_MS, 0, "窗口起点必须是整分钟");
+        assert!(ts >= w && ts < w + crate::timeutil::MINUTE_MS, "事件时间必须落在窗口内");
+        assert_eq!(s.len(), 16, "窗口标识形如 YYYY-MM-DDTHH:MM: {s}");
+        assert_eq!(&s[10..11], "T");
 
-    fn cfg() -> crate::pipeline::IngestorConfig {
-        crate::pipeline::IngestorConfig {
-            rows_threshold: 10_000,
-            time_threshold_secs: 5,
-            idle_timeout: Duration::from_secs(300),
-            flush_jitter_secs: 0, // 测试禁用 jitter
-            ..Default::default()
-        }
+        // 缺省 event_time → 用 received_at
+        let (w1, s1) = window_of(None, ts);
+        assert_eq!((w1, s1), (w, s));
     }
 
     #[test]
-    fn rows_threshold_triggers() {
-        let mut acc = BatchAccumulator::new();
-        let now = now_ms();
-        // 未来窗口：时间阈值不会触发，纯行数阈值判定
-        let future_window_ms = (now as i64) + 3_600_000;
-        acc.groups.insert(
-            ("t".into(), "s0".into(), "w1".into(), 0),
-            WindowGroup {
-                table: "t".into(),
-                shard: "s0".into(),
-                window_ms: future_window_ms,
-                window: "w1".into(),
-                payloads: Vec::new(),
-                seqs: Vec::new(),
-                first_seq: 0,
-                rows: 9_999,
-                created_at_ms: now,
-                epoch: 0,
-            },
-        );
-        assert!(acc.drain_ready(now, &cfg()).is_empty());
-        let g = acc
-            .groups
-            .get_mut(&("t".into(), "s0".into(), "w1".into(), 0))
-            .unwrap();
-        g.rows += 1;
-        let ready = acc.drain_ready(now, &cfg());
-        assert_eq!(ready.len(), 1);
-        assert_eq!(ready[0].rows, 10_000);
+    fn extract_event_time_handles_i64_and_null() {
+        let schema = SArc::new(Schema::new(vec![Field::new(
+            "event_time",
+            DataType::Int64,
+            true,
+        )]));
+        let b = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![SArc::new(Int64Array::from(vec![123i64, 456]))],
+        )
+        .unwrap();
+        assert_eq!(extract_event_time_ms(&b), Some(123));
+
+        let all_null = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![SArc::new(Int64Array::from(vec![Option::<i64>::None]))],
+        )
+        .unwrap();
+        assert_eq!(extract_event_time_ms(&all_null), None);
+
+        // 无 event_time 列 → None（按 received_at 归属窗口）
+        let other = SArc::new(Schema::new(vec![Field::new("x", DataType::Utf8, true)]));
+        let b2 = arrow::record_batch::RecordBatch::try_new(
+            other,
+            vec![SArc::new(StringArray::from(vec!["a"]))],
+        )
+        .unwrap();
+        assert_eq!(extract_event_time_ms(&b2), None);
     }
 
-    #[test]
-    fn time_threshold_triggers() {
-        let mut acc = BatchAccumulator::new();
-        // 窗口 6 秒前 → 已超过 5s 时间阈值（jitter=0）
-        acc.push(payload("t", "s0", "w1", 1), 0, 5, now_ms() - 6_000);
-        let ready = acc.drain_ready(now_ms(), &cfg());
-        assert_eq!(ready.len(), 1);
-    }
-
-    #[test]
-    fn idle_timeout_bottomline_triggers() {
-        let mut acc = BatchAccumulator::new();
-        // 窗口在未来（时钟偏差防护场景）：仅空闲兜底触发
-        let mut c = cfg();
-        c.idle_timeout = Duration::from_millis(100);
-        acc.push(payload("t", "s0", "w1", 1), 0, 1, now_ms() - 150);
-        let ready = acc.drain_ready(now_ms(), &c);
-        assert_eq!(ready.len(), 1);
-    }
-
-    #[test]
-    fn groups_isolated_by_shard_and_window() {
-        let mut acc = BatchAccumulator::new();
-        acc.push(payload("t", "s0", "w1", 1), 0, 1, now_ms());
-        acc.push(payload("t", "s1", "w1", 1), 1, 1, now_ms());
-        acc.push(payload("t", "s0", "w2", 1), 2, 1, now_ms());
-        assert_eq!(acc.len(), 3);
-    }
-
-    #[test]
-    fn jitter_spread() {
-        // ADR-10：不同 shard 的 flush 时刻被分散（防惊群）
-        let c = crate::pipeline::IngestorConfig {
-            flush_jitter_secs: 60,
-            time_threshold_secs: 0,
-            ..Default::default()
-        };
-        let mut acc = BatchAccumulator::new();
-        let now = now_ms();
-        for i in 0..5 {
-            acc.push(payload("t", &format!("s{i}"), "w1", 1), i, 1, now);
-        }
-        // 窗口刚开始 + jitter>0 → 不应立即全部 flush
-        let ready = acc.drain_ready(now, &c);
-        assert!(ready.len() < 5, "jitter 应推迟 flush（防同秒惊群）");
+    #[tokio::test]
+    async fn backoff_gives_up_after_retries() {
+        let mut calls = 0;
+        let res: Result<(), &str> = with_backoff(|| {
+            calls += 1;
+            async { Err("boom") }
+        })
+        .await;
+        assert!(res.is_err());
+        assert_eq!(calls, 5);
     }
 }

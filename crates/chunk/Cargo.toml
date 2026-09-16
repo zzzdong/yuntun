@@ -1,0 +1,18 @@
+[package]
+name = "yuntun-chunk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+yuntun-model = { path = "../model" }
+yuntun-store = { path = "../store" }
+arrow = { workspace = true }
+async-trait = { workspace = true }
+crc32fast = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+yuntun-testkit = { path = "../testkit" }
+futures = { workspace = true }

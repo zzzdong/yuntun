@@ -133,9 +133,11 @@ async fn main() {
         IngestorConfig {
             rows_threshold: 10_000,
             time_threshold_secs: 5,
-            idle_timeout: Duration::from_secs(60),
-            flush_jitter_secs: 0,
+            max_flush_delay_secs: 10,
+            chunk_max_resident_secs: 60,
+            flush_phase_spread_secs: 5,
             scan_interval: Duration::from_millis(200),
+            spill_dir: std::path::PathBuf::from(&wal_dir).join("spill"),
             ..Default::default()
         },
         wal,

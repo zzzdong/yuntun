@@ -1,17 +1,14 @@
-//! 存储层：对象存储抽象（详细设计 §2：S3 / 本地 / Mock）+ **分片存储形态**（[`shard`]）。
+//! 存储层：对象存储抽象（详细设计 §2：S3 / 本地 / Mock）+ **分片读侧接缝**（[`shard`]）。
 //!
 //! - 对象存储：统一封装 `object_store`，测试用 `memory`（阶段 0.5 Mock S3），
 //!   开发用 `local`（本地文件系统），生产用 `s3`（MinIO 兼容）；
-//! - 分片存储（[`shard`]）：同一 shard 的两种形态 —— **内存分片**（已 fsync、未落盘的热数据）
-//!   与 **磁盘分片**（对象存储上由 Manifest 索引的冷数据）。"写后立即可查（读己之写）"
-//!   属于本层语义，查询侧只依赖 store 层，不依赖 Ingestor 进程。
+//! - 分片（[`shard`]）：**磁盘分片**（对象存储上由 Manifest 索引的冷数据）与
+//!   **读侧接缝** [`ShardReader`]。热数据（内存 chunk / spill）的实现归 `yuntun-chunk`，
+//!   查询侧只依赖 [`ShardReader`]，因此"读己之写"在换实现（进程内 ↔ 远端）时调用方零改动。
 
 pub mod shard;
 
-pub use shard::{
-    DiskShard, HotBatch, MemoryShard, MemoryState, RemoteShard, ShardFetch, ShardId, ShardReader,
-    ShardStore, ShardTier, TableLiveness,
-};
+pub use shard::{DiskShard, RemoteShard, ShardFetch, ShardId, ShardReader, ShardTier};
 
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use std::sync::Arc;

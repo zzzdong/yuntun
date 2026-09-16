@@ -9,6 +9,7 @@ yuntun-model = { path = "../model" }
 yuntun-wal = { path = "../wal" }
 yuntun-catalog = { path = "../catalog" }
 yuntun-store = { path = "../store" }
+yuntun-chunk = { path = "../chunk" }
 yuntun-format = { path = "../format" }
 arrow = { workspace = true }
 uuid = { workspace = true }

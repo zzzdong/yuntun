@@ -31,6 +31,10 @@ pub enum LakeError {
     SchemaNotEmpty(String),
     #[error("invalid schema change: {0}")]
     InvalidSchemaChange(String),
+    /// 背压阶梯第三级（架构 §2.7）：chunk 内存 / 磁盘达水位，**明确拒绝**而非静默降级。
+    /// 客户端应退避后重试（DoPut 映射为 `RESOURCE_EXHAUSTED` + `retry-after`）。
+    #[error("resource exhausted: {0}")]
+    ResourceExhausted(String),
 
     // ---- 可重试（5xx / 暂态）----
     // C8: OCC 仅作用于 EvolveSchema，不作用于 CommitFiles（详细设计 §8.2）。

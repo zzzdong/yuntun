@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use yuntun_catalog::{CatalogOps, MemoryCatalog};
-use yuntun_ingest::{Ingestor, IngestorConfig};
+use yuntun_ingest::Ingestor;
 use yuntun_model::meta::{deserialize_schema, IngestConfig};
 use yuntun_model::ops::CreateTableRequest;
 use yuntun_model::wal_record::{ddl_op, Record};
@@ -80,24 +80,31 @@ impl Lakehouse {
         // 崩溃重启后表存在、可恢复（S1.6 验收）。
         replay_wal_ddl(&catalog, &wal).await?;
 
-        // ④ Ingestor
-        let ingest_cfg = IngestorConfig {
-            default_format: yuntun_format::DataFormat::parse(&cfg.ingest.default_format),
-            rows_threshold: cfg.ingest.rows_threshold,
-            time_threshold_secs: cfg.ingest.time_threshold_secs,
-            flush_jitter_secs: cfg.ingest.flush_jitter_secs,
-            scan_interval: Duration::from_millis(cfg.ingest.scan_interval_ms),
-            idempotency_ttl: Duration::from_secs(cfg.ingest.idempotency_ttl_hours * 3600),
-            ..Default::default()
-        };
-        // 分片存储（store 层）：内存分片（热）+ 磁盘分片（冷）；写入侧与查询侧共享同一实例
-        let shards = yuntun_store::ShardStore::local(store.clone());
-        let ingestor = Arc::new(Ingestor::with_shards(
+        // ③.9 配置自检：能启动但会静默劣化的项必须显式告警（不阻断启动）
+        for w in cfg.warnings() {
+            tracing::warn!("config: {w}");
+        }
+
+        // ④ 内存硬分区（架构 §2.8）：chunk 区与 query 执行区**互不抢占**
+        let partition = yuntun_chunk::MemoryPartition::with_thresholds(
+            cfg.chunk.chunk_mem_bytes(),
+            cfg.chunk.query_mem_bytes(),
+            cfg.chunk.pressure_thresholds(),
+        );
+
+        // ④.1 chunk 层：写入侧热缓冲 + 读侧热数据视图 + 内存背压（架构 §2）
+        let ingest_cfg = cfg.ingestor_config();
+        let chunks = yuntun_chunk::ChunkStore::new(
+            ingest_cfg.chunk_store_config(),
+            partition.chunk().clone(),
+        );
+        // 写入侧与查询侧共享**同一 chunk store 实例**（读己之写）
+        let ingestor = Arc::new(Ingestor::with_chunks(
             ingest_cfg,
             wal.clone(),
             catalog.clone(),
             store.clone(),
-            shards.clone(),
+            chunks.clone(),
         ));
 
         // ⑤ 崩溃恢复分流（§5.6）
@@ -108,10 +115,19 @@ impl Lakehouse {
 
         // ⑥ QueryEngine（缓存刷新在 spawn_background 中启动）
         let cache = Arc::new(yuntun_query::LocalCatalogCache::new());
-        // 读己之写：查询侧接线同一份分片存储的热数据读侧
-        // （阶段 0 = 进程内内存分片；分离部署换成 `RemoteShard`，调用方零改动）
-        cache.set_hot_shards(shards.hot());
-        let query = Arc::new(QueryEngine::new(store.clone(), cache.clone()));
+        // 读己之写：查询侧接线热数据读侧（进程内 chunk；分离部署换成 `RemoteShard`，零改动）
+        cache.set_hot_shards(chunks.clone());
+        // query 执行区内存池 = 另一块独立预算，超限直接报错而不抢 chunk 内存（架构 §2.8）
+        let query = Arc::new(
+            QueryEngine::with_query_memory_limit(
+                store.clone(),
+                cache.clone(),
+                cfg.chunk.query_mem_bytes(),
+            )
+            .map_err(|e| {
+                yuntun_model::error::LakeError::Other(format!("query memory partition: {e}"))
+            })?,
+        );
 
         // ⑦ SqlEngine（SQL 语义唯一实现；MySQL wire / Flight 共用同一份能力句柄）
         let sql = Arc::new(SqlEngine::new(

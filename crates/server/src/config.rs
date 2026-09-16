@@ -1,4 +1,4 @@
-//! 配置（详细设计 §11 配置项清单）。
+//! 配置（详细设计 §11 配置项清单 + 架构 §2.7/§2.8/§5.2/§5.3 新增项）。
 //!
 //! TOML 配置文件（standalone 启动参数 `--config`）：
 //! ```toml
@@ -13,10 +13,23 @@
 //! [wal]
 //! dir = "./data/wal"
 //!
+//! [chunk]
+//! spill_dir = "./data/spill"          # 必须本地磁盘（架构 §2.5）
+//! instance_id = "standalone"
+//! mem_budget_mb = 512                 # chunk 区（架构 §2.8 硬分区之一）
+//! query_mem_budget_mb = 512           # query 执行区（另一块，超限直接报错）
+//! soft_pct = 60                       # 背压阶梯（架构 §2.7）
+//! hard_pct = 80
+//! reject_pct = 95
+//!
 //! [ingest]
-//! rows_threshold = 10000
-//! time_threshold_secs = 5
-//! flush_jitter_secs = 60
+//! default_format = "parquet"
+//! rows_threshold = 500000             # seal 触发：让 RowGroup 一次成型（S1-10）
+//! bytes_threshold_mb = 128            # seal 触发：字节阈值
+//! time_threshold_secs = 5             # 最短驻留地板（seal 时刻由窗口关闭决定，ADR-10）
+//! max_flush_delay_secs = 30           # seal → flush 宽限期（架构 §5.2）
+//! chunk_max_resident_secs = 60        # 强制 seal+flush，防慢写入流撑爆 WAL（S1-9）
+//! flush_phase_spread_secs = 5         # 确定性相位偏移上限（替代随机 jitter，S2-9）
 //!
 //! [compaction]
 //! min_files = 5
@@ -29,6 +42,10 @@
 //! listen = "0.0.0.0:3306"
 //! auth = "trust"
 //! ```
+//!
+//! > **已移除**：`[ingest].flush_jitter_secs`（随机 jitter 会污染持久化上界，
+//! > 改为确定性相位偏移，见架构 §5.3 / S2-9）。旧的 `idle_timeout` 语义由
+//! > `chunk_max_resident_secs` 取代（后者更强：强制 seal **且** flush）。
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -95,9 +112,19 @@ impl Default for WalSection {
 pub struct IngestSection {
     /// vortex | parquet（ADR-1 FormatSwitch）
     pub default_format: String,
+    /// seal 触发：行数阈值（架构 §5.4；S1-10 默认 50 万行，让 RowGroup 一次成型）
     pub rows_threshold: u64,
+    /// seal 触发：字节阈值（MB，内存口径）
+    pub bytes_threshold_mb: u64,
+    /// **最短驻留地板**（秒）：见 `IngestorConfig::time_threshold_secs`。
+    /// 时间维度的 seal 时刻由**到达分钟窗口关闭**决定（ADR-10），本值是地板。
     pub time_threshold_secs: u64,
-    pub flush_jitter_secs: u64,
+    /// seal → flush 的宽限期（秒）：`flush_at = sealed_at + max_flush_delay`
+    pub max_flush_delay_secs: u64,
+    /// 强制 seal + flush 的最大驻留秒数（S1-9：防慢写入流把 WAL 撑爆）
+    pub chunk_max_resident_secs: u64,
+    /// 确定性相位偏移上限（秒，S2-9：替代随机 jitter，防惊群）
+    pub flush_phase_spread_secs: u64,
     pub scan_interval_ms: u64,
     /// 幂等键 TTL（小时）
     pub idempotency_ttl_hours: u64,
@@ -107,12 +134,79 @@ impl Default for IngestSection {
     fn default() -> Self {
         Self {
             default_format: "parquet".into(),
-            rows_threshold: 10_000,
+            rows_threshold: 500_000,
+            bytes_threshold_mb: 128,
             time_threshold_secs: 5,
-            flush_jitter_secs: 60,
+            max_flush_delay_secs: 30,
+            chunk_max_resident_secs: 60,
+            flush_phase_spread_secs: 5,
             scan_interval_ms: 100,
             idempotency_ttl_hours: 24,
         }
+    }
+}
+
+/// chunk 层配置（架构 §2.2 / §2.5 / §2.7 / §2.8）。
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
+pub struct ChunkSection {
+    /// spill 目录（**必须本地磁盘**：spill 是节点私有状态，架构 §2.5）
+    pub spill_dir: PathBuf,
+    /// 实例标识：确定性 flush 相位 hash 输入 + `FileManifest.source_instance`（架构 §4.4）
+    pub instance_id: String,
+    /// chunk 区内存上限（MB）：**必须保底**（架构 §2.8）
+    pub mem_budget_mb: u64,
+    /// query 执行区内存上限（MB）：超限直接报错，**绝不抢占 chunk 区**
+    pub query_mem_budget_mb: u64,
+    /// 背压阶梯：>= soft 后台 spill（架构 §2.7）
+    pub soft_pct: u8,
+    /// 背压阶梯：>= hard 强制 seal 并 spill
+    pub hard_pct: u8,
+    /// 背压阶梯：>= reject 拒绝写入（RESOURCE_EXHAUSTED）
+    pub reject_pct: u8,
+}
+
+impl Default for ChunkSection {
+    fn default() -> Self {
+        Self {
+            spill_dir: PathBuf::from("./data/spill"),
+            instance_id: "standalone".into(),
+            mem_budget_mb: 512,
+            query_mem_budget_mb: 512,
+            soft_pct: 60,
+            hard_pct: 80,
+            reject_pct: 95,
+        }
+    }
+}
+
+impl ChunkSection {
+    /// 背压阈值（百分比 → 比例；越界值退化为默认，避免配置写错就静默放大内存）。
+    pub fn pressure_thresholds(&self) -> yuntun_chunk::PressureThresholds {
+        let d = yuntun_chunk::PressureThresholds::default();
+        let to_ratio = |pct: u8, fallback: f64| {
+            if pct == 0 || pct > 100 {
+                fallback
+            } else {
+                pct as f64 / 100.0
+            }
+        };
+        let soft = to_ratio(self.soft_pct, d.soft);
+        let hard = to_ratio(self.hard_pct, d.hard);
+        let reject = to_ratio(self.reject_pct, d.reject);
+        yuntun_chunk::PressureThresholds {
+            soft,
+            hard,
+            reject,
+        }
+    }
+
+    pub fn chunk_mem_bytes(&self) -> usize {
+        (self.mem_budget_mb as usize).saturating_mul(1024 * 1024)
+    }
+
+    pub fn query_mem_bytes(&self) -> usize {
+        (self.query_mem_budget_mb as usize).saturating_mul(1024 * 1024)
     }
 }
 
@@ -188,6 +282,7 @@ pub struct Config {
     pub server: ServerConfig,
     pub store: StoreSection,
     pub wal: WalSection,
+    pub chunk: ChunkSection,
     pub ingest: IngestSection,
     pub compaction: CompactionSection,
     pub query: QuerySection,
@@ -202,6 +297,7 @@ impl Default for Config {
                 root: PathBuf::from("./data/store"),
             },
             wal: WalSection::default(),
+            chunk: ChunkSection::default(),
             ingest: IngestSection::default(),
             compaction: CompactionSection::default(),
             query: QuerySection::default(),
@@ -218,6 +314,60 @@ impl Config {
     pub fn from_path(p: &std::path::Path) -> Result<Self, String> {
         let s = std::fs::read_to_string(p).map_err(|e| format!("read {}: {e}", p.display()))?;
         Self::from_toml(&s)
+    }
+
+    /// 配置自检：列出"能启动但会静默劣化"的问题（**不阻断启动**，由装配层打日志）。
+    ///
+    /// 例：`chunk_max_resident_secs <= max_flush_delay_secs + flush_phase_spread_secs`
+    /// 会让"驻留硬兜底"早于正常 flush 到期触发，从而**绕过相位分散**——
+    /// 所有实例重新在同一秒 flush，ADR-10 的惊群问题复活，但功能测试全绿。
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let max_resident = self.ingest.chunk_max_resident_secs;
+        let normal_deadline = self.ingest.max_flush_delay_secs + self.ingest.flush_phase_spread_secs;
+        if max_resident <= normal_deadline {
+            out.push(format!(
+                "[ingest] chunk_max_resident_secs({max_resident}) 必须 > max_flush_delay_secs({}) + \
+                 flush_phase_spread_secs({})；否则驻留硬兜底绕过相位分散，flush 会重新聚集在同一秒",
+                self.ingest.max_flush_delay_secs, self.ingest.flush_phase_spread_secs
+            ));
+        }
+        if self.ingest.rows_threshold == 0 && self.ingest.bytes_threshold_mb == 0 {
+            out.push(
+                "[ingest] rows_threshold 与 bytes_threshold_mb 同时为 0：seal 只能靠窗口关闭"
+                    .into(),
+            );
+        }
+        let t = self.chunk.pressure_thresholds();
+        if !(t.soft < t.hard && t.hard < t.reject) {
+            out.push(format!(
+                "[chunk] 背压水位必须 soft < hard < reject（当前 {}/{}/{}）",
+                t.soft, t.hard, t.reject
+            ));
+        }
+        if self.chunk.chunk_mem_bytes() == 0 {
+            out.push("[chunk] mem_budget_mb = 0：chunk 区无内存预算，写入会被背压直接拒绝".into());
+        }
+        out
+    }
+
+    /// 展开为 Ingestor 配置（**配置 → 运行时映射的唯一入口**，避免装配处散落换算）。
+    pub fn ingestor_config(&self) -> yuntun_ingest::IngestorConfig {
+        yuntun_ingest::IngestorConfig {
+            default_format: yuntun_format::DataFormat::parse(&self.ingest.default_format),
+            instance_id: self.chunk.instance_id.clone(),
+            spill_dir: self.chunk.spill_dir.clone(),
+            rows_threshold: self.ingest.rows_threshold as usize,
+            bytes_threshold: (self.ingest.bytes_threshold_mb as usize) * 1024 * 1024,
+            time_threshold_secs: self.ingest.time_threshold_secs,
+            max_flush_delay_secs: self.ingest.max_flush_delay_secs,
+            chunk_max_resident_secs: self.ingest.chunk_max_resident_secs,
+            flush_phase_spread_secs: self.ingest.flush_phase_spread_secs,
+            scan_interval: Duration::from_millis(self.ingest.scan_interval_ms),
+            chunk_mem_budget: self.chunk.chunk_mem_bytes(),
+            idempotency_ttl: Duration::from_secs(self.ingest.idempotency_ttl_hours * 3600),
+            ..Default::default()
+        }
     }
 
     pub fn wal_config(&self) -> yuntun_wal::WalConfig {
@@ -306,5 +456,128 @@ users = [{ user = "yuntun", password = "secret" }]
         let cfg = Config::from_toml("").unwrap();
         assert_eq!(cfg.server.listen, "0.0.0.0:50051");
         assert_eq!(cfg.ingest.time_threshold_secs, 5);
+    }
+
+    #[test]
+    fn chunk_section_defaults_follow_architecture_bounds() {
+        let cfg = Config::from_toml("").unwrap();
+        // 架构 §2.8：两块预算独立
+        assert_eq!(cfg.chunk.mem_budget_mb, 512);
+        assert_eq!(cfg.chunk.query_mem_budget_mb, 512);
+        assert_eq!(cfg.chunk.chunk_mem_bytes(), 512 * 1024 * 1024);
+        // 架构 §2.7：60/80/95 三级
+        let t = cfg.chunk.pressure_thresholds();
+        assert_eq!((t.soft, t.hard, t.reject), (0.60, 0.80, 0.95));
+        // 架构 §5.2：持久化硬上界与可见性软目标分离，且驻留兜底更晚
+        assert!(cfg.ingest.max_flush_delay_secs > cfg.ingest.time_threshold_secs);
+        assert!(cfg.ingest.chunk_max_resident_secs > cfg.ingest.max_flush_delay_secs);
+    }
+
+    #[test]
+    fn chunk_section_parses_and_overrides() {
+        let cfg = Config::from_toml(
+            r#"
+[chunk]
+spill_dir = "/tmp/yuntun-spill"
+instance_id = "datanode-1"
+mem_budget_mb = 64
+query_mem_budget_mb = 256
+soft_pct = 50
+hard_pct = 70
+reject_pct = 90
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.chunk.instance_id, "datanode-1");
+        assert_eq!(cfg.chunk.chunk_mem_bytes(), 64 * 1024 * 1024);
+        assert_eq!(cfg.chunk.query_mem_bytes(), 256 * 1024 * 1024);
+        let t = cfg.chunk.pressure_thresholds();
+        assert_eq!((t.soft, t.hard, t.reject), (0.50, 0.70, 0.90));
+    }
+
+    #[test]
+    fn bogus_pressure_pct_falls_back_instead_of_silently_enlarging_budget() {
+        // 0 / >100 是配置错误：退化到默认水位，而不是把阈值变成 0（等于永不 spill）
+        let cfg = Config::from_toml("[chunk]\nsoft_pct = 0\nhard_pct = 200\nreject_pct = 0").unwrap();
+        let t = cfg.chunk.pressure_thresholds();
+        assert_eq!((t.soft, t.hard, t.reject), (0.60, 0.80, 0.95));
+    }
+
+    #[test]
+    fn ingestor_config_maps_every_bound() {
+        let cfg = Config::from_toml(
+            r#"
+[chunk]
+instance_id = "node-7"
+spill_dir = "/tmp/sp"
+mem_budget_mb = 8
+
+[ingest]
+rows_threshold = 123
+bytes_threshold_mb = 3
+time_threshold_secs = 2
+max_flush_delay_secs = 7
+chunk_max_resident_secs = 9
+flush_phase_spread_secs = 1
+scan_interval_ms = 50
+"#,
+        )
+        .unwrap();
+        let ic = cfg.ingestor_config();
+        assert_eq!(ic.instance_id, "node-7");
+        assert_eq!(ic.rows_threshold, 123);
+        assert_eq!(ic.bytes_threshold, 3 * 1024 * 1024);
+        assert_eq!(ic.max_flush_delay_secs, 7);
+        assert_eq!(ic.chunk_max_resident_secs, 9);
+        assert_eq!(ic.chunk_mem_budget, 8 * 1024 * 1024);
+        assert_eq!(ic.scan_interval, Duration::from_millis(50));
+        // seal 策略由配置一处展开（不散落在装配代码里）
+        let p = ic.seal_policy();
+        assert_eq!(p.max_flush_delay, Duration::from_secs(7));
+        assert_eq!(p.max_resident, Duration::from_secs(9));
+        assert_eq!(p.phase_spread, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn legacy_flush_jitter_key_is_ignored_not_fatal() {
+        // 旧配置里的 flush_jitter_secs 已移除：旧 TOML 仍应可解析（未知字段忽略），
+        // 但**不再影响** flush 时刻（改为确定性相位偏移，架构 §5.3）
+        let cfg = Config::from_toml("[ingest]\nrows_threshold = 5\nflush_jitter_secs = 60").unwrap();
+        assert_eq!(cfg.ingest.rows_threshold, 5);
+        assert_eq!(cfg.ingest.flush_phase_spread_secs, 5);
+    }
+
+    #[test]
+    fn shipped_example_config_stays_in_sync_with_parser() {
+        // 示例配置是运维的第一份文档：必须能被当前解析器完整理解，
+        // 否则"注释里写着、代码已改名"的漂移会静默生效（未知键被忽略）。
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("yuntun.toml.example");
+        let cfg = Config::from_path(&path).expect("yuntun.toml.example 必须可解析");
+        assert_eq!(cfg.chunk.instance_id, "standalone");
+        assert_eq!(cfg.chunk.pressure_thresholds().soft, 0.60);
+        assert_eq!(cfg.ingest.rows_threshold, 500_000);
+        assert_eq!(cfg.ingest.max_flush_delay_secs, 30);
+        assert!(cfg.sql.mysql.enabled);
+        assert!(cfg.warnings().is_empty(), "示例配置不得有潜在劣化项: {:?}", cfg.warnings());
+    }
+
+    #[test]
+    fn warnings_flag_resident_ceiling_that_bypasses_phase_spread() {
+        // 默认配置满足不变量
+        assert!(Config::default().warnings().is_empty());
+        // 硬兜底 ≤ 正常到期 → 会绕过相位分散（功能全绿但惊群复活）
+        let cfg = Config::from_toml(
+            "[ingest]\nmax_flush_delay_secs = 30\nflush_phase_spread_secs = 60\nchunk_max_resident_secs = 60",
+        )
+        .unwrap();
+        let w = cfg.warnings();
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("绕过相位分散"), "{w:?}");
+        // 零预算：写入必被拒
+        let cfg = Config::from_toml("[chunk]\nmem_budget_mb = 0").unwrap();
+        assert!(cfg.warnings().iter().any(|w| w.contains("内存预算")));
     }
 }

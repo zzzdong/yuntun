@@ -1114,6 +1114,9 @@ fn lake_status(e: LakeError) -> Status {
         LakeError::IdempotencyKeyRequired => Status::failed_precondition(e.to_string()),
         LakeError::IdempotencyKeyTooLong => Status::invalid_argument(e.to_string()),
         LakeError::TableNotFound(_) => Status::not_found(e.to_string()),
+        // 背压阶梯第三级（架构 §2.7）：返回 RESOURCE_EXHAUSTED 让客户端退避重试，
+        // 而不是 INTERNAL（后者会让客户端以为写入逻辑出错而放弃重试）
+        LakeError::ResourceExhausted(_) => Status::resource_exhausted(e.to_string()),
         _ => Status::internal(e.to_string()),
     }
 }

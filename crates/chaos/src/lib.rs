@@ -121,8 +121,11 @@ async fn build(
     let ingestor = Arc::new(Ingestor::new(
         IngestorConfig {
             rows_threshold: 1,
-            flush_jitter_secs: 0,
+            time_threshold_secs: 0,
+            max_flush_delay_secs: 0,
+            flush_phase_spread_secs: 0,
             scan_interval: Duration::from_millis(20),
+            spill_dir: wal_dir.join("spill"),
             ..Default::default()
         },
         wal,

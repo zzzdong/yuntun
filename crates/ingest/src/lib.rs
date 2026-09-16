@@ -1,12 +1,16 @@
-//! Ingestor：写入路径（Source → WAL → 攒批 → S3 → Meta，详细设计 §5）。
+//! Ingestor：写入路径（Source → WAL → chunk → 对象存储 → Meta，架构 §5 + 详细设计 §5）。
 //!
 //! 严格时序（C8 / §5.2）：
-//! ① Schema 解析/演进（OCC，**必须在写 S3 之前**）
-//! ② 写 WAL（Data，组提交 fsync）→ 数据已持久化
-//! ③ 攒批线程（只读 `< synced_seq`，C2）按 shard+window 分组
-//! ④ flush：BatchPending → 编码写 S3 → BatchS3Written → CommitFiles → BatchCommitted
+//! ① Schema 解析/演进（OCC，**必须在写对象存储之前**）
+//! ② 写 WAL（Data，组提交 fsync）→ 数据已持久化，**可查**
+//! ③ **chunk 吸收**（seal / spill / flush 计划统一由 `yuntun_chunk::ChunkStore` 决策）
+//! ④ flush：chunk → 对象存储 → `CommitFiles` → `batch Committed`
 //!
 //! ADR-11：BatchState 不单独存储，由 WAL 事件流重建（顺序即因果）。
+//!
+//! ## 双阈值（架构 §5.2，不得合并）
+//! - **可见性上界** = WAL fsync + 一个扫描周期（`scan_interval`）；
+//! - **持久化上界** = `seal_time + max_flush_delay`（确定，无随机 jitter）。
 
 pub mod accumulator;
 pub mod flush;
@@ -15,14 +19,22 @@ pub mod schema_cache;
 pub mod source;
 pub mod timeutil;
 
-pub use accumulator::{window_of, BatchAccumulator, WindowGroup};
-pub use flush::{FlushOutcome, LiveBatchTracker};
+pub use accumulator::{now_ms, window_of};
+pub use flush::{
+    abort_batch, flush_chunk, flush_chunk_with_id, payloads_to_batches, recommit_into_catalog,
+    FlushDeps, FlushOutcome, LiveBatchTracker,
+};
 pub use pipeline::{Ingestor, IngestorConfig};
 pub use schema_cache::SchemaCache;
 pub use source::{IngestSource, Receipt};
-/// 分片存储形态（内存分片 / 磁盘分片）在 **store 层**：`yuntun_store::{ShardStore, MemoryShard, ShardId}`。
-/// 写入侧只负责写内存分片、提交后交棒；查询侧从 store 层读取，不依赖本 crate 的进程。
-pub use yuntun_store::{MemoryShard, ShardId, ShardStore, ShardTier};
+
+/// chunk 层重导出：写入侧与查询侧共享同一套类型（避免上层重复依赖）。
+pub use yuntun_chunk::{
+    Chunk, ChunkData, ChunkId, ChunkKey, ChunkState, ChunkStore, ChunkStoreConfig, MemoryLedger,
+    MemoryPartition, Pressure, SealPolicy, TableLiveness,
+};
+/// 分片读取接缝（store 层）：查询侧只依赖 `ShardReader`，换实现（进程内 / 远端）零改动。
+pub use yuntun_store::{ShardId, ShardReader, ShardTier};
 
 use yuntun_model::error::LakeError;
 

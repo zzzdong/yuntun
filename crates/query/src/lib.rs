@@ -19,6 +19,8 @@ pub use table::YuntunTableProvider;
 pub use datafusion::execution::SendableRecordBatchStream;
 
 use datafusion::error::DataFusionError;
+use datafusion::execution::memory_pool::GreedyMemoryPool;
+use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::prelude::SessionContext;
 use yuntun_catalog::CatalogOps;
 
@@ -28,10 +30,15 @@ pub const STORE_URL: &str = "yuntun-store:///";
 pub const CATALOG_NAME: &str = "yuntun";
 pub const SCHEMA_NAME: &str = "public";
 
-/// 查询引擎（详细设计 §6.7）。
+/// 查询引擎（详细设计 §6.7 + 架构 §2.8 内存硬分区之一）。
+///
+/// `runtime` 持有 **query 执行区**的内存池：与 chunk 区（读写热缓冲）是两块**独立账本**，
+/// 互不借用。本块超限时 DataFusion 返回 `ResourcesExhausted`，
+/// **绝不抢占 chunk 区**（否则一个大基数 `GROUP BY` 就能把写入压垮）。
 pub struct QueryEngine {
     store: std::sync::Arc<dyn object_store::ObjectStore>,
     cache: std::sync::Arc<LocalCatalogCache>,
+    runtime: Option<std::sync::Arc<RuntimeEnv>>,
 }
 
 impl QueryEngine {
@@ -39,7 +46,49 @@ impl QueryEngine {
         store: std::sync::Arc<dyn object_store::ObjectStore>,
         cache: std::sync::Arc<LocalCatalogCache>,
     ) -> Self {
-        Self { store, cache }
+        Self {
+            store,
+            cache,
+            runtime: None,
+        }
+    }
+
+    /// 带 query 执行区内存上限的构造（架构 §2.8）。
+    ///
+    /// `query_mem_bytes = 0` 视为"不设上限"（单测 / 无写入同进程的场景）。
+    pub fn with_query_memory_limit(
+        store: std::sync::Arc<dyn object_store::ObjectStore>,
+        cache: std::sync::Arc<LocalCatalogCache>,
+        query_mem_bytes: usize,
+    ) -> Result<Self, DataFusionError> {
+        if query_mem_bytes == 0 {
+            return Ok(Self::new(store, cache));
+        }
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(std::sync::Arc::new(GreedyMemoryPool::new(query_mem_bytes)))
+            .build()?;
+        Ok(Self {
+            store,
+            cache,
+            runtime: Some(std::sync::Arc::new(runtime)),
+        })
+    }
+
+    /// query 执行区当前已预留字节（`None` = 未设上限）。
+    pub fn query_memory_reserved(&self) -> Option<usize> {
+        self.runtime
+            .as_ref()
+            .map(|rt| rt.memory_pool.reserved())
+    }
+
+    /// query 执行区内存上限（`None` = 未设上限）。
+    pub fn query_memory_limit(&self) -> Option<usize> {
+        self.runtime.as_ref().and_then(|rt| {
+            match rt.memory_pool.memory_limit() {
+                datafusion::execution::memory_pool::MemoryLimit::Finite(n) => Some(n),
+                _ => None,
+            }
+        })
     }
 
     pub fn cache(&self) -> std::sync::Arc<LocalCatalogCache> {
@@ -59,13 +108,16 @@ impl QueryEngine {
         &self,
         schema: &str,
     ) -> Result<SessionContext, DataFusionError> {
-        let mut ctx = SessionContext::new_with_config(
-            datafusion::prelude::SessionConfig::new()
-                .with_information_schema(true)
-                // G2（sql-access-design §四）：非限定表名 `FROM t` 解析到默认
-                // catalog/schema，wire 客户端（MySQL/PG）直接可用
-                .with_default_catalog_and_schema(CATALOG_NAME, schema),
-        );
+        let config = datafusion::prelude::SessionConfig::new()
+            .with_information_schema(true)
+            // G2（sql-access-design §四）：非限定表名 `FROM t` 解析到默认
+            // catalog/schema，wire 客户端（MySQL/PG）直接可用
+            .with_default_catalog_and_schema(CATALOG_NAME, schema);
+        // 硬分区：会话级内存池 = query 执行区（与 chunk 区互不抢占，架构 §2.8）
+        let mut ctx = match &self.runtime {
+            Some(rt) => SessionContext::new_with_config_rt(config, rt.clone()),
+            None => SessionContext::new_with_config(config),
+        };
         // JSON SQL 函数（json_extract / json_get / json_is_valid ...）：
         // JSON 列以 Utf8 文本存储，查询能力由本函数集提供（0.1 支持 ARRAY/MAP 的同时补齐）
         datafusion_functions_json::register_all(&mut ctx)?;
