@@ -152,7 +152,7 @@ standalone → server → ingest → chunk  → store → model
 | 阶段 0 | — | 写入/查询链路贯通（All-in-One） | ✅ 2026-09-08 |
 | 阶段 1 | — | Standalone 完备（crate 重构 / Flight SQL / SQL 写入 / CLI / 遗留清偿） | ✅ 主要项已完成 |
 | **阶段 1.5** | **R1（← R0）** | **数据平面地基：chunk 层**（内存热数据有界化 / spill / 背压 / 确定性落盘 / scan 接缝） | ✅ **2026-09-15**（§2.4） |
-| 阶段 2 | R0 收尾、R1 收尾 | 质量与性能：Chaos 11 场景 + 压测 baseline + Vortex + **观测指标**；**本阶段同时承担 §2.2 的定案**（阶段 3 的准入门槛） | 部分：观测已落地（T6.12 ✅）；chaos 已起步（5/11，抓出三个真缺陷：§27 幂等键不生效、§28.2 恢复重复文件、§28.1 提交窗口重复计数）；压测/定案待做 |
+| 阶段 2 | R0 收尾、R1 收尾 | 质量与性能：Chaos 11 场景 + 压测 baseline + Vortex + **观测指标**；**本阶段同时承担 §2.2 的定案**（阶段 3 的准入门槛） | 部分：观测已落地（T6.12 ✅）；chaos 已起步（5/11，三个真缺陷中 §27 / §28.2 已修，§28.1 待与 R3 同批修）；压测/定案待做 |
 | 阶段 3 | **R2 → R3 → R4 → R5 → R6** | 分布式化：Catalog 访问形态与抽象补位（R2）→ metanode/raft（R3）→ datanode 化 + **冷热边界按实例**（R4）→ 分布查询/对拍（R5）→ **compaction/GC 全局化**（R6） | **R2 已完成（7/8，见 §7.1）**；R3–R6 待 R2 余项 + 阶段 2 准出（就绪度基线见 §五） |
 | 阶段 4 | R6 之后 | 规模化：外部索引、Iceberg 等（`refactor.md` 未覆盖，留待重新评估） | 待定 |
 
@@ -474,7 +474,7 @@ SQL `INSERT` 返回成功时数据仅落 WAL（与 Flight DoPut 语义一致）�
 
 | ID | 内容 | 说明 | 为什么现在做 |
 |---|---|---|---|
-| T6.1–6.11 | Chaos 11 场景（v1.0 §5.2 全表沿用） | 含并发崩溃、`synced_seq` 验证、Batch 超时、磁盘水位 | 阶段 3 前置：`refactor.md §3` 明文"不要跳过"。**进行中：chaos 层 5/11（#1/#2/#3/#5/#6），另 4 项仅单测层**；已抓出三个真缺陷：幂等键完全不生效（§27）、恢复产出重复文件（§28.2，优先级最高）、提交窗口重复计数（§28.1） |
+| T6.1–6.11 | Chaos 11 场景（v1.0 §5.2 全表沿用） | 含并发崩溃、`synced_seq` 验证、Batch 超时、磁盘水位 | 阶段 3 前置：`refactor.md §3` 明文"不要跳过"。**进行中：chaos 层 5/11（#1/#2/#3/#5/#6），另 4 项仅单测层**；已抓出三个真缺陷、修掉两个：幂等键完全不生效（§27 ✅）、恢复产出重复文件（§28.2 ✅）、提交窗口重复计数（§28.1，待与 R3 同批） |
 | T6.12 | **S1-11 观测三项指标** ✅ **已完成（2026-09-17）** | `Lakehouse::metrics()` + 周期打点：chunk 内存水位 / **WAL 积压记录数** / 背压水位 + Catalog 版本与增量统计（可序列化，HTTP 导出待阶段 2 尾） | 没有它，R-7（内存越限）只能复现不能定位 |
 | T6.13 | **P0 定案**（v2.1 新增） | 用 T8 数据定 `flush_phase_spread_secs` / `max_flush_delay_secs` / `rows_threshold`，并**正式修订 ADR-10** | §2.2；未定案就不该改默认值 |
 | T6.14 | **chunk 压力与恢复专项**（v2.1 新增） | 触发 spill 的写入压力；spill 读回失败降级；大基数 `GROUP BY` 挤压 chunk 区（验证硬分区）；崩溃后 spill 清理 | S1 的"真实压力曲线"缺口 |
@@ -679,7 +679,7 @@ R2 Catalog 冻结（✅ 已完成）──► R3 metanode + raft
 | **R-10** | **相位分散量级未定案就被顺手改**（等于静默改掉 ADR-10 削峰） | 中 | 中 | §2.2 P0 + 不变量自检（`max_resident > max_flush_delay + spread`）＋ 改默认值必须附 T8 数据 |
 | **R-11** | **幂等键"看起来有、实际不生效"**（键被丢弃 / 提交不带键 / 无入口预筛）→ 客户端超时重试=静默重复计数；反向修过头则同请求的多批次互相判重=静默丢数据 | **已发生** | 高 | ✅ 已修（`operation-log §27`）：入口预筛 + fsync 后登记 + 恢复重建索引 + 多批次生产点**派生批次键**；新增 chaos #5 与客户端整请求重试用例；缺一条断言就会被"键已透传"的绿色误导 —— **凡是"已具备"的能力都要有一条断言其反面后果的用例** |
 | **R-12** | **提交 → `mark_committed` 窗口内重复计数**：`commit_files` 到 `mark_committed` 之间隔一跳 WAL fsync，此间同一批数据既在文件里又在热数据里 → 快照 ≥ S 的查询**偶发多计**（实测 4→6、9→12） | **已发生** | 中 | 测试已钉（`chaos::commit_to_mark_window_must_not_double_count`，`#[ignore]` 保留一键复现）＋ 精确断言前统一 `wait_hot_drained()`（`operation-log §28.1`）。**修复必须走读侧栅栏**（接缝带上"已知文件/batch 集合"，与 `refactor.md` S5-4 的 `known_manifest_ver` 同向）——锁/提前标记/粗水位三种快修都已论证不成立（§28.1），与 R3 同批设计 |
-| **R-13** | **崩溃恢复产出重复文件**：恢复建立的认领集（`ReplaySkip`）漏掉 WAL 中真实存在的 Data（实测 `claims=[0..1,1..2,2..3,2..3,5..6,5..6]` vs `data_seqs=[0,1,2,5,8,9]`），且两个不同批次共享同一区间 → 该 Data 被重放成第二个文件，**重启后数据持久重复**（9 批次 27 行 → 11 文件 33 行） | **已发生** | **高** | **下一步第一优先级**（`operation-log §28.2`）：先查 `BatchState.wal_seq_range` 的赋值/传递（`apply_record`、重做路径）。测试标 `#[ignore]` 保留诊断打印。它关系到 M0a"恢复不丢不重"，也是 R4 准入（多 datanode 重启不重）的前提 |
+| **R-13** | ~~崩溃恢复产出重复文件~~：**同一份 WAL 目录被两个攒批循环消费** —— 轮次间只 `cancel()` 不 await，新循环在旧循环未退出时就开写，同一条 Data 被各吸收一次并各自 flush → **两个文件、持久重复**（9 批次 27 行 → 11 文件 33 行） | **已发生** | 高 | ✅ **已修**（`operation-log §28.2`）：① 夹具 `cancel()` 后 await 循环退出；② 生产 `run_accumulator` 增"退出闸门"（cancel 已置位则本轮不做）。教训升格为通用约束：**节点私有状态（WAL 目录）同一时刻只能有一个消费者** —— R4 的 T12.5（启动即拒绝重复 `instance_id`）是它的显式化 |
 
 ---
 
@@ -706,7 +706,7 @@ R2 Catalog 冻结（✅ 已完成）──► R3 metanode + raft
 | 5 | **spill 可信性**：CRC 篡改/截断/魔数错误必须被发现并丢弃（WAL 仍是权威） | `spill::corrupted_payload_is_detected_by_crc` 等 | ✅ |
 | 6 | **release-after-commit（I4）**：提交后缓存追上之前不得释放（零可见性空洞） | `chunk::committed_chunk_visible_until_cache_catches_up_then_reclaimed` | ✅ |
 | 7 | **接缝可替换**：查询侧只依赖 `ShardReader` | `hot_shard_reader`（远端实现）+ `chunk::store_exposes_shard_reader_seam` | ✅ |
-| 8 | 崩溃恢复不回归（重提交/世代闸门/交错写入） | `m0a_recommit` 3 用例 + chaos 3 场景 | ✅ **降级为 ⚠️**：`chaos::crash_recovery_no_data_loss` 已确认**恢复产出重复文件**（`operation-log §28.2` / 风险 R-13），用例暂标 `#[ignore]`；`m0a_recommit` 仍绿 |
+| 8 | 崩溃恢复不回归（重提交/世代闸门/交错写入） | `m0a_recommit` 3 用例 + chaos 3 场景 | ✅（2026-09-18 复查：曾因"**同一份 WAL 目录被两个攒批循环消费**"产出重复文件，两处修复后转绿 —— 见 `operation-log §28.2` / R-13） |
 | 9 | 全量测试 + 零告警 | `cargo test --workspace`（189 passed / 0 failed）+ clippy | ✅ |
 
 ### 阶段 2（质量）

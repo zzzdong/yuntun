@@ -29,7 +29,7 @@
 //! | 3 | 孤儿清理不误删已知文件 | ✅ | `orphan_cleanup_spares_known_and_inflight_files`（含静置期在途文件防线） |
 //! | 4 | Schema 变更 + EXPLAIN 谓词下推 | ❌ | — |
 //! | 5 | 幂等键 + Compaction | ✅ | `idempotency_survives_compaction` |
-//! | 6 | 崩溃恢复（各状态点） | ⚠️ **已知缺陷** | `crash_recovery_no_data_loss`：恢复产出重复文件（`operation-log §28.2`），已 `#[ignore]` 保留诊断 |
+//! | 6 | 崩溃恢复（各状态点） | ✅ | `crash_recovery_no_data_loss`（5 轮硬崩溃；曾抓出"同一 WAL 目录两个消费者"的重复文件缺陷，已修，见 `operation-log §28.2`） |
 //! | 7 | WAL 撕裂 | ⚠️ 仅解码层 | `wal::segment::torn_write_detected_by_crc`；缺端到端 recover |
 //! | 8 | 并发写 + fsync 前/中/后 kill | ❌ | 需要 fsync 注入点 |
 //! | 9 | `synced_seq`（write 后 fsync 前 kill） | ⚠️ 仅读取层 | `wal::reader::scan_range_reads_only_synced` |
@@ -210,18 +210,26 @@ async fn build_with_delay(
 
 /// E3 / E2：crash 恢复无数据丢失（5 轮硬崩溃，同一目录滚动）。
 ///
-/// ⚠️ **当前是已知缺陷**（`operation-log §28.2`）：夹具补上"热数据读侧"接线后，
-/// 本用例稳定失败 —— 恢复后 **Manifest 里出现重复文件**（9 个批次 → 11 个文件，
-/// 33 行 vs acked 27 行）。
+/// ## 本轮在这里抓到的缺陷（`operation-log §28.2`，已修）
 ///
-/// 定位到的直接原因：恢复阶段建立的"认领集"（`ReplaySkip`）只覆盖
-/// `0..1, 1..2, 2..3, 2..3, 5..6, 5..6`，而 WAL 里的 Data 在 `[0,1,2,5,8,9]`
-/// —— **seq 8/9 无人认领**，于是被攒批循环重放成第二个文件（+2 文件 = +6 行）。
-/// 另外区间本身可疑（两个不同批次共享 `2..3` / `5..6`），指向
-/// `BatchState.wal_seq_range` 的传递/赋值，而非重放逻辑本身。
+/// 夹具接上"热数据读侧"后本用例稳定失败：9 个批次（27 行）恢复后变成
+/// **11 个文件（33 行）**，且持久不回落到 27。
 ///
-/// 修复前本用例是**红的**，因此标 `#[ignore]`：保留一键复现，不伪装绿灯。
-#[ignore = "已知缺陷：恢复后 Manifest 出现重复文件（operation-log §28.2）"]
+/// **根因不是恢复逻辑，而是"轮次之间换了消费者"**：上一轮结束时只
+/// `shutdown.cancel()`（发信号，**不 await**），而 cancel 不会打断已在执行的一轮
+/// （含对象存储写 + WAL fsync）；下一轮随即 `build` 并**在同一份 WAL 目录上起了
+/// 新的攒批循环** —— 两个消费者把同一条 Data 各吸收一次、各自 flush，
+/// 于是同一条 Data 产出两个文件（flush 日志实测同一 seq 被 flush 2–3 次）。
+///
+/// 修法两条，缺一不可：
+/// 1. **夹具**：`cancel()` 后 `await` 到循环真正退出（见函数尾部注释）；
+/// 2. **生产**：`run_accumulator` 增加"退出闸门"——cancel 已置位就不再开新一轮，
+///    把"退出瞬间仍落盘一批"的窗口关掉（`plan.md` R-13）。
+///
+/// 一般化：**节点私有状态（WAL 目录）同一时刻只能有一个消费者**。
+/// 恢复/交接流程里最容易违反它，而症状是"静默重复"。
+///
+/// 诊断开关：`YUNTUN_CHAOS_TRACE=1` 会打印认领集与 WAL 中 Data 的位置。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn crash_recovery_no_data_loss() {
     let _gate = CHAOS_GATE.lock().await;
@@ -269,7 +277,12 @@ async fn crash_recovery_no_data_loss() {
         setup = Some(build(&wal_dir, &store_root, &tables).await);
         let cur = setup.as_ref().unwrap();
         // [诊断] 恢复后的"认领集" vs WAL 中的 Data seq：认领不覆盖的 Data 会被重放成**第二个文件**
-        {
+        // [诊断] 恢复后的"认领集" vs WAL 中的 Data seq（`YUNTUN_CHAOS_TRACE=1` 开启）。
+        //
+        // 保留它的价值：定位"恢复产出重复文件"（`operation-log §28.2`）就是靠这里 ——
+        // 直接看到"哪些 Data 没有认领"以及"两个批次共享同一区间"。
+        // 平时不开，避免在 CI 输出里刷屏。
+        if std::env::var("YUNTUN_CHAOS_TRACE").is_ok() {
             let claims = cur.ingestor.replay_skip.lock().unwrap().clone();
             let data_seqs: Vec<u64> =
                 yuntun_wal::reader::WalReader::new(cur.ingestor.wal.shard_dir())
@@ -286,10 +299,56 @@ async fn crash_recovery_no_data_loss() {
                     .map(|c| format!("{}..{}", c.start, c.end))
                     .collect::<Vec<_>>()
             );
+            // WAL 原始记录：看 BatchPending 携带的区间是否与 Data 的真实位置一致
+            let dump: Vec<String> = yuntun_wal::reader::WalReader::new(
+                cur.ingestor.wal.shard_dir(),
+            )
+            .scan_from(0)
+            .unwrap()
+            .iter()
+            .map(|(s, r)| {
+                use yuntun_model::wal_record::Record as R;
+                let b = |id: &str| id[..6.min(id.len())].to_string();
+                match r {
+                    R::Data(p) => format!("{s}:Data({})", p.table),
+                    R::BatchPending(p) => format!(
+                        "{s}:Pending({} {}..{})",
+                        b(&p.batch_id),
+                        p.wal_seq_start,
+                        p.wal_seq_end
+                    ),
+                    R::BatchS3Written(p) => format!("{s}:S3W({})", b(&p.batch_id)),
+                    R::BatchCommitted(p) => format!("{s}:Commit({})", b(&p.batch_id)),
+                    R::BatchAbort(p) => format!("{s}:Abort({})", b(&p.batch_id)),
+                    _ => format!("{s}:other"),
+                }
+            })
+            .collect();
+            eprintln!("[诊断] WAL: {dump:?}");
+            // 恢复后的批次状态：batch_id 全量 + 区间 + 组键（定位区间为何重复/漏覆盖）
+            let rec = cur.ingestor.wal.full_recovery().unwrap();
+            let mut states: Vec<String> = rec
+                .states
+                .states
+                .values()
+                .map(|st| {
+                    format!(
+                        "{} {:?} range={:?} shard={} win={} rows={}",
+                        &st.batch_id[..8.min(st.batch_id.len())],
+                        st.status,
+                        st.wal_seq_range,
+                        st.shard,
+                        st.time_window,
+                        st.row_count
+                    )
+                })
+                .collect();
+            states.sort();
+            eprintln!("[诊断] states: {states:?}");
         }
         let shutdown = CancellationToken::new();
         // accumulator 必须在轮询期间保持运行（它负责重读 WAL → flush → commit）
-        let _acc = cur.ingestor.clone().spawn_accumulator(shutdown.clone());
+        let acc = cur.ingestor.clone().spawn_accumulator(shutdown.clone());
 
         // ④ 查询计数 == 累计 acked 行数（无丢失、无重复）。
         // 真实磁盘上"WAL 重放 → flush → commit"可能超过固定等待 → 轮询；
@@ -355,8 +414,15 @@ async fn crash_recovery_no_data_loss() {
             );
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        // 恢复完成后再停 accumulator（避免中断后续 flush）
+        // 恢复完成后再停 accumulator（避免中断后续 flush）。
+        //
+        // ⚠️ **必须 await 到它真正退出**：`cancel()` 只发信号，循环可能正跑完一轮
+        // （扫描 → 吸收 → 落盘）；而下一轮会重新 `build` 并起**新的**攒批循环。
+        // 两个循环消费**同一份 WAL 目录**时，同一条 Data 会被各吸收一次、各自 flush
+        // → **两个文件 = 重复计数**（本轮实测 9 批次产 11 文件 / 33 行）。
+        // 这正是"节点私有状态（WAL 目录）同一时刻只能有一个消费者"的具体体现。
         shutdown.cancel();
+        let _ = acc.await;
         assert_eq!(
             got, acked_rows,
             "round {round}: 恢复后行数必须等于累计 acked 行数（无丢失无重复）"
