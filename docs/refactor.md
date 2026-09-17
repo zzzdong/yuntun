@@ -2,7 +2,7 @@
 
 > 目标态定义见：`yuntun-v2-架构设计.md`
 > 本文回答：**现有代码怎么改、按什么顺序改、每步怎么验收、哪里能回滚**
-> 适用：v2 分支（standalone 已跑通、100+ 测试、WAL 权威/攒批/Parquet+Manifest 已闭环）
+> 适用：main 分支（2026-09-17 由 v2 改名；standalone 已跑通、100+ 测试、WAL 权威/攒批/Parquet+Manifest 已闭环）
 
 ---
 
