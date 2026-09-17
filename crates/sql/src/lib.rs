@@ -382,18 +382,24 @@ impl SqlEngine {
     }
 
     /// 批次序列送入 ingest 管线（WAL 权威，§4.4）。
+    ///
+    /// ⚠️ 幂等键是**语句级**的，而一条语句可能产出多个批次（`INSERT ... SELECT`
+    /// 的结果批次）。必须按批次派生键（[`yuntun_ingest::derive_batch_key`]），
+    /// 否则第 2..N 批会带着同一个键撞上第 1 批的幂等记录 → **静默丢数据**。
     pub(crate) async fn ingest_batches(
         &self,
         table: &str,
         batches: Vec<RecordBatch>,
         idempotency_key: Option<String>,
     ) -> Result<(), SqlError> {
-        for batch in batches {
+        for (idx, batch) in batches.into_iter().enumerate() {
             let ib = yuntun_model::IngestBatch {
                 table: table.to_string(),
                 shard_key: "default".to_string(),
                 record_batch: batch,
-                idempotency_key: idempotency_key.clone(),
+                idempotency_key: idempotency_key
+                    .as_deref()
+                    .map(|k| yuntun_ingest::derive_batch_key(k, idx as u64)),
                 received_at: std::time::SystemTime::now(),
             };
             self.ingest.ingest(ib).await.map_err(SqlError::from_lake)?;

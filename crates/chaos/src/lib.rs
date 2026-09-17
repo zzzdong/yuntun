@@ -17,6 +17,27 @@
 //!   writer 各带独立新列，OCC 冲突由 §5.2 重试循环消化，最终 schema 包含全部列。
 //! - **T6.8（查询侧多版本对齐）**：[`query_multi_version_alignment`] ——
 //!   v1/v2 文件共存，查询统一到最新 schema（缺失列 null 填充）。
+//! - **T6.5（幂等键 + Compaction）**：[`idempotency_survives_compaction`] ——
+//!   合并删除原文件后，同键重试仍幂等（§7.3.1 独立存储）。
+//!
+//! ## 场景清单与进度（`design.md` §12.3 的 11 项）
+//!
+//! | # | 场景 | chaos 层 | 备注 |
+//! |---|---|---|---|
+//! | 1 | Compaction 期间查询 | ❌ | 单测有快照隔离，无并发查询 |
+//! | 2 | 分片移除期间查询 | ❌ | — |
+//! | 3 | 孤儿清理不误删已知文件 | ❌ | 单测仅覆盖纯函数判定 |
+//! | 4 | Schema 变更 + EXPLAIN 谓词下推 | ❌ | — |
+//! | 5 | 幂等键 + Compaction | ✅ | `idempotency_survives_compaction` |
+//! | 6 | 崩溃恢复（各状态点） | ✅ | `crash_recovery_no_data_loss`（5 轮硬崩溃） |
+//! | 7 | WAL 撕裂 | ⚠️ 仅解码层 | `wal::segment::torn_write_detected_by_crc`；缺端到端 recover |
+//! | 8 | 并发写 + fsync 前/中/后 kill | ❌ | 需要 fsync 注入点 |
+//! | 9 | `synced_seq`（write 后 fsync 前 kill） | ⚠️ 仅读取层 | `wal::reader::scan_range_reads_only_synced` |
+//! | 10 | Batch 超时 + segment 释放 | ⚠️ 仅监控层 | `wal::cleanup::monitor_aborts_timed_out_batches`（未断言 segment 释放） |
+//! | 11 | 磁盘水位强制 abort | ⚠️ 仅监控层 | `wal::cleanup::monitor_force_aborts_on_disk_watermark` |
+//!
+//! **"单测有"不等于"通过"**：单测覆盖的是解码/判定的**纯逻辑**，
+//! chaos 层要的是真实磁盘 + 跨重启 + 并发下的端到端证据。表里标 ⚠️ 的都还欠这一层。
 
 // 本 crate 当前只含验收测试（E2/E3/T6.4/T6.8）与压测示例；以下导入均为测试专用。
 #[cfg(test)]
@@ -83,17 +104,18 @@ static CHAOS_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// 构建一套组件（每轮重建 = 模拟进程重启）。
 ///
-/// `tables`：重启后需要恢复的表定义。阶段 1 表定义由 raft snapshot 恢复（C5/§5.4.2）；
+/// `tables`：重启后需要恢复的表定义（第 3 个元素 = 是否强制幂等键）。
+/// 阶段 1 表定义由 raft snapshot 恢复（C5/§5.4.2）；
 /// 阶段 0 chaos harness 中由调用方重放（模拟 snapshot 已含表定义）。
 #[cfg(test)]
 async fn build(
     wal_dir: &std::path::Path,
     store_root: &std::path::Path,
-    tables: &[(&str, arrow::datatypes::SchemaRef)],
+    tables: &[(&str, arrow::datatypes::SchemaRef, bool)],
 ) -> Setup {
     let catalog = Arc::new(MemoryCatalog::new());
     // 恢复表定义（模拟 raft snapshot；已存在则跳过）
-    for (name, schema) in tables {
+    for (name, schema, require_key) in tables {
         if catalog.get_table(name).await.unwrap().is_none() {
             catalog
                 .create_table(CreateTableRequest {
@@ -103,7 +125,7 @@ async fn build(
                     partition_cols: vec![],
                     default_format: "parquet".into(),
                     ingest_config: yuntun_model::meta::IngestConfig {
-                        require_idempotency_key: false,
+                        require_idempotency_key: *require_key,
                         ..yuntun_model::meta::IngestConfig::standard()
                     },
                 })
@@ -161,7 +183,7 @@ async fn crash_recovery_no_data_loss() {
     let store_root = tmpdir("store");
 
     // 表定义随每轮 build 恢复（模拟 raft snapshot）
-    let tables = [("audit", schema())];
+    let tables = [("audit", schema(), false)];
     let mut setup: Option<Setup> = Some(build(&wal_dir, &store_root, &tables).await);
 
     let mut acked_rows = 0u64;
@@ -256,6 +278,7 @@ async fn concurrent_schema_evolution() {
         "evo",
         Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]))
             as arrow::datatypes::SchemaRef,
+        false,
     )];
     let setup = build(&wal_dir, &store_root, &tables).await;
 
@@ -316,6 +339,7 @@ async fn query_multi_version_alignment() {
         "mv",
         Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]))
             as arrow::datatypes::SchemaRef,
+        false,
     )];
     let setup = build(&wal_dir, &store_root, &tables).await;
 
@@ -413,4 +437,161 @@ async fn query_multi_version_alignment() {
         .unwrap()
         .value(0);
     assert_eq!(got, 1, "v1 文件缺失列应填 null（b IS NOT NULL 仅 1 行）");
+}
+
+// ---------------------------------------------------------------- 测试辅助
+//
+// 真实磁盘 + 并行 test binary 下固定 sleep 不可靠（恢复/flush 耗时随负载漂移），
+// 一律用"轮询到条件成立 + 60s 上界"。上界只兜"永不成立"，不冒充延迟指标。
+
+/// 等某个 shard 的可见文件数达到 `n`（返回当前清单）。
+#[cfg(test)]
+async fn wait_visible_files(
+    setup: &Setup,
+    table: &str,
+    shard: &str,
+    n: usize,
+) -> Vec<yuntun_model::meta::FileManifest> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let snap = setup.catalog.current_snapshot().await;
+        let files = setup
+            .catalog
+            .list_visible_files(table, snap, Some(shard))
+            .await
+            .unwrap_or_default();
+        if files.len() >= n || tokio::time::Instant::now() >= deadline {
+            return files;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// 查询 `count(*)`（先刷新查询侧缓存，否则读到的是空快照）。
+#[cfg(test)]
+async fn count_rows(setup: &Setup, qualified_table: &str) -> u64 {
+    setup
+        .engine
+        .catalog()
+        .refresh(&(setup.catalog.clone() as Arc<dyn CatalogOps>))
+        .await
+        .unwrap();
+    let batches = setup
+        .engine
+        .sql(&format!("SELECT count(*) FROM yuntun.{qualified_table}"))
+        .await
+        .unwrap();
+    batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0) as u64
+}
+
+// ---------------------------------------------------------------- 目录语义场景
+
+/// T6.5（`design.md` §12.3 #5）：**幂等键 + Compaction** ——
+/// 合并把原文件 `deleted_at` 之后，同一幂等键的重试**仍然幂等**。
+///
+/// 对应 §7.3.1 的"核心修正"：幂等键是**独立存储**，不随 FileManifest 生命周期消失。
+/// 为什么值得单独跑一遍端到端：入口预筛若（直接或间接）依赖"文件/批次还在"，
+/// compaction 之后就会"忘掉"这个键，客户端重试会**再写一份数据** ——
+/// 静默重复计数，而所有功能测试照样全绿。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idempotency_survives_compaction() {
+    let _gate = CHAOS_GATE.lock().await;
+    let wal_dir = tmpdir("wal-idem");
+    let store_root = tmpdir("store-idem");
+    // 强制幂等键（standard 模板 = require）→ 走完整的"必须带键"路径
+    let tables = [("idem", schema(), true)];
+    let setup = build(&wal_dir, &store_root, &tables).await;
+    let shutdown = CancellationToken::new();
+    let _acc = setup.ingestor.clone().spawn_accumulator(shutdown.clone());
+
+    let ingest = |key: &'static str, ts: i64| {
+        let ingestor = setup.ingestor.clone();
+        async move {
+            ingestor
+                .ingest(IngestBatch {
+                    table: "idem".into(),
+                    shard_key: "s0".into(),
+                    record_batch: batch(ts),
+                    idempotency_key: Some(key.into()),
+                    received_at: std::time::SystemTime::now(),
+                })
+                .await
+                .unwrap()
+        }
+    };
+
+    // ① 三个不同键各写一批（每批 3 行）
+    let mut acked_rows = 0u64;
+    for (i, k) in ["idem-k0", "idem-k1", "idem-k2"].iter().enumerate() {
+        let r = ingest(k, 100 + i as i64).await;
+        assert!(!r.duplicate, "首次写入不得被判重: {k}");
+        acked_rows += r.row_count;
+    }
+    assert_eq!(acked_rows, 9);
+
+    // 等落盘：rows_threshold=1 → 每批独立 chunk → 3 个文件
+    let files = wait_visible_files(&setup, "public.idem", "s0", 3).await;
+    assert_eq!(files.len(), 3, "三个批次应产出三个文件（后续 compaction 才有意义）");
+
+    // ② 重试（compaction 之前）：入口预筛命中 —— 不写 WAL、不加行
+    let dup = ingest("idem-k0", 999).await;
+    assert!(dup.duplicate, "同键重试必须被判重（否则静默重复）");
+    assert_eq!(dup.row_count, 0);
+    assert_eq!(dup.wal_seq, 0, "判重请求不得写 WAL");
+
+    // ③ compaction：3 文件 → 1 文件，旧文件 deleted_at
+    let catalog: Arc<dyn CatalogOps> = setup.catalog.clone();
+    let compactor = yuntun_compaction::Compactor {
+        cfg: yuntun_compaction::CompactionConfig {
+            min_files: 3,
+            ..Default::default()
+        },
+        catalog: catalog.clone(),
+        store: yuntun_store::create_store(&yuntun_store::StoreConfig::Local {
+            root: store_root.to_string_lossy().to_string(),
+        })
+        .unwrap(),
+        format: yuntun_format::DataFormat::Parquet,
+    };
+    let snap = catalog.current_snapshot().await;
+    let new_snap = yuntun_compaction::compact_shard(&compactor, "public.idem", "s0", snap)
+        .await
+        .unwrap()
+        .expect("文件数达阈值应触发合并");
+    let merged = catalog
+        .list_visible_files("public.idem", new_snap, Some("s0"))
+        .await
+        .unwrap();
+    assert_eq!(merged.len(), 1, "合并后只剩一个文件");
+    assert_eq!(merged[0].row_count, 9, "合并文件含全部 9 行");
+    // 旧快照仍见 3 个（快照隔离）——被测数据没被"已删"污染
+    assert_eq!(
+        catalog
+            .list_visible_files("public.idem", snap, Some("s0"))
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+
+    // ④ compaction 之后同键重试 → **仍然幂等**（键独立于文件生命周期）
+    let after = ingest("idem-k0", 1000).await;
+    assert!(
+        after.duplicate,
+        "合并删除原文件后，同键重试仍必须幂等（§7.3.1 独立存储）"
+    );
+    assert_eq!(after.row_count, 0);
+
+    // ⑤ 端到端：总行数恒为 9（无重复、无丢失）
+    assert_eq!(
+        count_rows(&setup, "public.idem").await,
+        acked_rows,
+        "compaction + 重试后行数不得增长"
+    );
+    shutdown.cancel();
 }

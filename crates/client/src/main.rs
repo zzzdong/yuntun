@@ -125,12 +125,23 @@ async fn run(argv: Vec<String>) -> Result<(), Box<dyn std::error::Error + Send +
                 .first()
                 .map(|r| r.expected_visible_in_secs)
                 .unwrap_or(0);
+            // 实际写入行数来自回执（**不是**输入行数）：同键重试会被幂等去重，
+            // 此时回执 row_count=0 且 duplicate=true —— 报"inserted N rows"会骗人。
+            let written: u64 = receipts.iter().map(|r| r.row_count).sum();
+            let deduped = receipts.iter().filter(|r| r.duplicate).count();
             println!(
-                "inserted {rows} rows into {table} (shard={shard}, batches={}, wal_seq_last={})",
+                "inserted {written} rows into {table} (shard={shard}, batches={}, wal_seq_last={})",
                 receipts.len(),
                 receipts.last().map(|r| r.wal_seq).unwrap_or(0)
             );
-            println!("数据约 {visible} 秒内可查（读己之写：攒批内存视图；落对象存储另有攒批窗口）");
+            if deduped > 0 {
+                println!(
+                    "其中 {deduped} 个批次被幂等去重（同键请求已落库，{rows} 行输入未重复写入）"
+                );
+            }
+            if written > 0 {
+                println!("数据约 {visible} 秒内可查（读己之写：攒批内存视图；落对象存储另有攒批窗口）");
+            }
             Ok(())
         }
         "tables" => {

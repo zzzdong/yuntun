@@ -1313,3 +1313,86 @@ ADR-10 的削峰是"60 秒内均匀分散"，而 `spread` 默认 5s → **分散
 
 ---
 
+## 27. 阶段 2 起步：chaos 场景 #5 抓出一个真 bug —— 幂等键在写入路径上不生效（2026-09-17）
+
+**触发**：着手补 `design.md` §12.3 的 chaos 场景 #5（幂等键 + Compaction）时，
+先确认"同键重试会被去重"这一前提是否成立 —— 结果**不成立**。
+场景写不出来，因为被测功能没实现（文档与 README 都认为它已实现）。
+
+### 27.1 证据（修改前的三处代码）
+
+| 位置 | 代码 | 后果 |
+|---|---|---|
+| `ingest/src/pipeline.rs` | `let _client_key = resolve_idempotency(...)` | 解析出的键**被丢弃**（下划线），只留下"强制表必须传键"的校验 |
+| `ingest/src/flush.rs` | `commit_files{ client_request_id: None }` | Meta 层唯一索引去重（`commit_files` 里那一段）**永不触发** |
+| 全仓 | `check_idempotency` 无任何业务调用方 | 入口预筛不存在 |
+
+净效果：**同一幂等键提交两次 = 两份数据**。客户端超时重试即命中，且完全静默。
+
+**为什么既有测试全绿**：`sql_idempotency_e2e` 系列断言的是"键被提取/强制/透传"
+（回执行数、`require` 表拒绝无键请求），**没有一条断言"同键重试不产生重复"**。
+这正是 `plan.md §5.3` 说的那类"不报错、只产出错数据"的缺口 ——
+功能测试绿 ≠ 语义正确。
+
+### 27.2 根因有两层（第二层是修完第一层才暴露的）
+
+**第一层：键根本没被使用**（见 27.1）。
+
+**第二层：键的粒度错配。** 幂等键标识的是**一次客户端请求**
+（一个 DoPut 流 / 一条语句），而一次请求可以产出**多个批次**：
+- 简易轨 `do_put`：多个 `FlightData` 消息；
+- FlightSQL prepared 装载：同上；
+- SQL `INSERT ... SELECT`：多结果批（`SqlEngine::ingest_batches` 逐批 ingest）。
+
+这些生产点把**同一个请求级键**发给了每一个批次。第一层修好之后，
+批次级预筛会把同流的第 2..N 批当成"第 1 批的重试"而**判重丢掉** ——
+从"静默重复"变成"静默丢数据"。
+（`client_sdk_end_to_end` 先炸出来：一次 `insert` 2 个批次，回执行数从 2 变 1。）
+
+### 27.3 修复
+
+**语义契约（本次定下）**：
+
+> 幂等键标识**一次客户端请求**。请求内第 `idx` 个批次的键 = `derive_batch_key(请求键, idx)`
+> （形如 `req-1#0`）。派生是确定的，因此幂等是**逐批**成立的 ——
+> 上次只成功了一部分时，重试**只补缺失的批次**，而不是"整流跳过"。
+
+| # | 改动 | 位置 |
+|---|---|---|
+| 1 | 新增 `derive_batch_key(request_key, idx)`（长度受 256 约束，截断主体保留后缀） | `ingest/src/lib.rs` |
+| 2 | 入口预筛：命中即返回 `duplicate = true`、`wal_seq = 0`、`row_count = 0`，**不写 WAL** | `ingest/src/pipeline.rs` |
+| 3 | WAL fsync 成功后登记键（防**并发**同键请求双双通过预筛）；`batch_id` 留空 = "已认领、批次未落盘" | 同上 |
+| 4 | 恢复时从 WAL Data 记录**重建键索引**（`MemoryCatalog` 重启即空），TTL 以重启时刻起算（保守方向） | 同上 |
+| 5 | 三个多批次生产点改用派生键 | `server/src/flight.rs`（简易轨 + prepared 装载）、`sql/src/lib.rs`（`INSERT ... SELECT`） |
+| 6 | `Receipt.duplicate` 透出到 SDK（`InsertReceipt`）与 CLI（"其中 N 个批次被幂等去重"，且 `inserted` 改报**实际写入行数**而非输入行数） | `client/` |
+
+**为什么预筛必须在写 WAL 之前**：一个 chunk 会聚合多条 Data 记录、各带自己的键，
+而 `commit_files` 只接受**单个** `client_request_id` —— 填任何一个都是错的
+（会把别的键的数据标记成那个键的批次）。所以"提交时按键集合去重"
+要等 R3 状态机（`refactor.md` S3-5），当前唯一正确的拦点是入口。
+这一点已写进 `flush.rs` 的代码注释，避免后来者"顺手补上"。
+
+### 27.4 验证
+
+- `cargo test --workspace`：**203 passed / 0 failed**；`clippy --all-targets` 0 警告。
+- **反证（防止写出空测试）**：把入口预筛条件临时改为 `false`
+  → `idempotency_survives_compaction` 立即失败在"同键重试必须被判重"。已恢复。
+- `client_sdk_end_to_end`（既有用例）在第二层修好之前是红的 ——
+  即"多批次共用一键"这条路径本来就有既有测试兜着，改动没有绕过它。
+- 新增用例：
+  - `chaos::idempotency_survives_compaction`：3 键 3 文件 → 合并成 1 文件（旧文件
+    `deleted_at`、旧快照仍见 3 个）→ 同键重试仍判重 → 总行数恒为 9；
+  - `client::replayed_request_is_deduplicated_batch_by_batch`：一次请求 2 批次
+    全部落库 + 整条请求重试**一行不加**；
+  - `ingest::batch_key_derivation_is_deterministic_and_distinct`（含 256 长度边界）。
+
+### 27.5 遗留
+
+| # | 项 | 归属 | 说明 |
+|---|---|---|---|
+| 1 | 提交层按"键集合"去重 | R3 | 需状态机支持一次提交多个键（`refactor.md` S3-5）；当前由入口预筛唯一兜底 |
+| 2 | 幂等键索引的独立持久化（fjall） | R3 | 现状靠 WAL 重建（单机正确）；跨进程共享需随 Catalog 进 metanode |
+| 3 | chaos 场景 #1/#2/#3/#4/#7/#8/#9/#10/#11 | 阶段 2 | 进度表见 `crates/chaos/src/lib.rs` 模块文档（区分"单测层有"与"chaos 层有"） |
+
+---
+

@@ -44,6 +44,16 @@ pub struct Receipt {
     pub expected_visible_at: u64,
     /// 攒批时间窗（秒）
     pub expected_visible_in_secs: u64,
+    /// **重复写入已被幂等去重**（§7.3 三层防护第一层预筛命中）。
+    ///
+    /// 语义：本次请求**没有**写入任何新数据 —— 该幂等键此前已登记，
+    /// 数据以第一次提交为准。此时 `wal_seq = 0`、`row_count = 0`、
+    /// `schema_version = 0`（三者均为"未写入"的哨兵值）。
+    ///
+    /// 客户端语义：**视为成功**（这正是幂等的意义：重试不产生重复），
+    /// 不要因为 `row_count = 0` 而报错或重试。
+    #[serde(default)]
+    pub duplicate: bool,
 }
 
 /// 从 Flight descriptor path 提取 (table, shard)。

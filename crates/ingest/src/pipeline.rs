@@ -267,7 +267,30 @@ impl Ingestor {
         let require_key = ingest_cfg.require_idempotency_key;
 
         // 幂等键处理矩阵（§7.3.2：【关键】强制表未传键必须拒绝）
-        let _client_key = crate::resolve_idempotency(require_key, b.idempotency_key.as_deref())?;
+        let client_key = crate::resolve_idempotency(require_key, b.idempotency_key.as_deref())?;
+
+        // 幂等预筛（§7.3 三层防护第一层）：该键已登记 → 返回重复回执，**不写 WAL**。
+        //
+        // 【为什么拦点必须在入口】一个 chunk 会聚合多个 Data 记录、各自带键，
+        // 而 flush 提交时 `commit_files` 只接受**单个** `client_request_id`
+        //（"提交键集合"粒度属 R3 状态机，`refactor.md` S3-5）。所以 Meta 层去重
+        // 兜不住"一个文件含多个键"的批次粒度 —— 入口是唯一正确的拦点。
+        // 漏掉它的后果是静默重复计数（客户端超时重试即命中）。
+        if let Some(k) = &client_key {
+            if self.catalog.check_idempotency(k).await?.is_some() {
+                tracing::debug!(key = %k, table = %table, "idempotency key already claimed, skipping write");
+                return Ok(Receipt {
+                    table: b.table,
+                    shard: b.shard_key,
+                    wal_seq: 0,
+                    row_count: 0,
+                    schema_version: 0,
+                    expected_visible_at: now_ms(),
+                    expected_visible_in_secs: 0,
+                    duplicate: true,
+                });
+            }
+        }
 
         // ①-④ Schema 解析 / OCC 演进（必须在写对象存储之前，C8）
         let schema_version = resolve_schema_version(
@@ -318,6 +341,21 @@ impl Ingestor {
             }))
             .await?;
 
+        // 幂等登记：WAL fsync 成功 = 该键的写入已持久（WAL 是权威），立刻登记
+        // —— 否则**并发同键请求**会双双通过上面的预筛、各写一份 Data。
+        //
+        // `batch_id` 此刻未知（flush 时才生成 UUIDv7），登记为空串：
+        // 幂等判定只需要"键存在"这一事实；空串 = 已认领、批次尚未落盘。
+        if let Some(k) = &client_key {
+            self.catalog
+                .record_idempotency(yuntun_model::meta::IdempotencyRecord {
+                    client_request_id: k.clone(),
+                    batch_id: String::new(),
+                    committed_at: now_ms().max(0) as u64 / 1000,
+                })
+                .await?;
+        }
+
         // 可见性上界 = WAL fsync + 一个扫描周期（不再是"攒批窗口 + jitter"）。
         let visible_ms = self.cfg.scan_interval.as_millis() as u64;
         Ok(Receipt {
@@ -328,6 +366,7 @@ impl Ingestor {
             schema_version,
             expected_visible_at: now_ms() + visible_ms,
             expected_visible_in_secs: visible_ms.div_ceil(1000).max(1),
+            duplicate: false,
         })
     }
 
@@ -545,14 +584,41 @@ impl Ingestor {
         // DDL 时间线：(seq, op, table)。Pending 批次重做前必须确认其 Data 属于**当前**表世代，
         // 否则"崩溃前已 DROP 的表"的重做数据会挂到不存在的表上（悬挂 Manifest），
         // 之后重建同名表即复活旧数据。
-        let timeline: Vec<(u64, u32, String)> = reader
-            .scan_from(0)?
-            .into_iter()
+        // 全量扫一遍 WAL：DDL 时间线与幂等键索引都要用（不扫两遍）
+        let all_records = reader.scan_from(0)?;
+        let timeline: Vec<(u64, u32, String)> = all_records
+            .iter()
             .filter_map(|(seq, rec)| match rec {
-                Record::Ddl(d) => Some((seq, d.op, d.table)),
+                Record::Ddl(d) => Some((*seq, d.op, d.table.clone())),
                 _ => None,
             })
             .collect();
+
+        // 幂等键索引重建（"独立存储"在单机形态的持久化方式）。
+        //
+        // `MemoryCatalog` 重启即空（C5），键索引只能从 WAL Data 记录恢复
+        // （Data 的 `client_request_id` 由 `ingest` 写入）。不重建的后果是
+        // **重启后同一幂等键的客户端重试会再写一份数据** —— 静默重复。
+        //
+        // TTL 以重启时刻起算（保守方向：宁可多去重一次，不可重复写入一次）。
+        let mut reindexed = 0usize;
+        for (_, rec) in &all_records {
+            let Record::Data(p) = rec else { continue };
+            if p.client_request_id.is_empty() {
+                continue;
+            }
+            self.catalog
+                .record_idempotency(yuntun_model::meta::IdempotencyRecord {
+                    client_request_id: p.client_request_id.clone(),
+                    batch_id: String::new(),
+                    committed_at: now_ms().max(0) as u64 / 1000,
+                })
+                .await?;
+            reindexed += 1;
+        }
+        if reindexed > 0 {
+            tracing::info!(reindexed, "rebuilt idempotency key index from WAL");
+        }
 
         // 按创建顺序处理（稳定输出）
         let mut states: Vec<_> = recovery.states.states.values().cloned().collect();

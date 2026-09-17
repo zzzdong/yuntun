@@ -59,6 +59,28 @@ pub fn resolve_idempotency(
     }
 }
 
+/// 把"一次请求的幂等键"派生为**该请求内第 `idx` 个批次**的键（§7.3 粒度）。
+///
+/// # 为什么必须有这一步
+/// 幂等键标识的是**一次客户端请求**（一个 DoPut 流 / 一条语句），而一次请求
+/// 可能产出**多个批次**（多 `FlightData` 消息、`INSERT ... SELECT` 的多结果批）。
+/// 若这些批次共用同一个键，批次级预筛会把同流的第 2..N 批当成"第一批的重试"
+/// —— **静默丢数据**。
+///
+/// 派生是**确定**的：同一请求重试得到同样的键序列，因此幂等是**逐批**成立的
+/// —— 比"整流跳过"更正确：上次只成功了一部分时，重试只补缺失的批次，
+/// 而不会因为第一批已存在就整条请求跳过。
+///
+/// 长度上限 256（[`yuntun_model::validate_idempotency_key`]）：超长时从**键主体**
+/// 截断，后缀保留（后缀才是区分批次的部分）。
+pub fn derive_batch_key(request_key: &str, idx: u64) -> String {
+    const MAX_LEN: usize = 256;
+    let suffix = format!("#{idx}");
+    let room = MAX_LEN.saturating_sub(suffix.len());
+    let base: String = request_key.chars().take(room).collect();
+    format!("{base}{suffix}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,6 +104,26 @@ mod tests {
         );
         // (false, false) => 不去重
         assert_eq!(resolve_idempotency(false, None).unwrap(), None);
+    }
+
+    #[test]
+    fn batch_key_derivation_is_deterministic_and_distinct() {
+        // 同一请求内的多批次必须得到**不同**的键 —— 否则批次级预筛会把第 2..N 批
+        // 当成"第一批的重试"而静默丢掉（多 FlightData / INSERT ... SELECT 都是这种形态）
+        let a = derive_batch_key("req-1", 0);
+        let b = derive_batch_key("req-1", 1);
+        assert_eq!(a, "req-1#0");
+        assert_ne!(a, b);
+
+        // 重试：同一请求 + 同一下标 → 同一键（逐批幂等的前提）
+        assert_eq!(derive_batch_key("req-1", 1), b);
+
+        // 长度约束：派生后仍须通过校验，否则"强制幂等键"的表会被直接拒绝
+        let long = "k".repeat(256);
+        let derived = derive_batch_key(&long, 12345);
+        assert!(derived.len() <= 256, "len={}", derived.len());
+        assert!(yuntun_model::validate_idempotency_key(&derived).is_ok());
+        assert!(derived.ends_with("#12345"), "批次区分后缀必须保留");
     }
 
     #[test]

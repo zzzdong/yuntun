@@ -78,6 +78,10 @@ pub struct InsertReceipt {
     /// 攒批时间窗（秒）
     #[serde(default)]
     pub expected_visible_in_secs: u64,
+    /// 该批次被**幂等去重**（此前同键请求已落库）：`row_count` 为 0，
+    /// 客户端应视为成功而非错误（重试不产生重复，§7.3）。
+    #[serde(default)]
+    pub duplicate: bool,
 }
 
 /// yuntun 客户端（可 clone 共享；tonic channel 内部为多路复用）。

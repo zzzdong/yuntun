@@ -547,6 +547,10 @@ impl FlightService for FlightServer {
         tokio::spawn(async move {
             let dict_ids: HashMap<i64, ArrayRef> = HashMap::new();
             let ack_stream = tx.clone();
+            // 流内批次序号：幂等键标识**整条请求（流）**，而一条流可以有多个
+            // `FlightData`。所有批次共用一个键会让第 2..N 批被第 1 批的幂等记录判重
+            // （静默丢数据），故按批次派生（§7.3 粒度）。
+            let mut batch_idx: u64 = 0;
             // 逐批处理：schema 解析 → WAL fsync → 回执
             loop {
                 let fd = tokio::select! {
@@ -560,7 +564,9 @@ impl FlightService for FlightServer {
                 if fd.data_header.is_empty() && fd.data_body.is_empty() {
                     continue;
                 }
-                let idempotency_key = parse_idempotency_key(&fd.app_metadata);
+                let idempotency_key = parse_idempotency_key(&fd.app_metadata)
+                    .map(|k| yuntun_ingest::derive_batch_key(&k, batch_idx));
+                batch_idx += 1;
                 let batch = match arrow_flight::utils::flight_data_to_arrow_batch(
                     &fd,
                     schema.clone(),
@@ -1130,7 +1136,12 @@ fn query_status(e: impl std::fmt::Display) -> Status {
 ///
 /// `default_key`：prepared 语句上携带的幂等键（S1.8；`None` 表示无）。
 /// 键优先级：**每条 `FlightData` 的 `app_metadata` > `default_key` > 语句级生成**
-/// （同一 `do_put` 的所有批次共享生成的键，满足 require 表强制检查，架构 §7.3.2）。
+/// （架构 §7.3.2）。
+///
+/// ⚠️ 一次 `do_put` 可以有**多个** `FlightData`，而上面的键是**整条请求级**的。
+/// 因此每个批次还要按流内序号派生（[`yuntun_ingest::derive_batch_key`]）：
+/// 否则第 2..N 批会带着同一个键撞上第 1 批的幂等记录，被静默丢弃。
+/// 派生键是确定的 → 重试**逐批**幂等（上次只成功一部分时只补缺失批次）。
 fn spawn_sql_ingest(
     ingest: Arc<Ingestor>,
     table: String,
@@ -1143,6 +1154,7 @@ fn spawn_sql_ingest(
         let dict_ids: HashMap<i64, ArrayRef> = HashMap::new();
         let mut rows: i64 = 0;
         let generated = format!("flightsql-{}", uuid::Uuid::now_v7());
+        let mut batch_idx: u64 = 0;
         loop {
             let fd = tokio::select! {
                 f = stream.next() => match f {
@@ -1170,9 +1182,12 @@ fn spawn_sql_ingest(
             };
             rows += batch.num_rows() as i64;
             // S1.8 键优先级：app_metadata（逐条）> prepared 上的键 > 语句级生成
-            let key = parse_idempotency_key(&fd.app_metadata)
+            let request_key = parse_idempotency_key(&fd.app_metadata)
                 .or_else(|| default_key.clone())
                 .unwrap_or_else(|| generated.clone());
+            // 请求级键 → 批次级键（见上：不派生会让同流的第 2..N 批被判重丢弃）
+            let key = yuntun_ingest::derive_batch_key(&request_key, batch_idx);
+            batch_idx += 1;
             let ib = IngestBatch {
                 table: table.clone(),
                 shard_key: "default".into(),

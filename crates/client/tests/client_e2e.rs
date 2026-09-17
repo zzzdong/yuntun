@@ -203,3 +203,72 @@ async fn client_sdk_end_to_end() {
     shutdown.cancel();
     let _ = server.await;
 }
+
+/// 查询当前行数（不等值，用于断言"重试之后**没有**增加"）。
+async fn count_now(client: &Client, sql: &str) -> i64 {
+    let batches = client.query(sql).await.unwrap();
+    batches
+        .first()
+        .and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>())
+        .map(|a| a.value(0))
+        .unwrap_or(0)
+}
+
+/// 幂等键的**粒度是请求**，不是批次。
+///
+/// 一次 `insert` = 一个 DoPut 流 = 一个请求级键，但流里可以有多个批次。
+/// 这两条断言缺一不可：
+/// 1. 同流的第 2..N 批**必须落库** —— 若所有批次共用一个键，批次级预筛会把
+///    它们当成"第 1 批的重试"丢掉（静默丢数据）；
+/// 2. 整条请求重试**必须一行不加** —— 若键根本不去重，客户端超时重试就写双份
+///    （静默重复计数）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replayed_request_is_deduplicated_batch_by_batch() {
+    let (client, _lakehouse, shutdown, server) = start_server().await;
+    client
+        .execute("CREATE TABLE idem (ts BIGINT, host TEXT, usage DOUBLE)")
+        .await
+        .unwrap();
+
+    let key = "req-multi-1".to_string();
+    let rows = vec![batch(1, "a", 0.5), batch(2, "b", 0.75)];
+
+    // ① 首次：两个批次都必须落库（派生键保证不被彼此判重）
+    let r1 = client
+        .insert_batches("idem", yuntun_client::DEFAULT_SHARD, rows.clone(), Some(key.clone()))
+        .await
+        .unwrap();
+    assert_eq!(r1.len(), 2, "每批一个回执");
+    assert_eq!(
+        r1.iter().map(|r| r.row_count).sum::<u64>(),
+        2,
+        "同一请求的多个批次不得互相判重（否则静默丢数据）"
+    );
+    wait_count(&client, "SELECT count(*) AS c FROM idem", 2).await;
+
+    // ② 整条请求重试（同键 + 同批次序列）：全部判重，行数不变
+    let r2 = client
+        .insert_batches("idem", yuntun_client::DEFAULT_SHARD, rows, Some(key))
+        .await
+        .unwrap();
+    assert_eq!(
+        r2.iter().map(|r| r.row_count).sum::<u64>(),
+        0,
+        "重试不得写入任何新行"
+    );
+    assert!(
+        r2.iter().all(|r| r.duplicate),
+        "重试的每批都应标记 duplicate（供客户端区分'0 行'与'失败'）"
+    );
+
+    // 给"如果真写了"留出可见窗口，再断言行数没有增长
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        count_now(&client, "SELECT count(*) AS c FROM idem").await,
+        2,
+        "重试后不得出现重复行"
+    );
+
+    shutdown.cancel();
+    let _ = server.await;
+}

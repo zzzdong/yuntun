@@ -12,6 +12,7 @@ yuntun-format = { path = "../format" }
 yuntun-catalog = { path = "../catalog" }
 yuntun-ingest = { path = "../ingest" }
 yuntun-query = { path = "../query" }
+yuntun-compaction = { path = "../compaction" }
 arrow = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

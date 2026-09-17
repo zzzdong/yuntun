@@ -197,6 +197,11 @@ pub async fn flush_chunk_with_id(
         .commit_files(CommitFilesRequest {
             table: input.shard.table.clone(),
             batch_id: batch_id.clone(),
+            // ⚠️ 这里刻意是 None：**一个 chunk 可能聚合多个幂等键**（多条 Data 记录），
+            // 而 `commit_files` 只接受单个 `client_request_id` —— 填任何一个都是错的
+            //（会把别的键的数据也标记成那个键的批次）。
+            // 幂等的实际拦点是 `Ingestor::ingest` 的入口预筛（§7.3 第一层）；
+            // "提交时按键集合去重"要等 R3 状态机（refactor.md S3-5）。
             client_request_id: None,
             shard: input.shard.shard.clone(),
             time_window: input.shard.window.clone(),
