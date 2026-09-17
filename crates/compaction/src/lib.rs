@@ -184,8 +184,31 @@ pub fn spawn_orphan_cleanup(
     grace: Duration,
     shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_orphan_cleanup_with_interval(
+        store,
+        catalog,
+        prefix,
+        grace,
+        Duration::from_secs(60),
+        shutdown,
+    )
+}
+
+/// 同 [`spawn_orphan_cleanup`]，但可指定轮询间隔。
+///
+/// 生产用 60s（见上，`grace` 才是安全边界，间隔只影响回收及时性）；
+/// **测试需要能把它压到毫秒级** —— 否则一条"不误删已知文件"的用例要跑一分钟以上，
+/// 没人会去跑它，等于没有防线。
+pub fn spawn_orphan_cleanup_with_interval(
+    store: Arc<dyn object_store::ObjectStore>,
+    catalog: Arc<dyn CatalogOps>,
+    prefix: String,
+    grace: Duration,
+    interval: Duration,
+    shutdown: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        let mut interval = tokio::time::interval(interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // batch_id → 首次发现为孤儿的时刻（Unix 毫秒）
         let mut first_seen: std::collections::HashMap<String, u64> =

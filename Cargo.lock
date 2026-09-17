@@ -4848,6 +4848,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "yuntun-catalog",
+ "yuntun-chunk",
  "yuntun-compaction",
  "yuntun-format",
  "yuntun-ingest",

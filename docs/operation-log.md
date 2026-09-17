@@ -1396,3 +1396,116 @@ ADR-10 的削峰是"60 秒内均匀分散"，而 `spread` 默认 5s → **分散
 
 ---
 
+## 28. 阶段 2 续：chaos #1/#2/#3 落地 —— 夹具保真度修复，抓出两个重复计数缺陷（2026-09-18）
+
+### 28.0 本轮落地
+
+| # | 场景 | 用例 | 结果 |
+|---|---|---|---|
+| 1 | Compaction 期间查询 | `compaction_during_query_keeps_counts_monotonic` | ✅ |
+| 2 | 分片移除期间查询 | `shard_removal_during_query_filters_by_deleted_at` | ✅ |
+| 3 | 孤儿清理不误删 | `orphan_cleanup_spares_known_and_inflight_files` | ✅（含"静置期内的在途文件绝不删"防线） |
+
+生产代码改动只有一处（加法式）：`compaction::spawn_orphan_cleanup_with_interval`——
+原来轮询间隔硬编码 60s，导致"不误删"这条用例要跑一分钟以上，
+**没人会跑的用例等于没有防线**；新函数保留原签名（包装器传 60s）。
+
+`#2` 顺带覆盖了 R2 的增量刷新：`drop_shard` 推 `manifest_ver`，
+查询侧必须靠增量 delta 把"文件消失"消费掉，否则会继续读已移除的分片。
+
+### 28.1 发现 A：提交 → `mark_committed` 窗口内**重复计数**（已确认，未修）
+
+**机制**：`Chunk::visible` 对 `committed_snapshot = None` 返回 `true`（"还没提交 → 对所有快照可见"）。
+而 flush 的 `commit_files`（产生快照 S，文件 `valid_from = S`）到调用方
+`chunks.mark_committed(id, S)` 之间隔了一次 **WAL fsync**（`BatchCommitted` 的 append）。
+这段时间里，快照 ≥ S 的查询会**同时**读到"已提交文件"与"热数据"。
+
+**确定性复现**（不靠并发去撞）：用 `Ingestor::flush_now` 走完 `commit_files` 但不 `mark_committed`，
+把这个窗口固定下来：
+
+```
+crates/chaos: commit_to_mark_window_must_not_double_count
+  文件在快照 S 可见（3 行） 且 chunks.read_table_sync(table, S) 仍返回 3 行
+  → 端到端查询实测 6 行（应为 3）
+```
+
+**症状特征**：窗口 ≈ 0.1–5ms（一跳 fsync），所以表现为**偶发多计**而非稳定错误。
+本轮实测到的污染：`query_multi_version_alignment`（4 → 6）、
+`idempotency_survives_compaction`（9 → 12）、并发采样序列 `[..., 21, 18, ...]`。
+**推论：任何"精确行数"断言在 flush 在飞时都可能偶发失败** —— 这类 flake 过去会被误判为
+"测试不稳定"，实际是被测系统的真实缺陷。
+
+**为什么不在本轮打补丁**：查过的三条路都不成立或不可靠 ——
+① 把 `mark_committed` 提到 `commit_files` 紧后面：窗口从"一跳 fsync"缩到几条指令，**仍然存在**，
+   把"偶发"变成"极偶发"反而更难查；
+② 用锁把 [commit, mark] 与"快照钉取"串起来：本地形态可行，但 **R3 换成远端 Catalog 后
+   commit 与本地 mark 天然非原子**，窗口必然回来 —— 不能把本地锁当成终局方案；
+③ 用粗粒度水位（"q > 预提交快照就隐藏热数据"）：并发 flush（A 在 S_A=6、B 在 S_B=7）时，
+   q=6 会看到 A 的文件但看不到 B 的数据 → **可见性空洞**（比重复更糟）。
+
+**正确方向（读侧栅栏）**：热数据是否可见，应由"该快照的 Manifest 里是否已含这批数据"决定，
+而不是由 chunk 的本地标志决定 —— 即把接缝从 `read_table(table, snapshot)` 演进为
+"带上调用方已知的文件/batch 集合"，与 R4/R5 的 `pull(table, range, known_manifest_ver)`
+（`refactor.md` S5-4）**同向**。建议与 R3 的 Catalog gRPC 一起设计，避免做两遍。
+
+**测试状态**：`commit_to_mark_window_must_not_double_count` 已就位并标 `#[ignore]`（一键复现）；
+其余用例在精确断言前统一调用 `wait_hot_drained()`（等热数据退场，把瞬时窗口排除掉）。
+
+### 28.2 发现 B：崩溃恢复产出**重复文件**（已确认，更严重）
+
+**症状**：夹具接上热数据读侧后（见 28.3），`crash_recovery_no_data_loss` **稳定失败**：
+9 个批次（27 行）在恢复后变成 **11 个文件（33 行）**，且行数不会回落（持久重复，非瞬时）。
+
+**定位证据**（诊断直接打印恢复后的认领集与 WAL Data 位置）：
+
+```
+round=2 claims=["0..1","1..2","2..3","2..3","5..6","5..6"]   data_seqs=[0,1,2,5,8,9]
+                         ^^^^ 两个批次共享同一区间        ^^^^^^ 无人认领
+→ seq 8/9 的 Data 被攒批循环重放成第二个文件（+2 文件 = +6 行）
+```
+
+两点可疑，都指向 `BatchState.wal_seq_range` 而非重放逻辑本身：
+1. **区间不覆盖**：恢复建立的 `ReplaySkip` 认领集漏掉了 WAL 里真实存在的 Data（seq 8/9）；
+2. **区间重复**：两个**不同批次**共享 `2..3` / `5..6` —— 每个批次应各有唯一区间。
+
+**为什么以前没被发现**：chaos 夹具当时**没有接热数据读侧**（28.3），
+查询只读文件、读不到热数据，把这条路径的整体行为掩盖了一部分；接上之后立刻稳定复现。
+`files=33 / hot=0` 说明重复落在 **Manifest 层**，与 28.1 的瞬时窗口无关。
+
+**影响**：崩溃重启后同一批数据被读两次 —— 属于 `plan.md §5.3` 的"静默错数据"第 1 类
+（重复计数），且是**持久**的（不是查询撞窗口）。
+
+**测试状态**：`crash_recovery_no_data_loss` 标 `#[ignore]`（保留诊断打印，一键复现）。
+这是**下一步第一优先级**：它关系到 M0a"恢复不丢不重"的成立与否，
+也直接影响 R4 的准入（多 datanode 重启不重）。
+
+### 28.3 夹具保真度修复：chaos 必须接热数据读侧
+
+`Setup` 此前用 `Ingestor::new(...)` 自建 chunk store，而查询侧**没有** `set_hot_shards` ——
+于是 chaos 里的"读己之写"根本没接线。这与 `Lakehouse::build_with_shutdown` 的装配不一致：
+**夹具比生产少接一条线，等于系统性地少测一条路径**（28.2 就是这么被掩盖的）。
+
+现在改为显式构造 `ChunkStore` + `Ingestor::with_chunks` + `cache.set_hot_shards(chunks)`，
+与生产装配一致。副作用是立刻暴露了 28.2 —— 这正是夹具的价值。
+
+### 28.4 测试侧沉淀（两条规则）
+
+1. **断言"最终行数"前先 `wait_hot_drained()`**（等所有 chunk 提交并被 reclaim）：
+   否则断言的是瞬时中间态，会把"系统缺陷"误报成"用例不稳定"。
+2. **已知缺陷标 `#[ignore]` + 保留一键复现的确定性探针**，不写"当前行为"的断言
+   （那等于把缺陷固化成规格），也不静默删掉用例。
+
+### 28.5 验证与本轮遗留
+
+- `cargo test --workspace`：**205 passed / 0 failed**（连跑两轮）；
+  `clippy --all-targets` 0 警告；chaos 单包 6 passed / 2 ignored。
+- 遗留（按优先级）：
+
+| # | 项 | 归属 | 说明 |
+|---|---|---|---|
+| 1 | **修复 28.2**（恢复产出重复文件） | 立即 | 先查 `BatchState.wal_seq_range` 的赋值与传递（`apply_record` / 重做路径） |
+| 2 | 修复 28.1（读侧栅栏） | 与 R3 同批设计 | 接缝演进方向见 28.1；单独打补丁会做两遍 |
+| 3 | chaos #4/#7/#8/#9/#10/#11 | 阶段 2 | 进度表见 `crates/chaos` 模块文档 |
+
+---
+

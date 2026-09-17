@@ -22,4 +22,6 @@ futures = { workspace = true }
 
 [dev-dependencies]
 yuntun-testkit = { path = "../testkit" }
+# 探针需要直接观察 chunk 层的可见性判定（提交→标记窗口）
+yuntun-chunk = { path = "../chunk" }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
