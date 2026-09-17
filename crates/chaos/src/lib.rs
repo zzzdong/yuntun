@@ -20,7 +20,11 @@
 //! - **T6.5（幂等键 + Compaction）**：[`idempotency_survives_compaction`] ——
 //!   合并删除原文件后，同键重试仍幂等（§7.3.1 独立存储）。
 //!
-//! ## 场景清单与进度（`design.md` §12.3 的 11 项）
+//! ## 场景清单与进度（`design.md` §12.3 的 11 项）—— **11/11 已完成**
+//!
+//! 11 项全部具备"真实磁盘 + 跨重启 + 并发"下的端到端证据。
+//! 过程中抓出五个真缺陷、修掉四个（`operation-log` §27 / §28.2 / §29.1 / §30 已修，
+//! §28.1 待与 R3 同批）。
 //!
 //! | # | 场景 | chaos 层 | 备注 |
 //! |---|---|---|---|
@@ -31,7 +35,7 @@
 //! | 5 | 幂等键 + Compaction | ✅ | `idempotency_survives_compaction` |
 //! | 6 | 崩溃恢复（各状态点） | ✅ | `crash_recovery_no_data_loss`（5 轮硬崩溃；曾抓出"同一 WAL 目录两个消费者"的重复文件缺陷，已修，见 `operation-log §28.2`） |
 //! | 7 | WAL 撕裂 | ✅ | `torn_wal_tail_is_rejected_and_prefix_survives`（曾抓出"撕裂后无法自愈"的缺陷，已在 `WalWriter::open` 截断修复，见 `operation-log §29.1` / R-14） |
-//! | 8 | 并发写 + fsync 前/中/后 kill | ❌ | 需要 fsync 注入点 |
+//! | 8 | 并发写 + fsync 前/中/后 kill | ✅ | `kill_before_fsync_keeps_acked_data_and_drops_unacked` / `kill_after_fsync_keeps_fsynced_data_without_ack`（靠 `WalConfig.fsync_hook` 注入，掉电模型 = 只有 fsync 过的字节算落盘） |
 //! | 9 | `synced_seq`（write 后 fsync 前 kill） | ✅ | `accumulator_never_reads_beyond_synced_seq`（未 fsync 的记录物理在盘上但绝不被吸收） |
 //! | 10 | Batch 超时 + segment 释放 | ✅ | `batch_timeout_releases_segment_after_object_store_failure`（对象存储不可写 → 批次卡 Pending → 超时 abort → **segment 回收**） |
 //! | 11 | 磁盘水位强制 abort | ✅ | `disk_watermark_aborts_oldest_batch_then_releases_segments`（优先 abort **最老**批次；全部终态后回收） |
@@ -1217,6 +1221,242 @@ async fn commit_to_mark_window_must_not_double_count() {
         hot_at_s, 0,
         "快照 S 已包含该批数据的文件，热数据不得同时可见（重复计数窗口）"
     );
+}
+
+// ---------------------------------------------------------------- fsync 点位故障（#8）
+//
+// 断电只会落在两个瞬时状态之一，二者对"数据还在不在"的答案**相反**：
+//
+// | 点位 | 盘上有什么 | 客户端拿到什么 |
+// |---|---|---|
+// | `BeforeSync` | 字节**可能从未落盘** | 没有 ack |
+// | `AfterSync`  | 字节**确定落盘** | 仍然没有 ack |
+//
+// 后一行是"至少一次"的来源：客户端没拿到 ack 会重试，而数据其实已在盘上
+// —— 所以写入方必须有幂等键（§7.3），否则重试即重复计数。
+// 这两个用例把两种断电分别固定下来。
+
+/// 构造"在第 `nth` 次 fsync 的 `point` 点位模拟掉电"的注入钩子。
+///
+/// **掉电模型：只有 fsync 过的字节算落盘。** `BeforeSync` 时把文件截回
+/// `synced_len`（未 fsync 的写入视为从未落盘）；`AfterSync` 时什么都不做（已落盘）。
+/// 随后 `panic!` 让提交线程死掉 —— 进程内最接近"进程被杀"的形态：此后 append 全部失败。
+#[cfg(test)]
+fn power_loss_hook(
+    nth: usize,
+    point: yuntun_wal::config::FsyncPoint,
+) -> (
+    yuntun_wal::config::FsyncHook,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let c = calls.clone();
+    let hook = yuntun_wal::config::FsyncHook::new(move |ev| {
+        if ev.point != point {
+            return;
+        }
+        let n = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if std::env::var("YUNTUN_CHAOS_TRACE").is_ok() {
+            eprintln!(
+                "[hook] n={n} point={point:?} synced_len={} file_len={} batch_len={}",
+                ev.synced_len, ev.file_len, ev.batch_len
+            );
+        }
+        if n != nth {
+            return;
+        }
+        if point == yuntun_wal::config::FsyncPoint::BeforeSync {
+            // 未 fsync 的字节从未落盘（掉电的物理后果）
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&ev.path)
+                .unwrap();
+            f.set_len(ev.synced_len).unwrap();
+            f.sync_all().unwrap();
+        }
+        panic!("simulated power loss at {point:?}");
+    });
+    (hook, calls)
+}
+
+/// 并发写若干批，返回 (已 ack 行数, 失败次数)。
+#[cfg(test)]
+async fn concurrent_ingest(
+    setup: &Setup,
+    table: &str,
+    n: usize,
+) -> (u64, usize) {
+    let mut handles = Vec::new();
+    for i in 0..n {
+        let ing = setup.ingestor.clone();
+        let t = table.to_string();
+        handles.push(tokio::spawn(async move {
+            ing.ingest(IngestBatch {
+                table: t,
+                shard_key: "s0".into(),
+                record_batch: batch(1000 + i as i64),
+                idempotency_key: None,
+                received_at: std::time::SystemTime::now(),
+            })
+            .await
+        }));
+    }
+    let (mut acked, mut failed) = (0u64, 0usize);
+    for h in handles {
+        match h.await.unwrap() {
+            Ok(r) => acked += r.row_count,
+            Err(_) => failed += 1,
+        }
+    }
+    (acked, failed)
+}
+
+/// 重建后等到"数据可见"（或超时），返回观测到的行数。
+#[cfg(test)]
+async fn recovered_rows(setup: &Setup, table: &str) -> u64 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        // 攒批循环负责把 WAL 里的 Data 重放出来
+        let n = count_rows_parts(&setup.catalog, &setup.engine, table).await;
+        if n > 0 || tokio::time::Instant::now() >= deadline {
+            return n;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// 恢复出的 **Data** 记录 seq 必须是 `0..n-1` 的连续前缀（中间不能有洞）。
+///
+/// 只数 `Data`：重启后攒批循环会把它们落盘，其间写入的
+/// `BatchPending/S3Written/Committed` 是**控制记录**，会插在 Data 之后。
+/// 把它们一起数会得到"条数对不上"的假失败（这正是第一版断言的错误）。
+#[cfg(test)]
+fn assert_data_seq_prefix(shard_dir: &std::path::Path, expected: usize) {
+    let data_seqs: Vec<u64> = yuntun_wal::reader::WalReader::new(shard_dir)
+        .scan_from(0)
+        .unwrap()
+        .into_iter()
+        .filter(|(_, r)| matches!(r, yuntun_model::wal_record::Record::Data(_)))
+        .map(|(s, _)| s)
+        .collect();
+    assert_eq!(
+        data_seqs.len(),
+        expected,
+        "恢复出的 Data 记录条数不符：{data_seqs:?}"
+    );
+    assert_eq!(
+        data_seqs,
+        (0..expected as u64).collect::<Vec<u64>>(),
+        "Data 记录的 seq 必须是连续前缀（有洞 = 中间的数据丢了）"
+    );
+}
+
+/// T6.8 ①（`design.md` §12.3 #8）：**kill 在 fsync 之前** —— 未 fsync 的写入必须消失，
+/// 但**已 ack 的数据一条都不能少**。
+///
+/// 这是"客户端拿到成功 = 已 fsync"这条契约的**反面断言**：
+/// 若实现先 ack 再 fsync（或根本没 fsync），这里的"已 ack 数据全在"就会失败。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kill_before_fsync_keeps_acked_data_and_drops_unacked() {
+    let _gate = CHAOS_GATE.lock().await;
+    let wal_dir = tmpdir("wal-kill-before");
+    let store_root = tmpdir("store-kill-before");
+    let (hook, calls) = power_loss_hook(3, yuntun_wal::config::FsyncPoint::BeforeSync);
+    let mut wcfg = yuntun_wal::WalConfig::for_dir(&wal_dir);
+    wcfg.group_commit_max_batch = 1; // 每条记录自成一批 → 一次 append 一次 fsync，点位可数
+    wcfg.fsync_hook = Some(hook);
+    let setup = build_full(
+        &wal_dir,
+        &store_root,
+        &[("k8", schema(), false)],
+        0,
+        wcfg,
+    )
+    .await;
+    let shard_dir = setup.ingestor.wal.shard_dir();
+
+    let (acked, failed) = concurrent_ingest(&setup, "k8", 6).await;
+    assert!(failed > 0, "注入点必须让至少一次写入失败，否则没测到 kill");
+    assert!(
+        calls.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+        "钩子至少应被触发 3 次"
+    );
+    assert_eq!(acked, 6, "前两批（各 3 行）应已 ack");
+    drop(setup);
+
+    // 重启：只有 fsync 过的字节能恢复
+    let setup = build_full(
+        &wal_dir,
+        &store_root,
+        &[("k8", schema(), false)],
+        0,
+        yuntun_wal::WalConfig::for_dir(&wal_dir),
+    )
+    .await;
+    let shutdown = CancellationToken::new();
+    let _acc = setup.ingestor.clone().spawn_accumulator(shutdown.clone());
+    let got = recovered_rows(&setup, "public.k8").await;
+    assert_eq!(
+        got, acked,
+        "掉电后**已 ack 的数据一条都不能少**；未 ack 的字节从未落盘，不该出现（acked={acked} got={got}）"
+    );
+    // 无空洞：恢复出的 Data 记录必须是 0..n-1 的连续前缀
+    assert_data_seq_prefix(&shard_dir, 2);
+    // 重建后的系统必须仍可写入（注入点在重启后已卸掉）
+    let more = ingest_into(&setup, "k8", "s1", 2000).await;
+    assert_eq!(wait_visible_rows(&setup, "public.k8", "s1", more).await, more);
+    shutdown.cancel();
+}
+
+/// T6.8 ②（`design.md` §12.3 #8）：**kill 在 fsync 之后、ack 之前** ——
+/// 数据**确定在盘上**（必须恢复），但客户端**没拿到成功**。
+///
+/// 这正是"至少一次 + 幂等键"的来源：客户端会重试这笔写入，而数据其实已经落盘 ——
+/// 幂等键（§7.3）就是为此存在的。用例把两侧都钉住：
+/// 恢复必须含这批数据，且该次写入必须**没有** ack（否则"至少一次"就不成立）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kill_after_fsync_keeps_fsynced_data_without_ack() {
+    let _gate = CHAOS_GATE.lock().await;
+    let wal_dir = tmpdir("wal-kill-after");
+    let store_root = tmpdir("store-kill-after");
+    let (hook, calls) = power_loss_hook(3, yuntun_wal::config::FsyncPoint::AfterSync);
+    let mut wcfg = yuntun_wal::WalConfig::for_dir(&wal_dir);
+    wcfg.group_commit_max_batch = 1;
+    wcfg.fsync_hook = Some(hook);
+    let setup = build_full(
+        &wal_dir,
+        &store_root,
+        &[("k8", schema(), false)],
+        0,
+        wcfg,
+    )
+    .await;
+    let shard_dir = setup.ingestor.wal.shard_dir();
+
+    let (acked, failed) = concurrent_ingest(&setup, "k8", 6).await;
+    assert!(failed > 0, "被 kill 的那一次写入必须没有 ack（客户端会重试）");
+    assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 3);
+    assert_eq!(acked, 6, "前两批应已 ack；第 3 批已 fsync 但未 ack");
+    drop(setup);
+
+    let setup = build_full(
+        &wal_dir,
+        &store_root,
+        &[("k8", schema(), false)],
+        0,
+        yuntun_wal::WalConfig::for_dir(&wal_dir),
+    )
+    .await;
+    let shutdown = CancellationToken::new();
+    let _acc = setup.ingestor.clone().spawn_accumulator(shutdown.clone());
+    let got = recovered_rows(&setup, "public.k8").await;
+    assert_eq!(
+        got,
+        acked + 3,
+        "已 fsync 的数据必须恢复（哪怕客户端没拿到 ack）：acked={acked} got={got}"
+    );
+    assert_data_seq_prefix(&shard_dir, 3);
+    shutdown.cancel();
 }
 
 // ---------------------------------------------------------------- 磁盘保护与批次超时

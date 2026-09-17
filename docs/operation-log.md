@@ -1680,3 +1680,85 @@ if segment_is_removable(.., &ranges) { remove_file(..) }                        
 | 4 | T8 基线压测 + P0 定案 | 阶段 2 | chaos 11/11 齐了之后的另一半门槛 |
 
 ---
+
+---
+
+## 31. chaos #8 落地 —— fsync 点位故障注入，chaos 场景 11/11 齐（2026-09-18）
+
+### 31.0 本轮落地
+
+| # | 场景 | 用例 | 结果 |
+|---|---|---|---|
+| 8① | 并发写 + kill 在 **fsync 之前** | `kill_before_fsync_keeps_acked_data_and_drops_unacked` | ✅ |
+| 8② | 并发写 + kill 在 **fsync 之后、ack 之前** | `kill_after_fsync_keeps_fsynced_data_without_ack` | ✅ |
+
+**这是唯一必须动生产代码才可测的场景** —— 断电只落在两个瞬时状态之一，
+二者对"数据还在不在"的答案**相反**，靠并发去撞是不可靠的。
+
+### 31.1 生产改动：fsync 事件注入点（生产零开销）
+
+| 位置 | 改动 |
+|---|---|
+| `wal/src/config.rs` | 新增 `FsyncPoint`（`BeforeSync` / `AfterSync`）、`FsyncEvent { point, path, synced_len, file_len, batch_len }`、`FsyncHook`（包一层 `Arc<dyn Fn>` 只为让 `WalConfig` 保持 `Debug`/`Clone`）；`WalConfig.fsync_hook: Option<FsyncHook>`，默认 `None` |
+| `wal/src/writer.rs` | `commit_loop` 在 `append_batch` 之后、`sync_all` 之前打 `BeforeSync`；在 `sync_all` 之后、推进水位/ack 之前打 `AfterSync`。生产路径只多一次 `Option` 判断 |
+
+**`FsyncEvent.synced_len` 是关键字段**：它是本次批量写入**之前**的文件长度，
+即此刻"确定已持久化"的字节边界。有了它，测试才能真正模拟掉电 ——
+
+> **掉电模型：只有 fsync 过的字节算落盘。** `BeforeSync` 时把文件
+> `set_len(synced_len)`（未 fsync 的写入视为从未落盘）再 `panic!` 让提交线程死掉
+> （进程内最接近"进程被杀"的形态：此后 append 全部失败）；`AfterSync` 时什么都不做。
+
+### 31.2 两个用例分别钉住什么
+
+| 用例 | 断言 | 顺手钉住的反面后果 |
+|---|---|---|
+| ① fsync 前 kill | `recovered == acked`（未 fsync 的字节不出现；**已 ack 的一条不少**）+ Data seq 是 `0..n-1` 连续前缀 | **ack 早于 fsync**（先 ack 后 fsync / 不 fsync）会让 acked 集合大于恢复集合 → 立刻红 |
+| ② fsync 后 ack 前 kill | `recovered == acked + 3`（已 fsync 必不丢，**哪怕客户端没拿到 ack**） | 这也正是**幂等键存在的理由**：客户端会重试这笔"没拿到 ack 但已经落盘"的写入（§7.3），没有幂等键就是重复计数 |
+
+**"Data seq 必须是连续前缀"** 是"无空洞"的直接断言：中间丢一条就是数据丢失。
+（第一版断言数了**全部**记录，把重启后攒批循环写入的 `BatchPending/S3Written/Committed`
+也数进去了 → 假失败。已改为只数 `Data`，理由写进了 helper 注释。）
+
+### 31.3 反证（确认不是空测试）
+
+把掉电模型撤掉（`BeforeSync` 时不截断，"未 fsync 的字节侥幸留了下来"）
+→ ① 立刻失败：`acked=6 got=9`（恢复了本该消失的那一批）。已恢复。
+
+### 31.4 诚实说明：这两个用例钉的是**顺序契约**，不是"真的调了 sync_all"
+
+持久性由钩子**建模**（截断到 `synced_len`），所以：
+
+- ✅ 能证明：ack 必须在 fsync 之后、水位不得越过 fsync 边界、恢复不会读到撕裂点之后、
+  已 fsync 的数据在 reopen 后仍在；
+- ❌ 不能证明：`sync_all()` 真的被调用了（把 `sync_all()` 换成空实现，这两个用例照样绿
+  —— 因为 tmpfs 上字节本来就在）。
+
+补这一块的正确做法是给注入点加**第三态**：`fsync 返回错误`（钩子返回
+`Result`，提交循环按写失败处理：seq 回滚、不 ack、水位不动）。已登记为遗留。
+
+### 31.5 chaos 进度：11/11
+
+`design.md` §12.3 的 11 个场景**全部**在 chaos 层有了真实磁盘 + 跨重启 + 并发的证据：
+
+| 阶段 | 进度 | 抓到的真缺陷 |
+|---|---|---|
+| 起步 | 3/11 | — |
+| 本轮之前 | 10/11 | §27 幂等键不生效、§28.2 恢复重复文件、§29.1 撕裂不可自愈、§30 abort 不同步视图 |
+| **现在** | **11/11** | （#8 未发现新缺陷；注入点按设计工作） |
+
+**下一步 = 阶段 2 的另一半门槛：T8 基线压测 + P0 定案**
+（相位分散量级 / `max_flush_delay` / `rows_threshold`）+ ADR-10 修订，
+现有 `chaos/examples/bench` 只测吞吐与 WAL ack 延迟，P0 要的是
+**CommitFiles 瞬时并发 / 文件数·天 / 持久化 P99**，需先扩测量口径。
+
+### 31.6 遗留
+
+| # | 项 | 归属 | 说明 |
+|---|---|---|---|
+| 1 | 注入点第三态：**fsync 返回错误** | 阶段 2 | 钩子返回 `Result`；断言"不 ack + seq 回滚 + 水位不动 + 系统仍可用" |
+| 2 | T8 基线压测 + P0 定案 | 阶段 2 | chaos 已 11/11，这是剩下的那一半 |
+| 3 | 修复 §28.1（读侧栅栏） | 与 R3 同批 | 见 28.1 |
+| 4 | 谓词下推转 `Exact`（§29.2） | 与 R5 同批 | 必须先转发 filters 到 Parquet 源 |
+
+---

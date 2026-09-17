@@ -317,9 +317,31 @@ fn commit_loop(rx: mpsc::Receiver<CommitRequest>, st: Arc<ShardState>, mut guard
         // 追加写入 + 一次性 fsync
         let records: Vec<Record> = batch.iter().map(|r| r.record.clone()).collect();
         let first_seq = guard.next_seq;
+        // 本次写入前的文件长度 = 此刻"确定已持久化"的边界（注入点要用它模拟掉电）
+        let synced_before = guard.writer.bytes_written;
         let write_result = (|| -> Result<(), LakeError> {
             guard.writer.append_batch(&records)?;
+            // 注入点 ①：已写盘、还没 fsync —— 此刻掉电，这些字节可能从未落盘
+            if let Some(h) = &st.cfg.fsync_hook {
+                h.call(crate::config::FsyncEvent {
+                    point: crate::config::FsyncPoint::BeforeSync,
+                    path: guard.writer.path.clone(),
+                    synced_len: synced_before,
+                    file_len: guard.writer.bytes_written,
+                    batch_len: records.len(),
+                });
+            }
             guard.writer.sync_all()?; // fsync（组提交核心）
+            // 注入点 ②：已 fsync、还没 ack —— 此刻掉电，数据在盘上但客户端不知道
+            if let Some(h) = &st.cfg.fsync_hook {
+                h.call(crate::config::FsyncEvent {
+                    point: crate::config::FsyncPoint::AfterSync,
+                    path: guard.writer.path.clone(),
+                    synced_len: guard.writer.bytes_written,
+                    file_len: guard.writer.bytes_written,
+                    batch_len: records.len(),
+                });
+            }
             Ok(())
         })();
 
