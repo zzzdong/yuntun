@@ -1527,3 +1527,80 @@ R4 拆进程时必须有显式约束（启动即拒绝重复 `instance_id`，`pl
 
 ---
 
+---
+
+## 29. chaos #4/#7/#9 落地 —— 发现：WAL 撕裂后**无法自愈**（新写入永不可见）
+
+### 29.0 本轮落地
+
+| # | 场景 | 用例 | 结果 |
+|---|---|---|---|
+| 4 | Schema 变更 + 谓词下推 | `schema_evolution_keeps_predicate_pushed_down` | ✅（但**未达设计期望**，见 29.2） |
+| 7 | WAL 撕裂 | `torn_wal_tail_is_rejected_and_prefix_survives` | ⚠️ **抓到缺陷**（见 29.1） |
+| 9 | `synced_seq` 边界 | `accumulator_never_reads_beyond_synced_seq` | ✅ |
+
+生产代码本轮**零改动**（三个场景都是检验既有行为）。
+
+### 29.1 缺陷：WAL 撕裂后无法自愈 → **写入全部成功、数据全部消失**
+
+**实测**：把最新 segment 的尾部截掉 10 字节（模拟掉电撕裂），重启后：
+- 恢复本身成功（CRC 拦下撕裂，不报错）✅
+- 截断点之前的记录能解出来（诊断：`segs=["1:2679B"]`、`records=["0:Data","1:Data"]`）
+- 但**恢复出的行数是 0**；
+- 更严重的是：**再写入一批（fsync 成功、拿到 ack）后，该数据 60 秒轮询仍不可见**。
+
+**根因**（代码核实，非推测）：
+
+| 环节 | 行为 | 问题 |
+|---|---|---|
+| `SegmentWriter::open_append` | `bytes_written = f.metadata()?.len()` | 以**文件物理长度**作为追加偏移 → 新记录被写在**撕裂的垃圾字节之后** |
+| `decode_segment_records` | 遇到 CRC 失败/length 越界即**停止 replay** | 读不到垃圾之后的任何记录 |
+| 全仓 | `crates/wal/src/*` **没有任何 `set_len`/truncate 修复** | 撕裂点永远不会被清理 |
+
+净效果：节点表现为"**写入全部成功、数据全部消失**" ——
+恰恰是 WAL 本该防止的那类故障，而且**完全静默**（ack 正常、无错误日志）。
+
+**为什么值得排在很前面**：撕裂写入是 WAL 存在的理由（`§4.9` / C3）。
+现在"检测到了撕裂"却"不能恢复使用"，等于把最需要自愈的场景做成了不可用状态。
+
+**正确修法**（属下一步）：恢复时把每个 segment **截断到最后一条完整记录的边界**
+（WAL 标准修复步骤：`set_len(valid_prefix_end)`），再让 writer 从该偏移继续追加。
+`decode_segment_records` 已经返回了"读到哪停的"信息（`complete` 标志 + 记录数），
+只需把"停止位置"回写到文件。用例已就绪，修完把 `#[ignore]` 去掉即可。
+
+### 29.2 差距：谓词下推只到 `Inexact`，`FilterExec` 未被消除
+
+`design.md` §12.3 #4 的期望是"**FilterExec 被消除**"。实测物理计划仍有
+`FilterExec: event_time@0 > 150`；逻辑计划显示 `TableScan: ... partial_filters=[...]`
+—— 说明谓词**确实下推到了扫描**（`partial_filters`），但表 provider 声明的是 `Inexact`：
+
+```rust
+// crates/query/src/table.rs:171
+// MVP：谓词交给 Parquet row-group 统计在 scan 内部处理，表级先声明 Inexact —— 正确且保守。
+Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+```
+
+**⚠️ 不能直接把 `Inexact` 改成 `Exact`**：那会让 DataFusion 撤掉 `FilterExec`，
+而 `YuntunTableProvider::scan` **忽略 `_filters`**（不转发给 Parquet 源）
+→ **静默漏过滤**（结果多出行）。正确顺序是：先让 `scan` 把谓词转发给 Parquet 源
+（由 Parquet 做行级过滤），再声明 `Exact`。
+
+用例只断言"谓词确实下推"（不断言 `FilterExec` 存在与否），
+因此**未来修好后无需改用例**。登记为后续项（与 R5 的块级剪枝/谓词下推同批）。
+
+### 29.3 验证与遗留
+
+- `cargo test --workspace`：**208 passed / 0 failed**；`clippy --all-targets` 0 警告；
+  chaos 单包 9 passed / **2 ignored**（§28.1 提交窗口、§29.1 撕裂自愈）。
+- 遗留（优先级）：
+
+| # | 项 | 归属 | 说明 |
+|---|---|---|---|
+| 1 | **修复 §29.1（撕裂后截断修复）** | 立即 | 恢复时 `set_len` 到最后一条完整记录边界；撕裂场景是 WAL 的立身之本 |
+| 2 | 修复 §28.1（读侧栅栏） | 与 R3 同批 | 见 28.1 |
+| 3 | 谓词下推转 `Exact`（§29.2） | 与 R5 同批 | **必须先转发 filters 到 Parquet 源**，否则静默漏过滤 |
+| 4 | chaos #8（fsync 前/中/后 kill） | 阶段 2 | 需要 `WalWriter` 的 fsync 注入点 |
+| 5 | chaos #10/#11（Batch 超时 / 磁盘水位） | 阶段 2 | 需要"S3 不可用"与"磁盘水位"的注入夹具 |
+
+---
+

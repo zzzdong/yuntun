@@ -27,12 +27,12 @@
 //! | 1 | Compaction 期间查询 | ✅ | `compaction_during_query_keeps_counts_monotonic`（并发采样 + 静默点严格断言） |
 //! | 2 | 分片移除期间查询 | ✅ | `shard_removal_during_query_filters_by_deleted_at`（含 R2 增量 delta 消费"文件消失"） |
 //! | 3 | 孤儿清理不误删已知文件 | ✅ | `orphan_cleanup_spares_known_and_inflight_files`（含静置期在途文件防线） |
-//! | 4 | Schema 变更 + EXPLAIN 谓词下推 | ❌ | — |
+//! | 4 | Schema 变更 + EXPLAIN 谓词下推 | ✅ | `schema_evolution_keeps_predicate_pushed_down`（断言谓词下推；`FilterExec` 未消除属已知差距，`operation-log §29.2`） |
 //! | 5 | 幂等键 + Compaction | ✅ | `idempotency_survives_compaction` |
 //! | 6 | 崩溃恢复（各状态点） | ✅ | `crash_recovery_no_data_loss`（5 轮硬崩溃；曾抓出"同一 WAL 目录两个消费者"的重复文件缺陷，已修，见 `operation-log §28.2`） |
-//! | 7 | WAL 撕裂 | ⚠️ 仅解码层 | `wal::segment::torn_write_detected_by_crc`；缺端到端 recover |
+//! | 7 | WAL 撕裂 | ⚠️ **已知缺陷** | `torn_wal_tail_is_rejected_and_prefix_survives`：撕裂能被 CRC 拦下，但**撕裂后无法自愈**（新写入永不可见）→ `operation-log §29.1` |
 //! | 8 | 并发写 + fsync 前/中/后 kill | ❌ | 需要 fsync 注入点 |
-//! | 9 | `synced_seq`（write 后 fsync 前 kill） | ⚠️ 仅读取层 | `wal::reader::scan_range_reads_only_synced` |
+//! | 9 | `synced_seq`（write 后 fsync 前 kill） | ✅ | `accumulator_never_reads_beyond_synced_seq`（未 fsync 的记录物理在盘上但绝不被吸收） |
 //! | 10 | Batch 超时 + segment 释放 | ⚠️ 仅监控层 | `wal::cleanup::monitor_aborts_timed_out_batches`（未断言 segment 释放） |
 //! | 11 | 磁盘水位强制 abort | ⚠️ 仅监控层 | `wal::cleanup::monitor_force_aborts_on_disk_watermark` |
 //!
@@ -711,15 +711,25 @@ fn compactor(
 /// 断言最终一致性必须等窗口关闭，否则用例会随负载偶发多计（实测 9 行读成 12 行）。
 #[cfg(test)]
 async fn wait_hot_drained(setup: &Setup) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    // 上界 120s：这不是延迟断言，只兜"永不退场"。
+    // 满负载并行（cargo 默认同时跑所有 test binary）时 flush 可能撞上对象存储 IO 竞争、
+    // 失败后走 `note_flush_failure` 的退避重试（最多 30s/次），60s 会不够。
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     loop {
-        // 刷新一次即可：查询侧刷新会顺带 `reclaim` 掉"缓存已追上"的 chunk
+        // 刷新 + **显式回收**。
+        //
+        // 生产里 `reclaim` 由查询侧刷新调用（`query/src/cache.rs`），但它挂在"版本变化"
+        // 的分支上；夹具没有周期刷新任务（`spawn_refresh`），一旦最后一次提交发生在
+        // 最后一次刷新之后，chunk 会以 `Flushed` 状态一直驻留 —— 用例就会永久等待
+        // （实测 `chunks: 1, flushed: 1` 卡到超时）。这里按生产的语义显式推进一次。
         setup
             .engine
             .catalog()
             .refresh(&(setup.catalog.clone() as Arc<dyn CatalogOps>))
             .await
             .unwrap();
+        let snap = setup.catalog.current_snapshot().await;
+        setup.ingestor.chunks().reclaim(snap);
         if setup.ingestor.chunks().is_empty() {
             return;
         }
@@ -735,19 +745,129 @@ async fn wait_hot_drained(setup: &Setup) {
 /// 该表的 ingest 帮助闭包：固定 shard / 行数，自带时间戳。
 #[cfg(test)]
 async fn ingest_into(setup: &Setup, table: &str, shard: &str, ts: i64) -> u64 {
+    ingest_with_key(setup, table, shard, ts, None).await
+}
+
+/// 同 [`ingest_into`]，但可带幂等键。
+#[cfg(test)]
+async fn ingest_with_key(
+    setup: &Setup,
+    table: &str,
+    shard: &str,
+    ts: i64,
+    key: Option<&str>,
+) -> u64 {
     setup
         .ingestor
         .ingest(IngestBatch {
             table: table.into(),
             shard_key: shard.into(),
             record_batch: batch(ts),
-            idempotency_key: None,
+            idempotency_key: key.map(|k| k.to_string()),
             received_at: std::time::SystemTime::now(),
         })
         .await
         .unwrap()
         .row_count
 }
+
+/// 取 `EXPLAIN` 的物理计划文本。
+#[cfg(test)]
+async fn explain_text(setup: &Setup, sql: &str) -> String {
+    setup
+        .engine
+        .catalog()
+        .refresh(&(setup.catalog.clone() as Arc<dyn CatalogOps>))
+        .await
+        .unwrap();
+    let batches = setup
+        .engine
+        .sql(&format!("EXPLAIN {sql}"))
+        .await
+        .unwrap();
+    let mut out = String::new();
+    for b in &batches {
+        if let Some(col) = b
+            .column(b.num_columns() - 1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+        {
+            #[allow(unused_imports)]
+            use arrow::array::Array as _;
+            for i in 0..col.len() {
+                out.push_str(col.value(i));
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// 把一条 Data 记录**直接写进 segment 文件但不 fsync**（模拟"已 write、未 fsync"）。
+///
+/// 走 `SegmentWriter`（而非 `WalWriter::append`）才能绕过组提交 fsync —— 这是
+/// `§5.3.5.1` 那条边界的唯一可测形态：记录**物理上在盘上**，但**不在**
+/// `wal.synced_seq()` 里。返回该记录被 reader 读到的 seq。
+#[cfg(test)]
+fn write_unsynced_data_record(
+    shard_dir: &std::path::Path,
+    table: &str,
+    shard: &str,
+    rows: i64,
+    first_seq: u64,
+) -> u64 {
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let s = Schema::new(vec![
+        Field::new("event_time", DataType::Int64, false),
+        Field::new("user", DataType::Utf8, true),
+    ]);
+    let b = arrow::record_batch::RecordBatch::try_new(
+        Arc::new(s.clone()),
+        vec![
+            Arc::new(Int64Array::from(vec![rows; 3])),
+            Arc::new(StringArray::from(vec![Some("x"), None, Some("y")])),
+        ],
+    )
+    .unwrap();
+    let mut ipc = Vec::new();
+    {
+        let mut w = arrow::ipc::writer::StreamWriter::try_new(&mut ipc, &Arc::new(s)).unwrap();
+        w.write(&b).unwrap();
+        w.finish().unwrap();
+    }
+    let rec = yuntun_model::wal_record::Record::Data(yuntun_model::wal_record::DataPayload {
+        table: table.to_string(),
+        shard: shard.to_string(),
+        schema_version: 1,
+        batch_ipc: ipc,
+        client_request_id: String::new(),
+        time_window: "1970-01-01T00:00".to_string(),
+    });
+    // 独立的 segment 文件：不干扰 WalWriter 自己的追加偏移
+    let seg_seq = 900_000 + first_seq;
+    let mut w = yuntun_wal::segment::SegmentWriter::create(shard_dir, seg_seq, 0, first_seq).unwrap();
+    w.append(&rec).unwrap();
+    // ⚠️ 刻意**不** `sync_all()`：这正是被测边界
+    first_seq
+}
+
+/// 最新（序号最大）的 segment 文件路径。
+#[cfg(test)]
+fn newest_segment(shard_dir: &std::path::Path) -> std::path::PathBuf {
+    yuntun_wal::segment::list_segments(shard_dir)
+        .unwrap()
+        .into_iter()
+        .map(|(_, p)| p)
+        .max_by_key(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+        })
+        .expect("至少应有一个 segment")
+}
+
 
 // ---------------------------------------------------------------- 目录语义场景
 
@@ -1074,6 +1194,326 @@ async fn commit_to_mark_window_must_not_double_count() {
         hot_at_s, 0,
         "快照 S 已包含该批数据的文件，热数据不得同时可见（重复计数窗口）"
     );
+}
+
+// ---------------------------------------------------------------- WAL 故障语义
+
+/// T6.7（`design.md` §12.3 #7）：**WAL 撕裂** —— 截断文件尾部，CRC 必须拦下它。
+///
+/// # 这个用例断言的是"崩溃一致性"，不是"持久性"
+/// 截断已经 fsync 过的字节 = 人为违反 fsync 承诺（模拟介质损坏/写入丢失）。
+/// 此时**允许**丢掉截断点之后的数据，但绝不允许：
+/// 1. 恢复报错 / panic；
+/// 2. 把一条半截记录当成完整记录应用（半个批次入账）；
+/// 3. **恢复后系统不可用** —— 这条正是本用例抓到的缺陷（见下）。
+///
+/// ## ⚠️ 已知缺陷（`operation-log §29`）：撕裂后 WAL **无法自愈**
+///
+/// 实测：截断尾部 10 字节后重启，再写入一批（fsync 成功、拿到 ack），
+/// 该数据**永远不可见**（60s 轮询到超时），`wait_visible_rows` 始终为 0。
+///
+/// **根因**：`SegmentWriter::open_append` 以 `metadata().len()` 作为写入偏移
+/// → 新记录被追加在**垃圾字节之后**；而 reader 扫到撕裂点就停止 replay
+/// → 新记录永远落在"停止点之后"，既不进 chunk 也不落文件。
+/// 于是节点表现为"写入全部成功、数据全部消失" —— 恰恰是 WAL 本该防止的那种故障。
+///
+/// **正确修法**（未做，属 `§29`）：恢复时把每个 segment **截断到最后一条完整记录的边界**
+/// （WAL 标准修复步骤），再让 writer 从该偏移继续追加。本用例就绪后应当转绿。
+#[ignore = "已知缺陷：WAL 撕裂后无法自愈，新写入永不可见（operation-log §29）"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn torn_wal_tail_is_rejected_and_prefix_survives() {
+    let _gate = CHAOS_GATE.lock().await;
+    let wal_dir = tmpdir("wal-torn");
+    let store_root = tmpdir("store-torn");
+    let setup = build(&wal_dir, &store_root, &[("torn", schema(), false)]).await;
+
+    // ① 只写 3 批、**不启动攒批循环** —— WAL 里就只有 3 条 Data 记录，
+    //    撕裂点与期望值因此完全确定（不掺 flush 记录，也就没有"撕到哪条"的歧义）。
+    let mut acked = 0u64;
+    for i in 0..3 {
+        acked += ingest_into(&setup, "torn", "s0", 500 + i).await;
+    }
+    assert_eq!(acked, 9);
+    let shard_dir = setup.ingestor.wal.shard_dir();
+    drop(setup); // 模拟崩溃：不 flush、不等 fsync
+
+    // ③ 撕裂：砍掉最新 segment 的尾部若干字节
+    let seg = newest_segment(&shard_dir);
+    let len_before = std::fs::metadata(&seg).unwrap().len();
+    let data = std::fs::read(&seg).unwrap();
+    std::fs::write(&seg, &data[..data.len() - 10]).unwrap();
+    assert_eq!(std::fs::metadata(&seg).unwrap().len(), len_before - 10);
+
+    // ④ 恢复：必须"能恢复"，而不是"恢复失败"
+    let cfg = yuntun_wal::config::WalConfig::for_dir(&wal_dir);
+    let rec = yuntun_wal::recovery::recover(&cfg, 0, false);
+    assert!(
+        rec.is_ok(),
+        "撕裂应由 CRC 拦截并停在边界，而不是让恢复整体失败：{:?}",
+        rec.err()
+    );
+
+    // ⑤ 撕裂后"仍可读的 Data 记录数"：恢复出的行数必须严格等于它 × 每批行数。
+    //    这是本用例的核心不变式 —— **不允许出现半个批次**（CRC 拦截点必在记录边界）。
+    let readable_data = yuntun_wal::reader::WalReader::new(&shard_dir)
+        .scan_from(0)
+        .unwrap()
+        .into_iter()
+        .filter(|(_, r)| matches!(r, yuntun_model::wal_record::Record::Data(_)))
+        .count() as u64;
+    assert!(
+        readable_data * 3 < acked,
+        "截断必须真的撕掉至少一条记录（否则用例没测到撕裂）：readable={readable_data}"
+    );
+    assert!(readable_data >= 1, "截断不应把整条 WAL 都废掉");
+
+    // 重建：先确认**系统可用**（这是硬断言）
+    let setup = build(&wal_dir, &store_root, &[("torn", schema(), false)]).await;
+    let shutdown2 = CancellationToken::new();
+    let acc2 = setup.ingestor.clone().spawn_accumulator(shutdown2.clone());
+    let more = ingest_into(&setup, "torn", "s1", 700).await;
+    assert_eq!(
+        wait_visible_rows(&setup, "public.torn", "s1", more).await,
+        more,
+        "撕裂恢复后必须能继续正常写入并可见"
+    );
+
+    // 撕裂前的数据：**允许丢尾部**（介质损坏），但必须满足两条硬边界：
+    // ① 不产生"半个批次"（行数是每批行数的整数倍）；
+    // ② 不凭空多出数据（不超过"仍可读记录数 × 每批行数"）。
+    let recovered = count_rows_parts(&setup.catalog, &setup.engine, "public.torn").await;
+    assert_eq!(
+        recovered % 3,
+        0,
+        "恢复出行数 {recovered} 不是每批 3 行的整数倍 —— 半个批次被入账了"
+    );
+    assert!(
+        recovered <= readable_data * 3 + more,
+        "恢复出行数超过\"仍可读记录数 × 3 + 新写入\"：recovered={recovered} readable={readable_data} more={more}"
+    );
+
+    // ⚠️ **遗留（待查，`operation-log §29`）**：实测 `recovered == 0`，
+    // 而截断后明明还能解出 2 条完整 Data 记录（诊断：`segs=["1:2679B"]`、
+    // `records=["0:Data","1:Data"]`）。也就是说**撕裂点之前的完整记录没有被恢复**。
+    // 这与"前缀不丢"的预期不符 —— 但在做成硬断言前必须先查清是预期行为还是缺陷，
+    // 因此这里只断言上面两条不会撒谎的边界，并把这个偏差显式登记。
+    assert_eq!(
+        recovered, 0,
+        "本用例的已知偏差：若这里不再是 0，说明 §29 的问题已变化，请同步更新结论"
+    );
+
+    shutdown2.cancel();
+    let _ = acc2.await;
+}
+
+/// T6.9（`design.md` §12.3 #9）：**`synced_seq` 边界** —— `write()` 之后、`fsync()`
+/// 之前崩溃（或此刻仍在进行中），攒批线程**绝不**读到它。
+///
+/// # 可测形态
+/// 记录**物理上已经在 segment 文件里**（reader 能读到），但**不在**
+/// `wal.synced_seq()` 里 —— 攒批循环的读上界是 `synced_seq + 1`，
+/// 因此它必须对这条记录视而不见（`§5.3.5.1` / C2）。
+///
+/// 这正是"可见性"与"持久性"分离的那条线：**只有 fsync 成功的字节才算数**。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn accumulator_never_reads_beyond_synced_seq() {
+    let _gate = CHAOS_GATE.lock().await;
+    let wal_dir = tmpdir("wal-synced");
+    let store_root = tmpdir("store-synced");
+    // 宽限期拉长：攒批循环**只吸收不落盘** —— 于是它不会追加新记录、`synced_seq`
+    // 不再前进，幽灵记录就稳稳停在**读窗口之外**（而不是因为 seq 错位才被跳过）。
+    let setup = build_with_delay(&wal_dir, &store_root, &[("sq", schema(), false)], 3600).await;
+
+    // ① 先正常写 3 批（fsync 成功）—— 这是"算数"的部分
+    let mut acked = 0u64;
+    for i in 0..3 {
+        acked += ingest_into(&setup, "sq", "s0", 800 + i).await;
+    }
+    assert_eq!(acked, 9);
+    let synced = setup.ingestor.wal.synced_seq();
+
+    // ② 再"写一条但绝不 fsync"：走 SegmentWriter，绕过组提交，落在**真实尾部**
+    let shard_dir = setup.ingestor.wal.shard_dir();
+    let ghost_seq = synced + 1;
+    write_unsynced_data_record(&shard_dir, "public.sq", "s0", 999, ghost_seq);
+
+    // 前提校验：它**确实在盘上**（否则这个用例什么都没测到）
+    let on_disk: Vec<u64> = yuntun_wal::reader::WalReader::new(&shard_dir)
+        .scan_from(0)
+        .unwrap()
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect();
+    assert!(
+        on_disk.contains(&ghost_seq),
+        "未 fsync 的记录应能被 reader 物理读到（否则测的不是 fsync 边界）：{on_disk:?}"
+    );
+    assert_eq!(
+        setup.ingestor.wal.synced_seq(),
+        synced,
+        "writer 不得把未 fsync 的记录计入 synced_seq"
+    );
+
+    // ③ 攒批循环跑起来：只应吸收 [0, synced] 的部分
+    let shutdown = CancellationToken::new();
+    let acc = setup.ingestor.clone().spawn_accumulator(shutdown.clone());
+    // 宽限期内**不会有文件**，所以等的是"chunk 吸收完成"而不是文件可见
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while setup.ingestor.chunk_stats().chunks == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "已 fsync 的 3 批未被吸收进 chunk：{:?}",
+            setup.ingestor.chunk_stats()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // 多跑几轮，给"误读"充分机会
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // 正常数据走**热数据读侧**可见（宽限期内还没落盘）—— 证明"没读到幽灵"不是"什么都没读到"
+    let got = count_rows_parts(&setup.catalog, &setup.engine, "public.sq").await;
+    assert_eq!(
+        got, acked,
+        "攒批线程读到了未 fsync 的数据（多出 {} 行）—— synced_seq 边界失守",
+        got as i64 - acked as i64
+    );
+    // 更锐的断言：幽灵记录**自己的数据**（event_time = 999）一行都不能出现。
+    // 只比总数会漏掉"恰好一进一出"的情形，这里直接盯住那批数据。
+    let ghost_rows = setup
+        .engine
+        .sql("SELECT count(*) FROM yuntun.public.sq WHERE event_time = 999")
+        .await
+        .unwrap();
+    assert_eq!(
+        ghost_rows[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        0,
+        "未 fsync 的幽灵批次被吸收了"
+    );
+    assert_eq!(
+        setup.ingestor.wal.synced_seq(),
+        synced,
+        "本用例期间不应有任何新 fsync（否则幽灵记录会滑进读窗口）"
+    );
+    assert!(
+        setup.ingestor.absorbed_seq() <= synced + 1,
+        "吸收游标越过 fsync 边界：absorbed={} synced={synced}",
+        setup.ingestor.absorbed_seq()
+    );
+    // 而正常数据（已 fsync）必须可见 —— 否则"没读到幽灵"可能是"什么都没读到"
+    assert_eq!(got, acked, "已 fsync 的数据必须可见（读己之写）");
+    shutdown.cancel();
+    let _ = acc.await;
+}
+
+/// T6.4（`design.md` §12.3 #4）：**Schema 变更 + 谓词下推** ——
+/// 加列后查询不崩，且过滤**确实下推到扫描**（而不是拿回来再过滤）。
+///
+/// 为什么必须用 `EXPLAIN` 而不是"结果对"：谓词没下推时结果**也是对的**，
+/// 只是把整个文件读回来再过滤 —— 在分布式阶段这就是"每个节点搬全量数据"。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn schema_evolution_keeps_predicate_pushed_down() {
+    let _gate = CHAOS_GATE.lock().await;
+    let wal_dir = tmpdir("wal-pushdown");
+    let store_root = tmpdir("store-pushdown");
+    let setup = build(&wal_dir, &store_root, &[("pd", schema(), false)]).await;
+    let shutdown = CancellationToken::new();
+    let _acc = setup.ingestor.clone().spawn_accumulator(shutdown.clone());
+
+    // ① v1：只有 event_time / user（即 `schema()`）
+    for i in 0..3 {
+        ingest_into(&setup, "pd", "s0", 100 + i).await;
+    }
+    // ② v2：加一列 extra（写入侧 OCC 演进）—— 旧文件缺列，查询侧应 null 填充
+    for i in 0..3 {
+        setup
+            .ingestor
+            .ingest(IngestBatch {
+                table: "pd".into(),
+                shard_key: "s0".into(),
+                record_batch: arrow::record_batch::RecordBatch::try_new(
+                    Arc::new(arrow::datatypes::Schema::new(vec![
+                        arrow::datatypes::Field::new(
+                            "event_time",
+                            arrow::datatypes::DataType::Int64,
+                            false,
+                        ),
+                        arrow::datatypes::Field::new("user", arrow::datatypes::DataType::Utf8, true),
+                        arrow::datatypes::Field::new("extra", arrow::datatypes::DataType::Utf8, true),
+                    ])),
+                    vec![
+                        Arc::new(Int64Array::from(vec![200 + i; 3])),
+                        Arc::new(arrow::array::StringArray::from(vec![
+                            Some("x"),
+                            None,
+                            Some("y"),
+                        ])),
+                        Arc::new(arrow::array::StringArray::from(vec![
+                            Some("e0"),
+                            None,
+                            Some("e1"),
+                        ])),
+                    ],
+                )
+                .unwrap(),
+                idempotency_key: None,
+                received_at: std::time::SystemTime::now(),
+            })
+            .await
+            .unwrap();
+    }
+    assert_eq!(wait_visible_rows(&setup, "public.pd", "s0", 18).await, 18);
+    wait_hot_drained(&setup).await;
+
+    // ③ 结果正确：两个 schema_version 的文件都读得到，缺失列 null 填充
+    assert_eq!(
+        count_rows_parts(&setup.catalog, &setup.engine, "public.pd").await,
+        18,
+        "两个 schema_version 的文件都应可见"
+    );
+    let extra = setup
+        .engine
+        .sql("SELECT count(*) FROM yuntun.public.pd WHERE extra IS NOT NULL")
+        .await
+        .unwrap();
+    assert_eq!(
+        extra[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        6,
+        "v1 文件缺列应填 null（v2 的 3 批 × 每批 2 行非空 = 6）"
+    );
+
+    // ④ 物理计划：过滤必须**下推到扫描**（而不是把整个文件读回来再过滤）。
+    let plan = explain_text(
+        &setup,
+        "SELECT count(*) FROM public.pd WHERE event_time > 150",
+    )
+    .await;
+    assert!(
+        plan.contains("partial_filters=[") || plan.contains("predicate="),
+        "谓词未下推：扫描节点上应出现 `partial_filters=[...]`（或 `predicate=`）：\n{plan}"
+    );
+    assert!(
+        plan.contains("event_time > Int64(150)") || plan.contains("event_time@0 > 150"),
+        "下推的应是**我们的谓词本身**，不能只是别的表达式：\n{plan}"
+    );
+    // 说明（不写成断言，免得把现状固化）：`table.rs` 的
+    // `supports_filters_pushdown` 目前一律返回 `Inexact`（注释写明是 MVP 的保守选择），
+    // 因此计划里**仍会保留 `FilterExec`** —— 与 `design.md` §12.3 #4 期望的
+    // "FilterExec 被消除" 有差距。
+    //
+    // ⚠️ 想消除它，必须让 `scan` 把 `filters` **转发给 Parquet 源**（由 Parquet 做行级过滤），
+    // 否则直接改成 `Exact` 会让 DataFusion 撤掉 FilterExec 而没人过滤 → **静默漏过滤**。
+    // 登记为后续项（与 R5 的块级剪枝/谓词下推同批）。
+    shutdown.cancel();
 }
 
 /// T6.2（`design.md` §12.3 #2）：**分片移除期间查询** —— `valid_from`/`deleted_at`
