@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use yuntun_catalog::{CatalogOps, MemoryCatalog};
+use yuntun_catalog::CatalogOps;
 use yuntun_model::error::LakeError;
 use yuntun_model::meta::FileManifest;
 
@@ -42,11 +42,14 @@ impl Default for CompactionConfig {
 }
 
 /// 合并依赖。
-/// 【阶段 0 约束】Compaction 是内部组件，与 MemoryCatalog 同进程；
-/// 阶段 1 Catalog 引入 gRPC 后，L2 提交改走 `CommitCompaction` RPC。
+///
+/// 【接缝】`catalog` 是 `Arc<dyn CatalogOps>` 而**不是** `Arc<MemoryCatalog>`：
+/// "Compaction 与 Catalog 同进程"是部署事实，但版本演进（R2/R3：Catalog 转 gRPC）
+/// 不能因此返工。L2 提交走 [`CatalogOps::commit_compaction`]、孤儿对账走
+/// [`CatalogOps::known_batch_ids`]，两者都已在 trait 上（`plan.md §5.1-B`）。
 pub struct Compactor {
     pub cfg: CompactionConfig,
-    pub catalog: Arc<MemoryCatalog>,
+    pub catalog: Arc<dyn CatalogOps>,
     pub store: Arc<dyn object_store::ObjectStore>,
     pub format: yuntun_format::DataFormat,
 }
@@ -131,8 +134,8 @@ pub async fn compact_shard(
     Ok(Some(new_snapshot))
 }
 
-/// 通过 [`MemoryCatalog::commit_compaction`] 提交（若 catalog 是其它实现，
-/// MVP 直接报错 —— Compaction 是内部组件，与 MemoryCatalog 同进程）。
+/// 通过 [`CatalogOps::commit_compaction`] 提交（L2：旧文件 `deleted_at` + 新文件
+/// `valid_from = snapshot+1`，一次原子完成）。实现无关。
 async fn commit_compaction_files(
     compactor: &Compactor,
     _table: &str,
@@ -143,6 +146,7 @@ async fn commit_compaction_files(
     compactor
         .catalog
         .commit_compaction(&old_ids, vec![new_manifest])
+        .await
 }
 
 /// 孤儿文件判定（§9.1 / §12.2.1）：
@@ -175,7 +179,7 @@ pub fn classify_orphans(
 /// 因此重启场景下 known_batch_ids 在清理循环启动前已就绪。
 pub fn spawn_orphan_cleanup(
     store: Arc<dyn object_store::ObjectStore>,
-    catalog: Arc<MemoryCatalog>,
+    catalog: Arc<dyn CatalogOps>,
     prefix: String,
     grace: Duration,
     shutdown: CancellationToken,
@@ -198,7 +202,14 @@ pub fn spawn_orphan_cleanup(
                     continue;
                 }
             };
-            let known: HashSet<String> = catalog.known_batch_ids().into_iter().collect();
+            let known: HashSet<String> = match catalog.known_batch_ids().await {
+                Ok(ids) => ids.into_iter().collect(),
+                Err(e) => {
+                    // 【安全】对账基准拿不到时**绝不删除任何对象**：宁可留垃圾文件
+                    tracing::error!(error = %e, "orphan cleanup: known_batch_ids failed, skip this round");
+                    continue;
+                }
+            };
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
@@ -301,6 +312,7 @@ mod tests {
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc as SArc;
+    use yuntun_catalog::MemoryCatalog;
     use yuntun_model::ops::CommitFilesRequest;
     use yuntun_model::ops::CreateTableRequest;
 
@@ -312,7 +324,7 @@ mod tests {
         .unwrap()
     }
 
-    fn compactor(catalog: Arc<MemoryCatalog>) -> Compactor {
+    fn compactor(catalog: Arc<dyn CatalogOps>) -> Compactor {
         Compactor {
             cfg: CompactionConfig {
                 min_files: 3,
@@ -346,7 +358,7 @@ mod tests {
     async fn compact_merges_files_atomically() {
         let catalog: Arc<MemoryCatalog> = Arc::new(MemoryCatalog::new());
         setup(&catalog).await;
-        let c = compactor(catalog.clone());
+        let c = compactor(catalog.clone() as Arc<dyn CatalogOps>);
 
         // 写 3 个文件并提交
         let mut batch_ids = Vec::new();
@@ -423,7 +435,7 @@ mod tests {
     async fn compact_skips_when_below_threshold() {
         let catalog: Arc<MemoryCatalog> = Arc::new(MemoryCatalog::new());
         setup(&catalog).await;
-        let c = compactor(catalog.clone());
+        let c = compactor(catalog.clone() as Arc<dyn CatalogOps>);
         let snap = catalog.current_snapshot().await;
         // 无文件 → None
         assert!(compact_shard(&c, "t", "s0", snap).await.unwrap().is_none());

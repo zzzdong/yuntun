@@ -1,8 +1,11 @@
 //! Query 桥接：DataFusion 查询引擎（详细设计 §6.7 / §8 / ADR-6）。
 //!
 //! **架构铁律（C7）**：Query 严禁网络调用 —— Catalog 查询必须走本地缓存。
-//! 本 crate 通过 [`cache::LocalCatalogCache`]（TTL 刷新，默认 30s，§11 [query].cache_ttl）
-//! 满足此约束；缓存穿透错误即 bug。
+//! 本 crate 通过 [`cache::LocalCatalog`]（**版本驱动 + 增量刷新**，S2-5/S2-7）满足此约束；
+//! 缓存穿透错误即 bug。
+//!
+//! **每查询一次快照（S2-4）**：构造会话时取一次 [`cache::CatalogSnapshot`]（不可变、`Arc` 共享），
+//! 规划期与 scan 全程复用 —— 同一次查询看到的 schema / 文件清单 / 可见性边界必然同一版本。
 //!
 //! 表发现路径：`yuntun.public.<table>`；Manifest 驱动（C7）：TableProvider 的
 //! scan 由 `list_visible_files(snapshot)` 结果构造 Parquet 文件组。
@@ -11,7 +14,10 @@ pub mod cache;
 pub mod provider;
 pub mod table;
 
-pub use cache::{spawn_cache_refresh, CachedTable, LocalCatalogCache};
+pub use cache::{
+    spawn_cache_refresh, CachedTable, CatalogSnapshot, LocalCatalog, LocalCatalogStats,
+    RefreshOutcome,
+};
 pub use provider::{YuntunCatalogProvider, YuntunSchemaProvider};
 pub use table::YuntunTableProvider;
 
@@ -37,18 +43,18 @@ pub const SCHEMA_NAME: &str = "public";
 /// **绝不抢占 chunk 区**（否则一个大基数 `GROUP BY` 就能把写入压垮）。
 pub struct QueryEngine {
     store: std::sync::Arc<dyn object_store::ObjectStore>,
-    cache: std::sync::Arc<LocalCatalogCache>,
+    catalog: std::sync::Arc<LocalCatalog>,
     runtime: Option<std::sync::Arc<RuntimeEnv>>,
 }
 
 impl QueryEngine {
     pub fn new(
         store: std::sync::Arc<dyn object_store::ObjectStore>,
-        cache: std::sync::Arc<LocalCatalogCache>,
+        catalog: std::sync::Arc<LocalCatalog>,
     ) -> Self {
         Self {
             store,
-            cache,
+            catalog,
             runtime: None,
         }
     }
@@ -58,18 +64,18 @@ impl QueryEngine {
     /// `query_mem_bytes = 0` 视为"不设上限"（单测 / 无写入同进程的场景）。
     pub fn with_query_memory_limit(
         store: std::sync::Arc<dyn object_store::ObjectStore>,
-        cache: std::sync::Arc<LocalCatalogCache>,
+        catalog: std::sync::Arc<LocalCatalog>,
         query_mem_bytes: usize,
     ) -> Result<Self, DataFusionError> {
         if query_mem_bytes == 0 {
-            return Ok(Self::new(store, cache));
+            return Ok(Self::new(store, catalog));
         }
         let runtime = RuntimeEnvBuilder::new()
             .with_memory_pool(std::sync::Arc::new(GreedyMemoryPool::new(query_mem_bytes)))
             .build()?;
         Ok(Self {
             store,
-            cache,
+            catalog,
             runtime: Some(std::sync::Arc::new(runtime)),
         })
     }
@@ -91,8 +97,14 @@ impl QueryEngine {
         })
     }
 
-    pub fn cache(&self) -> std::sync::Arc<LocalCatalogCache> {
-        self.cache.clone()
+    /// 本地 Catalog（物化视图：刷新由后台任务驱动）。
+    pub fn catalog(&self) -> std::sync::Arc<LocalCatalog> {
+        self.catalog.clone()
+    }
+
+    /// 当前不可变 Catalog 快照（诊断 / 测试）。
+    pub fn snapshot(&self) -> std::sync::Arc<CatalogSnapshot> {
+        self.catalog.snapshot()
     }
 
     /// 构造会话：注册对象存储 + yuntun catalog（每次查询新会话，会话级状态隔离）。
@@ -125,9 +137,12 @@ impl QueryEngine {
             .parse()
             .map_err(|e| DataFusionError::Configuration(format!("invalid store url: {e}")))?;
         ctx.register_object_store(&url, self.store.clone());
+        // 【S2-4】每查询取一次不可变快照：规划与 scan 全程同版本
+        let snapshot = self.catalog.snapshot();
+        let hot = self.catalog.hot_shards();
         ctx.register_catalog(
             CATALOG_NAME,
-            std::sync::Arc::new(YuntunCatalogProvider::new(self.cache.clone())),
+            std::sync::Arc::new(YuntunCatalogProvider::new(snapshot, hot)),
         );
         Ok(ctx)
     }
@@ -210,6 +225,6 @@ impl QueryEngine {
         ttl: std::time::Duration,
         shutdown: tokio_util::sync::CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
-        spawn_cache_refresh(self.cache.clone(), catalog, ttl, shutdown)
+        spawn_cache_refresh(self.catalog.clone(), catalog, ttl, shutdown)
     }
 }

@@ -158,7 +158,7 @@ scan_interval_ms = 20
     tokio::time::sleep(Duration::from_millis(600)).await;
     lakehouse
         .query
-        .cache()
+        .catalog()
         .refresh(&(lakehouse.catalog.clone() as Arc<dyn CatalogOps>))
         .await
         .unwrap();
@@ -372,7 +372,7 @@ scan_interval_ms = 20
     tokio::time::sleep(Duration::from_millis(600)).await;
     lakehouse
         .query
-        .cache()
+        .catalog()
         .refresh(&(lakehouse.catalog.clone() as Arc<dyn CatalogOps>))
         .await
         .unwrap();

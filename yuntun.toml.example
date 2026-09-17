@@ -45,6 +45,9 @@ query_mem_budget_mb = 512
 soft_pct = 60
 hard_pct = 80
 reject_pct = 95
+# 指标周期打点（秒；0 = 关闭）。输出"故障现场三件套"：
+# chunk 内存水位 / WAL 积压 / 背压水位 + Catalog 版本与增量刷新统计（T6.12）。
+metrics_log_interval_secs = 30
 
 [ingest]
 # ADR-1 FormatSwitch：vortex 需编译期 --features vortex 并锁定 Git Commit；

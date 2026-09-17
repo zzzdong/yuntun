@@ -234,7 +234,7 @@ async fn multi_schema_create_isolate_and_recover() {
     tokio::time::sleep(Duration::from_millis(700)).await;
     lakehouse
         .query
-        .cache()
+        .catalog()
         .refresh(&(lakehouse.catalog.clone() as Arc<dyn CatalogOps>))
         .await
         .unwrap();

@@ -16,6 +16,7 @@
 //! | 持久化上界 | 与可见性混为一谈 | 独立常量 `max_flush_delay`（§5.2 双阈值） |
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -128,6 +129,11 @@ pub struct Ingestor {
     pub chunks: Arc<ChunkStore>,
     /// M0：攒批重放跳过集——已被终态批次"认领"的 (组键, 半开区间)。
     pub replay_skip: Mutex<Vec<ReplaySkip>>,
+    /// 攒批线程已吸收到哪条 WAL seq（观测用，T6.12）。
+    ///
+    /// `wal.synced_seq() - absorbed_seq` = **WAL 积压**：已 fsync 但尚未进 chunk 的记录数。
+    /// 它同时是"内存越限"的缓冲池大小 —— 没有任何指标比它更能解释"为什么内存超了"。
+    absorbed_seq: AtomicU64,
 }
 
 /// 攒批重放的跳过声明：一个已重提交/重做的批次对其 Data 区间的"认领"。
@@ -187,7 +193,38 @@ impl Ingestor {
             schema_cache: Arc::new(SchemaCache::default()),
             chunks,
             replay_skip: Mutex::new(Vec::new()),
+            absorbed_seq: AtomicU64::new(0),
         }
+    }
+
+    /// 攒批线程已吸收到的 WAL seq（观测用）。
+    pub fn absorbed_seq(&self) -> u64 {
+        self.absorbed_seq.load(Ordering::SeqCst)
+    }
+
+    /// **WAL 积压**：已 fsync 但尚未吸收进 chunk 的记录数（≥0）。
+    ///
+    /// 这是 T6.12 三项指标之一：它解释了"内存为什么会超预算"——
+    /// chunk 记账是无条件的（可见性优先），越限部分由这里吸收。
+    ///
+    /// # 口径（**半开区间，差一会报出错误的积压**）
+    /// - `wal.synced_seq()` = 已 fsync 的**最高 seq（含）** → 可读记录是 `[0, synced_seq]`
+    /// - `absorbed_seq()` = 已吸收的**下一条 seq** → 已吸收记录是 `[0, absorbed_seq)`
+    /// - 因此积压 = `synced_seq + 1 - absorbed_seq`
+    ///
+    /// 空 WAL 时 `synced_seq = 0`、`absorbed_seq = 0` → 积压为 0（`+1` 与 `-1` 相抵）。
+    pub fn wal_backlog(&self) -> u64 {
+        (self.wal.synced_seq() + 1).saturating_sub(self.absorbed_seq())
+    }
+
+    /// chunk 层观测快照（内存水位 / 压力 / 各态数量）。
+    pub fn chunk_stats(&self) -> yuntun_chunk::store::ChunkStoreStats {
+        self.chunks.stats()
+    }
+
+    /// 当前背压水位。
+    pub fn pressure(&self) -> yuntun_chunk::Pressure {
+        self.chunks.pressure()
     }
 
     /// chunk 层句柄（热数据读侧接缝：查询侧 `set_hot_shards(chunks)`）。
@@ -358,6 +395,7 @@ impl Ingestor {
                                 _ => {}
                             }
                             last_read = seq + 1;
+                            self.absorbed_seq.store(last_read, Ordering::SeqCst);
                         }
                     }
                     Err(e) => {

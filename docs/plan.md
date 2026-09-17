@@ -152,8 +152,8 @@ standalone → server → ingest → chunk  → store → model
 | 阶段 0 | — | 写入/查询链路贯通（All-in-One） | ✅ 2026-09-08 |
 | 阶段 1 | — | Standalone 完备（crate 重构 / Flight SQL / SQL 写入 / CLI / 遗留清偿） | ✅ 主要项已完成 |
 | **阶段 1.5** | **R1（← R0）** | **数据平面地基：chunk 层**（内存热数据有界化 / spill / 背压 / 确定性落盘 / scan 接缝） | ✅ **2026-09-15**（§2.4） |
-| 阶段 2 | R0 收尾、R1 收尾 | 质量与性能：Chaos 11 场景 + 压测 baseline + Vortex + **观测指标**；**本阶段同时承担 §2.2 的定案**（阶段 3 的准入门槛） | 待开工 |
-| 阶段 3 | **R2 → R3 → R4 → R5 → R6** | 分布式化：Catalog 访问形态与抽象补位（R2）→ metanode/raft（R3）→ datanode 化 + **冷热边界按实例**（R4）→ 分布查询/对拍（R5）→ **compaction/GC 全局化**（R6） | 待开工（就绪度基线见 §五） |
+| 阶段 2 | R0 收尾、R1 收尾 | 质量与性能：Chaos 11 场景 + 压测 baseline + Vortex + **观测指标**；**本阶段同时承担 §2.2 的定案**（阶段 3 的准入门槛） | 部分：观测已落地（T6.12 ✅），chaos/压测/定案待做 |
+| 阶段 3 | **R2 → R3 → R4 → R5 → R6** | 分布式化：Catalog 访问形态与抽象补位（R2）→ metanode/raft（R3）→ datanode 化 + **冷热边界按实例**（R4）→ 分布查询/对拍（R5）→ **compaction/GC 全局化**（R6） | **R2 已完成（7/8，见 §7.1）**；R3–R6 待 R2 余项 + 阶段 2 准出（就绪度基线见 §五） |
 | 阶段 4 | R6 之后 | 规模化：外部索引、Iceberg 等（`refactor.md` 未覆盖，留待重新评估） | 待定 |
 
 ```
@@ -475,7 +475,7 @@ SQL `INSERT` 返回成功时数据仅落 WAL（与 Flight DoPut 语义一致）�
 | ID | 内容 | 说明 | 为什么现在做 |
 |---|---|---|---|
 | T6.1–6.11 | Chaos 11 场景（v1.0 §5.2 全表沿用） | 含并发崩溃、`synced_seq` 验证、Batch 超时、磁盘水位 | 阶段 3 前置：`refactor.md §3` 明文"不要跳过" |
-| T6.12 | **S1-11 观测三项指标**（v2.1 新增） | 内存账本水位 / WAL 积压字节 / 背压水位 → 暴露为指标（日志 + 可选 HTTP） | 没有它，R-7（内存越限）只能复现不能定位 |
+| T6.12 | **S1-11 观测三项指标** ✅ **已完成（2026-09-17）** | `Lakehouse::metrics()` + 周期打点：chunk 内存水位 / **WAL 积压记录数** / 背压水位 + Catalog 版本与增量统计（可序列化，HTTP 导出待阶段 2 尾） | 没有它，R-7（内存越限）只能复现不能定位 |
 | T6.13 | **P0 定案**（v2.1 新增） | 用 T8 数据定 `flush_phase_spread_secs` / `max_flush_delay_secs` / `rows_threshold`，并**正式修订 ADR-10** | §2.2；未定案就不该改默认值 |
 | T6.14 | **chunk 压力与恢复专项**（v2.1 新增） | 触发 spill 的写入压力；spill 读回失败降级；大基数 `GROUP BY` 挤压 chunk 区（验证硬分区）；崩溃后 spill 清理 | S1 的"真实压力曲线"缺口 |
 | T6.15 | TTL 分片移除 + segment 清理闸门（R21） | 阶段 0 遗留 | 影响 WAL 磁盘占用（与 §2.2 的 P2 联动） |
@@ -487,7 +487,7 @@ SQL `INSERT` 返回成功时数据仅落 WAL（与 Flight DoPut 语义一致）�
 
 1. chaos 11 场景 100% 通过、无 flaky（含并行执行）；
 2. 基线数据入库，且 **P0 三项全部定案**（默认值已按定案调整）；
-3. T6.12 指标可观测；T6.14 的内存曲线不高于基线；
+3. ✅ T6.12 指标已可观测；T6.14 的内存曲线不高于基线（**待压测**）；
 4. §2.3 的文档同步项 1/2/3/4/6 完成（**尤其 ADR-10 必须与实现一致**）。
 
 ---
@@ -498,21 +498,35 @@ SQL `INSERT` 返回成功时数据仅落 WAL（与 Flight DoPut 语义一致）�
 > 顺序不可颠倒：R2（抽象就位）→ R3（元数据权威）→ R4（进程拆分 + 分布式语义）
 > → R5（并发查询）→ R6（后台作业全局化）。
 
-### 7.1 R2：Catalog 访问形态与抽象补位（≈2–3 周）
+### 7.1 R2：Catalog 访问形态与抽象补位 —— ✅ 已完成（7/8，2026-09-17）
 
-| ID | 内容 | 说明 |
+> 落地细节与对照审查见 `docs/operation-log.md §26`。
+> **本轮刻意只做单进程形态**：接口按远程形态定义，实现仍是同进程
+> —— 换成 gRPC 客户端时业务代码一行不改。
+
+| ID | 内容 | 状态 |
 |---|---|---|
-| T10.1 | 定义 `CatalogProvider` 抽象（同步、无网络读） | 符合 DataFusion 同步 API 约束 |
-| T10.2 | 实现 `LocalCatalog`（直读本地内存） | standalone 与 datanode 自用 |
-| T10.3 | **版本号分两组**：`schema_ver` / `manifest_ver` 分离 | 否则每次 flush 都让全表 schema 失效 |
-| T10.4 | 每查询一次预取（immutable 快照：schema + manifest + 节点列表） | 消除 200ms 全量拉取 |
-| T10.5 | watch 后台任务 + manifest delta 接口 | 无变化零开销返回；有变化拉增量 |
-| T10.6 | 本地缓存持久化（可选降级） | metanode 不可用时仍可查历史 |
-| **T10.7** | **抽象 `CommitCompaction` + 让 Compactor/孤儿清理只依赖 `CatalogOps`** | **v2.1 新增**：现状是具体类型旁路（§5.1-B），不补则 R3 编译不过 |
-| T10.8 | proto 启用 tonic-build（同签名演进） | 为 R3 铺路 |
+| T10.1 | 定义 `CatalogProvider` 抽象（同步、无网络读） | ✅ `LocalCatalog` + `CatalogSnapshot`（符合 DataFusion 同步 API 约束） |
+| T10.2 | 实现 `LocalCatalog`（直读本地内存） | ✅ 物化视图，只依赖 `CatalogOps` trait |
+| T10.3 | **版本号分两组**：`schema_ver` / `manifest_ver` 分离 | ✅ `CatalogVersion`；DDL 推前者、flush/compaction 推后者 |
+| T10.4 | 每查询一次预取（immutable 快照：schema + manifest + 节点列表） | ✅ `CatalogSnapshot`（`Arc` 共享；写时复制代价与文件数无关） |
+| T10.5 | watch 后台任务 + manifest delta 接口 | ✅ `version()` 无变化零开销 + `manifest_delta(since)` 只重拉变更表 |
+| T10.6 | 本地缓存持久化（可选降级） | ⏳ 留 R3 后（需序列化格式；先有"刷新失败保留旧快照"的可用性底线） |
+| T10.7 | **抽象 `CommitCompaction` + Compactor/孤儿清理只依赖 `CatalogOps`** | ✅ 已上 trait；`Arc<MemoryCatalog>` 已消除 |
+| T10.8 | proto 启用 tonic-build（同签名演进） | ⏳ 随 R3 一起（与 raft 服务同一批 codegen，单独做无收益） |
 
-**准出**：standalone 全量回归绿；Catalog 调用具备"预取 + delta + 版本失效"形态；
-`yuntun-compaction` 不再依赖 `MemoryCatalog` 具体类型。
+**准出（已达成）**：
+
+1. ✅ standalone 全量回归绿（200 passed / 0 failed，clippy 0 警告）；
+2. ✅ Catalog 调用具备"预取 + delta + 版本失效"形态
+   （证据：`full_reload_then_incremental_touches_only_changed_table` 用 `Arc::ptr_eq`
+   断言无关表**未被触碰**；`snapshot_is_immutable_across_refreshes` 断言快照跨刷新不变）；
+3. ✅ `yuntun-compaction` 不再依赖 `MemoryCatalog` 具体类型。
+
+**R2 的两个副产品（都属"分布式地基"）**：
+
+- **观测三项指标**（T6.12）已落地：chunk 内存水位 / WAL 积压 / 背压水位 + Catalog 版本与增量统计；
+- **刷新失败保留旧快照**：单进程看不出价值，R3（metanode 偶发不可用）时是可用性底线。
 
 ### 7.2 R3：metanode 独立 + raft（≈3–4 周）
 
@@ -576,14 +590,14 @@ standalone 仍可单机运行（同一份装配的裁剪）。
 ### 8.1 依赖关系（不可颠倒的部分）
 
 ```
-阶段 2（S0 收尾 + 定案 + 观测）
+阶段 2（S0 收尾 + 定案 + 观测）   [T6.12 ✅]
    ├── T6.1–6.11 chaos 11 场景 ────────────────┐   (阶段 3 的全部前置)
    ├── T8 基线压测 ──► T6.13 P0 定案 ──► ADR-10 修订
    ├── T6.12 观测指标 ──► T6.14 chunk 压力专项
    └── T6.15 / T9.x（可与上并行）
                         │
                         ▼
-R2 Catalog 冻结（含 T10.7 抽象补位）──► R3 metanode + raft
+R2 Catalog 冻结（✅ 已完成）──► R3 metanode + raft
                         │                      │
                         └──────────────────────┴──► R4 datanode + 冷热边界按实例
                                                             │
@@ -613,7 +627,7 @@ R2 Catalog 冻结（含 T10.7 抽象补位）──► R3 metanode + raft
 | 里程碑 | 门槛（未达成不得进入下一格） |
 |---|---|
 | M1 = 阶段 2 准出 | chaos 100% 无 flaky + 基线入库 + **P0 全部定案** + 指标可观测 + 文档同步完成 |
-| M2 = R2 准出 | standalone 全量回归绿 + Catalog 具备预取/delta/版本失效形态 + `yuntun-compaction` 不依赖具体类型 |
+| M2 = R2 准出 | ✅ **已达成**（2026-09-17）：200 passed/0 failed + 预取/delta/版本失效形态 + compaction 不依赖具体类型（余 T10.6/T10.8 随 R3） |
 | M3 = R3 准出 | 3 节点 raft 写入不中断 + metanode 重启后 Catalog 一致 + standalone 仍可单机运行 |
 | M4 = R4 准出 | 多 datanode 并发写 + 查询，**与单节点串行结果精确相等**；节点重启不丢不重 |
 | M5 = R5 准出 | 对拍通过（硬要求）+ 查询中节点故障行为符合声明 |

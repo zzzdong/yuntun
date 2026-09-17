@@ -1,20 +1,22 @@
-//! Manifest 驱动的 TableProvider（C7 / 详细设计 §8）+ **内存分片**（读己之写）。
+//! Manifest 驱动的 TableProvider（C7 / 详细设计 §8）+ **热数据**（读己之写）。
 //!
 //! scan 把同一 shard 的两种形态合并成一个执行计划（见 `yuntun_store::shard`）：
-//! ① **内存分片**：已 fsync、尚未落盘的"热"数据，经 store 层的 [`ShardReader`] 读取
-//!    （阶段 0 = 进程内；分离部署 = `RemoteShard`）—— 写后立即可查，
-//!    不再受 flush jitter（≤60s）与查询缓存 TTL（30s）影响；
+//! ① **热数据**：已 fsync、尚未落盘的 chunk，经 store 层的 [`ShardReader`] 读取
+//!    （阶段 0 = 进程内 chunk store；分离部署 = `RemoteShard`）—— 写后立即可查；
 //! ② **磁盘分片**：已落对象存储的 Parquet 文件组（Manifest 驱动，快照隔离）。
 //!
-//! 交接无空洞/无重复：内存分片条目在提交成功后转为 `Committed(snapshot)`，查询侧在
-//! `cached_snapshot < snapshot` 时仍读内存分片、之后交给磁盘分片。
+//! 交接无空洞/无重复：chunk 在 `commit_files` 成功且**查询缓存追上该快照**之前一直可见
+//! （架构 §4.5 / I4）。
+//!
+//! **快照一致性（S2-4）**：provider 持有的是 `Arc<CatalogSnapshot>`（规划期取一次），
+//! 因此"可见文件清单"与"schema"必然同版本 —— 不会出现 schema 是新的、文件是旧的。
 //!
 //! - 列裁剪 / 谓词下推交给 DataFusion（Parquet 统计 + ParquetSource）；
 //! - 【硬编码】file_path 全部以 `yuntun-store:///` 为根；
-//! - 多 schema_version 共存：内存批次与文件都对齐到表当前 schema
+//! - 多 schema_version 共存：批次与文件都对齐到表当前 schema
 //!   （同名列宽化 + 缺失列 null 填充，§6.8 / `arrow_util::align_batch`）。
 
-use crate::cache::CachedTable;
+use crate::cache::CatalogSnapshot;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::datasource::object_store::ObjectStoreUrl;
@@ -33,20 +35,31 @@ use datafusion_datasource_parquet::source::ParquetSource;
 use std::sync::Arc;
 use yuntun_store::ShardReader;
 
-/// 一张 yuntun 表的 DataFusion 视图（快照固定：缓存刷新间隔内一致）。
+/// 一张 yuntun 表的 DataFusion 视图（**绑定在某个不可变 Catalog 快照上**）。
 #[derive(Debug)]
 pub struct YuntunTableProvider {
-    table: CachedTable,
+    /// 规划期取一次的 Catalog 快照：schema / 文件清单 / 可见性边界都取自它
+    snapshot: Arc<CatalogSnapshot>,
+    /// 全限定表标识 `schema.table`
+    ident: String,
+    schema: arrow::datatypes::SchemaRef,
     store_url: ObjectStoreUrl,
-    /// 热数据读侧（store 层 [`ShardReader`]）：scan 时读内存分片。
+    /// 热数据读侧（store 层 [`ShardReader`]）：scan 时读 chunk。
     /// `None` = 未接线（单测），退化为纯磁盘分片（Manifest）可见性。
     hot: Option<Arc<dyn ShardReader>>,
 }
 
 impl YuntunTableProvider {
-    pub fn new(table: CachedTable, hot: Option<Arc<dyn ShardReader>>) -> Self {
+    pub fn new(
+        snapshot: Arc<CatalogSnapshot>,
+        ident: impl Into<String>,
+        schema: arrow::datatypes::SchemaRef,
+        hot: Option<Arc<dyn ShardReader>>,
+    ) -> Self {
         Self {
-            table,
+            snapshot,
+            ident: ident.into(),
+            schema,
             store_url: ObjectStoreUrl::parse(crate::STORE_URL)
                 .unwrap_or_else(|_| ObjectStoreUrl::local_filesystem()),
             hot,
@@ -57,14 +70,14 @@ impl YuntunTableProvider {
 #[async_trait]
 impl datafusion::catalog::TableProvider for YuntunTableProvider {
     fn schema(&self) -> arrow::datatypes::SchemaRef {
-        self.table.schema.clone()
+        self.schema.clone()
     }
 
     fn table_type(&self) -> datafusion::logical_expr::TableType {
         datafusion::logical_expr::TableType::Base
     }
 
-    /// scan：内存未落盘数据 ∪ 已提交 Parquet 文件组（见模块注释）。
+    /// scan：热数据 ∪ 已提交文件组（见模块注释）。
     async fn scan(
         &self,
         _state: &dyn Session,
@@ -72,14 +85,16 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-        let schema = self.table.schema.clone();
+        let schema = self.schema.clone();
         let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
 
-        // ① 内存分片（读己之写）：写后即可查，不等 flush jitter / 缓存 TTL
+        // 快照里的表条目 —— 不可变，规划期读多次结果一致
+        let table = self.snapshot.get(&self.ident);
+
+        // ① 热数据（读己之写）：写后即可查，不等 flush / 缓存 TTL
         if let Some(hot) = &self.hot {
-            let ident = self.table.meta.qualified_name();
             let raw = hot
-                .read_table(&ident, self.table.snapshot)
+                .read_table(&self.ident, self.snapshot.snapshot)
                 .await
                 .map_err(|e| {
                     datafusion::error::DataFusionError::Execution(format!("hot shard read: {e}"))
@@ -104,29 +119,31 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
             }
         }
 
-        // ② 已提交文件（Manifest 驱动，C7）
-        if !self.table.files.is_empty() {
-            let files: Vec<PartitionedFile> = self
-                .table
-                .files
-                .iter()
-                .map(|f| PartitionedFile::new(f.file_path.clone(), f.file_size))
-                .collect();
+        // ② 已提交文件（Manifest 驱动，C7）：文件清单来自**本 provider 的快照**
+        if let Some(t) = table {
+            if !t.files.is_empty() {
+                let files: Vec<PartitionedFile> = t
+                    .files
+                    .iter()
+                    .map(|f| PartitionedFile::new(f.file_path.clone(), f.file_size))
+                    .collect();
 
-            let source: Arc<dyn FileSource> = Arc::new(ParquetSource::new(
-                datafusion_datasource::table_schema::TableSchemaBuilder::new(schema.clone()).build(),
-            ));
+                let source: Arc<dyn FileSource> = Arc::new(ParquetSource::new(
+                    datafusion_datasource::table_schema::TableSchemaBuilder::new(schema.clone())
+                        .build(),
+                ));
 
-            let mut builder = FileScanConfigBuilder::new(self.store_url.clone(), source)
-                .with_file_group(FileGroup::new(files));
-            if let Some(p) = projection {
-                builder = builder
-                    .with_projection_indices(Some(p.clone()))
-                    .map_err(|e| {
-                        datafusion::error::DataFusionError::Execution(format!("projection: {e}"))
-                    })?;
+                let mut builder = FileScanConfigBuilder::new(self.store_url.clone(), source)
+                    .with_file_group(FileGroup::new(files));
+                if let Some(p) = projection {
+                    builder = builder
+                        .with_projection_indices(Some(p.clone()))
+                        .map_err(|e| {
+                            datafusion::error::DataFusionError::Execution(format!("projection: {e}"))
+                        })?;
+                }
+                inputs.push(DataSourceExec::from_data_source(builder.build()));
             }
-            inputs.push(DataSourceExec::from_data_source(builder.build()));
         }
 
         // ③ 空表：给一个空的内存执行（保持 schema / 投影语义）

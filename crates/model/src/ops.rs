@@ -113,6 +113,54 @@ pub struct CommitFilesResponse {
     pub commit_index: u64,
 }
 
+// ---------------- 版本与增量（S2-5 / S2-7）----------------
+
+/// Catalog **版本号，分两组**（`refactor.md` S2-5）。
+///
+/// 为什么要分：`commit_files` 是最高频的写（每次 flush 一次），若与 schema 变更共用
+/// 一个版本号，则**每次 flush 都会让全表 schema 缓存失效**，缓存退化为全量重建。
+///
+/// | 组 | 谁在推 | 变化频率 | 缓存该做什么 |
+/// |---|---|---|---|
+/// | `schema_ver` | `create/drop table`、`create/drop schema`、`evolve_schema` | 低（DDL） | 全量重建（表清单 + 每个表的结构） |
+/// | `manifest_ver` | `commit_files`、`commit_compaction`、`drop_shard`、`drop_table` | 高（写入持续推） | **只按增量拉变化的表** |
+///
+/// 与既有两个号的区别（**不要混用**）：
+/// - `snapshot`：**快照隔离**语义（文件 `valid_from <= snapshot` 才可见），查询一致性用；
+/// - `read_index`：Raft 线性化位置（阶段 3 由 raft 提供）；
+/// - 本结构：**缓存失效**语义，只回答"要不要重拉、拉哪些"。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct CatalogVersion {
+    pub schema_ver: u64,
+    pub manifest_ver: u64,
+}
+
+/// 自 `since_manifest_ver` 以来，文件清单发生过变化的表（S2-7 增量接口）。
+///
+/// 消费方语义：对 `changed_tables` 里的每个表重拉一次可见文件即可，
+/// **不必**遍历全部表；其余表的缓存条目原样有效。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ManifestDelta {
+    /// 变更表的全限定标识（去重、升序）
+    pub changed_tables: Vec<String>,
+    /// `true` = 增量无法表达（如发生了删表/重建），调用方必须**全量重建**。
+    /// 增量接口宁可保守：无法表达就要求全量，绝不允许"漏掉变更"。
+    pub full_reload_required: bool,
+}
+
+impl ManifestDelta {
+    pub fn full() -> Self {
+        Self {
+            changed_tables: Vec::new(),
+            full_reload_required: true,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.full_reload_required && self.changed_tables.is_empty()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ListVisibleFilesRequest {
     pub table: String,

@@ -81,7 +81,7 @@ async fn execute_update(
 async fn refresh_cache(lakehouse: &Lakehouse) {
     lakehouse
         .query
-        .cache()
+        .catalog()
         .refresh(&(lakehouse.catalog.clone() as Arc<dyn CatalogOps>))
         .await
         .unwrap();

@@ -1210,5 +1210,106 @@ ADR-10 的削峰是"60 秒内均匀分散"，而 `spread` 默认 5s → **分散
 | 6 | query 区内存池的**可观测性**（当前只在上限处失败，无水位指标） | S1-11（阶段 2 T6.12） |
 | 7 | **规划缺口（本轮核查新发现）**：`Compactor` / 孤儿清理绑具体 `MemoryCatalog`（R2 必补 `CommitCompaction`）；`source_instance` 只写不读（R4）；孤儿 GC 非多写者安全（R6） | `plan.md §5.1`/`§7` |
 
+## 26. R2：Catalog 访问形态改造 + 观测能力（单进程 standalone 形态，2026-09-17）
+
+> 承接 §25 与 `plan.md §五`（就绪度基线）。本轮只做**不需要拆进程**的部分：
+> 控制平面的**形态与接缝**（refactor S2-1 ~ S2-8）+ 观测（T6.12），
+> 不碰 raft / 进程拆分 / fanout / 全局 compaction。
+>
+> 一句话：**控制平面的接口已经按"远程形态"定义好了，现在还是同进程实现；
+> 换成 gRPC 客户端时业务代码一行不改。**
+
+### 26.1 落地内容
+
+| 项 | 内容 | 落点 |
+|---|---|---|
+| **S2-5 版本分两组** | `CatalogVersion { schema_ver, manifest_ver }`；DDL 推 schema、flush/compaction 推 manifest | `model/ops.rs`、`catalog/lib.rs` |
+| **S2-7 增量接口** | `manifest_delta(since)` → 变更表清单；实现用"每表最后变更版本"（O(表数)，无界日志） | `catalog/lib.rs` |
+| **S2-4 每查询一次快照** | `CatalogSnapshot`（不可变 + `Arc`），provider/scan 全程复用同一份；**不再每次 `table()` 深拷贝文件清单** | `query/src/{cache,provider,table}.rs` |
+| **S2-1/2/6 本地物化视图** | `LocalCatalogCache` → `LocalCatalog`：版本驱动 + 增量刷新 + "无变化零开销" + 失败保留旧快照 | `query/src/cache.rs` |
+| **S2-3/R2 抽象补位（T10.7）** | `commit_compaction` / `known_batch_ids` **上 trait**；`Compactor` / 孤儿清理改依赖 `Arc<dyn CatalogOps>` | `catalog/lib.rs`、`compaction/lib.rs` |
+| **T6.12 观测** | `Lakehouse::metrics()` + 周期结构化打点：chunk 内存水位 / WAL 积压 / 背压水位 + Catalog 版本与增量统计 | `server/src/lib.rs`、`ingest/pipeline.rs` |
+| **S2-4 附带** | 节点列表进快照（`snapshot.nodes`，standalone = 单节点）——"分片归属"必须与 schema/manifest 同版本 | `query/src/cache.rs`、`server/src/lib.rs` |
+
+### 26.2 关键设计点（为什么这样做）
+
+1. **不可变快照不是"性能优化"，是正确性要求。**
+   DataFusion 的 `CatalogProvider`/`SchemaProvider`/`TableProvider` 是**同步 trait**，规划期
+   会被反复调用；若每次都读一个会变的结构，**同一次查询的 plan 与 scan 可能看到两个版本**
+   （漏读/幻读）。改为"构建新快照 → 原子替换"后，读侧只拿 `Arc`。
+   `CatalogSnapshot.tables` 用 `HashMap<String, Arc<CachedTable>>`：写时复制的代价与
+   **文件数无关**（否则每次增量刷新都要克隆全表文件清单，增量就白做了）。
+
+2. **版本分两组是"让增量成为可能"的前提。**
+   flush 是最高频的写。若与 schema 共用版本号，**每次 flush 都会让全表 schema 失效**
+   → 缓存退化为全量重建。分开后：DDL（低频）→ 全量；写入（高频）→ 只拉变化的表。
+   回归证据：`full_reload_then_incremental_touches_only_changed_table` 用 `Arc::ptr_eq`
+   断言"无关表**没有被触碰**"—— 而不是"结果恰好一样"。
+
+3. **增量接口必须能报"消失的表"。**
+   删表若只靠 schema_ver 触发全量，一旦调用方漏判就会**留着过期缓存**。
+   因此删表同时推两组版本，且增量把被删表也报出来（`drop_table_advances_both_versions`）。
+
+4. **`commit_compaction` / `known_batch_ids` 必须在 trait 上。**
+   它们此前是 `MemoryCatalog` 的固有方法，导致 `Compactor.catalog: Arc<MemoryCatalog>` ——
+   "同进程"是部署事实，但**不能因此把类型写死**：R3 把 Catalog 换成 gRPC 客户端时编译不过
+   （`plan.md §5.1-B` 的本轮实测）。这是"单机可跑、分布式不返工"最便宜的一处接缝。
+
+5. **观测的三项是"故障现场三件套"。**
+   内存水位 / WAL 积压 / 背压水位：没有它们，压力类故障只能复现不能定位。
+   尤其 **WAL 积压**——chunk 记账是无条件的（可见性优先于预算），越限部分正是靠它吸收；
+   它也是唯一能解释"内存为什么超预算"的量。打点内容可 `serde_json` 序列化（将来接 HTTP/监控）。
+
+### 26.3 本轮暴露/发现的问题
+
+1. **`wal_backlog` 的口径极易写错（差一即误导运维）**：
+   实现时第一版把 `synced_seq` 当成"下一条待写 seq"，报出多 1 的积压 ——
+   而这**不会让任何功能测试变红**，只在运维判断上出错。
+   已用契约化的单测钉住（`wal_backlog_counts_fsynced_but_unabsorbed_records`：
+   写入 2 条未吸收 → 积压 = 2；吸收后 → 0），并在代码注释里写明半开区间公式。
+   *教训*：**指标也是接口**，必须像接口一样有契约测试。
+2. **刷新失败语义必须显式化**：刷新失败**保留旧快照**（宁可读稍旧数据，也不要查询不可用），
+   错误记入 `last_error` 供告警（`failed_refresh_keeps_previous_snapshot_and_records_error`）。
+   这条在单进程时看不出价值，但在 R3（metanode 偶发不可用）时是可用性底线。
+3. **chaos 并行 flake 根因确认**：`cargo test` 默认**并行跑所有 test binary**，
+   `yuntun-chaos` 与另外 46 个 binary 争 CPU/IO；实测并行下 30s 恢复上限不足
+   （单跑 1.3s / 3 passed）。本轮把该上限放宽到 60s 并写明理由
+   ——**正确性断言不用超时冒充延迟指标**；根治（chaos 独立跑 / 去 flaky）属 `plan.md` T6.1。
+
+### 26.4 与既有设计的对照
+
+| 维度 | 出处 | 本轮做法 | 判定 |
+|---|---|---|---|
+| **C7「Query 无网络」** | 详设 §6.7 / ADR-6 | 读路径仍全部走本地快照（同步、无锁、无网络）；`LocalCatalog` 只依赖 `CatalogOps` trait | ✅ 保持 |
+| **ADR-6「本地缓存 + 变更通知」** | §4 | 由**TTL 轮询**演进为**版本驱动 + 增量 + watch 形态**（`version()` 无变化零开销返回 = 带版本号请求） | ✅ 演进（方向与 ADR-6 一致） |
+| S2-4「每查询一次预取」 | `refactor.md` | `CatalogSnapshot` 每会话取一次 | ✅ 达成 |
+| S2-5「版本号分两组」 | `refactor.md` | `CatalogVersion{schema_ver, manifest_ver}` | ✅ 达成 |
+| S2-7「manifest delta」 | `refactor.md` | `manifest_delta(since)` + `full_reload_required` 保守回退 | ✅ 达成 |
+| T6.12「三项指标」 | `plan.md` | metrics + 周期日志（HTTP 导出未做，见 26.6） | ✅ 基本达成 |
+| C5「Catalog 仅存内存」 | 详设 §6.1 | 未动（内存 + 由 WAL 重放 DDL 重建；raft snapshot 属 R3） | ✅ 保持 |
+
+### 26.5 验证
+
+- `cargo test --workspace`：**200 passed / 0 failed**（本轮新增 11 个用例）；
+  `cargo clippy --workspace --all-targets` **0 警告**。
+- 新增用例：
+  - `catalog`（4）：版本分组（建表/提交文件各推哪一组）、增量只报变更表、
+    删表同时推两组版本、compaction 推新旧两表的 manifest_ver；
+  - `query/tests/catalog_snapshot.rs`（5）：全量→增量只碰变更表（`Arc::ptr_eq` 硬证据）、
+    DDL 强制全量、**快照跨刷新不可变**、无变化零开销、**刷新失败保留旧快照并记错**；
+  - `ingest`（1）：`wal_backlog` 半开区间口径；
+  - `server/tests/metrics_e2e.rs`（1）：三项指标 + Catalog 版本 + query 区上限 + 可序列化。
+- 既有回归全绿（含 chaos 3 场景：单跑 1.3s）。
+
+### 26.6 遗留（对应 plan.md 相应条目）
+
+| # | 项 | 归属 | 说明 |
+|---|---|---|---|
+| 1 | proto 启用 tonic-build（T10.8） | R3 前 | 与 raft 服务是同一批 codegen 工作，单独做没有收益 |
+| 2 | 指标 HTTP 导出 | 阶段 2 尾 | 需要新增依赖（当前离线环境不可加），先以结构化日志交付 |
+| 3 | chaos 与其余 binary 并行导致的 flake 根治 | T6.1 | 建议 CI 分两步：`cargo test --workspace --exclude yuntun-chaos` + `cargo test -p yuntun-chaos` |
+| 4 | `cache_ttl_secs` 降级为纯兜底（S2-10） | 阶段 2 | 版本驱动已上线，TTL 目前仍作为兜底保留 |
+| 5 | 本地缓存持久化（S2-8） | R3 后 | metanode 不可用时降级服务，需要序列化格式 |
+
 ---
 

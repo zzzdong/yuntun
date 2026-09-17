@@ -168,16 +168,27 @@ S0 收尾 ──► S1 chunk ──► S2 catalog ──► S3 metanode ──�
 
 ### 5.1 任务清单
 
-| # | 任务 | 要点 |
-|---|---|---|
-| S2-1 | 定义 `CatalogProvider` 抽象 | 同步、无网络读（符合 DataFusion 同步 API 约束） |
-| S2-2 | 实现 `LocalCatalog` | 直读本地内存，standalone 与 datanode 自用 |
-| S2-3 | 预留 `CachedCatalog` 接口 | 本地物化 + 按版本失效，S4 后启用 |
-| S2-4 | 每查询一次预取 | 解析出表 → 一次性拉 schema + manifest + 节点列表 → 构建 immutable 快照 |
-| S2-5 | **版本号分两组** | schema_ver 与 manifest_ver 分离，否则每次 flush 都让全表 schema 失效 |
-| S2-6 | watch 后台任务 | 带版本号请求；无变化零开销返回，有变化拉 delta |
-| S2-7 | manifest delta 接口 | "自 version X 以来的变更"，而非全量 |
-| S2-8 | 本地缓存持久化 | 落磁盘，重启可用；metanode 不可用时降级服务 |
+> **✅ 状态（2026-09-17）**：S2-1 ~ S2-7 **已在单进程形态落地**（`operation-log §26`），
+> S2-8 留待 R3 之后。落地时**新增一项前置**（下表的 S2-0）：
+> 抽象补位必须在 R3 之前做，否则 Compactor 绑具体类型会让 Catalog 转 gRPC 时编译不过。
+
+| # | 任务 | 要点 | 状态 |
+|---|---|---|---|
+| **S2-0** | **抽象补位**：`commit_compaction` / `known_batch_ids` 上 `CatalogOps`，Compactor 与孤儿清理不再依赖 `MemoryCatalog` | **上 trait 是硬要求**（"同进程"是部署事实，不是类型约束） | ✅ |
+| S2-1 | 定义 `CatalogProvider` 抽象 | 同步、无网络读（符合 DataFusion 同步 API 约束） | ✅ |
+| S2-2 | 实现 `LocalCatalog` | 直读本地内存，standalone 与 datanode 自用 | ✅ |
+| S2-3 | 预留 `CachedCatalog` 接口 | 本地物化 + 按版本失效，S4 后启用 | ✅（即 `LocalCatalog` 的形态） |
+| S2-4 | 每查询一次预取 | 构建 immutable 快照（schema + manifest + 节点列表），规划期不再读可变结构 | ✅ |
+| S2-5 | **版本号分两组** | schema_ver 与 manifest_ver 分离，否则每次 flush 都让全表 schema 失效 | ✅ |
+| S2-6 | watch 后台任务 | 带版本号请求；无变化零开销返回，有变化拉 delta | ✅ |
+| S2-7 | manifest delta 接口 | "自 version X 以来的变更"，而非全量 | ✅ |
+| S2-8 | 本地缓存持久化 | 落磁盘，重启可用；metanode 不可用时降级服务 | ⏳ R3 后 |
+
+**两条落地时才明确的约束**（写进代码注释与回归用例，避免后续被"优化"掉）：
+
+1. **快照必须真的不可变**：`CatalogSnapshot.tables` 用 `Arc<CachedTable>`，写时复制的代价与
+   文件数无关；否则"增量刷新"每次仍要克隆全表文件清单，等于没做。
+2. **增量接口必须能报"消失的表"**：删表若只靠 schema_ver 兜底，一旦调用方漏判就会留着过期缓存。
 | S2-9 | **flush jitter 重构** | 随机 jitter → 确定性相位偏移：`sealed_at + max_flush_delay + hash(instance,key) % flush_phase_spread`。**机制部分已在 S1 落地**；剩余的是 **spread 量级定案**（5s 会把 ADR-10 的 60s 分散面收窄 12 倍，属 P0 实测决策，见 `plan.md §2.2`）+ **ADR-10 原文正式修订**（`plan.md §2.3-1`） |
 | S2-10 | `cache_ttl_secs` 降级为兜底 | 不再作为主要失效手段 |
 

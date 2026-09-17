@@ -118,7 +118,7 @@ async fn ingest_then_query_visible() {
     assert!(recovery.states.states.len() >= 2, "至少两个 batch");
 
     // ⑥ Query：缓存刷新 + SQL
-    let cache = Arc::new(yuntun_query::LocalCatalogCache::new());
+    let cache = Arc::new(yuntun_query::LocalCatalog::new());
     cache.refresh(&catalog).await.unwrap();
 
     let engine = QueryEngine::new(store.clone(), cache);
@@ -148,7 +148,7 @@ async fn ingest_then_query_visible() {
     assert!(!batches.is_empty());
 
     // ⑧ 表列表（多 schema：缓存键为全限定标识 `schema.table`）
-    let names = engine.cache().table_names().await;
+    let names = engine.catalog().table_names().await;
     assert!(names.contains(&"public.audit".to_string()), "{names:?}");
 }
 
@@ -169,7 +169,7 @@ async fn cache_ttl_keeps_queries_off_network_path() {
         .await
         .unwrap();
 
-    let cache = Arc::new(yuntun_query::LocalCatalogCache::new());
+    let cache = Arc::new(yuntun_query::LocalCatalog::new());
     let shutdown = CancellationToken::new();
     let handle = yuntun_query::spawn_cache_refresh(
         cache.clone(),

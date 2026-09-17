@@ -18,9 +18,9 @@ use yuntun_model::meta::{
     compute_stats_lite, FileManifest, FileStatus, IdempotencyRecord, SchemaVersion, TableMeta,
 };
 use yuntun_model::ops::{
-    qualified_name, split_qualified, validate_schema_name, validate_table_name, CommitFilesRequest,
-    CommitFilesResponse, CreateTableRequest, EvolveSchemaRequest, EvolveSchemaResponse,
-    DEFAULT_SCHEMA,
+    qualified_name, split_qualified, validate_schema_name, validate_table_name, CatalogVersion,
+    CommitFilesRequest, CommitFilesResponse, CreateTableRequest, EvolveSchemaRequest,
+    EvolveSchemaResponse, ManifestDelta, DEFAULT_SCHEMA,
 };
 use yuntun_model::schema::{apply_change, SchemaChangeKind};
 
@@ -76,15 +76,39 @@ pub trait CatalogOps: Send + Sync {
     /// 文件 Manifest 移除（数据文件转孤儿，由孤儿清理回收，plan §4.3）。
     async fn drop_table(&self, name: &str) -> Result<(), LakeError>;
 
+    // ---- Compaction / 运维（**必须在 trait 上**）----
+    /// Compaction 提交（L2，§6.3）：旧文件 `deleted_at`、新文件 `valid_from = snapshot+1`，一次原子完成。
+    ///
+    /// 【为什么必须在 trait 上】Compaction 与 Catalog 同进程是**部署事实**，
+    /// 但**不能因此绑具体类型**：Catalog 转 gRPC（R3）时 `Arc<MemoryCatalog>` 会编译不过
+    /// （`plan.md §5.1-B` 实测）。这是"单机可跑、分布式不返工"的关键接缝。
+    async fn commit_compaction(
+        &self,
+        old_batch_ids: &[String],
+        new_files: Vec<FileManifest>,
+    ) -> Result<u64, LakeError>;
+
+    /// 全部已知 batch_id（孤儿清理对账用，§12.2.1）——同上，不得绑具体实现。
+    async fn known_batch_ids(&self) -> Result<Vec<String>, LakeError>;
+
     // ---- 幂等 ----
     async fn check_idempotency(&self, key: &str) -> Result<Option<String>, LakeError>;
     async fn record_idempotency(&self, rec: IdempotencyRecord) -> Result<(), LakeError>;
 
-    // ---- 快照 / 线性化 ----
-    /// 当前可见快照号（Query 读取用）
+    // ---- 快照 / 线性化 / 版本 ----
+    /// 当前可见快照号（Query 读取用；**快照隔离**语义，与版本号不是一回事）
     async fn current_snapshot(&self) -> u64;
     /// 已 apply 的变更序号（Raft 线性化抽象，阶段 0 单调自增）
     async fn read_index(&self) -> u64;
+
+    /// 缓存失效用的**分组版本号**（S2-5）。
+    async fn version(&self) -> CatalogVersion;
+
+    /// 自 `since_manifest_ver` 以来文件清单变化的表（S2-7 增量接口）。
+    ///
+    /// 消费方只重拉 `changed_tables`，其余表缓存原样有效；
+    /// 无法表达时返回 [`ManifestDelta::full`]（保守，宁可全量也不漏变更）。
+    async fn manifest_delta(&self, since_manifest_ver: u64) -> Result<ManifestDelta, LakeError>;
 }
 
 /// 归一化表标识：裸名 → `public.<name>`；限定名原样（兼容 v1 单 schema 数据/调用）。
@@ -119,6 +143,15 @@ pub struct MemoryCatalog {
     snapshot_version: AtomicU64,
     /// 已 apply 的变更数（Raft 线性化抽象，T3.5）
     last_applied: AtomicU64,
+    /// 结构变更计数（表 / schema / schema 演进）—— 缓存**全量重建**的触发器（S2-5）
+    schema_ver: AtomicU64,
+    /// 文件清单变更计数 —— 缓存**增量刷新**的触发器（S2-5）
+    manifest_ver: AtomicU64,
+    /// 每个表最后一次文件清单变更的 `manifest_ver`（S2-7 增量接口的数据来源）。
+    ///
+    /// 用"每表最后变更版本"而不是 append-only 日志：查询是 O(表数) 而不是 O(变更数)，
+    /// 且不会无界增长；表被删时同步移除（删表走 schema_ver → 调用方全量重建）。
+    table_manifest_ver: RwLock<HashMap<String, u64>>,
 }
 
 impl Default for MemoryCatalog {
@@ -137,6 +170,9 @@ impl MemoryCatalog {
             idempotency: RwLock::new(HashMap::new()),
             snapshot_version: AtomicU64::new(1),
             last_applied: AtomicU64::new(0),
+            schema_ver: AtomicU64::new(0),
+            manifest_ver: AtomicU64::new(0),
+            table_manifest_ver: RwLock::new(HashMap::new()),
         }
     }
 
@@ -149,9 +185,19 @@ impl MemoryCatalog {
         before - map.len()
     }
 
-    /// 全部已知 batch_id（孤儿清理用，§12.2.1：先排除 Meta 已知文件）。
-    pub fn known_batch_ids(&self) -> Vec<String> {
-        self.files.read().unwrap().keys().cloned().collect()
+    /// 结构变更：推进 `schema_ver`（缓存全量重建）。
+    fn bump_schema_ver(&self) -> u64 {
+        self.schema_ver.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// 文件清单变更：推进 `manifest_ver` 并记下该表的最后变更版本（缓存增量刷新）。
+    fn bump_manifest_ver(&self, table: &str) -> u64 {
+        let v = self.manifest_ver.fetch_add(1, Ordering::SeqCst) + 1;
+        self.table_manifest_ver
+            .write()
+            .unwrap()
+            .insert(normalize_table(table), v);
+        v
     }
 
     /// 【修复】原子推进快照号并返回新值。
@@ -165,31 +211,6 @@ impl MemoryCatalog {
         self.snapshot_version.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    /// Compaction 提交：旧文件标记 deleted_at，新文件 valid_from = snapshot+1（L2，§6.3）。
-    pub fn commit_compaction(
-        &self,
-        old_batch_ids: &[String],
-        new_files: Vec<FileManifest>,
-    ) -> Result<u64, LakeError> {
-        let next = self.next_snapshot();
-        let mut files = self.files.write().unwrap();
-        // 先确认旧文件仍可见（避免与并发 drop_shard 冲突时错误复活数据）
-        for id in old_batch_ids {
-            if let Some(f) = files.get_mut(id) {
-                if f.deleted_at == 0 {
-                    f.deleted_at = next;
-                }
-            }
-        }
-        for mut nf in new_files {
-            nf.valid_from = next;
-            nf.status = FileStatus::Active as u32;
-            files.insert(nf.batch_id.clone(), nf);
-        }
-        drop(files);
-        self.last_applied.fetch_add(1, Ordering::SeqCst);
-        Ok(next)
-    }
 }
 
 #[async_trait::async_trait]
@@ -203,6 +224,7 @@ impl CatalogOps for MemoryCatalog {
             return Err(LakeError::SchemaAlreadyExists(name.to_string()));
         }
         drop(ns);
+        self.bump_schema_ver();
         self.last_applied.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -227,6 +249,7 @@ impl CatalogOps for MemoryCatalog {
             return Err(LakeError::SchemaNotEmpty(name.to_string()));
         }
         self.namespaces.write().unwrap().remove(name);
+        self.bump_schema_ver();
         self.last_applied.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -277,6 +300,7 @@ impl CatalogOps for MemoryCatalog {
             },
         );
         tables.insert(qualified, meta.clone());
+        self.bump_schema_ver();
         self.last_applied.fetch_add(1, Ordering::SeqCst);
         Ok(meta)
     }
@@ -334,6 +358,7 @@ impl CatalogOps for MemoryCatalog {
         );
         table.current_schema_version = new_version;
         table.arrow_schema = yuntun_model::meta::serialize_schema(&new_schema);
+        self.bump_schema_ver();
         self.last_applied.fetch_add(1, Ordering::SeqCst);
 
         Ok(EvolveSchemaResponse {
@@ -414,6 +439,7 @@ impl CatalogOps for MemoryCatalog {
             files.insert(req.batch_id.clone(), f);
         }
         drop(files);
+        self.bump_manifest_ver(&req.table);
         self.last_applied.fetch_add(1, Ordering::SeqCst);
 
         Ok(CommitFilesResponse {
@@ -455,6 +481,7 @@ impl CatalogOps for MemoryCatalog {
             }
         }
         drop(files);
+        self.bump_manifest_ver(&key);
         self.last_applied.fetch_add(1, Ordering::SeqCst);
         Ok(n)
     }
@@ -479,6 +506,9 @@ impl CatalogOps for MemoryCatalog {
             .unwrap()
             .retain(|_, f| normalize_table(&f.table) != key);
         self.snapshot_version.fetch_add(1, Ordering::SeqCst);
+        // 结构与清单都变了：schema_ver 让缓存全量重建，manifest_ver 兜一层增量消费者
+        self.bump_schema_ver();
+        self.bump_manifest_ver(&key);
         self.last_applied.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -504,6 +534,70 @@ impl CatalogOps for MemoryCatalog {
 
     async fn read_index(&self) -> u64 {
         self.last_applied.load(Ordering::SeqCst)
+    }
+
+    async fn version(&self) -> CatalogVersion {
+        CatalogVersion {
+            schema_ver: self.schema_ver.load(Ordering::SeqCst),
+            manifest_ver: self.manifest_ver.load(Ordering::SeqCst),
+        }
+    }
+
+    async fn manifest_delta(&self, since_manifest_ver: u64) -> Result<ManifestDelta, LakeError> {
+        let current = self.manifest_ver.load(Ordering::SeqCst);
+        if since_manifest_ver >= current {
+            return Ok(ManifestDelta::default());
+        }
+        let map = self.table_manifest_ver.read().unwrap();
+        let mut changed_tables: Vec<String> = map
+            .iter()
+            .filter(|(_, v)| **v > since_manifest_ver)
+            .map(|(t, _)| t.clone())
+            .collect();
+        changed_tables.sort();
+        Ok(ManifestDelta {
+            changed_tables,
+            full_reload_required: false,
+        })
+    }
+
+    // ---------------------------------------------------------- compaction / 运维
+
+    /// Compaction 提交（L2，§6.3）：旧文件标记 `deleted_at`，新文件 `valid_from = snapshot+1`，
+    /// 一次原子完成；并推进受影响表的 `manifest_ver`（供缓存增量刷新）。
+    async fn commit_compaction(
+        &self,
+        old_batch_ids: &[String],
+        new_files: Vec<FileManifest>,
+    ) -> Result<u64, LakeError> {
+        let next = self.next_snapshot();
+        let mut touched: HashSet<String> = HashSet::new();
+        let mut files = self.files.write().unwrap();
+        // 先确认旧文件仍可见（避免与并发 drop_shard 冲突时错误复活数据）
+        for id in old_batch_ids {
+            if let Some(f) = files.get_mut(id) {
+                if f.deleted_at == 0 {
+                    f.deleted_at = next;
+                }
+                touched.insert(normalize_table(&f.table));
+            }
+        }
+        for mut nf in new_files {
+            nf.valid_from = next;
+            nf.status = FileStatus::Active as u32;
+            touched.insert(normalize_table(&nf.table));
+            files.insert(nf.batch_id.clone(), nf);
+        }
+        drop(files);
+        self.last_applied.fetch_add(1, Ordering::SeqCst);
+        for t in &touched {
+            self.bump_manifest_ver(t);
+        }
+        Ok(next)
+    }
+
+    async fn known_batch_ids(&self) -> Result<Vec<String>, LakeError> {
+        Ok(self.files.read().unwrap().keys().cloned().collect())
     }
 }
 
@@ -561,6 +655,149 @@ mod tests {
         .await
         .unwrap();
         c
+    }
+
+    // ---------------- 版本分组与增量（S2-5 / S2-7）----------------
+
+    /// 建表 / 演进 = 结构变更（`schema_ver`）；提交文件 = 清单变更（`manifest_ver`）。
+    ///
+    /// **两组的价值**：flush 是最高频的写。若共用一个版本号，每次 flush 都会让全表
+    /// schema 缓存失效 → 缓存退化为全量重建。
+    #[tokio::test]
+    async fn version_splits_schema_and_manifest_changes() {
+        let c = MemoryCatalog::new();
+        let v0 = c.version().await;
+        assert_eq!((v0.schema_ver, v0.manifest_ver), (0, 0));
+
+        c.create_table(CreateTableRequest {
+            name: "t".into(),
+            namespace: DEFAULT_SCHEMA.into(),
+            schema: schema(&[("a", DataType::Int64)]),
+            partition_cols: vec![],
+            default_format: "parquet".into(),
+            ingest_config: yuntun_model::meta::IngestConfig::standard(),
+        })
+        .await
+        .unwrap();
+        let v1 = c.version().await;
+        assert_eq!(v1.schema_ver, 1, "建表推 schema_ver");
+        assert_eq!(v1.manifest_ver, 0, "建表不推 manifest_ver");
+
+        commit_one(&c, "t", "b1", 1).await;
+        let v2 = c.version().await;
+        assert_eq!(v2.schema_ver, 1, "提交文件**不得**推 schema_ver");
+        assert_eq!(v2.manifest_ver, 1);
+
+        c.evolve_schema(EvolveSchemaRequest {
+            table: "t".into(),
+            change: SchemaChange::AddColumn {
+                field: Field::new("b", DataType::Int64, true),
+            },
+            expected_version: 1,
+        })
+        .await
+        .unwrap();
+        let v3 = c.version().await;
+        assert_eq!(v3.schema_ver, 2, "schema 演进推 schema_ver");
+        assert_eq!(v3.manifest_ver, 1, "schema 演进不动 manifest_ver");
+    }
+
+    /// 增量接口只报"变过的表"——这是避免"每 flush 全表重拉"的关键。
+    #[tokio::test]
+    async fn manifest_delta_reports_only_changed_tables() {
+        let c = MemoryCatalog::new();
+        for name in ["t1", "t2"] {
+            c.create_table(CreateTableRequest {
+                name: name.into(),
+                namespace: DEFAULT_SCHEMA.into(),
+                schema: schema(&[("a", DataType::Int64)]),
+                partition_cols: vec![],
+                default_format: "parquet".into(),
+                ingest_config: yuntun_model::meta::IngestConfig::standard(),
+            })
+            .await
+            .unwrap();
+        }
+        commit_one(&c, "t1", "b1", 1).await;
+        let after_t1 = c.version().await.manifest_ver;
+
+        // 无变更 → 空增量（零开销返回）
+        let d = c.manifest_delta(after_t1).await.unwrap();
+        assert!(d.is_empty(), "无变更应返回空增量: {d:?}");
+
+        commit_one(&c, "t2", "b2", 2).await;
+        let d = c.manifest_delta(after_t1).await.unwrap();
+        assert_eq!(d.changed_tables, vec!["public.t2".to_string()]);
+        assert!(!d.full_reload_required);
+
+        // since 落后到起点 → 两张表都在（首次刷新必须拿到全部）
+        let d = c.manifest_delta(0).await.unwrap();
+        assert_eq!(
+            d.changed_tables,
+            vec!["public.t1".to_string(), "public.t2".to_string()]
+        );
+    }
+
+    /// 删表：结构与清单同时变（schema_ver 让调用方全量重建，增量也报该表）。
+    #[tokio::test]
+    async fn drop_table_advances_both_versions() {
+        let c = catalog_with_table().await;
+        commit_one(&c, "audit", "b1", 1).await;
+        let before = c.version().await;
+
+        c.drop_table("audit").await.unwrap();
+        let after = c.version().await;
+        assert!(after.schema_ver > before.schema_ver, "删表推 schema_ver");
+        assert!(after.manifest_ver > before.manifest_ver, "删表推 manifest_ver");
+
+        let d = c.manifest_delta(before.manifest_ver).await.unwrap();
+        assert!(
+            d.changed_tables.contains(&"public.audit".to_string()),
+            "增量必须报出被删的表，否则调用方会留着过期缓存: {d:?}"
+        );
+    }
+
+    /// compaction 提交同样推 manifest_ver（否则查询缓存看不到合并结果）。
+    #[tokio::test]
+    async fn commit_compaction_advances_manifest_version_of_old_and_new_tables() {
+        let c = catalog_with_table().await;
+        commit_one(&c, "audit", "b1", 1).await;
+        let v0 = c.version().await.manifest_ver;
+
+        let new_file = FileManifest {
+            file_path: "yuntun/public/audit/dt=w/shard=s0/merged.parquet".into(),
+            batch_id: "merged1".into(),
+            table: "public.audit".into(),
+            shard: "s0".into(),
+            time_window: "w".into(),
+            row_count: 3,
+            ..Default::default()
+        };
+        c.commit_compaction(&["b1".to_string()], vec![new_file])
+            .await
+            .unwrap();
+        assert!(c.version().await.manifest_ver > v0);
+        let d = c.manifest_delta(v0).await.unwrap();
+        assert_eq!(d.changed_tables, vec!["public.audit".to_string()]);
+    }
+
+    async fn commit_one(c: &MemoryCatalog, table: &str, batch_id: &str, snapshot_hint: u64) {
+        let _ = snapshot_hint;
+        c.commit_files(CommitFilesRequest {
+            table: table.into(),
+            batch_id: batch_id.into(),
+            client_request_id: None,
+            shard: "s0".into(),
+            time_window: "w".into(),
+            files: vec![FileManifest {
+                file_path: format!("yuntun/public/{table}/dt=w/shard=s0/{batch_id}.parquet"),
+                ..Default::default()
+            }],
+            schema_version: 1,
+            row_count: 1,
+        })
+        .await
+        .unwrap();
     }
 
     fn manifest(batch_id: &str, path: &str) -> FileManifest {
@@ -788,7 +1025,10 @@ mod tests {
             .unwrap();
         assert!(files.is_empty(), "Manifest 已移除（数据文件转孤儿）");
         assert!(
-            !c.known_batch_ids().contains(&"b1".to_string()),
+            !c.known_batch_ids()
+                .await
+                .unwrap()
+                .contains(&"b1".to_string()),
             "batch 不再已知 → 孤儿清理可回收"
         );
         assert!(matches!(

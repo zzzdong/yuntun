@@ -125,7 +125,7 @@ async fn count_rows(lakehouse: &Lakehouse) -> i64 {
     tokio::time::sleep(Duration::from_millis(700)).await;
     lakehouse
         .query
-        .cache()
+        .catalog()
         .refresh(&(lakehouse.catalog.clone() as Arc<dyn CatalogOps>))
         .await
         .unwrap();

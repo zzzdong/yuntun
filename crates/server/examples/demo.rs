@@ -205,7 +205,7 @@ scan_interval_ms = 50
     // ---- ⑥ SQL 查询（走 Flight do_get 外部通道：Ticket = SQL）----
     lakehouse
         .query
-        .cache()
+        .catalog()
         .refresh(&(lakehouse.catalog.clone() as Arc<dyn CatalogOps>))
         .await?;
 
@@ -267,7 +267,7 @@ scan_interval_ms = 50
     tokio::time::sleep(Duration::from_millis(700)).await;
     lakehouse
         .query
-        .cache()
+        .catalog()
         .refresh(&(lakehouse.catalog.clone() as Arc<dyn CatalogOps>))
         .await?;
     run(
@@ -279,7 +279,7 @@ scan_interval_ms = 50
     tokio::time::sleep(Duration::from_millis(700)).await;
     lakehouse
         .query
-        .cache()
+        .catalog()
         .refresh(&(lakehouse.catalog.clone() as Arc<dyn CatalogOps>))
         .await?;
     print_batches(

@@ -11,7 +11,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use yuntun_catalog::{CatalogOps, MemoryCatalog};
 use yuntun_model::error::LakeError;
 use yuntun_model::ops::CreateTableRequest;
-use yuntun_query::{LocalCatalogCache, QueryEngine};
+use yuntun_query::{LocalCatalog, QueryEngine};
 use yuntun_store::{RemoteShard, ShardFetch, ShardId, ShardTier};
 
 /// 假传输：一份静态的"远端分片服务"数据（不依赖 MemoryShard，真正独立）。
@@ -79,7 +79,7 @@ async fn query_reads_hot_data_through_remote_shard_reader() {
         Arc::new(RemoteShard::new(Arc::new(CannedFetch { entries })));
     assert_eq!(reader.tier(), ShardTier::Memory);
 
-    let cache = Arc::new(LocalCatalogCache::new());
+    let cache = Arc::new(LocalCatalog::new());
     cache.set_hot_shards(reader);
     cache.refresh(&catalog).await.unwrap();
 

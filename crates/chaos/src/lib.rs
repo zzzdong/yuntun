@@ -134,7 +134,7 @@ async fn build(
     ));
     // 崩溃恢复分流（build 阶段，模拟 Lakehouse::build_with_shutdown 行为）
     ingestor.resume_recovered().await.unwrap();
-    let cache = Arc::new(yuntun_query::LocalCatalogCache::new());
+    let cache = Arc::new(yuntun_query::LocalCatalog::new());
     let engine = Arc::new(QueryEngine::new(
         yuntun_store::create_store(&yuntun_store::StoreConfig::Local {
             root: store_root.to_string_lossy().to_string(),
@@ -201,13 +201,18 @@ async fn crash_recovery_no_data_loss() {
         let _acc = cur.ingestor.clone().spawn_accumulator(shutdown.clone());
 
         // ④ 查询计数 == 累计 acked 行数（无丢失、无重复）。
-        // 真实磁盘上"WAL 重放 → flush → commit"可能超过固定等待 → 轮询（上限 30s）；
+        // 真实磁盘上"WAL 重放 → flush → commit"可能超过固定等待 → 轮询；
         // tmpfs 上通常首轮即满足。
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        //
+        // 上限 60s：本断言验证的是**数据不丢**（正确性），不是恢复延迟（性能）。
+        // cargo 默认**并行跑所有 test binary**，本套件会与另外 46 个 binary 争 CPU/IO，
+        // 实测并行负载下 30s 可能不足（单跑 1.3s）。恢复延迟的指标留给阶段 2 的压测，
+        // 不在这里用超时冒充（去 flaky 的根治见 plan.md T6.1：chaos 独立跑）。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         let mut got: u64;
         loop {
             cur.engine
-                .cache()
+                .catalog()
                 .refresh(&(cur.catalog.clone() as Arc<dyn yuntun_catalog::CatalogOps>))
                 .await
                 .unwrap();
@@ -357,7 +362,8 @@ async fn query_multi_version_alignment() {
     // flush 两个批次（轮询等待落盘；真实磁盘 + 并发负载下固定 sleep 不可靠）
     let shutdown = CancellationToken::new();
     let _acc = setup.ingestor.clone().spawn_accumulator(shutdown.clone());
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    // 同上：多 binary 并行下的负载余量（该断言关注"最终一致"，不关注延迟）
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let snap = setup.catalog.current_snapshot().await;
         let n = setup
@@ -376,7 +382,7 @@ async fn query_multi_version_alignment() {
     // 查询：统一到 v2 schema；v1 文件缺失 b 列 → null 填充
     setup
         .engine
-        .cache()
+        .catalog()
         .refresh(&(setup.catalog.clone() as Arc<dyn yuntun_catalog::CatalogOps>))
         .await
         .unwrap();

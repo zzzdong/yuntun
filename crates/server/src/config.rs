@@ -21,6 +21,7 @@
 //! soft_pct = 60                       # 背压阶梯（架构 §2.7）
 //! hard_pct = 80
 //! reject_pct = 95
+//! metrics_log_interval_secs = 30     # 指标周期打点（0 = 关闭，T6.12）
 //!
 //! [ingest]
 //! default_format = "parquet"
@@ -164,6 +165,11 @@ pub struct ChunkSection {
     pub hard_pct: u8,
     /// 背压阶梯：>= reject 拒绝写入（RESOURCE_EXHAUSTED）
     pub reject_pct: u8,
+    /// 指标周期打点间隔（秒，T6.12）；`0` = 关闭。
+    ///
+    /// 打点内容是"故障现场三件套"：内存水位 / WAL 积压 / 背压水位 + Catalog 版本，
+    /// 用一条结构化日志输出（standalone 阶段即运维的第一手现场）。
+    pub metrics_log_interval_secs: u64,
 }
 
 impl Default for ChunkSection {
@@ -176,6 +182,7 @@ impl Default for ChunkSection {
             soft_pct: 60,
             hard_pct: 80,
             reject_pct: 95,
+            metrics_log_interval_secs: 30,
         }
     }
 }

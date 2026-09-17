@@ -549,7 +549,7 @@ impl SqlEngine {
                         let select_sql = src.body.to_string();
                         // 读源前刷新本地缓存：尽量覆盖最近已 commit 的文件（§4.5 可见性）
                         self.query
-                            .cache()
+                            .catalog()
                             .refresh(&self.catalog)
                             .await
                             .map_err(|e| SqlError::Internal(e.to_string()))?;
@@ -605,7 +605,7 @@ impl SqlEngine {
                 .await?;
                 // DataFusion 本地缓存立即感知新表（INSERT ... SELECT 源可立即引用）
                 self.query
-                    .cache()
+                    .catalog()
                     .refresh(&self.catalog)
                     .await
                     .map_err(|e| SqlError::Internal(e.to_string()))?;
@@ -640,7 +640,7 @@ impl SqlEngine {
                                     .await?;
                                     // DataFusion 本地缓存立即感知表移除
                                     self.query
-                                        .cache()
+                                        .catalog()
                                         .refresh(&self.catalog)
                                         .await
                                         .map_err(|e| SqlError::Internal(e.to_string()))?;

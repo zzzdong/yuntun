@@ -129,6 +129,92 @@ async fn ingest_accumulate_flush_reaches_manifest_and_wal_terminal() {
     assert_eq!(rows, 3);
 }
 
+/// 指标口径回归（`plan.md` T6.12）：`wal_backlog` 是**半开区间**差值。
+///
+/// `synced_seq` 是含端点的最高已 fsync seq，`absorbed_seq` 是"下一条待吸收 seq"，
+/// 因此积压 = `synced_seq + 1 - absorbed_seq`。**差一**就会在空闲时谎报积压
+/// （或更糟：在真积压时谎报 0），而这类错误只会体现在运维判断上，不会让任何功能测试变红。
+#[tokio::test]
+async fn wal_backlog_counts_fsynced_but_unabsorbed_records() {
+    let wal_guard = yuntun_testkit::TestDir::tmpfs("backlog-wal");
+    let wal_dir = wal_guard.path().to_path_buf();
+
+    let catalog: Arc<dyn CatalogOps> = Arc::new(MemoryCatalog::new());
+    let store = yuntun_store::create_store(&yuntun_store::StoreConfig::Memory).unwrap();
+    catalog
+        .create_table(CreateTableRequest {
+            name: "t".into(),
+            namespace: yuntun_model::ops::DEFAULT_SCHEMA.into(),
+            schema: table_schema(),
+            partition_cols: vec![],
+            default_format: "parquet".into(),
+            ingest_config: yuntun_model::meta::IngestConfig {
+                require_idempotency_key: false,
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+
+    let wal = yuntun_wal::writer::WalWriter::open(yuntun_wal::WalConfig::for_dir(&wal_dir), 0)
+        .await
+        .unwrap();
+    // 阈值拉满：只观察"吸收"，不触发 flush
+    let mut cfg = eager_config(&wal_dir);
+    cfg.rows_threshold = usize::MAX;
+    cfg.bytes_threshold = usize::MAX;
+    cfg.max_flush_delay_secs = 3600;
+    let ingestor = Arc::new(Ingestor::new(cfg, wal.clone(), catalog.clone(), store));
+
+    for v in [1i64, 2] {
+        ingestor
+            .ingest(IngestBatch {
+                table: "t".into(),
+                shard_key: "s0".into(),
+                record_batch: arrow::record_batch::RecordBatch::try_new(
+                    table_schema(),
+                    vec![Arc::new(Int64Array::from(vec![v]))],
+                )
+                .unwrap(),
+                idempotency_key: None,
+                received_at: std::time::SystemTime::now(),
+            })
+            .await
+            .unwrap();
+    }
+
+    // 攒批线程尚未启动：两条 Data 记录全部处于"已 fsync 未吸收" → 积压 = 2
+    assert_eq!(wal.synced_seq(), 1);
+    assert_eq!(ingestor.absorbed_seq(), 0);
+    assert_eq!(ingestor.wal_backlog(), 2, "积压 = synced + 1 - absorbed");
+
+    // 启动攒批：吸收完两条后积压归零
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let handle = ingestor.clone().spawn_accumulator(shutdown.clone());
+    let mut backlog = ingestor.wal_backlog();
+    for _ in 0..100 {
+        backlog = ingestor.wal_backlog();
+        if backlog == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    shutdown.cancel();
+    let _ = handle.await;
+
+    assert_eq!(backlog, 0, "吸收完成后积压必须归零（空闲时谎报积压会误导运维）");
+    assert!(ingestor.absorbed_seq() > wal.synced_seq());
+    // 数据确实进了 chunk（可见性承诺），只是还没落盘
+    let rows: usize = ingestor
+        .chunks()
+        .read_table_sync("public.t", 0)
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(rows, 2);
+    assert_eq!(ingestor.chunk_stats().flushed, 0, "阈值拉满时不应 flush");
+}
+
 #[tokio::test]
 async fn sealed_chunk_survives_satisfies_wal_recovery_contract() {
     // 未 flush 的 chunk 保持可见（可见性上界绑 WAL，不绑 flush）

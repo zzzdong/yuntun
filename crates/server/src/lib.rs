@@ -34,6 +34,148 @@ pub struct Lakehouse {
     pub shutdown: CancellationToken,
 }
 
+// ---------------------------------------------------------------- 观测（T6.12）
+
+/// chunk 区指标。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChunkMetrics {
+    pub chunks: usize,
+    pub open: usize,
+    pub sealed: usize,
+    pub spilled: usize,
+    pub flushed: usize,
+    /// 账本口径的内存占用（字节）
+    pub resident_bytes: usize,
+    pub budget_bytes: usize,
+    /// 背压水位（比例）
+    pub pressure_ratio: f64,
+    pub pressure: String,
+}
+
+/// WAL 指标。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WalMetrics {
+    /// 已 fsync 的最高 seq（可见性上界）
+    pub synced_seq: u64,
+    pub next_seq: u64,
+    pub current_segment: u64,
+    /// 攒批线程已吸收到的 seq
+    pub absorbed_seq: u64,
+    /// **WAL 积压记录数**：已 fsync 但尚未进 chunk —— 内存越限的缓冲池
+    pub backlog_records: u64,
+    /// WAL 目录字节数（磁盘占用）
+    pub dir_bytes: u64,
+}
+
+/// Catalog 本地物化视图指标。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CatalogMetrics {
+    pub schema_ver: u64,
+    pub manifest_ver: u64,
+    pub snapshot: u64,
+    pub tables: usize,
+    pub refreshes: u64,
+    pub full_reloads: u64,
+    /// 增量路径累计重拉的表数（对比 `full_reloads` 可看出增量的收益）
+    pub delta_tables: u64,
+    /// 最近一次刷新失败原因（None = 健康；刷新失败会保留旧快照）
+    pub last_error: Option<String>,
+}
+
+/// query 执行区指标。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QueryMetrics {
+    pub reserved_bytes: Option<usize>,
+    pub limit_bytes: Option<usize>,
+}
+
+/// **运行期可观测快照**（`plan.md` T6.12）。
+///
+/// 三项"故障现场三件套"：**内存水位**（chunk）、**WAL 积压**（吸收是否落后）、
+/// **背压水位**（写入被拒的边缘）。没有这三项时，压力类问题只能复现不能定位。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LakehouseMetrics {
+    pub chunk: ChunkMetrics,
+    pub wal: WalMetrics,
+    pub catalog: CatalogMetrics,
+    pub query: QueryMetrics,
+}
+
+impl Lakehouse {
+    /// 采集一次指标快照（`plan.md` T6.12 的单一实现；后台打点复用同一函数）。
+    pub async fn metrics(&self) -> LakehouseMetrics {
+        collect_metrics(&self.ingestor, &self.query, &self.catalog, &self.wal).await
+    }
+}
+
+/// 指标采集的**唯一实现**（同步/异步调用方共用，避免两处口径漂移）。
+///
+/// 四个句柄即可覆盖全部指标，因此不持有整个 `Lakehouse`：
+/// 后台打点任务只 clone 这四样，不必让 `Lakehouse` 变成 `'static`/`Arc`。
+pub async fn collect_metrics(
+    ingestor: &Arc<Ingestor>,
+    query: &Arc<QueryEngine>,
+    catalog: &Arc<MemoryCatalog>,
+    wal: &WalWriter,
+) -> LakehouseMetrics {
+    let cs = ingestor.chunk_stats();
+    let chunks = ingestor.chunks();
+    let ledger = chunks.ledger();
+    LakehouseMetrics {
+        chunk: ChunkMetrics {
+            chunks: cs.chunks,
+            open: cs.open,
+            sealed: cs.sealed,
+            spilled: cs.spilled,
+            flushed: cs.flushed,
+            resident_bytes: cs.resident_bytes,
+            budget_bytes: ledger.limit(),
+            pressure_ratio: ledger.ratio(),
+            pressure: format!("{:?}", cs.pressure),
+        },
+        wal: WalMetrics {
+            synced_seq: wal.synced_seq(),
+            next_seq: wal.next_seq(),
+            current_segment: wal.current_segment(),
+            absorbed_seq: ingestor.absorbed_seq(),
+            backlog_records: ingestor.wal_backlog(),
+            dir_bytes: dir_bytes(&wal.shard_dir()),
+        },
+        catalog: {
+            let v = catalog.version().await;
+            let stats = query.catalog().stats();
+            CatalogMetrics {
+                schema_ver: v.schema_ver,
+                manifest_ver: v.manifest_ver,
+                snapshot: stats.snapshot,
+                tables: stats.tables,
+                refreshes: stats.refreshes,
+                full_reloads: stats.full_reloads,
+                delta_tables: stats.delta_tables,
+                last_error: query.catalog().last_error(),
+            }
+        },
+        query: QueryMetrics {
+            reserved_bytes: query.query_memory_reserved(),
+            limit_bytes: query.query_memory_limit(),
+        },
+    }
+}
+
+/// 目录内文件字节合计（WAL 磁盘占用；失败返回 0，不因观测失败影响主流程）。
+fn dir_bytes(dir: &std::path::Path) -> u64 {
+    std::fs::read_dir(dir)
+        .map(|it| {
+            it.flatten()
+                .filter_map(|e| e.metadata().ok())
+                .filter(|m| m.is_file())
+                .map(|m| m.len())
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+
 impl Lakehouse {
     /// 按配置装配全部组件（不启动服务）。
     pub async fn build(cfg: &Config) -> Result<Self, yuntun_model::error::LakeError> {
@@ -114,9 +256,12 @@ impl Lakehouse {
         }
 
         // ⑥ QueryEngine（缓存刷新在 spawn_background 中启动）
-        let cache = Arc::new(yuntun_query::LocalCatalogCache::new());
+        let cache = Arc::new(yuntun_query::LocalCatalog::new());
         // 读己之写：查询侧接线热数据读侧（进程内 chunk；分离部署换成 `RemoteShard`，零改动）
         cache.set_hot_shards(chunks.clone());
+        // 节点列表进入快照（S2-4）：standalone = 本节点；R4 起由成员发现提供。
+        // 放在快照里是为了让"分片归属"与 schema/manifest 同一版本，避免跨版本拼计划。
+        cache.set_nodes(vec![cfg.chunk.instance_id.clone()]);
         // query 执行区内存池 = 另一块独立预算，超限直接报错而不抢 chunk 内存（架构 §2.8）
         let query = Arc::new(
             QueryEngine::with_query_memory_limit(
@@ -210,14 +355,74 @@ impl Lakehouse {
             self.shutdown.clone(),
         ));
 
+        // 指标周期打点（T6.12）：内存水位 / WAL 积压 / 背压 / Catalog 版本
+        if cfg.chunk.metrics_log_interval_secs > 0 {
+            handles.push(spawn_metrics_log(
+                self,
+                Duration::from_secs(cfg.chunk.metrics_log_interval_secs),
+                self.shutdown.clone(),
+            ));
+        }
+
         handles
     }
+}
+
+/// 指标周期打点（`plan.md` T6.12）。
+///
+/// **为什么单独做这件事**：压力类故障（内存越限、写入被拒、恢复变慢）在缺少指标时
+/// 只能靠复现，无法定位。这里把"内存水位 / WAL 积压 / 背压 / Catalog 版本增量"打成
+/// 一条结构化日志 —— standalone 阶段它就是运维的第一手现场。
+pub fn spawn_metrics_log(
+    lh: &Lakehouse,
+    interval: Duration,
+    shutdown: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    let ingestor = lh.ingestor.clone();
+    let query = lh.query.clone();
+    let catalog = lh.catalog.clone();
+    let wal = lh.wal.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = ticker.tick() => {}
+            }
+            let m = collect_metrics(&ingestor, &query, &catalog, &wal).await;
+            tracing::info!(
+                chunk_chunks = m.chunk.chunks,
+                chunk_open = m.chunk.open,
+                chunk_sealed = m.chunk.sealed,
+                chunk_spilled = m.chunk.spilled,
+                chunk_flushed = m.chunk.flushed,
+                chunk_resident_mb = m.chunk.resident_bytes / (1024 * 1024),
+                chunk_budget_mb = m.chunk.budget_bytes / (1024 * 1024),
+                pressure = %m.chunk.pressure,
+                pressure_pct = (m.chunk.pressure_ratio * 100.0) as u64,
+                wal_synced_seq = m.wal.synced_seq,
+                wal_absorbed_seq = m.wal.absorbed_seq,
+                wal_backlog = m.wal.backlog_records,
+                wal_dir_mb = m.wal.dir_bytes / (1024 * 1024),
+                catalog_schema_ver = m.catalog.schema_ver,
+                catalog_manifest_ver = m.catalog.manifest_ver,
+                catalog_tables = m.catalog.tables,
+                catalog_refreshes = m.catalog.refreshes,
+                catalog_full_reloads = m.catalog.full_reloads,
+                catalog_delta_tables = m.catalog.delta_tables,
+                query_mem_reserved_mb = m.query.reserved_bytes.map(|b| b / (1024 * 1024)),
+                "metrics"
+            );
+        }
+    })
 }
 
 /// 启动时重放 WAL 中的 DDL 记录（S1.7）。
 ///
 /// 单节点重启后 MemoryCatalog 为空（C5），SQL CREATE/DROP 的表清单由 WAL Ddl
-/// 记录重建；重放幂等（TableAlreadyExists / TableNotFound 忽略）。
+/// 记录重建；重放幂等（TableAlreadyExists / TableNotFound 忽略），保证 SQL 写入的数据
+/// 崩溃重启后表存在、可恢复（S1.6 验收）。
 async fn replay_wal_ddl(
     catalog: &Arc<MemoryCatalog>,
     wal: &WalWriter,

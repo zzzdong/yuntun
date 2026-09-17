@@ -1,14 +1,19 @@
-//! DataFusion CatalogProvider / SchemaProvider（详细设计 §6.7）。
+//! DataFusion CatalogProvider / SchemaProvider（详细设计 §6.7；S2-4 不可变快照）。
 //!
-//! 读路径全部走本地缓存（C7），同步 + 异步混合 trait 下零网络调用。
+//! 读路径全部走本地快照（C7），同步 + 异步混合 trait 下**零网络调用**。
+//!
+//! **关键点（S2-4）**：provider 持有的是 `Arc<CatalogSnapshot>` —— 一次查询（= 一个
+//! `SessionContext`）在规划期无论调用多少次 `schema()`/`table()`，看到的都是**同一个
+//! Catalog 版本**；`Arc` 共享也省掉了每次 `table()` 深拷贝文件清单的开销。
 
-use crate::cache::LocalCatalogCache;
+use crate::cache::CatalogSnapshot;
 use crate::table::YuntunTableProvider;
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::TableType;
 use std::sync::Arc;
+use yuntun_store::ShardReader;
 
 /// 表类型常量（SchemaProvider::table_type 用）。
 const BASE_TABLE: TableType = TableType::Base;
@@ -16,16 +21,23 @@ const BASE_TABLE: TableType = TableType::Base;
 /// schema 层：表发现（**单个 schema** 的视图，多 schema 时按 namespace 实例化）。
 #[derive(Debug)]
 pub struct YuntunSchemaProvider {
-    cache: Arc<LocalCatalogCache>,
+    snapshot: Arc<CatalogSnapshot>,
     /// 本 provider 对应的 schema（MySQL 的 database 概念）
     namespace: String,
+    /// 热数据读侧（与快照同源注入；`None` = 未接线，退化为纯磁盘分片）
+    hot: Option<Arc<dyn ShardReader>>,
 }
 
 impl YuntunSchemaProvider {
-    pub fn new(cache: Arc<LocalCatalogCache>, namespace: impl Into<String>) -> Self {
+    pub fn new(
+        snapshot: Arc<CatalogSnapshot>,
+        namespace: impl Into<String>,
+        hot: Option<Arc<dyn ShardReader>>,
+    ) -> Self {
         Self {
-            cache,
+            snapshot,
             namespace: namespace.into(),
+            hot,
         }
     }
 }
@@ -33,26 +45,17 @@ impl YuntunSchemaProvider {
 #[async_trait]
 impl SchemaProvider for YuntunSchemaProvider {
     fn table_names(&self) -> Vec<String> {
-        // trait 是同步的：内部用 try_read（缓存从不长锁，不可能失败；
-        // 万一被阻塞返回空列表 —— 绝不 panic 绝不网络调用）
-        self.cache
-            .tables
-            .try_read()
-            .map(|m| {
-                m.values()
-                    .filter(|t| t.meta.schema_name() == self.namespace)
-                    .map(|t| t.meta.name.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+        // 同步 + 不可变快照：无锁、无网络、不 panic
+        self.snapshot.table_names_in(&self.namespace)
     }
 
     async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
-        match self.cache.get_in(&self.namespace, name).await {
-            // 传入热数据读侧：scan 时把内存分片（尚未落盘的热数据）并进文件组（读己之写）
+        match self.snapshot.get_in(&self.namespace, name) {
             Some(t) => Ok(Some(Arc::new(YuntunTableProvider::new(
-                t,
-                self.cache.hot_shards(),
+                self.snapshot.clone(),
+                t.meta.qualified_name(),
+                t.schema.clone(),
+                self.hot.clone(),
             )))),
             None => Ok(None),
         }
@@ -83,44 +86,37 @@ impl SchemaProvider for YuntunSchemaProvider {
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        let ident = yuntun_model::ops::qualified_name(&self.namespace, name);
-        self.cache
-            .tables
-            .try_read()
-            .map(|m| m.contains_key(&ident))
-            .unwrap_or(false)
+        self.snapshot.get_in(&self.namespace, name).is_some()
     }
 }
 
 /// catalog 层：**多 schema**（MySQL 的 database 概念）。
 ///
-/// schema 清单来自本地缓存（刷新时同步 Catalog `list_schemas`），
-/// 每个 schema 实例化一个 [`YuntunSchemaProvider`] 视图。
+/// schema 清单来自快照（S2-4：与表清单同版本），每个 schema 实例化一个
+/// [`YuntunSchemaProvider`] 视图，共享同一份不可变快照。
 #[derive(Debug)]
 pub struct YuntunCatalogProvider {
-    cache: Arc<LocalCatalogCache>,
+    snapshot: Arc<CatalogSnapshot>,
+    hot: Option<Arc<dyn ShardReader>>,
 }
 
 impl YuntunCatalogProvider {
-    pub fn new(cache: Arc<LocalCatalogCache>) -> Self {
-        Self { cache }
+    pub fn new(snapshot: Arc<CatalogSnapshot>, hot: Option<Arc<dyn ShardReader>>) -> Self {
+        Self { snapshot, hot }
     }
 }
 
 impl CatalogProvider for YuntunCatalogProvider {
     fn schema_names(&self) -> Vec<String> {
-        self.cache
-            .schemas
-            .try_read()
-            .map(|v| v.clone())
-            .unwrap_or_default()
+        self.snapshot.schemas.clone()
     }
 
     fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        if self.schema_names().iter().any(|s| s == name) {
+        if self.snapshot.schemas.iter().any(|s| s == name) {
             Some(Arc::new(YuntunSchemaProvider::new(
-                self.cache.clone(),
+                self.snapshot.clone(),
                 name.to_string(),
+                self.hot.clone(),
             )))
         } else {
             None
