@@ -76,6 +76,16 @@ impl yuntun_wal::cleanup::BatchStateView for LiveBatchTracker {
             .cloned()
             .collect()
     }
+
+    /// 与 WAL 保持一致：`BatchAbort` 是**终态**（C4），`apply_record` 会移除该状态。
+    ///
+    /// 少了这一步，"已被放弃的批次"会一直留在 `non_terminal()` 里，
+    /// 它的 `wal_seq_range` 会永远挡住 segment 释放（见 trait 上的说明）。
+    fn note_abort(&self, batch_id: &str) {
+        self.observe(&Record::BatchAbort(BatchAbortPayload {
+            batch_id: batch_id.to_string(),
+        }));
+    }
 }
 
 /// flush 依赖集合（**只含外部资源**：WAL / Catalog / 对象存储 / 批次追踪器）。

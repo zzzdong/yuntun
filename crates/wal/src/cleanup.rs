@@ -20,6 +20,16 @@ use yuntun_model::wal_record::Record;
 pub trait BatchStateView: Send + Sync {
     /// 全部非终态批次（Pending / S3Written）
     fn non_terminal(&self) -> Vec<BatchState>;
+
+    /// 监控线程写入一发 `BatchAbort` 之后**通知视图**，使其与 WAL 保持一致。
+    ///
+    /// 【为什么必须有】否则"已被 abort 的批次"仍留在 [`Self::non_terminal`] 里，
+    /// 它的 `wal_seq_range` 会一直挡住 segment 释放 ——
+    /// 于是 WAL 磁盘**只增不减**，与 §5.3.6.1 期望的"abort 后 segment 立刻可回收"不符。
+    /// 症状很隐蔽：批次确实被放弃了，但它的 segment 永远留着。
+    ///
+    /// 默认空实现：只读视图（如测试桩、纯查询视图）无需关心。
+    fn note_abort(&self, _batch_id: &str) {}
 }
 
 /// 磁盘使用率提供者（0.0 ~ 1.0）。
@@ -103,6 +113,9 @@ pub fn spawn_timeout_monitor(
                         .await
                     {
                         tracing::error!(error = %e, "failed to append BatchAbort");
+                    } else {
+                        // 视图必须同步：否则该批次的 wal_seq_range 会一直挡住 segment 释放
+                        view.note_abort(&st.batch_id);
                     }
                     // 该 batch 若已写 S3 → 文件成为孤儿，由孤儿清理回收
                 }
@@ -119,13 +132,17 @@ pub fn spawn_timeout_monitor(
                             usage = %disk.usage(),
                             "disk watermark exceeded, force aborting oldest batch"
                         );
-                        let _ = wal
+                        let r = wal
                             .append(Record::BatchAbort(
                                 yuntun_model::wal_record::BatchAbortPayload {
                                     batch_id: oldest.batch_id.clone(),
                                 },
                             ))
                             .await;
+                        if r.is_ok() {
+                            // 同 ①：视图不同步 → 被放弃的批次会一直挡住 segment 释放
+                            view.note_abort(&oldest.batch_id);
+                        }
                     }
                 }
             }

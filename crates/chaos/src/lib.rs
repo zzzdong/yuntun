@@ -33,8 +33,8 @@
 //! | 7 | WAL 撕裂 | ✅ | `torn_wal_tail_is_rejected_and_prefix_survives`（曾抓出"撕裂后无法自愈"的缺陷，已在 `WalWriter::open` 截断修复，见 `operation-log §29.1` / R-14） |
 //! | 8 | 并发写 + fsync 前/中/后 kill | ❌ | 需要 fsync 注入点 |
 //! | 9 | `synced_seq`（write 后 fsync 前 kill） | ✅ | `accumulator_never_reads_beyond_synced_seq`（未 fsync 的记录物理在盘上但绝不被吸收） |
-//! | 10 | Batch 超时 + segment 释放 | ⚠️ 仅监控层 | `wal::cleanup::monitor_aborts_timed_out_batches`（未断言 segment 释放） |
-//! | 11 | 磁盘水位强制 abort | ⚠️ 仅监控层 | `wal::cleanup::monitor_force_aborts_on_disk_watermark` |
+//! | 10 | Batch 超时 + segment 释放 | ✅ | `batch_timeout_releases_segment_after_object_store_failure`（对象存储不可写 → 批次卡 Pending → 超时 abort → **segment 回收**） |
+//! | 11 | 磁盘水位强制 abort | ✅ | `disk_watermark_aborts_oldest_batch_then_releases_segments`（优先 abort **最老**批次；全部终态后回收） |
 //!
 //! **"单测有"不等于"通过"**：单测覆盖的是解码/判定的**纯逻辑**，
 //! chaos 层要的是真实磁盘 + 跨重启 + 并发下的端到端证据。表里标 ⚠️ 的都还欠这一层。
@@ -69,6 +69,9 @@ use yuntun_model::ops::CreateTableRequest;
 use yuntun_model::IngestBatch;
 #[cfg(test)]
 use yuntun_query::QueryEngine;
+// 供 `tracker.non_terminal()` 的方法解析（trait 实现已在 ingest 侧）
+#[cfg(test)]
+use yuntun_wal::cleanup::BatchStateView as _;
 
 /// 一套可重建的 Lakehouse 组件（chaos 轮次间共享目录）。
 #[cfg(test)]
@@ -136,6 +139,28 @@ async fn build_with_delay(
     tables: &[(&str, arrow::datatypes::SchemaRef, bool)],
     max_flush_delay_secs: u64,
 ) -> Setup {
+    build_full(
+        wal_dir,
+        store_root,
+        tables,
+        max_flush_delay_secs,
+        yuntun_wal::WalConfig::for_dir(wal_dir),
+    )
+    .await
+}
+
+/// 全参数版本：额外可覆盖 WAL 配置（segment 轮转大小 / 监控间隔 / 水位 / 批次超时）。
+///
+/// 磁盘水位与批次超时这两类场景**必须**能压小 `segment_max_size`（逼出轮转）
+/// 与 `monitor_interval`（否则要等 60s 一轮），所以需要这个入口。
+#[cfg(test)]
+async fn build_full(
+    wal_dir: &std::path::Path,
+    store_root: &std::path::Path,
+    tables: &[(&str, arrow::datatypes::SchemaRef, bool)],
+    max_flush_delay_secs: u64,
+    wal_cfg: yuntun_wal::WalConfig,
+) -> Setup {
     let catalog = Arc::new(MemoryCatalog::new());
     // 恢复表定义（模拟 raft snapshot；已存在则跳过）
     for (name, schema, require_key) in tables {
@@ -160,9 +185,7 @@ async fn build_with_delay(
         root: store_root.to_string_lossy().to_string(),
     })
     .unwrap();
-    let wal = yuntun_wal::writer::WalWriter::open(yuntun_wal::WalConfig::for_dir(wal_dir), 0)
-        .await
-        .unwrap();
+    let wal = yuntun_wal::writer::WalWriter::open(wal_cfg, 0).await.unwrap();
     let cfg = IngestorConfig {
         rows_threshold: 1,
         time_threshold_secs: 0,
@@ -1194,6 +1217,221 @@ async fn commit_to_mark_window_must_not_double_count() {
         hot_at_s, 0,
         "快照 S 已包含该批数据的文件，热数据不得同时可见（重复计数窗口）"
     );
+}
+
+// ---------------------------------------------------------------- 磁盘保护与批次超时
+
+/// 把目录改成只读（**模拟对象存储不可用**）。
+///
+/// 用权限而不是 mock：路径与"真实落盘语义"一致（chaos 本就用真实磁盘），
+/// 且不需要给 `object_store` 写一整套失败替身。
+/// ⚠️ 以 root 运行时 chmod 不生效 —— 因此用例里有"必须产生非终态批次"的前置断言，
+/// 夹具失效会立刻报出来，而不是让用例悄悄变成空测试。
+#[cfg(test)]
+fn set_readonly(dir: &std::path::Path, read_only: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = if read_only { 0o555 } else { 0o755 };
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// 固定水位的盘用量探针（模拟"磁盘填到 X%"）。
+#[cfg(test)]
+struct FixedUsage(f64);
+
+#[cfg(test)]
+impl yuntun_wal::cleanup::DiskUsage for FixedUsage {
+    fn usage(&self) -> f64 {
+        self.0
+    }
+}
+
+/// 等 `cond` 成立（超时即失败）。cond 为真时返回它。
+#[cfg(test)]
+async fn wait_until<T>(what: &str, mut cond: impl FnMut() -> Option<T>) -> T {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(v) = cond() {
+            return v;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "等待超时：{what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// T6.10（`design.md` §12.3 #10）：**Batch 超时 + segment 释放**。
+///
+/// 场景：**对象存储写不进去**（把 store 根目录置为只读，等价于"S3 永久不可用"）。
+/// flush 走在"写 S3"这一步失败 → 批次停在 `Pending`（非终态）。
+/// 之后监控线程应按 `batch_timeout` 写 `BatchAbort`，把批次变成终态，
+/// 并**回收其 segment** —— `§5.3.6.1` 要的正是"垃圾桶（segment）别一直涨"。
+///
+/// ⚠️ 这里同时验证一个曾经的缺口：监控线程写了 `BatchAbort` 却**不更新视图**，
+/// 于是"已放弃的批次"仍留在 `non_terminal()` 里，它的 `wal_seq_range` 会永远挡住
+/// segment 释放 —— 磁盘只增不减（已修：`BatchStateView::note_abort`）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn batch_timeout_releases_segment_after_object_store_failure() {
+    let _gate = CHAOS_GATE.lock().await;
+    let wal_dir = tmpdir("wal-batch-timeout");
+    let store_root = tmpdir("store-batch-timeout");
+    let mut wal_cfg = yuntun_wal::WalConfig::for_dir(&wal_dir);
+    wal_cfg.segment_max_size = 2048; // 小 segment → 强制轮转（否则无从验证"释放"）
+    wal_cfg.batch_timeout = Duration::from_millis(150);
+    wal_cfg.monitor_interval = Duration::from_millis(20);
+    let setup = build_full(
+        &wal_dir,
+        &store_root,
+        &[("bt", schema(), false)],
+        0,
+        wal_cfg,
+    )
+    .await;
+    let shard_dir = setup.ingestor.wal.shard_dir();
+    let shutdown = CancellationToken::new();
+    let acc = setup.ingestor.clone().spawn_accumulator(shutdown.clone());
+
+    // ① 让对象存储不可写（= S3 永久不可用），再写入几批
+    set_readonly(&store_root, true);
+    for i in 0..3 {
+        ingest_into(&setup, "bt", "s0", 900 + i).await;
+    }
+
+    // ② 前置：flush 必须真的卡成非终态（否则夹具失效，用例会变成空测试）
+    let tracker = setup.ingestor.tracker.clone();
+    wait_until("flush 未产生非终态批次（S3 失败路径没跑到）", || {
+        let nt = tracker.non_terminal();
+        (!nt.is_empty()).then_some(nt)
+    })
+    .await;
+
+    let before = yuntun_wal::segment::list_segments(&shard_dir).unwrap().len();
+    assert!(
+        before >= 2,
+        "需要轮转出多个 segment 才能验证释放（实测 {before} 个，检查 segment_max_size）"
+    );
+
+    // ③ 启动超时监控（真实装配里由 `Lakehouse::spawn_background` 启动）
+    let segments = setup.ingestor.wal.full_recovery().unwrap().segments;
+    let monitor = yuntun_wal::cleanup::spawn_timeout_monitor(
+        setup.ingestor.wal.clone(),
+        tracker.clone(),
+        None, // 水位不参与本用例
+        segments,
+        shutdown.clone(),
+    );
+
+    // ④ 批次超时 → 全部终态（视图同步）
+    wait_until("批次未被 abort", || {
+        tracker.non_terminal().is_empty().then_some(())
+    })
+    .await;
+
+    // ⑤ segment 回收：所有批次终态 → 非活跃 segment 可删（再等几轮监控 tick 执行清理）
+    wait_until("非活跃 segment 未被回收（磁盘会只增不减）", || {
+        let n = yuntun_wal::segment::list_segments(&shard_dir).unwrap().len();
+        (n == 1).then_some(n)
+    })
+    .await;
+
+    shutdown.cancel();
+    let _ = monitor.await;
+    let _ = acc.await;
+    set_readonly(&store_root, false); // 复原，便于目录清理
+}
+
+/// T6.11（`design.md` §12.3 #11）：**磁盘水位** —— 人为把水位抬到 95%，
+/// 验证"强制 abort **最老**的未完成批次"，且最终所有批次终态后 segment 被回收。
+///
+/// 与 `#10` 共用夹具（对象存储不可用 → 批次停在 Pending），
+/// 区别在触发条件：这里是**水位**（batch_timeout 设成 1h，确保只走水位这条路）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disk_watermark_aborts_oldest_batch_then_releases_segments() {
+    let _gate = CHAOS_GATE.lock().await;
+    let wal_dir = tmpdir("wal-watermark");
+    let store_root = tmpdir("store-watermark");
+    let mut wal_cfg = yuntun_wal::WalConfig::for_dir(&wal_dir);
+    wal_cfg.segment_max_size = 2048;
+    wal_cfg.batch_timeout = Duration::from_secs(3600); // 只测水位，隔离批次超时
+    wal_cfg.monitor_interval = Duration::from_millis(20);
+    wal_cfg.disk_high_watermark = 0.80;
+    let setup = build_full(
+        &wal_dir,
+        &store_root,
+        &[("wm", schema(), false)],
+        0,
+        wal_cfg,
+    )
+    .await;
+    let shard_dir = setup.ingestor.wal.shard_dir();
+    let shutdown = CancellationToken::new();
+    let acc = setup.ingestor.clone().spawn_accumulator(shutdown.clone());
+
+    set_readonly(&store_root, true);
+    for i in 0..3 {
+        ingest_into(&setup, "wm", "s0", 950 + i).await;
+    }
+    let tracker = setup.ingestor.tracker.clone();
+    let initial = wait_until("flush 未产生非终态批次", || {
+        let nt = tracker.non_terminal();
+        (nt.len() >= 2).then_some(nt)
+    })
+    .await;
+
+    // 最老的批次 = created_at_ms 最小者（监控线程也按这个排序挑人）
+    let oldest_id = initial
+        .iter()
+        .min_by_key(|s| s.created_at_ms)
+        .unwrap()
+        .batch_id
+        .clone();
+
+    let segments = setup.ingestor.wal.full_recovery().unwrap().segments;
+    let monitor = yuntun_wal::cleanup::spawn_timeout_monitor(
+        setup.ingestor.wal.clone(),
+        tracker.clone(),
+        Some(Arc::new(FixedUsage(0.95))), // > 80% 水位
+        segments,
+        shutdown.clone(),
+    );
+
+    // ① 第一个被 abort 的必须是**最老的**那个批次
+    let after_first = wait_until("水位未触发任何 abort", || {
+        let nt = tracker.non_terminal();
+        (nt.len() < initial.len()).then_some(nt)
+    })
+    .await;
+    assert!(
+        !after_first.iter().any(|s| s.batch_id == oldest_id),
+        "水位应优先 abort 最老的批次（{oldest_id} 仍在：{:?}）",
+        after_first.iter().map(|s| &s.batch_id).collect::<Vec<_>>()
+    );
+
+    // ② 水位持续超限 → 逐个清空；全部终态后 segment 应被回收
+    wait_until("批次未被全部 abort", || {
+        tracker.non_terminal().is_empty().then_some(())
+    })
+    .await;
+    wait_until("非活跃 segment 未被回收", || {
+        let n = yuntun_wal::segment::list_segments(&shard_dir).unwrap().len();
+        (n == 1).then_some(n)
+    })
+    .await;
+
+    // ③ WAL 侧的终态必须与视图一致（视图同步不是"只改内存"）
+    let rec = setup.ingestor.wal.full_recovery().unwrap();
+    assert!(
+        rec.states.states.values().all(|s| s.is_terminal()),
+        "WAL 恢复出的批次应全部终态：{:?}",
+        rec.states
+            .states
+            .iter()
+            .map(|(id, s)| (id.clone(), s.status))
+            .collect::<Vec<_>>()
+    );
+
+    shutdown.cancel();
+    let _ = monitor.await;
+    let _ = acc.await;
+    set_readonly(&store_root, false);
 }
 
 // ---------------------------------------------------------------- WAL 故障语义

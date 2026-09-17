@@ -1612,3 +1612,71 @@ Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
 
 ---
 
+---
+
+## 30. chaos #10/#11 落地 —— 发现：监控线程 abort 后**不同步视图**，segment 永不释放
+
+### 30.0 本轮落地
+
+| # | 场景 | 用例 | 结果 |
+|---|---|---|---|
+| 10 | Batch 超时 + segment 释放（S3 不可用） | `batch_timeout_releases_segment_after_object_store_failure` | ✅ |
+| 11 | 磁盘水位强制 abort 最老批次 | `disk_watermark_aborts_oldest_batch_then_releases_segments` | ✅ |
+
+**夹具新增**（都在测试侧）：
+
+1. `build_full(...)`：可覆盖 `WalConfig` —— 水位/超时场景必须能压小
+   `segment_max_size`（逼出轮转，否则无从验证"释放"）与 `monitor_interval`
+   （否则一轮要等 60s）；
+2. **"S3 永久不可用"用权限实现**：把 store 根目录 `chmod 0o555`，
+   不用给 `object_store` 写整套失败替身。⚠️ 以 root 运行时 chmod 不生效 ——
+   因此用例里有"**必须产生非终态批次**"的前置断言，夹具失效会立即报错，
+   而不是让用例悄悄变成空测试。
+
+### 30.1 缺陷：abort 只写 WAL，不同步视图 → segment 只增不减 + BatchAbort 重复写
+
+`spawn_timeout_monitor` 在两条路径上写 `BatchAbort`（批次超时 / 磁盘水位）后
+**只 append WAL，不通知 `BatchStateView`**。而随后的 segment 清理依赖
+`view.non_terminal()` 给出的 `wal_seq_range` 判断"有没有批次还引用这个 segment"：
+
+```rust
+for st in view.non_terminal() { if st.is_timed_out(..) { wal.append(BatchAbort) } }   // ① 写 WAL
+let non_terminal = view.non_terminal();                                             // ② 仍含刚 abort 的批次
+let ranges = non_terminal.iter().map(|s| s.wal_seq_range);                           // ③ 区间仍在
+if segment_is_removable(.., &ranges) { remove_file(..) }                             // ④ 永远不删
+```
+
+两个后果：
+1. **segment 永不回收** —— 与 §5.3.6.1 期望的"abort 后 segment 立刻可回收"相反，
+   WAL 磁盘只增不减；批次明明已被放弃，它的 segment 却一直留着；
+2. **每轮重复写 `BatchAbort`** —— 视图永远非空 → 下一个 tick 又把同一条 abort 写一遍
+   （生产 `monitor_interval` 是 60s，即每分钟一条无谓记录）。
+
+**修法**：给 `BatchStateView` 加一个默认空实现的 `note_abort(&self, batch_id)`，
+监控线程在 append 成功后调用；`LiveBatchTracker` 的实现就是
+`observe(&Record::BatchAbort{..})` —— 与 WAL 同一份语义（C4：Abort 是终态、状态被移除），
+不是"另设一套内存标记"。默认空实现保证只读视图（测试桩等）无需改动。
+
+**两条路径都要修**：批次超时（①）与磁盘水位（②）各有一处 append。
+
+### 30.2 反证（确认用例不是空测试）
+
+把 `view.note_abort(..)` 临时撤掉 → `batch_timeout_releases_segment_after_object_store_failure`
+**立即失败**在"批次未被 abort"（视图永远非空，60s 超时），且失败点比"segment 未回收"更早
+—— 恰好说明"视图与 WAL 不一致"是最先炸出来的症状。已恢复。
+
+### 30.3 验证与遗留
+
+- `cargo test --workspace`：**212 passed / 0 failed**；`clippy --all-targets` 0 警告；
+  chaos 单包 **12 passed / 1 ignored**（只剩 §28.1）。
+- chaos 进度：**10/11**（`design.md` §12.3 的 11 个场景里只剩 #8）。
+- 遗留：
+
+| # | 项 | 归属 | 说明 |
+|---|---|---|---|
+| 1 | chaos #8（并发写 + fsync 前/中/后 kill） | 阶段 2 | 需要给 `WalWriter` 加 **fsync 注入点**（唯一的场景，必须动生产代码才可测） |
+| 2 | 修复 §28.1（读侧栅栏） | 与 R3 同批 | 见 28.1 |
+| 3 | 谓词下推转 `Exact`（§29.2） | 与 R5 同批 | 必须先转发 filters 到 Parquet 源 |
+| 4 | T8 基线压测 + P0 定案 | 阶段 2 | chaos 11/11 齐了之后的另一半门槛 |
+
+---

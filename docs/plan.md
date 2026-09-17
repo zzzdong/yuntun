@@ -152,7 +152,7 @@ standalone → server → ingest → chunk  → store → model
 | 阶段 0 | — | 写入/查询链路贯通（All-in-One） | ✅ 2026-09-08 |
 | 阶段 1 | — | Standalone 完备（crate 重构 / Flight SQL / SQL 写入 / CLI / 遗留清偿） | ✅ 主要项已完成 |
 | **阶段 1.5** | **R1（← R0）** | **数据平面地基：chunk 层**（内存热数据有界化 / spill / 背压 / 确定性落盘 / scan 接缝） | ✅ **2026-09-15**（§2.4） |
-| 阶段 2 | R0 收尾、R1 收尾 | 质量与性能：Chaos 11 场景 + 压测 baseline + Vortex + **观测指标**；**本阶段同时承担 §2.2 的定案**（阶段 3 的准入门槛） | 部分：观测已落地（T6.12 ✅）；chaos 已到 8/11（§27 / §28.2 / §29.1 已修，§28.1 待与 R3 同批）；压测/定案待做 |
+| 阶段 2 | R0 收尾、R1 收尾 | 质量与性能：Chaos 11 场景 + 压测 baseline + Vortex + **观测指标**；**本阶段同时承担 §2.2 的定案**（阶段 3 的准入门槛） | 部分：观测已落地（T6.12 ✅）；chaos 已到 10/11（§27 / §28.2 / §29.1 / §30 已修，§28.1 待与 R3 同批，只剩 #8 需 fsync 注入点）；压测/定案待做 |
 | 阶段 3 | **R2 → R3 → R4 → R5 → R6** | 分布式化：Catalog 访问形态与抽象补位（R2）→ metanode/raft（R3）→ datanode 化 + **冷热边界按实例**（R4）→ 分布查询/对拍（R5）→ **compaction/GC 全局化**（R6） | **R2 已完成（7/8，见 §7.1）**；R3–R6 待 R2 余项 + 阶段 2 准出（就绪度基线见 §五） |
 | 阶段 4 | R6 之后 | 规模化：外部索引、Iceberg 等（`refactor.md` 未覆盖，留待重新评估） | 待定 |
 
@@ -474,7 +474,7 @@ SQL `INSERT` 返回成功时数据仅落 WAL（与 Flight DoPut 语义一致）�
 
 | ID | 内容 | 说明 | 为什么现在做 |
 |---|---|---|---|
-| T6.1–6.11 | Chaos 11 场景（v1.0 §5.2 全表沿用） | 含并发崩溃、`synced_seq` 验证、Batch 超时、磁盘水位 | 阶段 3 前置：`refactor.md §3` 明文"不要跳过"。**进行中：chaos 层 8/11（#1–#7、#9）；#8/#10/#11 待做**。已抓出四个真缺陷、修掉三个：幂等键不生效（§27 ✅）、恢复重复文件（§28.2 ✅）、**WAL 撕裂不可自愈（§29.1 ✅）**、提交窗口重复计数（§28.1，待与 R3 同批） |
+| T6.1–6.11 | Chaos 11 场景（v1.0 §5.2 全表沿用） | 含并发崩溃、`synced_seq` 验证、Batch 超时、磁盘水位 | 阶段 3 前置：`refactor.md §3` 明文"不要跳过"。**进行中：chaos 层 10/11（只剩 #8 需 fsync 注入点）**。已抓出**五个**真缺陷、修掉四个：幂等键不生效（§27 ✅）、恢复重复文件（§28.2 ✅）、WAL 撕裂不可自愈（§29.1 ✅）、**监控 abort 不同步视图致 segment 永不释放（§30 ✅）**、提交窗口重复计数（§28.1，待与 R3 同批） |
 | T6.12 | **S1-11 观测三项指标** ✅ **已完成（2026-09-17）** | `Lakehouse::metrics()` + 周期打点：chunk 内存水位 / **WAL 积压记录数** / 背压水位 + Catalog 版本与增量统计（可序列化，HTTP 导出待阶段 2 尾） | 没有它，R-7（内存越限）只能复现不能定位 |
 | T6.13 | **P0 定案**（v2.1 新增） | 用 T8 数据定 `flush_phase_spread_secs` / `max_flush_delay_secs` / `rows_threshold`，并**正式修订 ADR-10** | §2.2；未定案就不该改默认值 |
 | T6.14 | **chunk 压力与恢复专项**（v2.1 新增） | 触发 spill 的写入压力；spill 读回失败降级；大基数 `GROUP BY` 挤压 chunk 区（验证硬分区）；崩溃后 spill 清理 | S1 的"真实压力曲线"缺口 |
@@ -679,6 +679,7 @@ R2 Catalog 冻结（✅ 已完成）──► R3 metanode + raft
 | **R-10** | **相位分散量级未定案就被顺手改**（等于静默改掉 ADR-10 削峰） | 中 | 中 | §2.2 P0 + 不变量自检（`max_resident > max_flush_delay + spread`）＋ 改默认值必须附 T8 数据 |
 | **R-11** | **幂等键"看起来有、实际不生效"**（键被丢弃 / 提交不带键 / 无入口预筛）→ 客户端超时重试=静默重复计数；反向修过头则同请求的多批次互相判重=静默丢数据 | **已发生** | 高 | ✅ 已修（`operation-log §27`）：入口预筛 + fsync 后登记 + 恢复重建索引 + 多批次生产点**派生批次键**；新增 chaos #5 与客户端整请求重试用例；缺一条断言就会被"键已透传"的绿色误导 —— **凡是"已具备"的能力都要有一条断言其反面后果的用例** |
 | **R-12** | **提交 → `mark_committed` 窗口内重复计数**：`commit_files` 到 `mark_committed` 之间隔一跳 WAL fsync，此间同一批数据既在文件里又在热数据里 → 快照 ≥ S 的查询**偶发多计**（实测 4→6、9→12） | **已发生** | 中 | 测试已钉（`chaos::commit_to_mark_window_must_not_double_count`，`#[ignore]` 保留一键复现）＋ 精确断言前统一 `wait_hot_drained()`（`operation-log §28.1`）。**修复必须走读侧栅栏**（接缝带上"已知文件/batch 集合"，与 `refactor.md` S5-4 的 `known_manifest_ver` 同向）——锁/提前标记/粗水位三种快修都已论证不成立（§28.1），与 R3 同批设计 |
+| **R-15** | ~~监控线程 abort 后不同步视图~~：`spawn_timeout_monitor` 写 `BatchAbort` 只进 WAL，不通知 `BatchStateView` → 已放弃的批次仍留在 `non_terminal()`、其 `wal_seq_range` 永远挡住 segment 释放（**WAL 磁盘只增不减**），并且每轮重复写一条 `BatchAbort` | **已发生** | 中 | ✅ **已修**（`operation-log §30`）：`BatchStateView` 增默认空实现的 `note_abort`，两条 abort 路径（批次超时 / 磁盘水位）append 成功后调用；`LiveBatchTracker` 用 `observe(BatchAbort)` 实现（与 WAL 同一语义，不另设内存标记）。用例 `chaos::batch_timeout_releases_segment_after_object_store_failure`，撤掉同步即变红 |
 | **R-14** | ~~WAL 撕裂后无法自愈~~：`open_append` 以文件物理长度作追加偏移，新记录写在撕裂的垃圾字节之后，而 replay 扫到撕裂点即停止 → **写入全部成功（ack 正常）但数据全部不可见**，静默、永久 | **已发生** | 高 | ✅ **已修**（`operation-log §29.1`）：`WalWriter::open` 接管目录时（**在打开活跃 segment 之前**）把每个 segment 截断到最后一条完整记录的边界（`set_len` + fsync）；覆盖全部 segment。新增 `segment::repair_torn_tail` + `decode_with_stop`（原 `decode_segment_records` 签名不变）。回归用例：`wal::writer::open_repairs_torn_tail_so_new_appends_are_readable` + chaos #7 转正 |
 | **R-13** | ~~崩溃恢复产出重复文件~~：**同一份 WAL 目录被两个攒批循环消费** —— 轮次间只 `cancel()` 不 await，新循环在旧循环未退出时就开写，同一条 Data 被各吸收一次并各自 flush → **两个文件、持久重复**（9 批次 27 行 → 11 文件 33 行） | **已发生** | 高 | ✅ **已修**（`operation-log §28.2`）：① 夹具 `cancel()` 后 await 循环退出；② 生产 `run_accumulator` 增"退出闸门"（cancel 已置位则本轮不做）。教训升格为通用约束：**节点私有状态（WAL 目录）同一时刻只能有一个消费者** —— R4 的 T12.5（启动即拒绝重复 `instance_id`）是它的显式化 |
 
