@@ -208,6 +208,43 @@ pub fn encode_record(rec: &Record) -> Vec<u8> {
     buf
 }
 
+/// 内部：解码并返回 `(记录, 停止偏移, 是否在文件末尾完整结束)`。
+///
+/// 「停止偏移」= 下一条（撕裂的）记录的**起始字节**，即"最后一条完整记录之后的边界"。
+/// 修复撕裂尾部（[`repair_torn_tail`]）需要它来 `set_len`。
+fn decode_with_stop(header: &FileHeader, data: &[u8]) -> (Vec<(u64, Record)>, usize, bool) {
+    let mut records = Vec::new();
+    let mut seq = header.first_seq;
+    let mut pos = FILE_HEADER_SIZE;
+    loop {
+        if pos + RECORD_HEADER_SIZE > data.len() {
+            // 不足一个 record header：剩余字节不足 9 → 若正好为 0 则完整结束
+            return (records, pos, pos == data.len());
+        }
+        let length = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        let crc = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap());
+        let ty = data[pos + 8];
+        let payload_start = pos + RECORD_HEADER_SIZE;
+        if payload_start + length > data.len() {
+            // 尾部截断（§4.9）：停止 replay
+            return (records, pos, false);
+        }
+        let payload = &data[payload_start..payload_start + length];
+        if record_crc(ty, payload) != crc {
+            // CRC 校验失败 = 撕裂写入边界（§4.9）：停止 replay
+            return (records, pos, false);
+        }
+        match Record::decode(ty, payload) {
+            Ok(rec) => {
+                records.push((seq, rec));
+                seq += 1;
+                pos = payload_start + length;
+            }
+            Err(_) => return (records, pos, false),
+        }
+    }
+}
+
 /// 从 segment 字节流中顺序解出记录，返回 `(序号, Record)`。
 ///
 /// 崩溃恢复正确性核心（§4.9 / C3）：
@@ -218,36 +255,52 @@ pub fn encode_record(rec: &Record) -> Vec<u8> {
 ///
 /// 返回 `(已解出记录, 是否在文件末尾完整结束)`。
 pub fn decode_segment_records(header: &FileHeader, data: &[u8]) -> (Vec<(u64, Record)>, bool) {
-    let mut records = Vec::new();
-    let mut seq = header.first_seq;
-    let mut pos = FILE_HEADER_SIZE;
-    loop {
-        if pos + RECORD_HEADER_SIZE > data.len() {
-            // 不足一个 record header：剩余字节不足 9 → 若正好为 0 则完整结束
-            return (records, pos == data.len());
-        }
-        let length = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-        let crc = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap());
-        let ty = data[pos + 8];
-        let payload_start = pos + RECORD_HEADER_SIZE;
-        if payload_start + length > data.len() {
-            // 尾部截断（§4.9）：停止 replay
-            return (records, false);
-        }
-        let payload = &data[payload_start..payload_start + length];
-        if record_crc(ty, payload) != crc {
-            // CRC 校验失败 = 撕裂写入边界（§4.9）：停止 replay
-            return (records, false);
-        }
-        match Record::decode(ty, payload) {
-            Ok(rec) => {
-                records.push((seq, rec));
-                seq += 1;
-                pos = payload_start + length;
-            }
-            Err(_) => return (records, false),
-        }
+    let (records, _stop, complete) = decode_with_stop(header, data);
+    (records, complete)
+}
+
+/// 把撕裂的 segment **截断到最后一条完整记录的边界**，返回 `(原长度, 新长度)`。
+///
+/// 完整结束（无撕裂）→ 返回 `Ok(None)`，不动文件。
+///
+/// # 为什么必须在"接管 WAL 目录"时做（`operation-log §29.1`）
+/// 追加偏移取自**文件物理长度**（[`SegmentWriter::open_append`]）。若不截断，
+/// 新记录会写在撕裂的垃圾字节**之后**；而 replay 扫到撕裂点就停止 ——
+/// 新记录永远落在"停止点之后"，既不进 chunk 也不落文件。
+/// 症状是**写入全部成功（ack 正常）但数据全部不可见**，且完全静默。
+///
+/// 这是 WAL 的标准修复步骤（"截断到最后一个合法记录边界"）：
+/// 撕裂的那条记录本来就不完整（也没有恢复价值），把它连同之后的垃圾一起丢弃，
+/// 换来"WAL 可继续使用"。
+pub fn repair_torn_tail(path: &Path) -> Result<Option<(u64, u64)>, WalError> {
+    let data = std::fs::read(path)
+        .map_err(|e| WalError::Other(format!("read {}: {e}", path.display())))?;
+    if data.len() < FILE_HEADER_SIZE {
+        return Err(WalError::Other(format!(
+            "segment {} too short ({})",
+            path.display(),
+            data.len()
+        )));
     }
+    if data[0..4] != WAL_MAGIC {
+        return Err(WalError::BadMagic(path.display().to_string()));
+    }
+    let header = FileHeader::decode(&data)?;
+    let (_, stop, complete) = decode_with_stop(&header, &data);
+    if complete {
+        return Ok(None);
+    }
+    let before = data.len() as u64;
+    let f = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|e| WalError::Other(format!("open {} for truncate: {e}", path.display())))?;
+    f.set_len(stop as u64)
+        .map_err(|e| WalError::Other(format!("truncate {}: {e}", path.display())))?;
+    // 修复本身也要落盘：否则下次启动还得再修一次（且可能再次踩到同一问题）
+    f.sync_all()
+        .map_err(|e| WalError::Other(format!("fsync {} after truncate: {e}", path.display())))?;
+    Ok(Some((before, stop as u64)))
 }
 
 /// load_segment 的返回形态：文件头 + (seq, Record) 列表 + 尾部是否撕裂。

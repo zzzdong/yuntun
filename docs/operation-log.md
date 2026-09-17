@@ -1541,7 +1541,7 @@ R4 拆进程时必须有显式约束（启动即拒绝重复 `instance_id`，`pl
 
 生产代码本轮**零改动**（三个场景都是检验既有行为）。
 
-### 29.1 缺陷：WAL 撕裂后无法自愈 → **写入全部成功、数据全部消失**
+### 29.1 缺陷：WAL 撕裂后无法自愈 → **写入全部成功、数据全部消失**（已修）
 
 **实测**：把最新 segment 的尾部截掉 10 字节（模拟掉电撕裂），重启后：
 - 恢复本身成功（CRC 拦下撕裂，不报错）✅
@@ -1563,10 +1563,18 @@ R4 拆进程时必须有显式约束（启动即拒绝重复 `instance_id`，`pl
 **为什么值得排在很前面**：撕裂写入是 WAL 存在的理由（`§4.9` / C3）。
 现在"检测到了撕裂"却"不能恢复使用"，等于把最需要自愈的场景做成了不可用状态。
 
-**正确修法**（属下一步）：恢复时把每个 segment **截断到最后一条完整记录的边界**
-（WAL 标准修复步骤：`set_len(valid_prefix_end)`），再让 writer 从该偏移继续追加。
-`decode_segment_records` 已经返回了"读到哪停的"信息（`complete` 标志 + 记录数），
-只需把"停止位置"回写到文件。用例已就绪，修完把 `#[ignore]` 去掉即可。
+**已修**（R-14）：接管 WAL 目录时先把每个 segment **截断到最后一条完整记录的边界**
+（WAL 标准修复步骤），再让 writer 从该偏移继续追加。三处改动：
+
+| # | 位置 | 改动 |
+|---|---|---|
+| 1 | `wal/src/segment.rs` | 抽出 `decode_with_stop`（多返回"停止偏移 = 撕裂记录起始字节"），`decode_segment_records` 保持原签名不变；新增 `repair_torn_tail(path)`：无撕裂返回 `Ok(None)` 不动文件，有撕裂则 `set_len(stop)` + **fsync**（修复本身也要落盘） |
+| 2 | `wal/src/writer.rs` | `WalWriter::open` **在 `open_active_segment` 之前**调用 `repair_torn_tails`（顺序关键：追加偏移取自文件物理长度）。修复覆盖**全部** segment，不只活跃的 |
+| 3 | 测试 | `wal::writer::open_repairs_torn_tail_so_new_appends_are_readable`（最小回归：8 条 → 撕尾 → 接管 → 文件长度回到 7 条边界、`synced_seq == 6`、**新 append 的 seq 7 必须可被 `scan_from` 读到**、不再报告 torn）；chaos 场景去掉 `#[ignore]` 并恢复原设计断言 |
+
+**验证**：`cargo test --workspace` **210 passed / 0 failed**（连跑两轮）；
+chaos 单包 **10 passed / 1 ignored**（只剩 §28.1）；`clippy` 0 警告。
+撕裂场景现在同时满足：前缀全恢复 + 不产生半个批次 + **恢复后能继续写入且可见**。
 
 ### 29.2 差距：谓词下推只到 `Inexact`，`FilterExec` 未被消除
 
@@ -1596,7 +1604,7 @@ Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
 
 | # | 项 | 归属 | 说明 |
 |---|---|---|---|
-| 1 | **修复 §29.1（撕裂后截断修复）** | 立即 | 恢复时 `set_len` 到最后一条完整记录边界；撕裂场景是 WAL 的立身之本 |
+| 1 | ~~修复 §29.1（撕裂后截断修复）~~ | ✅ **已修** | `WalWriter::open` 接管时 `set_len` 到最后一条完整记录边界（三处改动见 29.1）；用例已取消 `#[ignore]` 并转绿 |
 | 2 | 修复 §28.1（读侧栅栏） | 与 R3 同批 | 见 28.1 |
 | 3 | 谓词下推转 `Exact`（§29.2） | 与 R5 同批 | **必须先转发 filters 到 Parquet 源**，否则静默漏过滤 |
 | 4 | chaos #8（fsync 前/中/后 kill） | 阶段 2 | 需要 `WalWriter` 的 fsync 注入点 |

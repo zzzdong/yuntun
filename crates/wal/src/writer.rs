@@ -91,6 +91,12 @@ impl WalWriter {
         std::fs::create_dir_all(&shard_dir)?;
         fsync_dir(&cfg.dir).ok(); // 确保新建目录项持久化（best effort）
 
+        // 【R-14 / §29.1】接管目录前先**修复撕裂尾部**：把每个 segment 截断到最后一条
+        // 完整记录的边界。必须在 `open_active_segment` 之前 —— 追加偏移取自文件物理长度，
+        // 不截断的话新记录会写在撕裂的垃圾字节之后，而 replay 扫到撕裂点就停止
+        // →「写入全部成功、数据全部不可见」（静默、永久）。
+        repair_torn_tails(&cfg, shard_id)?;
+
         // 快速 replay 确定 next_seq（只取 CRC 边界）
         let rec = recovery::recover(&cfg, shard_id, true)?;
         let next_seq = rec.last_seq; // recover 返回"下一条可用 seq"
@@ -176,6 +182,34 @@ impl WalWriter {
     pub fn full_recovery(&self) -> Result<Recovery, LakeError> {
         recovery::recover(&self.state.cfg, self.state.shard_id, false)
     }
+}
+
+/// 截断所有撕裂 segment 的尾部（R-14 / `operation-log §29.1`）。
+///
+/// **修复范围取全部 segment 而不只是活跃的**：活跃的必须修（否则新写入不可见）；
+/// 陈旧的也顺手修，避免"历史 segment 留一截垃圾"在下一次扫描时再次触发
+/// "replay 停在这里"的困惑（它不影响新写入，但会让人误判边界）。
+fn repair_torn_tails(cfg: &WalConfig, shard_id: u64) -> Result<(), LakeError> {
+    let shard_dir = cfg.shard_dir(shard_id);
+    for (_, path) in list_segments(&shard_dir)? {
+        match crate::segment::repair_torn_tail(&path) {
+            Ok(Some((before, after))) => {
+                tracing::warn!(
+                    segment = %path.display(),
+                    before_bytes = before,
+                    after_bytes = after,
+                    "torn segment tail truncated (wal repaired)"
+                );
+            }
+            Ok(None) => {}
+            // 文件头损坏：与 recovery 的处理保持一致（告警 + 跳过，等人工介入）
+            Err(WalError::BadMagic(p)) => {
+                tracing::error!(segment = %p, "segment header corrupted, skip repair")
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
 }
 
 /// 打开活跃 segment：
@@ -372,6 +406,60 @@ mod tests {
         assert_eq!(wal.next_seq(), 5, "下一条可用 seq");
         let ack = wal.append(rec(99)).await.unwrap();
         assert_eq!(ack.seq, 5);
+    }
+
+    /// 【R-14 回归】撕裂尾部必须在**接管时**被截断 —— 否则新写入永远不可见。
+    ///
+    /// `operation-log §29.1` 的最小复现：追加偏移取自文件物理长度，若不截断，
+    /// 新记录会写在撕裂的垃圾字节**之后**，而 replay 扫到撕裂点就停止
+    /// →「写入全部成功（ack 正常）、数据全部不可见」，且完全静默。
+    #[tokio::test]
+    async fn open_repairs_torn_tail_so_new_appends_are_readable() {
+        let dir = tmpdir("repair");
+        let cfg = WalConfig::for_dir(&dir);
+        let seg = || crate::segment::list_segments(&cfg.shard_dir(0)).unwrap().remove(0).1;
+        let (len7, len8);
+        {
+            let wal = WalWriter::open(cfg.clone(), 0).await.unwrap();
+            for i in 0..7 {
+                wal.append(rec(i)).await.unwrap();
+            }
+            len7 = std::fs::metadata(seg()).unwrap().len();
+            wal.append(rec(7)).await.unwrap(); // 第 8 条：接下来会把它撕掉
+            len8 = std::fs::metadata(seg()).unwrap().len();
+        }
+        // 模拟掉电撕裂：砍掉最后一条记录的尾部
+        let p = seg();
+        let data = std::fs::read(&p).unwrap();
+        std::fs::write(&p, &data[..data.len() - 6]).unwrap();
+        assert_eq!(std::fs::metadata(&p).unwrap().len(), len8 - 6);
+
+        // 接管 WAL 目录：应把尾部截断到最后一条**完整**记录的边界
+        let wal = WalWriter::open(cfg.clone(), 0).await.unwrap();
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().len(),
+            len7,
+            "撕裂尾部必须被截断到第 7 条记录的边界（连同垃圾一起丢弃）"
+        );
+        assert_eq!(wal.synced_seq(), 6, "7 条保留 → 已 fsync 边界是 seq 6");
+        assert_eq!(wal.next_seq(), 7, "下一条可用 seq 从边界续起");
+
+        // 关键回归：新写入必须**落在扫描范围之内**
+        let ack = wal.append(rec(100)).await.unwrap();
+        assert_eq!(ack.seq, 7, "seq 从修复后的边界继续，不回退也不跳号");
+        let recs = crate::reader::WalReader::new(wal.shard_dir())
+            .scan_from(0)
+            .unwrap();
+        assert_eq!(recs.len(), 8, "7 条保留 + 1 条新写 = 8（撕裂那条已被丢弃）");
+        assert_eq!(
+            recs.last().unwrap().0,
+            7,
+            "新记录必须可被读到 —— 修复前它落在撕裂垃圾之后，永远读不到"
+        );
+        assert!(
+            !recovery::recover(&cfg, 0, false).unwrap().torn_write_detected,
+            "修复后不应再报告撕裂（边界已与文件末尾一致）"
+        );
     }
 
     /// 【回归】组提交内每条记录回各自的 seq（旧实现整批都回 last_seq）。

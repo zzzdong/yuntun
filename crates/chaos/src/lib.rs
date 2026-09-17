@@ -30,7 +30,7 @@
 //! | 4 | Schema 变更 + EXPLAIN 谓词下推 | ✅ | `schema_evolution_keeps_predicate_pushed_down`（断言谓词下推；`FilterExec` 未消除属已知差距，`operation-log §29.2`） |
 //! | 5 | 幂等键 + Compaction | ✅ | `idempotency_survives_compaction` |
 //! | 6 | 崩溃恢复（各状态点） | ✅ | `crash_recovery_no_data_loss`（5 轮硬崩溃；曾抓出"同一 WAL 目录两个消费者"的重复文件缺陷，已修，见 `operation-log §28.2`） |
-//! | 7 | WAL 撕裂 | ⚠️ **已知缺陷** | `torn_wal_tail_is_rejected_and_prefix_survives`：撕裂能被 CRC 拦下，但**撕裂后无法自愈**（新写入永不可见）→ `operation-log §29.1` |
+//! | 7 | WAL 撕裂 | ✅ | `torn_wal_tail_is_rejected_and_prefix_survives`（曾抓出"撕裂后无法自愈"的缺陷，已在 `WalWriter::open` 截断修复，见 `operation-log §29.1` / R-14） |
 //! | 8 | 并发写 + fsync 前/中/后 kill | ❌ | 需要 fsync 注入点 |
 //! | 9 | `synced_seq`（write 后 fsync 前 kill） | ✅ | `accumulator_never_reads_beyond_synced_seq`（未 fsync 的记录物理在盘上但绝不被吸收） |
 //! | 10 | Batch 超时 + segment 释放 | ⚠️ 仅监控层 | `wal::cleanup::monitor_aborts_timed_out_batches`（未断言 segment 释放） |
@@ -1202,24 +1202,21 @@ async fn commit_to_mark_window_must_not_double_count() {
 ///
 /// # 这个用例断言的是"崩溃一致性"，不是"持久性"
 /// 截断已经 fsync 过的字节 = 人为违反 fsync 承诺（模拟介质损坏/写入丢失）。
-/// 此时**允许**丢掉截断点之后的数据，但绝不允许：
+/// 此时**允许**丢掉截断点之后的那条记录，但绝不允许：
 /// 1. 恢复报错 / panic；
 /// 2. 把一条半截记录当成完整记录应用（半个批次入账）；
-/// 3. **恢复后系统不可用** —— 这条正是本用例抓到的缺陷（见下）。
+/// 3. 撕裂点之前的完整记录缺失；
+/// 4. **恢复后系统不可用**。
 ///
-/// ## ⚠️ 已知缺陷（`operation-log §29`）：撕裂后 WAL **无法自愈**
+/// # 本用例抓到的缺陷（已修，`operation-log §29.1` / R-14）
+/// 修复前：截断尾部后重启，再写入一批（fsync 成功、ack 正常），该数据
+/// **永远不可见** —— 因为 `SegmentWriter::open_append` 以 `metadata().len()`
+/// 作追加偏移，新记录被写在**撕裂的垃圾字节之后**，而 replay 扫到撕裂点即停止。
+/// 节点表现为「写入全部成功、数据全部消失」，静默且永久。
 ///
-/// 实测：截断尾部 10 字节后重启，再写入一批（fsync 成功、拿到 ack），
-/// 该数据**永远不可见**（60s 轮询到超时），`wait_visible_rows` 始终为 0。
-///
-/// **根因**：`SegmentWriter::open_append` 以 `metadata().len()` 作为写入偏移
-/// → 新记录被追加在**垃圾字节之后**；而 reader 扫到撕裂点就停止 replay
-/// → 新记录永远落在"停止点之后"，既不进 chunk 也不落文件。
-/// 于是节点表现为"写入全部成功、数据全部消失" —— 恰恰是 WAL 本该防止的那种故障。
-///
-/// **正确修法**（未做，属 `§29`）：恢复时把每个 segment **截断到最后一条完整记录的边界**
-/// （WAL 标准修复步骤），再让 writer 从该偏移继续追加。本用例就绪后应当转绿。
-#[ignore = "已知缺陷：WAL 撕裂后无法自愈，新写入永不可见（operation-log §29）"]
+/// 修法：接管 WAL 目录时（`WalWriter::open`）先把每个 segment
+/// **截断到最后一条完整记录的边界**（WAL 标准修复步骤）。
+/// 本用例现在断言的就是"修复后 prefix 全恢复 + 新写入可见"。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn torn_wal_tail_is_rejected_and_prefix_survives() {
     let _gate = CHAOS_GATE.lock().await;
@@ -1267,39 +1264,32 @@ async fn torn_wal_tail_is_rejected_and_prefix_survives() {
     );
     assert!(readable_data >= 1, "截断不应把整条 WAL 都废掉");
 
-    // 重建：先确认**系统可用**（这是硬断言）
+    // 重建（`WalWriter::open` 会先修复撕裂尾部）：
     let setup = build(&wal_dir, &store_root, &[("torn", schema(), false)]).await;
+
+    // ④ 撕裂点之前的完整记录**一条都不能少**（修复后 prefix 必须全部恢复）
     let shutdown2 = CancellationToken::new();
     let acc2 = setup.ingestor.clone().spawn_accumulator(shutdown2.clone());
+    assert_eq!(
+        wait_visible_rows(&setup, "public.torn", "s0", readable_data * 3).await,
+        readable_data * 3,
+        "撕裂点之前的完整记录必须全部恢复（readable={readable_data}）"
+    );
+
+    // ⑤ 系统仍可用：继续写入 → 可见。
+    //    修复前这里必然失败：新记录被写在撕裂的垃圾字节之后，replay 扫不到
+    //    →「写入成功、数据不可见」（`operation-log §29.1`）。
     let more = ingest_into(&setup, "torn", "s1", 700).await;
     assert_eq!(
         wait_visible_rows(&setup, "public.torn", "s1", more).await,
         more,
         "撕裂恢复后必须能继续正常写入并可见"
     );
-
-    // 撕裂前的数据：**允许丢尾部**（介质损坏），但必须满足两条硬边界：
-    // ① 不产生"半个批次"（行数是每批行数的整数倍）；
-    // ② 不凭空多出数据（不超过"仍可读记录数 × 每批行数"）。
-    let recovered = count_rows_parts(&setup.catalog, &setup.engine, "public.torn").await;
+    wait_hot_drained(&setup).await;
     assert_eq!(
-        recovered % 3,
-        0,
-        "恢复出行数 {recovered} 不是每批 3 行的整数倍 —— 半个批次被入账了"
-    );
-    assert!(
-        recovered <= readable_data * 3 + more,
-        "恢复出行数超过\"仍可读记录数 × 3 + 新写入\"：recovered={recovered} readable={readable_data} more={more}"
-    );
-
-    // ⚠️ **遗留（待查，`operation-log §29`）**：实测 `recovered == 0`，
-    // 而截断后明明还能解出 2 条完整 Data 记录（诊断：`segs=["1:2679B"]`、
-    // `records=["0:Data","1:Data"]`）。也就是说**撕裂点之前的完整记录没有被恢复**。
-    // 这与"前缀不丢"的预期不符 —— 但在做成硬断言前必须先查清是预期行为还是缺陷，
-    // 因此这里只断言上面两条不会撒谎的边界，并把这个偏差显式登记。
-    assert_eq!(
-        recovered, 0,
-        "本用例的已知偏差：若这里不再是 0，说明 §29 的问题已变化，请同步更新结论"
+        count_rows_parts(&setup.catalog, &setup.engine, "public.torn").await,
+        readable_data * 3 + more,
+        "总数 = 撕裂前的完整记录 + 新写入；撕裂那条不允许以半个批次形式出现"
     );
 
     shutdown2.cancel();
