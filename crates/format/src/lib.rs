@@ -135,6 +135,22 @@ pub fn decode_batch(
 
 // ---------------- Parquet（回退路径，默认可用）----------------
 
+/// **单个 RowGroup 的最大行数**（显式设定，`operation-log §36`）。
+///
+/// 之前不设 → 用 crate 默认（约 100 万行）→ 实测**整文件恰好 1 个 RowGroup**
+/// （`operation-log §33.4`：5.5k~27k 行的文件都是 1 组）。后果有两个方向：
+///
+/// - **查询**：剪枝粒度退化为"文件"。文件小（当前 1KB 行约 2.7 万行 / 16MB）时无害，
+///   但一旦 `bytes_threshold` 上调或换窄 schema 使文件变大，就变成"文件内无法跳读"；
+/// - **写入**：一个 RowGroup 的所有列缓冲要同时驻留内存才能落盘 —— 组越大峰值越高
+///   （实测 VmHWM 峰值中编码缓冲占相当一部分，`operation-log §33.2`）。
+///
+/// 取 **65,536 行**：1KB 行时约 64MB/组（在 chunk 预算可承受范围），
+/// 且对当前文件规模**不改变行为**（27k 行 < 64k → 仍是 1 组），只作为
+/// "文件变大时不要退化成单组" 的**显式上界**。改这个值必须同时给
+/// （文件大小、扫描剪枝、写入峰值内存）三组数据。
+const MAX_ROWS_PER_ROW_GROUP: usize = 65_536;
+
 fn encode_parquet(batch: &arrow::record_batch::RecordBatch) -> Result<Vec<u8>, LakeError> {
     use parquet::arrow::ArrowWriter;
     use parquet::file::properties::WriterProperties;
@@ -142,6 +158,7 @@ fn encode_parquet(batch: &arrow::record_batch::RecordBatch) -> Result<Vec<u8>, L
         .set_compression(parquet::basic::Compression::ZSTD(
             parquet::basic::ZstdLevel::default(),
         ))
+        .set_max_row_group_size(MAX_ROWS_PER_ROW_GROUP)
         .build();
     let mut buf = Vec::with_capacity(1024);
     let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props))
@@ -224,6 +241,48 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    /// RowGroup 边界**显式钉住**：`max_row_group_size` 不设会退回 crate 默认（约 100 万行）
+    /// → 大文件退化为"一个 RowGroup"，剪枝粒度=文件、写入峰值内存无上界。
+    ///
+    /// 用 Int64 单列（无字符串分配）写 20 万行，断言分组数 = ceil(200000 / 65536) = 4。
+    #[test]
+    fn parquet_row_groups_are_bounded_by_explicit_setting() {
+        let schema = SArc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let rows = MAX_ROWS_PER_ROW_GROUP * 3 + 1234; // 跨 3 个完整组 + 一个尾巴
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![SArc::new(Int64Array::from((0..rows as i64).collect::<Vec<_>>()))],
+        )
+        .unwrap();
+
+        let bytes = encode_parquet(&batch).unwrap();
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        let reader =
+            SerializedFileReader::new(bytes::Bytes::copy_from_slice(&bytes)).expect("parquet footer");
+        let groups = reader.metadata().num_row_groups();
+        let expected = rows.div_ceil(MAX_ROWS_PER_ROW_GROUP);
+        assert_eq!(
+            groups, expected,
+            "RowGroup 数必须由 MAX_ROWS_PER_ROW_GROUP 决定（rows={rows}，期望 {expected} 组，实际 {groups}）"
+        );
+        // 且每个组不超过上限（防止实现被换成"整批一组"后测试仍绿）
+        for i in 0..groups {
+            let rg = reader.metadata().row_group(i);
+            assert!(
+                (rg.num_rows() as usize) <= MAX_ROWS_PER_ROW_GROUP,
+                "第 {i} 组 {} 行超过上限 {MAX_ROWS_PER_ROW_GROUP}",
+                rg.num_rows()
+            );
+        }
+        // 解码回来行数不变（分组不影响语义）
+        let back: usize = decode_parquet(&bytes)
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(back, rows);
     }
 
     #[tokio::test]

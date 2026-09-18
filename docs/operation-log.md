@@ -2059,3 +2059,48 @@ window_closed    files=  3  rows min/p50/max = 12000 / 22500 / 25000
 | 4 | 内存水位路径的定位精度（`enforce_pressure` 何时真的触发） | 阶段 2 | 本轮已有 `seal_pressure` 字段可统计，样本还少（2/40） |
 
 ---
+
+---
+
+## 36. `max_row_group_size` 专项：显式设定 65,536 行 + 端到端验证（2026-09-19）
+
+### 36.0 落地
+
+| 位置 | 改动 |
+|---|---|
+| `format/src/lib.rs` | 新增 `MAX_ROWS_PER_ROW_GROUP = 65_536`；`encode_parquet` 显式 `set_max_row_group_size`（此前**只设了 ZSTD** → 用 crate 默认约 100 万行） |
+| `format` 测试 | `parquet_row_groups_are_bounded_by_explicit_setting`：写 `65536×3+1234` 行 → 断言**分组数 = ceil(rows/上限) = 4**，且**每组不超过上限**（防实现被换回"整批一组"仍绿）；顺便断言解码后行数不变 |
+
+### 36.1 为什么必须显式设（两个方向的后果）
+
+不设 → 默认上限远大于单文件行数 → **整文件恰好 1 个 RowGroup**（§33.4 实测 5.5k~27k 行都是 1 组）：
+
+| 方向 | 后果 |
+|---|---|
+| 查询 | **剪枝粒度 = 文件**。当前文件小（1KB 行约 2.7 万行 / 16MB）时无害；一旦 `bytes_threshold` 上调或换窄 schema 使文件变大，就变成"文件内无法跳读" |
+| 写入 | 一个 RowGroup 的所有列缓冲要**同时驻留**才能落盘 —— 组越大峰值内存越高（§33.2 实测 VmHWM 里编码缓冲占相当一部分） |
+
+取 **65,536 行**的理由：1KB 行时约 64MB/组（chunk 预算可承受）；且对**当前**文件规模**不改变行为**
+（27k 行 < 64k → 仍是 1 组），只作为"文件变大时不要退化成单组"的**显式上界**。
+
+### 36.2 端到端验证（窄行 + 大 `rows_threshold`，让文件超过 64k 行）
+
+```text
+cargo run --release -p yuntun-chaos --example bench_baseline -- 45 1 500 40 0 30 150000 0 1024
+（pad=0 → 窄行；rows_threshold=15 万；bytes_threshold=1GB 确保字节阈值不抢先）
+
+RowGroup 实测 : rows=150000 row_groups=3 | rows=150000 row_groups=3 | rows=60500 row_groups=1
+```
+
+**15 万行的文件 = 3 组**（= ceil(150000/65536) ✓），**60,500 行 = 1 组**（< 上限 ✓）
+—— 与上限一致。改动前这两种文件都只会是 1 组。
+
+### 36.3 遗留
+
+| # | 项 | 说明 |
+|---|---|---|
+| 1 | 改 `MAX_ROWS_PER_ROW_GROUP` 的门槛 | 注释里写明：必须同时给**文件大小 / 扫描剪枝 / 写入峰值内存**三组数据 |
+| 2 | 剪枝收益的定量测量 | 本轮只证明了"分组数符合上限"；"组级剪枝省了多少扫描"需要带谓词的扫描基准（属 T8 扩展） |
+| 3 | Vortex 路径 | `encode_vortex` 仍是 feature-flag 占位（ADR-1 锁定 Git Commit 后启用），届时需单独确认其 RowGroup 语义 |
+
+---
