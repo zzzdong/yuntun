@@ -208,6 +208,15 @@ pub async fn flush_chunk_with_id(
         // 写侧结束时刻（**chunk 的真实封口时刻**，由 chunk 层带出）
         // → 与 committed_at_ms 之差即"封口到持久化"的实际耗时，即对外承诺的上界口径
         sealed_at_ms: input.sealed_at_ms,
+        // 封口原因 + 当时水位档位（`operation-log §34.3`：让"文件为什么这么小"可查，不再靠排除法）
+        seal_reason: input
+            .seal_reason
+            .map(|r| r.as_str().to_string())
+            .unwrap_or_default(),
+        seal_pressure: input
+            .pressure_at_seal
+            .map(|p| format!("{p:?}"))
+            .unwrap_or_default(),
         committed_at_ms,
         ..Default::default()
     }];

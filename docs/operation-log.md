@@ -2007,3 +2007,55 @@ chunk_mem_budget  ≳  写入速率 × (seal→committed + 读侧 reclaim 周期
 | 5 | RowGroup = 1 个/文件（未设 `max_row_group_size`） | §33.4 |
 
 ---
+
+---
+
+## 35. seal 原因落地观测 → 真相是 `bytes_threshold`（第三次、也是最后一次修正）（2026-09-18）
+
+### 35.0 落地
+
+| 位置 | 改动 |
+|---|---|
+| `chunk/src/chunk.rs` | `Chunk.seal_reason` / `pressure_at_seal` + `seal_tagged(reason, pressure, now)` |
+| `chunk/src/store.rs` | `SealReason` 扩充（+`ResidentCap` / `Pressure` / `Manual` + `as_str()` 稳定字符串）；`pending_seal` 登记表（`plan_flush` / `enforce_pressure` 决定要 seal 时登记原因，`seal()` 取用 —— 这样 `plan.seal: Vec<ChunkId>` 的公开签名不用改）；`flush_input` 带出 |
+| `model/src/meta.rs` | `FileManifest.seal_reason`（tag 18）/ `seal_pressure`（tag 19） |
+| `ingest/src/flush.rs` | 封口点打点（恢复重做路径留空） |
+| `chaos/examples/bench_baseline.rs` | 按 seal 原因 / 水位档位分组统计 + 实测每行占用 |
+| 测试 | `seal_reason_and_pressure_are_recorded_and_carried_to_flush_input`（Rows / WindowClosed / Pressure 三种原因各一条断言） |
+
+### 35.1 实测：`bytes_threshold` 在 **Normal 水位**下正常触发
+
+20 MB/s、单 shard、1KB 行、`md=0/spread=30`、`rows=50万`、`bytes=128MB`：
+
+```
+---- seal 原因分布 ----
+bytes_threshold  files= 35  rows min/p50/max = 27000 / 27000 / 27000
+pressure         files=  2  rows min/p50/max = 14000 / 14000 / 17000
+window_closed    files=  3  rows min/p50/max = 12000 / 22500 / 25000
+封口时水位档位        : {"Normal": 33, "Soft": 5, "Hard": 2}
+```
+
+### 35.2 结论（含对我前两次判断的纠正）
+
+| # | 结论 | 依据 |
+|---|---|---|
+| 1 | **"内存压力主导 seal"不成立**（§33.2 与 §34.2 的候选被否） | 35/40 文件是 `bytes_threshold`，其中 33/40 水位 **Normal** |
+| 2 | **有效账本口径 ≈ 4.9 KB/行**（1KB 行的现实形态） | 128MB ÷ 27000 行 = 4.97 KB/行；`bytes=32MB` 档 → 7000 行（32/128×27000 ≈ 6750 ✓ 线性吻合） |
+| 3 | **"新建批探针"量错了对象**（885 B/行，差 5.6×） | chunk 持有的是 **WAL 解码后**的 Arrow 形态（偏移/容量/属性与新建批不同）。以后**一律用实测**：`文件行数 ≈ bytes_threshold ÷ 有效口径` |
+| 4 | **"每窗口每 shard ≤1 文件"只在"窗口内数据量 ≤ `bytes_threshold`"时成立** | 20 MB/s × 60s = **1.2 GB ≫ 128MB** → 必然多文件（实测 26~92 个/窗口）。**这不是缺陷，是阈值与速率的算术关系**；128MB 对应 1KB 行 ≈ 2.7 万行/文件 |
+| 5 | 压力触发是**次要因素**（2/40），且它是"水位顶掉窗口承诺"的真实路径，相位让位（§34）仍应保留 | 同上 |
+
+**对 ADR-10 的影响**：其"每窗口每 shard 最多 1 个文件"是**低/中速率下**的结论。
+高吞吐下要么接受多文件（并写明条件），要么**按速率放大 `bytes_threshold`**（= 用内存换文件数，
+因为要让一个窗口的数据不封口，必须在内存里hold 住 `速率 × 60s`）。
+
+### 35.3 遗留
+
+| # | 项 | 归属 | 说明 |
+|---|---|---|---|
+| 1 | ADR-10 措辞修正（加"当窗口内数据量 > `bytes_threshold` 时为多个文件"） | 阶段 2 | 与本条同批 |
+| 2 | 是否让 `bytes_threshold` 随速率自适应 / 给用户一个"目标文件行数"配置 | 阶段 2 | 目前用户只能设字节阈值，却观测到行数 —— 口径不直观 |
+| 3 | "有效口径 5× 于新建批"的根因（WAL 解码形态的具体构成） | 阶段 2 | 影响内存预算定容（D11）的精度；先记为已标定常数 4.9 KB/行（1KB 行） |
+| 4 | 内存水位路径的定位精度（`enforce_pressure` 何时真的触发） | 阶段 2 | 本轮已有 `seal_pressure` 字段可统计，样本还少（2/40） |
+
+---

@@ -352,10 +352,23 @@ flush_moment = seal_time + max_flush_delay + (fnv1a(instance_id, table, shard, w
 
 **效果**：由于 hash 输入固定，同一 shard 的 flush 时刻**稳定可预测**；不同 shard 均匀分散到 `spread` 秒，实现削峰，同时保持"每窗口每 shard 最多 1 个文件"的小文件控制目标。
 
-> ⚠️ "每窗口每 shard ≤1 文件" 是**窗口驱动 seal 下的结果，不是硬不变量**：
-> ① `rows_threshold` 被触发（高吞吐表）时同一窗口会产出多个文件（实测 T=5 万 + 5000 行/秒/shard
-> → 4 文件/窗口）；② event_time 落在上一窗口、但到达时该窗口已关闭的"延迟到达"批次会
-> 另起 chunk（实测出现晚于 `md+spread` 的离群提交，见 `operation-log §32.4` 遗留）。
+> ⚠️ **"每窗口每 shard ≤1 文件"有前提，不是硬不变量**（`operation-log §35` 实测）：
+>
+> ```text
+> 文件数/窗口/shard ≈ max(1, 窗口内数据量 ÷ bytes_threshold)
+> ```
+>
+> - 本目标是**低/中速率下的结论**：仅当"一个窗口的数据量 ≤ `bytes_threshold`"时成立；
+> - 高吞吐必然多文件：实测 20 MB/s × 60s = **1.2 GB**，而 `bytes_threshold` 默认 128 MB
+>   → 一个窗口产出 **26~92 个文件**（`seal_reason = bytes_threshold`，水位 **Normal**）；
+> - 要让一个窗口只产 1 个文件，就得在内存里 hold 住"速率 × 60s"的数据
+>   —— 那是**用内存换文件数**的显式取舍，不是默认行为；
+> - 另有两个次要来源：`rows_threshold`（窄行表，实测 T=5 万 + 5000 行/秒/shard → 4 文件/窗口）
+>   与"延迟到达"批次（event_time 落在上一窗口但到达时已关闭 → 另起 chunk，实测有晚于
+>   `md+spread` 的离群提交，见 `operation-log §32.4`）。
+>
+> **1KB 行的有效账本口径 ≈ 4.9 KB/行**（实测标定 = `bytes_threshold` ÷ 单文件行数）
+> → 128 MB 实际只够 **~2.7 万行/文件**。**不要**用"新建批的 `get_array_memory_size`"换算（差 5.6×）。
 
 3. **客户端软路由**：SDK 侧一致性哈希，**仅为优化局部性，不保证**。节点不可用时自动 fallback 到其他节点，**不阻塞写入**。
 

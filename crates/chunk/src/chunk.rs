@@ -9,7 +9,10 @@ use arrow::record_batch::RecordBatch;
 use yuntun_model::error::LakeError;
 use yuntun_store::ShardId;
 
+use crate::budget::Pressure;
 use crate::spill::{self, SpillMeta};
+// seal 原因定义在 store（与 `should_seal` 同一处，避免两处枚举漂移）
+use crate::store::SealReason;
 use crate::stats::ColumnStats;
 
 /// 分钟毫秒（ADR-10：攒批窗口按整分钟对齐）。
@@ -197,6 +200,11 @@ pub struct Chunk {
     /// 若锚事件时间，客户端回补历史数据时窗口早已关闭，会退化为"每条一批"。
     pub window_end_ms: u64,
     pub sealed_at_ms: Option<u64>,
+    /// 封口的**原因**（`operation-log §34.3`：不落它就只能靠排除法推断"为什么文件这么小"）。
+    /// 由 `ChunkStore` 在 seal 时写入，随 `ChunkFlushInput` 进 `FileManifest`。
+    pub seal_reason: Option<SealReason>,
+    /// 封口**瞬间的内存水位档位**：区分"阈值/窗口触发"与"内存压力触发"的唯一硬证据。
+    pub pressure_at_seal: Option<Pressure>,
     /// 覆盖的 WAL seq（升序；组内直写时无空洞，交错写入下可能跳号）
     pub seqs: Vec<u64>,
     /// 覆盖的 WAL seq 半开区间 `[start, end)`（WAL 回收点语义用，S1-8）
@@ -231,6 +239,8 @@ impl Chunk {
             created_at_ms: now_ms,
             window_end_ms: (window_start_ms(now_ms as i64) + MINUTE_MS) as u64,
             sealed_at_ms: None,
+            seal_reason: None,
+            pressure_at_seal: None,
             seqs: Vec::new(),
             wal_seq_range: 0..0,
             committed_snapshot: None,
@@ -282,8 +292,24 @@ impl Chunk {
 
     /// seal：封口（行数 / 字节 / 时间 / schema 变化触发）。
     pub fn seal(&mut self, now_ms: u64) -> Result<(), LakeError> {
+        self.seal_tagged(SealReason::Manual, None, now_ms)
+    }
+
+    /// 带**原因**与**封口时水位档位**的 seal（可观测性的落点，`operation-log §34.3`）。
+    ///
+    /// `reason` 必须由调用方给出：只有调用方知道是 `should_seal` 的哪个分支、
+    /// 还是 `enforce_pressure`/`max_resident` 兜底 —— 这三者对"文件为什么这么小"
+    /// 的含义完全不同（阈值=设计内，压力=水位顶掉削峰与窗口承诺）。
+    pub fn seal_tagged(
+        &mut self,
+        reason: SealReason,
+        pressure: Option<Pressure>,
+        now_ms: u64,
+    ) -> Result<(), LakeError> {
         self.transition(ChunkState::Sealed)?;
         self.sealed_at_ms = Some(now_ms);
+        self.seal_reason = Some(reason);
+        self.pressure_at_seal = pressure;
         Ok(())
     }
 

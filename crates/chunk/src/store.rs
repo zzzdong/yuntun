@@ -84,16 +84,44 @@ impl Default for SealPolicy {
 }
 
 /// seal 触发原因（诊断用）。
+///
+/// **必须可观测**（`operation-log §34.3`）：不落它就只能靠排除法推断"高吞吐下为什么文件只有 24MB"，
+/// 而阈值 / 窗口 / 兜底 / 压力这四种原因对"文件为什么这么小"的含义**完全不同** ——
+/// 阈值触发是设计内，`Pressure` 触发意味着**削峰与窗口承诺已被顶掉**。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SealReason {
-    /// 行数达阈值
+    /// 行数达阈值（`rows_threshold`）
     Rows,
-    /// 字节数达阈值
+    /// 字节数达阈值（`bytes_threshold`，**Arrow 内存口径**）
     Bytes,
     /// **到达分钟窗口关闭**（ADR-10：整分钟对齐，保证每窗口每 shard 最多 1 个小文件）
     WindowClosed,
     /// `schema_version` 变化（架构 §2.4：文件内同一 schema）
     SchemaChanged,
+    /// **驻留硬兜底**（`max_resident`：防慢写入流把 WAL 撑爆，S1-9）
+    ResidentCap,
+    /// **内存水位强制 seal**（`enforce_pressure` ≥ Hard）：**会打破"每窗口每 shard ≤1 文件"**
+    Pressure,
+    /// 外部 / 管理性调用（测试与运维 API）——正常写入路径不应出现
+    Manual,
+}
+
+impl SealReason {
+    /// 稳定字符串（进 `FileManifest.seal_reason`，供 grep / 指标分组）。
+    ///
+    /// 用**显式映射**而不是 `{:?}`：manifest 是持久格式，Debug 输出随重构变化
+    /// 会让历史文件的取值悄悄漂移。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SealReason::Rows => "rows_threshold",
+            SealReason::Bytes => "bytes_threshold",
+            SealReason::WindowClosed => "window_closed",
+            SealReason::SchemaChanged => "schema_changed",
+            SealReason::ResidentCap => "resident_cap",
+            SealReason::Pressure => "pressure",
+            SealReason::Manual => "manual",
+        }
+    }
 }
 
 /// [`ChunkStore::append`] 的结果。
@@ -178,6 +206,10 @@ pub struct ChunkFlushInput {
     /// 用"现在"会把 `max_flush_delay + phase` 这段**从延迟里抹掉**，
     /// 于是对外承诺的持久化上界看起来永远达标（这是最危险的一类指标失真）。
     pub sealed_at_ms: u64,
+    /// 封口原因（进 `FileManifest.seal_reason`）。恢复重做路径为 `None`。
+    pub seal_reason: Option<SealReason>,
+    /// 封口瞬间的内存水位档位（区分"阈值触发"与"压力触发"的硬证据）。
+    pub pressure_at_seal: Option<Pressure>,
 }
 
 /// 观测/打点快照。
@@ -205,6 +237,11 @@ struct Inner {
     /// 每个 key 当前处于 `Open` 的 chunk
     open: HashMap<ChunkKey, ChunkId>,
     chunks: BTreeMap<ChunkId, Chunk>,
+    /// `plan_flush` / `enforce_pressure` 预先登记的 seal 原因，供随后的 `seal()` 取用。
+    ///
+    /// 这样做的理由：`plan.seal` 是 `Vec<ChunkId>`（保持公开 API 与既有调用方不变），
+    /// 而原因只有"决定要 seal"的那一刻知道 → 存在这里，比改签名侵入面小得多。
+    pending_seal: HashMap<ChunkId, (SealReason, Option<Pressure>)>,
 }
 
 /// chunk 注册表与内存账本的唯一持有者（进程内共享）。
@@ -339,7 +376,7 @@ impl ChunkStore {
                     .unwrap_or(false);
                 if changed {
                     if let Some(c) = inner.chunks.get_mut(&prev) {
-                        c.seal(now_ms)?;
+                        c.seal_tagged(SealReason::SchemaChanged, Some(pressure), now_ms)?;
                     }
                     inner.open.remove(&key);
                     sealed = Some((prev, SealReason::SchemaChanged));
@@ -371,7 +408,11 @@ impl ChunkStore {
             };
 
             if let Some(reason) = reason {
-                inner.chunks.get_mut(&id).expect("checked above").seal(now_ms)?;
+                inner
+                    .chunks
+                    .get_mut(&id)
+                    .expect("checked above")
+                    .seal_tagged(reason, Some(pressure), now_ms)?;
                 inner.open.remove(&key);
                 sealed = Some((id, reason));
             }
@@ -456,9 +497,13 @@ impl ChunkStore {
             Some(c) => c.key.clone(),
             None => return Ok(()),
         };
+        let (reason, pressure) = inner
+            .pending_seal
+            .remove(&id)
+            .unwrap_or((SealReason::Manual, None));
         let chunk = inner.chunks.get_mut(&id).expect("checked above");
         if chunk.state == ChunkState::Open {
-            chunk.seal(now_ms)?;
+            chunk.seal_tagged(reason, pressure, now_ms)?;
         }
         if inner.open.get(&key).copied() == Some(id) {
             inner.open.remove(&key);
@@ -549,7 +594,14 @@ impl ChunkStore {
                 let inner = self.inner.lock().unwrap();
                 inner.open.values().copied().collect()
             };
+            let pressure = self.pressure();
             for id in open {
+                // 原因必须显式登记：`Pressure` 触发是"水位顶掉窗口承诺"的直接证据
+                self.inner
+                    .lock()
+                    .unwrap()
+                    .pending_seal
+                    .insert(id, (SealReason::Pressure, Some(pressure)));
                 // seal 已 sealed 的 chunk 幂等；失败只记日志（下一轮重试）
                 if self.seal(id, now_ms).is_ok() {
                     actions.push(PressureAction::ForcedSeal(id));
@@ -608,6 +660,8 @@ impl ChunkStore {
         let max_resident_ms = policy.max_resident.as_millis() as u64;
         let phase_yields = !matches!(self.pressure(), Pressure::Normal);
         let mut plan = FlushPlan::default();
+        // 循环内是对 `inner.chunks` 的不可变借用 → 待 seal 原因先收集，出循环后写入
+        let mut pending: Vec<(ChunkId, SealReason)> = Vec::new();
         let inner = self.inner.lock().unwrap();
         for c in inner.chunks.values() {
             if matches!(c.state, ChunkState::Flushed | ChunkState::Released) {
@@ -618,9 +672,11 @@ impl ChunkStore {
                 .sealed_at_ms
                 .is_some_and(|s| now_ms.saturating_sub(s) >= max_resident_ms);
 
-            let seal_due =
-                c.state == ChunkState::Open && (open_too_long || self.should_seal(c, now_ms).is_some());
+            let seal_reason = self.should_seal(c, now_ms);
+            let seal_due = c.state == ChunkState::Open && (open_too_long || seal_reason.is_some());
             if seal_due {
+                // `open_too_long` 是兜底（S1-9），`should_seal` 未给出原因时归到它
+                pending.push((c.id, seal_reason.unwrap_or(SealReason::ResidentCap)));
                 plan.seal.push(c.id);
             }
 
@@ -636,6 +692,15 @@ impl ChunkStore {
                     self.phase_yielded.fetch_add(1, Ordering::SeqCst);
                 }
                 plan.flush.push(c.id);
+            }
+        }
+        // 记录待 seal 的原因（`seal()` 随后取用）；借用已结束，可直接写
+        {
+            let mut inner = inner;
+            for (id, reason) in pending {
+                inner
+                    .pending_seal
+                    .insert(id, (reason, Some(self.pressure())));
             }
         }
         plan
@@ -694,6 +759,8 @@ impl ChunkStore {
             rows: chunk.rows as u64,
             // 未封口的 chunk 不会走到这里；兜底用创建时刻（宁大不小，方向安全）
             sealed_at_ms: chunk.sealed_at_ms.unwrap_or(chunk.created_at_ms),
+            seal_reason: chunk.seal_reason,
+            pressure_at_seal: chunk.pressure_at_seal,
         }))
     }
 
@@ -1354,6 +1421,73 @@ mod tests {
         let p = tight.store.plan_flush(1_000 + 30_001);
         assert!(p.flush.contains(&id));
         assert_eq!(p.phase_yielded, 0, "正常到期不是让位");
+    }
+
+    /// **封口原因必须落进 `ChunkFlushInput`**（`operation-log §34.3/§35`）。
+    ///
+    /// 这是"文件为什么这么小"唯一可信的答案来源：没有它就只能靠排除法，
+    /// 而本项目已经因此**两次推翻过自己的结论**（§34.1 认为压力主导、§35 实测是字节阈值）。
+    #[test]
+    fn seal_reason_and_pressure_are_recorded_and_carried_to_flush_input() {
+        // ① 行数阈值触发
+        let f = fixture("chunk-seal-reason-rows", tight_policy(2), 1 << 20);
+        let out = f
+            .store
+            .append(key(), 1, schema(), 0, vec![batch(vec![1, 2])], 1_000)
+            .unwrap();
+        let sealed = out.sealed.expect("行数阈值应触发 seal");
+        assert_eq!(sealed.1, SealReason::Rows);
+        let input = f.store.flush_input(sealed.0).unwrap().expect("已 sealed 可取");
+        assert_eq!(input.seal_reason, Some(SealReason::Rows));
+        assert_eq!(input.pressure_at_seal, Some(Pressure::Normal));
+
+        // ② 窗口关闭触发
+        let p = SealPolicy {
+            rows_threshold: 1000,
+            bytes_threshold: usize::MAX,
+            min_resident: Duration::ZERO,
+            max_flush_delay: Duration::ZERO,
+            max_resident: Duration::from_secs(3600),
+            phase_spread: Duration::ZERO,
+        };
+        let f = fixture("chunk-seal-reason-window", p, 1 << 20);
+        let out = f
+            .store
+            .append(key(), 1, schema(), 0, vec![batch(vec![1, 2])], 1_000)
+            .unwrap();
+        assert!(out.sealed.is_none());
+        // 窗口结束时由 plan_flush 决定 seal，原因在此登记
+        let plan = f.store.plan_flush(61_000);
+        assert_eq!(plan.seal.len(), 1);
+        f.store.seal(out.chunk_id, 61_000).unwrap();
+        let input = f.store.flush_input(out.chunk_id).unwrap().unwrap();
+        assert_eq!(input.seal_reason, Some(SealReason::WindowClosed));
+
+        // ③ 水位强制（Hard）：原因必须是 Pressure —— 它是"削峰/窗口承诺被顶掉"的直接证据
+        let bytes = {
+            let probe = fixture("chunk-seal-reason-probe", tight_policy(1000), 1 << 20);
+            probe
+                .store
+                .append(key(), 1, schema(), 0, vec![batch(vec![1, 2])], 1_000)
+                .unwrap();
+            probe.store.stats().resident_bytes
+        };
+        let f = fixture("chunk-seal-reason-pressure", tight_policy(1000), bytes);
+        f.store
+            .append(key(), 1, schema(), 0, vec![batch(vec![1, 2])], 1_000)
+            .unwrap();
+        assert!(matches!(f.store.pressure(), Pressure::Hard | Pressure::Reject));
+        let actions = f.store.enforce_pressure(1_001);
+        assert!(
+            actions.iter().any(|a| matches!(a, PressureAction::ForcedSeal(_))),
+            "Hard 档应强制 seal open chunk"
+        );
+        let input = f.store.flush_input(ChunkId(1)).unwrap().unwrap();
+        assert_eq!(input.seal_reason, Some(SealReason::Pressure));
+        assert!(matches!(
+            input.pressure_at_seal,
+            Some(Pressure::Hard) | Some(Pressure::Reject)
+        ));
     }
 
     #[test]

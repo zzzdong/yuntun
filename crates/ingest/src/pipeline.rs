@@ -747,6 +747,8 @@ impl Ingestor {
                         rows,
                         // 恢复重做：原封口时刻已不可知，用 0（调用方不得把恢复路径当延迟样本）
                         sealed_at_ms: 0,
+                        seal_reason: None,
+                        pressure_at_seal: None,
                     };
                     flush_chunk_with_id(&input, &deps, Some(st.batch_id.clone())).await?;
                     redone += 1;

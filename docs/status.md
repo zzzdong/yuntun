@@ -73,7 +73,7 @@ MySQL 端口 **trust 无鉴权**（按网络隔离部署）；MySQL 轨结果集
 | D7 | 幂等预筛位置 | **ingest 入口**（写 WAL 之前）；命中即 `duplicate=true`、不写 WAL | `commit_files` 只接受单个 `client_request_id`，而一个 chunk 聚合多个键 → 提交层无法按键集合去重（属 R3 状态机） |
 | D8 | Catalog 快照 | **每查询取一次不可变快照**（`Arc` 共享），规划到 scan 全程复用 | 不是性能优化而是**正确性要求**：DataFusion 的 provider 是同步 trait、规划期反复调用，读会变的结构会让同一次查询的 plan 与 scan 看到两个版本 |
 | D9 | 幂等键独立存储 | 键**不随 FileManifest 生命周期消失**（compaction 删除原文件后重试仍幂等） | 否则合并后客户端重试 = 再写一份（静默重复） |
-| D10 | `rows_threshold` / `bytes_threshold` | **均保持 50 万 / 128MB（定案：不改）** | 实测**两者都不触发**：宽行表（885B/行）先撞 128MB（≈15 万行），高吞吐下再被**内存水位**接管；反证：把 `bytes_threshold` 降到 32MB 反而产出更小文件（4.2MB vs 16.4MB）→ "降阈值=控文件大小"是错的。详见 `operation-log §33` |
+| D10 | `rows_threshold` / `bytes_threshold` | **均保持 50 万 / 128MB（定案：不改）**，但**必须知道实际效果** | `seal_reason` 实测（`operation-log §35`）：1KB 行时**有效账本口径 ≈ 4.9 KB/行** → 128MB 只够 **~2.7 万行/文件**（不是按 885B/行推出的 15 万行）；**"每窗口每 shard ≤1 文件"仅在"窗口内数据量 ≤ `bytes_threshold`"时成立**（20MB/s × 60s = 1.2GB ≫ 128MB → 26~92 文件/窗口）。`rows_threshold` 在窄行表才可能触发 |
 | D11 | **chunk 预算定容规则** | `chunk_mem_budget ≳ 写入速率 × (写入→flush 的滞留)`，其中滞留含"窗口对齐等待 + `md` + `spread`" | 实测 20MB/s resident ~437~470MB（滞留 ≈22s）；低速 2MB/s → Normal。**⚠️ 本轮修正**：`spread` 只影响延迟与压力档位（5s→6.6s、30s→28.6~37.5s），**不影响文件大小** → §33 的"水位 ≈ 速率 × spread"因果**已被推翻**（`operation-log §34.1`） |
 
 **规则**：以上任何一项要改，必须先在 `operation-log` 里附**实测数据**（`plan.md §2.2` 的"先有实测再改默认值"）。
@@ -126,22 +126,22 @@ MySQL 端口 **trust 无鉴权**（按网络隔离部署）；MySQL 轨结果集
 chaos 已 11/11，但**基线压测只覆盖单进程**：真多节点 CommitFiles 瞬时并发、真实 S3 PUT 绝对延迟、
 内存曲线时序、离群提交归因（`operation-log §32.4`）均未测。
 
-### 5.4 P1：**seal 原因不可观测**（当前最大的一块"凭排除法推断"）
+### 5.4 已收敛：文件数由"窗口内数据量 ÷ `bytes_threshold`"决定（不再是疑点）
 
-**已经确证的**（`operation-log §33/§34`）：
+`FileManifest.seal_reason` / `seal_pressure` 落地后实测（`operation-log §35`，20MB/s、1KB 行）：
 
-| 现象 | 低速 2 MB/s | 高速 20 MB/s |
-|---|---|---|
-| 每窗口每 shard 文件数（ADR-10 目标 ≤1） | ✅ 1 | ❌ **26 ~ 92** |
-| `seal→committed`（承诺 = 窗口关闭 + `md` + `spread` = 30s） | ✅ 9.8s | ❌ **28.6 ~ 49.3s** |
+```
+bytes_threshold  files=35（水位 Normal 33 / Soft 5 / Hard 2）
+pressure         files= 2
+window_closed    files= 3
+```
 
-**未确证的**：为什么高吞吐下 chunk 稳定封口在 **27000 行 / 16.4MB**。
-`rows_threshold`(50万) 与 `bytes_threshold`(128MB ⇒ 15.2 万行) 都解释不了它；
-`enforce_pressure` 是候选，但本轮实现的"相位让位"在该负载下 `phase_yielded = 0`
-（水位在 Hard 与 Normal 间高频振荡，`plan_flush` 取样点常落在回落之后）→ **候选未证实**。
-
-**下一步第一件事**：让 seal 原因成为可观测量（`FileManifest.seal_reason` + 封口时水位档位），
-再按原因分组统计 —— 在此之前不再靠排除法给结论（`operation-log §34.3`）。
+**结论**：`bytes_threshold` 是主因，**"内存压力主导"不成立**（§33/§34 的候选被否）。
+1KB 行的**有效账本口径 ≈ 4.9 KB/行** → 128MB ≈ **2.7 万行/文件**；
+`文件/窗口/shard ≈ max(1, 窗口内数据量 ÷ bytes_threshold)`。
+所以"每窗口每 shard ≤1 文件"（ADR-10 目标）**只在 `窗口内数据量 ≤ bytes_threshold` 时成立** ——
+高吞吐下必然多文件（20MB/s × 60s = 1.2GB）。**这是阈值与速率的算术关系，不是缺陷**，
+但 **ADR-10 的措辞需要加这个限定语**。
 
 另：Parquet 写入**未设 `max_row_group_size`** → 实测 5.5k~27k 行的文件**都是 1 个 RowGroup**
 → **剪枝粒度 = 文件**。
@@ -152,8 +152,8 @@ chaos 已 11/11，但**基线压测只覆盖单进程**：真多节点 CommitFil
 
 | # | 事项 | 准入 / 验收 | 为什么是这个顺序 |
 |---|---|---|---|
-| 1 | **让 seal 原因可观测**（`FileManifest.seal_reason` + 封口时水位档位 + 按原因分组统计） | 能直接读出各 seal 原因的占比与行数分布 | 它终结"27000 行/文件"的排除法推断（本轮已因此修正过一次结论）；是处置压力/阈值的**前提**，否则改了也不知道改对没有 |
-| 2 | **按原因处置**（提高预算 / 让 reclaim 不依赖读侧 / 压力路径改为相位让位——**已实现待验证** / 修 ADR-10 措辞） | 20MB/s 单 shard：每窗口每 shard ≤1 文件 且 `seal→committed` p99 ≤ `md+spread` | 依赖上一项的观测 |
+| 1 | **ADR-10 措辞修正**：加"当窗口内数据量 > `bytes_threshold` 时为多个文件/窗口"的限定语 | 与实测一致（§5.4） | 它是当前唯一"文档与现实不符"的架构承诺；不改会让后来者以为实现有 bug |
+| 2 | 让文件数可预期：`bytes_threshold` 是否随速率自适应，或暴露"目标文件行数"配置 | 用户设的是字节、观测到的是行数，口径不直观 | 属易用性/可运维性 |
 | 3 | `max_row_group_size` 专项 | 显式设定（实测现状 = 整文件 1 组）→ 需测 RowGroup 大小对扫描剪枝/压缩率/写入内存的影响 | 与文件大小互为约束 |
 | 4 | **真多节点基线压测** | 多进程/多机 CommitFiles 瞬时并发 + 真实 S3 延迟；同时补内存曲线时序 | 单进程测量把"节点内 flush 串行"与"跨节点并发"混在一起（比值可迁移、绝对量级不可）→ R4 前必须有真实量级 |
 | 3 | **R3：metanode 独立 + raft** | M3：3 节点写入不中断 + metanode 全量重启后 Catalog 与重启前一致 | Catalog 逻辑**零改动**（R2 已把访问形态按远程定义），只换状态机宿主；先做控制平面是因为数据平面已就绪 |

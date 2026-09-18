@@ -200,6 +200,17 @@ pub struct FileManifest {
     /// 推：那两个是快照语义，与墙上时钟无关。
     #[prost(uint64, tag = "17")]
     pub committed_at_ms: u64,
+    /// **封口原因**（`SealReason::as_str()`，见 chunk 层）。
+    ///
+    /// 为什么必须落盘：高吞吐下"文件为什么只有 24MB"曾只能靠排除法推断（`operation-log §34.3`）——
+    /// 阈值 / 窗口 / 驻留兜底 / 内存压力四种原因的含义**完全不同**：
+    /// `pressure` 意味着**削峰与窗口承诺已被内存水位顶掉**，而 `rows_threshold` 是设计内行为。
+    #[prost(string, tag = "18")]
+    pub seal_reason: String,
+    /// **封口瞬间的内存水位档位**（Normal/Soft/Hard/Reject）。
+    /// 与 `seal_reason` 配对：区分"阈值触发"与"水位触发"的硬证据。
+    #[prost(string, tag = "19")]
+    pub seal_pressure: String,
 }
 
 impl FileManifest {

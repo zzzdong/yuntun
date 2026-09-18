@@ -249,21 +249,20 @@ async fn main() {
         let probe = make_batch(0, batch_rows, now_ms(), pad);
         let mem = probe.get_array_memory_size();
         println!(
-            "账本口径              : {:.0} B/行（单批 {} 行 = {:.1} MB）→ bytes_threshold 将在约 {} 行触发，\
-             rows_threshold 在 {} 行触发 → **谁先谁定**",
+            "账本口径(探针)        : {:.0} B/行（新建批的 get_array_memory_size）→ 据此推断 bytes_threshold 在约 {} 行触发；\
+             ⚠️ 实测 chunk 实际持有形态的每行占用约为其 5 倍（见 §35）→ **决策别用这个数**",
             mem as f64 / batch_rows as f64,
-            batch_rows,
-            mem as f64 / 1e6,
             bytes_threshold_mb * 1024 * 1024 / (mem / batch_rows).max(1),
-            rows_threshold
         );
     }
 
-    // ⚠️ **必须模拟读者**：`ChunkStore::reclaim`（归还 Flushed chunk 的内存）**只被读侧调用**
-    // （`query/src/cache.rs`：按"查询缓存已追上的快照"回收）。没有读者时账本只增不减 →
-    // 压力升到 Hard → `enforce_pressure` **强制 seal**，于是文件大小由**内存压力**决定
-    // 而不是由 `rows_threshold`/窗口决定（第一版就是这么测出 27k 行/文件的假象，
-    // 而 885B/行 时 bytes_threshold 本应允许 151k 行）。
+    // 模拟读者：`ChunkStore::reclaim`（归还 Flushed chunk 的内存）只被读侧调用
+    // （`query/src/cache.rs`：按"查询缓存已追上的快照"回收）。无读者时账本只增不减 →
+    // 压力升到 Hard → `enforce_pressure` 强制 seal + spill。
+    //
+    // ⚠️ 但**别把这个当成"27k 行/文件"的解释**：加上 `seal_reason` 观测后实测（§35），
+    // 27k 行/文件的原因是 **`bytes_threshold` 在 Normal 水位下正常触发**（35/40 文件），
+    // 压力触发只有 2/40 —— 这一条曾经被误判为"压力主导"（§33.2），已纠正。
     // 用 `YUNTUN_BENCH_NO_READER=1` 可复现"无读者"路径（它本身就是个生产现象：写多读少的
     // 节点会小文件化 + spill IO + seal→committed 超出承诺上界）。
     let stop_reader = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -478,6 +477,43 @@ async fn main() {
             ));
         }
     }
+
+    // ---- seal 原因分布（`operation-log §34.3` 的落点）----
+    // 这是本轮加观测的目的：**直接读出**"谁把文件切小了"，不再靠排除法推断。
+    let mut by_reason: std::collections::BTreeMap<String, (usize, Vec<i64>)> = Default::default();
+    for f in &files {
+        let e = by_reason
+            .entry(if f.seal_reason.is_empty() {
+                "(未记录)".to_string()
+            } else {
+                f.seal_reason.clone()
+            })
+            .or_insert((0, Vec::new()));
+        e.0 += 1;
+        e.1.push(f.row_count as i64);
+    }
+    println!("\n---- seal 原因分布 ----");
+    for (r, (n, rows)) in &by_reason {
+        let mut rows = rows.clone();
+        rows.sort_unstable();
+        println!(
+            "{r:<16} files={n:>3}  rows min/p50/max = {} / {} / {}",
+            rows.first().copied().unwrap_or(0),
+            pct(&rows, 0.5),
+            rows.last().copied().unwrap_or(0)
+        );
+    }
+    let mut by_pressure: std::collections::BTreeMap<String, usize> = Default::default();
+    for f in &files {
+        *by_pressure
+            .entry(if f.seal_pressure.is_empty() {
+                "(未记录)".to_string()
+            } else {
+                f.seal_pressure.clone()
+            })
+            .or_default() += 1;
+    }
+    println!("封口时水位档位        : {by_pressure:?}");
 
     println!("---- P0 证据 ----");
     println!("写入                  : {sent_rows} rows in {write_secs:.1}s ({:.0} rows/s)，实际落盘 {rows} rows", sent_rows as f64 / write_secs);
