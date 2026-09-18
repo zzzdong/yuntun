@@ -75,9 +75,10 @@ impl Default for SealPolicy {
             rows_threshold: 500_000,
             bytes_threshold: 128 * 1024 * 1024,
             min_resident: Duration::from_secs(5),
-            max_flush_delay: Duration::from_secs(30),
+            // P0 定案（T8 基线，operation-log §32）：宽限期 0、相位分散 30s
+            max_flush_delay: Duration::from_secs(0),
             max_resident: Duration::from_secs(60),
-            phase_spread: Duration::from_secs(5),
+            phase_spread: Duration::from_secs(30),
         }
     }
 }
@@ -165,6 +166,12 @@ pub struct ChunkFlushInput {
     pub seqs: Vec<u64>,
     pub wal_seq_range: Range<u64>,
     pub rows: u64,
+    /// **封口时刻**（Unix 毫秒）：写侧结束的那一刻。
+    ///
+    /// 必须从 chunk 带出来而不是在 flush 里取现在 —— flush 可能在到期后才被调度，
+    /// 用"现在"会把 `max_flush_delay + phase` 这段**从延迟里抹掉**，
+    /// 于是对外承诺的持久化上界看起来永远达标（这是最危险的一类指标失真）。
+    pub sealed_at_ms: u64,
 }
 
 /// 观测/打点快照。
@@ -653,6 +660,8 @@ impl ChunkStore {
             seqs: chunk.seqs.clone(),
             wal_seq_range: chunk.wal_seq_range.clone(),
             rows: chunk.rows as u64,
+            // 未封口的 chunk 不会走到这里；兜底用创建时刻（宁大不小，方向安全）
+            sealed_at_ms: chunk.sealed_at_ms.unwrap_or(chunk.created_at_ms),
         }))
     }
 
@@ -1262,7 +1271,7 @@ mod tests {
         let k = key();
         let a = f.store.phase_offset_ms(&k);
         assert_eq!(a, f.store.phase_offset_ms(&k), "相位偏移必须确定可预测");
-        assert!(a < 5_000, "相位偏移不得超出 max_flush_delay 之外的 spread");
+        assert!(a < 30_000, "相位偏移不得超出 spread（默认 30s，P0 定案）");
 
         // 不同实例（节点）应分散
         let other = {

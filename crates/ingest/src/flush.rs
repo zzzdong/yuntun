@@ -183,6 +183,11 @@ pub async fn flush_chunk_with_id(
     deps.tracker.observe(&s3written);
 
     // ⑤ 提交 Meta（幂等，§6.4）
+    //
+    // 提交时刻**在构造 manifest 时打点**（= 发出提交请求的时刻，误差 = CommitFiles 往返）；
+    // 不这么做就没法把请求带出去。R3 换 gRPC 后仍须由**发起方**（leader）打点：
+    // 状态机要在所有副本上确定性地应用同一份 manifest，时间戳不能各自取现在。
+    let committed_at_ms = now_ms();
     let files = vec![yuntun_model::meta::FileManifest {
         file_path: file_path.clone(),
         batch_id: batch_id.clone(),
@@ -200,6 +205,10 @@ pub async fn flush_chunk_with_id(
             &merged,
             &yuntun_model::meta::default_sort_columns(&merged.schema()),
         )?),
+        // 写侧结束时刻（**chunk 的真实封口时刻**，由 chunk 层带出）
+        // → 与 committed_at_ms 之差即"封口到持久化"的实际耗时，即对外承诺的上界口径
+        sealed_at_ms: input.sealed_at_ms,
+        committed_at_ms,
         ..Default::default()
     }];
     let resp = deps
@@ -271,6 +280,9 @@ pub async fn recommit_into_catalog(
             time_window: st.time_window.clone(),
             partition_key: st.time_window.clone(),
             source_instance: deps.instance_id.clone(),
+            // 恢复重提交：`sealed_at_ms` 是原 flush 的时刻，WAL 里没记（重提交不追加记录，
+            // 见本函数文档），故留 0 —— 调用方不应把恢复路径的该项当延迟样本。
+            committed_at_ms: now_ms(),
             ..Default::default()
         })
         .collect();

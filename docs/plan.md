@@ -152,7 +152,7 @@ standalone → server → ingest → chunk  → store → model
 | 阶段 0 | — | 写入/查询链路贯通（All-in-One） | ✅ 2026-09-08 |
 | 阶段 1 | — | Standalone 完备（crate 重构 / Flight SQL / SQL 写入 / CLI / 遗留清偿） | ✅ 主要项已完成 |
 | **阶段 1.5** | **R1（← R0）** | **数据平面地基：chunk 层**（内存热数据有界化 / spill / 背压 / 确定性落盘 / scan 接缝） | ✅ **2026-09-15**（§2.4） |
-| 阶段 2 | R0 收尾、R1 收尾 | 质量与性能：Chaos 11 场景 + 压测 baseline + Vortex + **观测指标**；**本阶段同时承担 §2.2 的定案**（阶段 3 的准入门槛） | 部分：观测已落地（T6.12 ✅）；**chaos 已 11/11 齐**（§27 / §28.2 / §29.1 / §30 已修，§28.1 待与 R3 同批）；**剩余 = T8 基线压测 + P0 定案 + ADR-10 修订** |
+| 阶段 2 | R0 收尾、R1 收尾 | 质量与性能：Chaos 11 场景 + 压测 baseline + Vortex + **观测指标**；**本阶段同时承担 §2.2 的定案**（阶段 3 的准入门槛） | 部分：观测已落地（T6.12 ✅）；**chaos 已 11/11 齐**（§27 / §28.2 / §29.1 / §30 已修，§28.1 待与 R3 同批）；**T8 基线已入库、P0 ①/③ 已定案、ADR-10 已修订**（`operation-log §32`）；**剩余 = P0 ② `rows_threshold`（缺 RowGroup 实测）+ 真多节点压测** |
 | 阶段 3 | **R2 → R3 → R4 → R5 → R6** | 分布式化：Catalog 访问形态与抽象补位（R2）→ metanode/raft（R3）→ datanode 化 + **冷热边界按实例**（R4）→ 分布查询/对拍（R5）→ **compaction/GC 全局化**（R6） | **R2 已完成（7/8，见 §7.1）**；R3–R6 待 R2 余项 + 阶段 2 准出（就绪度基线见 §五） |
 | 阶段 4 | R6 之后 | 规模化：外部索引、Iceberg 等（`refactor.md` 未覆盖，留待重新评估） | 待定 |
 
@@ -189,7 +189,8 @@ standalone → server → ingest → chunk  → store → model
 
 | # | 决策项 | 现状 | 定案所需证据 | 期限 |
 |---|---|---|---|---|
-| **P0** | `flush_phase_spread_secs` 量级（5s → 60s？）与 `max_flush_delay_secs`（30s → 0？） | 5s / 30s。窗口对齐后低吞吐表 flush 集中在"窗口关闭 + 30~35s"的 5s 带内，**分散面比 ADR-10 收窄 12 倍** | 阶段 2 baseline：同表多 shard 下的 CommitFiles / S3 PUT 瞬时并发峰值；文件数/天；持久化 P99 | 阶段 2 首轮 |
+| **P0** ✅**已定案** | `flush_phase_spread_secs`（5s → 30s）与 `max_flush_delay_secs`（30s → 0） | **已改为 30s / 0**（`ingest` + `chunk` + `server` 默认值 + `yuntun.toml.example` + ADR-10 原文） | 100 shard / 500 行/秒（每 shard 300 行/分钟）实测（`operation-log §32`）：**提交带宽 ≈ spread**（配 5s 实测 4.86s）；**峰值提交 ≈ shards/spread**：spread=5 → **87 次/秒**（均值 2.4 的 36 倍），spread=30 → **10 次/秒**；`seal→committed` p99：现值 35.1s → **新值 31.4s（更好）**；宽限期不减少文件数（300 vs 301）→ 定案 `md=0/spread=30` **两个维度都优于现默认** | ✅ 阶段 2 首轮完成 |
+| **P0** ⏳**待测** | `rows_threshold` 默认 50 万是否合适 | 保持 50 万（**未改**） | 已测到半数：阈值触发时同一 (shard,窗口) 产出 **4 个文件**（T=5 万 + 5000 行/秒/shard）、单文件行数=阈值；低吞吐表（300 行/窗口/shard）**阈值永不触发**，文件数由 **shard×窗口** 决定（实测 100 shard 低吞吐表 = **20.7 万文件/天**，调阈值无效）。**缺 RowGroup 实测**（1KB 行 + 50 万行 ≈ 500MB 单文件的上界是否可接受）→ 按"先有实测再改默认值"**本期不改** | 阶段 2（RowGroup 专项） |
 | **P0** | `rows_threshold` 默认 50 万是否合适 | 已从 1 万提到 50 万（S1-10） | 高吞吐表（metrics/traces）的单文件大小与 RowGroup 收益；小文件数 | 阶段 2 首轮 |
 | **P2** | spill 复用（校验 WAL 引用一致则沿用副本）替代"丢弃重来" | 当前丢弃重来（正确但重启后重新编码） | 重启恢复耗时占比（大 WAL 场景） | 阶段 2 |
 | **P2** | `chunk_max_resident_secs`（60s）与 WAL 物理回收的关系 | 强制 seal+flush 已实现；segment 清理闸门仍是 R21 遗留 | WAL 磁盘占用峰值 vs 写入速率 | 阶段 2 |
@@ -211,7 +212,7 @@ chunk_max_resident_secs > max_flush_delay_secs + flush_phase_spread_secs
 
 | # | 项 | 目标文档 | 期限 |
 |---|---|---|---|
-| 1 | **ADR-10 正式修订**：jitter 锚点由 `window_start` 改为 `seal_time`；量级待 P0 定案；保留"窗口对齐 + 每窗口每 shard ≤1 文件"的目标 | `architecture.md` §4 | 阶段 3 前（与 R2 Catalog 冻结同批） |
+| 1 | ~~**ADR-10 正式修订**~~ ✅ **已完成**（v12）：锚点 `seal_time`、确定性相位、量级 `md=0`/`spread=30s` + 定案实测表；并明确"每窗口每 shard ≤1 文件"不是硬不变量（阈值触发/延迟到达会破） | `architecture.md` §4 + `design.md` §5.3/§11 | ✅ 已完成 |
 | 2 | crate 图补 `yuntun-chunk`：`model → store → chunk → ingest → server`，`query → store` | `architecture.md` §3.2 | 同上 |
 | 3 | **节点私有状态清单**：WAL 目录 + **spill 目录**（ADR-3"WAL 本地独占"的边界需含 spill；备份/迁移/盘满排查都要知道） | `architecture.md` §5.3 / README | 同上 |
 | 4 | **ADR-9 / README 已知限制**：`best_effort` 的 RPO 由"≤jitter 60s"变为"窗口关闭 + max_flush_delay" | `architecture.md` §4 / README §4 | 同上 |
@@ -432,7 +433,7 @@ SQL `INSERT` 返回成功时数据仅落 WAL（与 Flight DoPut 语义一致）�
 | 能力 | 现状 | 阻塞点 | 归属 |
 |---|---|---|---|
 | 故障刻画（chaos 11 场景） | 仅 3 场景（并发崩溃 / kill -9 等） | 未刻画就上 raft：故障组合指数级放大（`refactor.md §3` 明确"不要跳过"） | 阶段 2 |
-| 基线压测 | 未入库 | **P0 定案（相位分散量级 / `max_flush_delay` / `rows_threshold`）没有数据支撑** | 阶段 2 |
+| 基线压测 | ✅ **已入库** | `chaos/examples/bench_baseline.rs`（T8）+ `operation-log §32` 数据表：提交时刻分布/带宽、峰值提交数、seal→committed 延迟、文件数·天、单文件行数。**仍缺**：真多节点（跨进程/跨机）的 CommitFiles 瞬时并发、真实 S3 PUT 绝对延迟、RowGroup 收益 | 阶段 2（剩余部分） |
 | 观测指标（S1-11） | 未接 | 内存水位 / WAL 积压 / 背压水位三项不可见 → 压力问题只能复现不能定位 | 阶段 2 |
 | 文档同步（ADR-10 等） | 未修订 | ADR 原文与实现不一致，下一位实现者会按原文改回**违例实现** | 阶段 2 末 |
 
@@ -476,17 +477,17 @@ SQL `INSERT` 返回成功时数据仅落 WAL（与 Flight DoPut 语义一致）�
 |---|---|---|---|
 | T6.1–6.11 | Chaos 11 场景（v1.0 §5.2 全表沿用） | 含并发崩溃、`synced_seq` 验证、Batch 超时、磁盘水位 | 阶段 3 前置：`refactor.md §3` 明文"不要跳过"。**✅ 11/11 全部在 chaos 层有真实磁盘 + 跨重启 + 并发的证据**（`operation-log §31`）。过程中抓出**五个**真缺陷、修掉四个：幂等键不生效（§27 ✅）、恢复重复文件（§28.2 ✅）、WAL 撕裂不可自愈（§29.1 ✅）、监控 abort 不同步视图（§30 ✅）、提交窗口重复计数（§28.1，待与 R3 同批）。**下一步 = T8 基线压测 + P0 定案**（相位分散量级 / `max_flush_delay` / `rows_threshold`）+ ADR-10 修订 |
 | T6.12 | **S1-11 观测三项指标** ✅ **已完成（2026-09-17）** | `Lakehouse::metrics()` + 周期打点：chunk 内存水位 / **WAL 积压记录数** / 背压水位 + Catalog 版本与增量统计（可序列化，HTTP 导出待阶段 2 尾） | 没有它，R-7（内存越限）只能复现不能定位 |
-| T6.13 | **P0 定案**（v2.1 新增） | 用 T8 数据定 `flush_phase_spread_secs` / `max_flush_delay_secs` / `rows_threshold`，并**正式修订 ADR-10** | §2.2；未定案就不该改默认值 |
+| T6.13 | **P0 定案**（v2.1 新增） | 用 T8 数据定 `flush_phase_spread_secs` / `max_flush_delay_secs` / `rows_threshold`，并**正式修订 ADR-10** | §2.2；未定案就不该改默认值。**进度 2/3**：①相位分散+宽限期 ✅ 定案（30s/0）、③持久化上界口径 ✅（= 窗口关闭 + md + spread，实测吻合）并已改写 ADR-10；②`rows_threshold` ⏳ 缺 RowGroup 实测 |
 | T6.14 | **chunk 压力与恢复专项**（v2.1 新增） | 触发 spill 的写入压力；spill 读回失败降级；大基数 `GROUP BY` 挤压 chunk 区（验证硬分区）；崩溃后 spill 清理 | S1 的"真实压力曲线"缺口 |
 | T6.15 | TTL 分片移除 + segment 清理闸门（R21） | 阶段 0 遗留 | 影响 WAL 磁盘占用（与 §2.2 的 P2 联动） |
 | T7.x | SQL 写入路径专项 Chaos | Flight SQL / INSERT × 崩溃点组合 | 验证与 DoPut 同等持久性 |
-| T8.x | 压测与基线入库 | 吞吐 / P99 / 内存曲线 / **CommitFiles 瞬时并发** / 文件数·天 | P0 的证据来源 |
+| T8.x | 压测与基线入库 | 吞吐 / P99 / 内存曲线 / **CommitFiles 瞬时并发** / 文件数·天 | P0 的证据来源。**✅ 已入库**：`bench_baseline`（提交时刻分布 + 峰值并发 + 文件数·天 + seal→committed）→ `operation-log §32`；**遗留**：真多节点、真实 S3、RowGroup、内存曲线 |
 | T9.x | Vortex：锁 commit + feature 打开 + Parquet 对比 | ADR-1 | 遗留清偿大头 |
 
 **准出（阶段 3 的准入）**
 
 1. chaos 11 场景 100% 通过、无 flaky（含并行执行）；
-2. 基线数据入库，且 **P0 三项全部定案**（默认值已按定案调整）；
+2. 基线数据入库（✅ T8 已入库），且 **P0 三项全部定案**（默认值已按定案调整）——**现为 2/3**，剩 `rows_threshold` 待 RowGroup 实测；
 3. ✅ T6.12 指标已可观测；T6.14 的内存曲线不高于基线（**待压测**）；
 4. §2.3 的文档同步项 1/2/3/4/6 完成（**尤其 ADR-10 必须与实现一致**）。
 
@@ -676,7 +677,7 @@ R2 Catalog 冻结（✅ 已完成）──► R3 metanode + raft
 | **R-7** | **"内存硬上限"被可见性优先级击穿**（`chunk` 记账无条件，靠 WAL 积压吸收） | 中 | 中 | 入口 95% 拒写 + 观测三项指标（内存占用 / WAL 积压 / 水位）；阶段 2 压测确认积压峰值有界（§2.2-6） |
 | **R-8** | **"单机做完只剩网络化"的判断被夸大**（D-3）：冷热边界按实例、compaction 租约、孤儿 GC 多写者安全都是**新增语义**，不是网络化 | **高** | 高 | v2.1 修正已入册：R4 的 T12.2（消费 `source_instance`）/ R6 的 T14.1–T14.3 单列；准入顺序见 §8.1 三条硬顺序 |
 | **R-9** | **孤儿 GC 误删在途文件**（多写者 + 进程内 `first_seen`）→ 静默丢数据 | **高** | 高 | T14.3 专项：GC 必须能识别"已上传未提交"（在途窗口），并**以多节点并发压测零误删作为 R6 准出**（§10） |
-| **R-10** | **相位分散量级未定案就被顺手改**（等于静默改掉 ADR-10 削峰） | 中 | 中 | §2.2 P0 + 不变量自检（`max_resident > max_flush_delay + spread`）＋ 改默认值必须附 T8 数据 |
+| **R-10** | **相位分散量级未定案就被顺手改**（等于静默改掉 ADR-10 削峰） | ✅ **已定案**（30s/0，附 T8 实测） | 中 | ✅ 已缓解：P0 ① 定案 + ADR-10 原文已改（防按旧原文改回 `window_start` 锚点）+ 不变量自检 `max_resident > md + spread`（`warnings()`）+ `yuntun.toml.example` 写明"改默认值必须附 T8 数据" |
 | **R-11** | **幂等键"看起来有、实际不生效"**（键被丢弃 / 提交不带键 / 无入口预筛）→ 客户端超时重试=静默重复计数；反向修过头则同请求的多批次互相判重=静默丢数据 | **已发生** | 高 | ✅ 已修（`operation-log §27`）：入口预筛 + fsync 后登记 + 恢复重建索引 + 多批次生产点**派生批次键**；新增 chaos #5 与客户端整请求重试用例；缺一条断言就会被"键已透传"的绿色误导 —— **凡是"已具备"的能力都要有一条断言其反面后果的用例** |
 | **R-12** | **提交 → `mark_committed` 窗口内重复计数**：`commit_files` 到 `mark_committed` 之间隔一跳 WAL fsync，此间同一批数据既在文件里又在热数据里 → 快照 ≥ S 的查询**偶发多计**（实测 4→6、9→12） | **已发生** | 中 | 测试已钉（`chaos::commit_to_mark_window_must_not_double_count`，`#[ignore]` 保留一键复现）＋ 精确断言前统一 `wait_hot_drained()`（`operation-log §28.1`）。**修复必须走读侧栅栏**（接缝带上"已知文件/batch 集合"，与 `refactor.md` S5-4 的 `known_manifest_ver` 同向）——锁/提前标记/粗水位三种快修都已论证不成立（§28.1），与 R3 同批设计 |
 | **R-15** | ~~监控线程 abort 后不同步视图~~：`spawn_timeout_monitor` 写 `BatchAbort` 只进 WAL，不通知 `BatchStateView` → 已放弃的批次仍留在 `non_terminal()`、其 `wal_seq_range` 永远挡住 segment 释放（**WAL 磁盘只增不减**），并且每轮重复写一条 `BatchAbort` | **已发生** | 中 | ✅ **已修**（`operation-log §30`）：`BatchStateView` 增默认空实现的 `note_abort`，两条 abort 路径（批次超时 / 磁盘水位）append 成功后调用；`LiveBatchTracker` 用 `observe(BatchAbort)` 实现（与 WAL 同一语义，不另设内存标记）。用例 `chaos::batch_timeout_releases_segment_after_object_store_failure`，撤掉同步即变红 |
@@ -720,7 +721,7 @@ R2 Catalog 冻结（✅ 已完成）──► R3 metanode + raft
 |---|---|---|
 | 1 | chaos **11 场景 100%** 无 flaky（含并行执行） | CI 连续 N 轮 |
 | 2 | 基线数据入库（吞吐 / P99 / 内存曲线 / **CommitFiles 瞬时并发** / 文件数·天） | 压测报告 |
-| 3 | **P0 三项全部定案**，默认值已按定案调整，ADR-10 已修订 | §2.2 登记表逐项签署 |
+| 3 | **P0 三项全部定案**，默认值已按定案调整，ADR-10 已修订（⏳ 2/3：`rows_threshold` 待 RowGroup 实测） | §2.2 登记表逐项签署 |
 | 4 | 观测三项指标（内存水位 / WAL 积压 / 背压水位）可读 | 日志 + 指标导出 |
 | 5 | chunk 压力专项：触发 spill、spill 读回失败降级、大基数 `GROUP BY` 下写入不受影响、崩溃后 spill 清理 | T6.14 |
 | 6 | 内存曲线不高于基线 | 压测报告 |

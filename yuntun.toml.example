@@ -65,15 +65,24 @@ bytes_threshold_mb = 128
 time_threshold_secs = 5
 
 # ---- 持久化上界（架构 §5.2：**不得与可见性混为一谈**）----
-# flush_at = seal_time + max_flush_delay (+ 确定性相位偏移)
+# flush_at = seal_time + max_flush_delay + 确定性相位偏移
 # 可见性上界绑 WAL fsync（约一个 scan_interval），持久化上界绑本值。
 # 低吞吐表实际持久化上界 ≈ 窗口关闭(≤60s) + max_flush_delay + 相位(≤spread)。
-max_flush_delay_secs = 30
+#
+# 默认 0：T8 基线实测该宽限期**不减少文件数**（同一窗口仍是 1 文件/shard），
+# 只把持久化上界从 spread 推迟到 max_flush_delay + spread（实测 5.2s → 35.1s）。
+# 削峰交给下面的相位分散，不拿持久化延迟去买（operation-log §32）。
+max_flush_delay_secs = 0
 # 强制 seal + flush 的最大驻留秒数：防慢写入流把 WAL 撑爆（S1-9）
+# ⚠️ 不变量：chunk_max_resident_secs > max_flush_delay_secs + flush_phase_spread_secs
+# 违反时硬兜底会早于正常到期触发 → 绕过相位分散（启动自检会告警）。
 chunk_max_resident_secs = 60
 # 确定性相位偏移上限（秒）：flush 到期时间确定，各实例仍分散以防惊群（S2-9）
 # 【已移除】flush_jitter_secs：随机 jitter 会让持久化上界不可预测。
-flush_phase_spread_secs = 5
+# 默认 30：实测提交带宽 ≈ spread、峰值提交数 ≈ shards / spread。
+# spread=5 时 100 个 shard 的提交挤在 5s 带内，实测峰值 87 次/秒（均值 2.4 的 36 倍）；
+# spread=30 降到 10 次/秒，而持久化上界 31s 仍优于旧默认（35s）。
+flush_phase_spread_secs = 30
 
 scan_interval_ms = 100
 # 幂等键 TTL（小时，§7.3.1）

@@ -55,11 +55,21 @@ pub struct IngestorConfig {
     /// ⚠️ 它**不是** seal 时刻：时间维度的 seal 触发是**到达分钟窗口关闭**（ADR-10
     /// 明文否决"达到阈值后 N 秒"——那会让低吞吐表在一个窗口内产出十余个小文件）。
     pub time_threshold_secs: u64,
-    /// seal → flush 的宽限期（秒）：`flush_at = sealed_at + max_flush_delay`
+    /// seal → flush 的宽限期（秒）：`flush_at = sealed_at + max_flush_delay + phase`
+    ///
+    /// **默认 0（T8 基线定案）**：实测该宽限期**不减少文件数**（低吞吐表同一窗口仍是
+    /// 1 文件/shard），只把持久化上界从 `spread` 推迟到 `max_flush_delay + spread`
+    /// （实测 5.2s → 35.1s）。既然削峰靠相位分散，就不该再用持久化延迟买它。
     pub max_flush_delay_secs: u64,
     /// **强制 seal + flush 的最大驻留秒数**（S1-9：防慢写入流把 WAL 撑爆）
     pub chunk_max_resident_secs: u64,
     /// 确定性相位偏移上限（秒，S2-9：替代随机 jitter）
+    ///
+    /// **默认 30（T8 基线定案）**：实测提交带宽 ≈ spread（配 5s → 实测 4.86s），
+    /// 峰值提交数 ≈ shards / spread。`spread=5` 时 100 个 shard 的提交挤在 5s 带内，
+    /// 实测峰值 87 次/秒（均值 2.4 的 36 倍）；`spread=30` 降到 10 次/秒。
+    /// 上限受不变量约束：`chunk_max_resident_secs(60) > max_flush_delay(0) + spread`
+    /// → spread ≤ 59；取 30 留一倍余量。
     pub flush_phase_spread_secs: u64,
     /// 攒批扫描间隔（同时是**可见性上界**：fsync 后最长一个周期即可查）
     pub scan_interval: Duration,
@@ -80,9 +90,9 @@ impl Default for IngestorConfig {
             rows_threshold: 500_000,
             bytes_threshold: 128 * 1024 * 1024,
             time_threshold_secs: 5,
-            max_flush_delay_secs: 30,
+            max_flush_delay_secs: 0,
             chunk_max_resident_secs: 60,
-            flush_phase_spread_secs: 5,
+            flush_phase_spread_secs: 30,
             scan_interval: Duration::from_millis(100),
             chunk_mem_budget: 512 * 1024 * 1024,
             require_idempotency_by_default: true,
@@ -735,6 +745,8 @@ impl Ingestor {
                         seqs,
                         wal_seq_range: s..e,
                         rows,
+                        // 恢复重做：原封口时刻已不可知，用 0（调用方不得把恢复路径当延迟样本）
+                        sealed_at_ms: 0,
                     };
                     flush_chunk_with_id(&input, &deps, Some(st.batch_id.clone())).await?;
                     redone += 1;
@@ -905,7 +917,8 @@ mod tests {
             p.max_resident > p.max_flush_delay,
             "驻留硬兜底必须晚于正常 flush 到期，否则兜底会变成常态路径"
         );
-        assert_eq!(p.phase_spread, Duration::from_secs(5));
+        // P0 定案（T8 基线，operation-log §32）：spread 30s、宽限期 0s
+        assert_eq!(p.phase_spread, Duration::from_secs(30));
         assert_eq!(p.rows_threshold, 500_000, "S1-10：RowGroup 一次成型");
         // ADR-10：时间维度的 seal 是"窗口关闭"，地板必须短于一个窗口，
         // 否则 seal 时刻又会退化成"创建后 N 秒"

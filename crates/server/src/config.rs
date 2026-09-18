@@ -28,9 +28,9 @@
 //! rows_threshold = 500000             # seal 触发：让 RowGroup 一次成型（S1-10）
 //! bytes_threshold_mb = 128            # seal 触发：字节阈值
 //! time_threshold_secs = 5             # 最短驻留地板（seal 时刻由窗口关闭决定，ADR-10）
-//! max_flush_delay_secs = 30           # seal → flush 宽限期（架构 §5.2）
+//! max_flush_delay_secs = 0            # seal → flush 宽限期（0 = 封口即到期，T8 定案）
 //! chunk_max_resident_secs = 60        # 强制 seal+flush，防慢写入流撑爆 WAL（S1-9）
-//! flush_phase_spread_secs = 5         # 确定性相位偏移上限（替代随机 jitter，S2-9）
+//! flush_phase_spread_secs = 30        # 确定性相位偏移上限（替代随机 jitter，S2-9；T8 定案）
 //!
 //! [compaction]
 //! min_files = 5
@@ -138,9 +138,9 @@ impl Default for IngestSection {
             rows_threshold: 500_000,
             bytes_threshold_mb: 128,
             time_threshold_secs: 5,
-            max_flush_delay_secs: 30,
+            max_flush_delay_secs: 0,
             chunk_max_resident_secs: 60,
-            flush_phase_spread_secs: 5,
+            flush_phase_spread_secs: 30,
             scan_interval_ms: 100,
             idempotency_ttl_hours: 24,
         }
@@ -475,9 +475,18 @@ users = [{ user = "yuntun", password = "secret" }]
         // 架构 §2.7：60/80/95 三级
         let t = cfg.chunk.pressure_thresholds();
         assert_eq!((t.soft, t.hard, t.reject), (0.60, 0.80, 0.95));
-        // 架构 §5.2：持久化硬上界与可见性软目标分离，且驻留兜底更晚
-        assert!(cfg.ingest.max_flush_delay_secs > cfg.ingest.time_threshold_secs);
-        assert!(cfg.ingest.chunk_max_resident_secs > cfg.ingest.max_flush_delay_secs);
+        // 架构 §5.2：持久化硬上界（= md + spread）与可见性软目标分离，且驻留兜底更晚
+        //
+        // ⚠️ 不得断言 `max_flush_delay_secs > time_threshold_secs` —— 这是**旧默认值
+        // 遗留的错觉**：两者量纲无关（一个是"seal 后多久 flush"，一个是"窗口关闭前
+        // 最短驻留"），T8 定案后前者为 0。真正的不变量只有下面这条（`warnings()` 同款）。
+        assert_eq!(cfg.ingest.max_flush_delay_secs, 0);
+        assert_eq!(cfg.ingest.flush_phase_spread_secs, 30);
+        assert!(
+            cfg.ingest.chunk_max_resident_secs
+                > cfg.ingest.max_flush_delay_secs + cfg.ingest.flush_phase_spread_secs,
+            "驻留兜底必须晚于正常到期（否则绕过相位分散）"
+        );
     }
 
     #[test]
@@ -551,7 +560,7 @@ scan_interval_ms = 50
         // 但**不再影响** flush 时刻（改为确定性相位偏移，架构 §5.3）
         let cfg = Config::from_toml("[ingest]\nrows_threshold = 5\nflush_jitter_secs = 60").unwrap();
         assert_eq!(cfg.ingest.rows_threshold, 5);
-        assert_eq!(cfg.ingest.flush_phase_spread_secs, 5);
+        assert_eq!(cfg.ingest.flush_phase_spread_secs, 30);
     }
 
     #[test]
@@ -566,7 +575,7 @@ scan_interval_ms = 50
         assert_eq!(cfg.chunk.instance_id, "standalone");
         assert_eq!(cfg.chunk.pressure_thresholds().soft, 0.60);
         assert_eq!(cfg.ingest.rows_threshold, 500_000);
-        assert_eq!(cfg.ingest.max_flush_delay_secs, 30);
+        assert_eq!(cfg.ingest.max_flush_delay_secs, 0);
         assert!(cfg.sql.mysql.enabled);
         assert!(cfg.warnings().is_empty(), "示例配置不得有潜在劣化项: {:?}", cfg.warnings());
     }

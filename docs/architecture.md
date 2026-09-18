@@ -310,26 +310,48 @@ enum Durability {
 
 1. **时间窗口对齐**：所有 Ingestor 的攒批窗口按**整分钟对齐**（而非"达到阈值后 5 秒"）。同一时间窗口的文件数 ≤ Ingestor 节点数，时间上可预测。
 
-2. **【v8 新增】Flush Jitter 削峰**：在整分钟对齐的基础上，为 flush 动作引入基于 hash 的随机抖动：
+2. **【v12 修订】确定性相位分散削峰**（原 v8 的 Jitter 实现**已违例**，见下方修订说明）：
 
 ```
-flush_moment = window_start + (hash(shard_id + table_name) % 60) seconds
+flush_moment = seal_time + max_flush_delay + (fnv1a(instance_id, table, shard, window) % spread)
 ```
 
-**⚠️ 关键澄清**：Jitter 打散的是 **flush 动作发生的时刻**，**不改变** `time_window` 的数据归属。
+**⚠️ 关键澄清**：相位分散的是 **flush 动作发生的时刻**，**不改变** `time_window` 的数据归属。
 
 - 数据仍按 `event_time` 归属 `14:00` 窗口
-- 但各 shard 的 flush 分散在 `14:00:00` ~ `14:00:59` 之间的固定时刻
+- 但各 shard 的 flush 分散在 `seal_time + max_flush_delay` 之后的 `spread` 秒内
+
+**两个量级的定案依据（T8 基线，`operation-log §32`；100 shard 低吞吐表实测）**：
+
+| 量 | 取值 | 实测 |
+|---|---|---|
+| `max_flush_delay` | **0**（原 30） | 该宽限期**不减少文件数**（同一窗口仍 1 文件/shard），只把上界从 `spread` 推到 `md+spread`（实测 5.2s → 35.1s）→ 取消它 |
+| `phase_spread` | **30s**（原 5） | 提交带宽 ≈ spread（配 5s 实测 4.86s）；峰值提交 ≈ shards/spread（spread=5 实测 **87 次/秒**，均值 2.4 的 36 倍；spread=30 降到 **10 次/秒**）；上界 `seal→committed` 31.4s（仍优于原默认 35.1s） |
+
+**为什么锚点必须是 `seal_time`**：窗口对齐（决策 1）让 chunk 在**窗口关闭时**才封口；
+若仍按 `window_start` 算抖动量，则 `seal_time + hash % 60` 会把"窗口关闭"这一时刻
+重新对齐回窗口内的固定偏移，相位分散形同虚设。
 
 **为什么必需**：若不加 Jitter，100 个节点会在每分钟第 0 秒**同时** flush —— 同时触发 S3 Multipart Upload 与 `CommitFiles` gRPC，导致：
 - Meta Raft Leader 承受周期性写入尖峰，可能触发选举超时（Leader 假死切换）
 - S3 API 瞬时并发过高返回 `503 Slow Down`
 
-**效果**：由于 `hash(shard)` 固定，同一 shard 的 flush 时刻**稳定可预测**；不同 shard 均匀分散到 60 秒，实现削峰，同时保持"每窗口每 shard 最多 1 个文件"的小文件控制目标。
+**效果**：由于 hash 输入固定，同一 shard 的 flush 时刻**稳定可预测**；不同 shard 均匀分散到 `spread` 秒，实现削峰，同时保持"每窗口每 shard 最多 1 个文件"的小文件控制目标。
+
+> ⚠️ "每窗口每 shard ≤1 文件" 是**窗口驱动 seal 下的结果，不是硬不变量**：
+> ① `rows_threshold` 被触发（高吞吐表）时同一窗口会产出多个文件（实测 T=5 万 + 5000 行/秒/shard
+> → 4 文件/窗口）；② event_time 落在上一窗口、但到达时该窗口已关闭的"延迟到达"批次会
+> 另起 chunk（实测出现晚于 `md+spread` 的离群提交，见 `operation-log §32.4` 遗留）。
 
 3. **客户端软路由**：SDK 侧一致性哈希，**仅为优化局部性，不保证**。节点不可用时自动 fallback 到其他节点，**不阻塞写入**。
 
 **与 ADR-8 的关系**：软路由是**优化**而非**约束**——任何时候任何节点仍可写任何数据，保持 ADR-3 的"互不感知"。
+
+> 📌 **v12 修订说明**：v7/v8 原文是"`flush_moment = window_start + hash % 60`"（随机抖动）。
+> 实现从未按此落地：窗口对齐（决策 1）使 seal 发生在窗口关闭时刻，锚点已改为 `seal_time`，
+> 且抖动量是**确定性**的（同一 shard 每次相同），量级由 T8 基线定案为 `spread=30s` / `md=0`。
+> 必须正式修订而不是"继续按实现走"的理由：**旧原文会让下一位实现者按它改回违例版本**
+> （`window_start` 锚点 = 相位分散失效 + 随机 jitter = 持久化上界不可预测）。
 
 > 📌 **v8 修正说明**：v7 原设计仅有"整分钟对齐"，未意识到它与系统自身的削峰目标相冲突（100 节点同秒 flush 的惊群效应）。此为 v7 的设计缺陷，v8 通过 Jitter 修正，同时保持了 ADR-10 控制小文件的初衷不变。
 
@@ -1872,7 +1894,7 @@ async fn orphan_sweeper() {
 | **15（v10 新增）** | **Catalog 内存增长**（内存 + snapshot 方案） | 100 万文件 ≈ 200MB；超 5000 万（~10GB）引入 fjall CF 作缓存（§5.4.5） |
 | **8（v7 新增）** | **UUIDv7 时钟回拨** | 引入时钟回拨保护（检测到时间倒退时自旋等待或复用上一毫秒 sequence）；监控暴露 `clock_drift_ms` |
 | **9（v7 新增）** | **Schema 碎片过多导致查询适配开销大** | Compaction 收敛（§6.8）；监控 schema_version 分布 |
-| **10（v8 新增）** | **惊群效应**：整分钟对齐导致所有节点同秒 flush，Meta Raft 与 S3 承受周期性尖峰 | Flush Jitter：按 `hash(shard+table) % 60` 打散 flush 时刻（§4 ADR-10） |
+| **10（v8 新增）** | **惊群效应**：整分钟对齐导致所有节点同秒 flush，Meta Raft 与 S3 承受周期性尖峰 | 确定性相位分散：`seal_time + hash(instance,table,shard,window) % spread`（§4 ADR-10；量级 T8 定案 = md 0 / spread 30s） |
 | **11（v8 新增）** | **幂等键存储膨胀**：千万级写入导致 Raft Snapshot 无限增长 | TTL 24h + 按表配置 `require_idempotency_key`（高吞吐表可关闭）（§7.3.1） |
 | **12（v8 新增）** | **幂等键生命周期耦合（v7 隐含缺陷）**：依附 FileManifest 时，Compaction 删除文件会导致幂等失效 | 独立 `idempotency_records` 表，自有 TTL（§7.3.1 修正 1） |
 
@@ -1946,7 +1968,7 @@ async fn orphan_sweeper() {
 | Catalog 缓存落后 30 秒 | 最终一致性 + 版本校验兜底 |
 | Meta Raft Leader 切换 | 写入不中断，无脑裂 |
 | 时钟回拨（手动调时间） | UUIDv7 与 `time_window` 不错乱 |
-| **惊群效应压测** | 100 节点同窗口，Flush Jitter 是否有效削峰（§4 ADR-10） |
+| **惊群效应压测** | 100 节点同窗口，相位分散是否有效削峰（§4 ADR-10）。**部分已测**：单进程 100 shard 实测 spread=5 → 峰值 87 次/秒、spread=30 → 10 次/秒（`operation-log §32`）；真多节点待阶段 2 |
 | 网络分区恢复 | Ingestor 重连后 BatchStateStore 状态正确恢复 |
 | **【v11 新增】Snapshot 期间 Leader 稳定性** | 持续写入下强制触发 snapshot，验证无 Leader 切换（§5.4.3.1 异步序列化生效） |
 | Meta 吞吐 | 达到 10K CommitFiles/sec（§2.1） |

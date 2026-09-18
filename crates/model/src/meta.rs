@@ -186,6 +186,20 @@ pub struct FileManifest {
     /// 事后再加需要回填历史 manifest。
     #[prost(string, tag = "15")]
     pub source_instance: String,
+    /// **本次 flush 启动的时刻**（chunk 封口 → 开始落盘，Unix 毫秒）。
+    ///
+    /// 与 `committed_at_ms` 之差 = 该文件从"写侧结束"到"持久化完成"的实际耗时
+    /// （= `max_flush_delay + phase + 对象存储 PUT + CommitFiles`）。
+    /// 这是对外承诺"数据 X 秒内持久"的**可核验口径** —— 无此字段只能靠推算。
+    #[prost(uint64, tag = "16")]
+    pub sealed_at_ms: u64,
+    /// **提交 Meta 成功**的时刻（Unix 毫秒）。
+    ///
+    /// 用途：① 运维回答"这个文件什么时候提交的"；② T8 基线（提交时刻分布 →
+    /// 惊群峰值 / 文件数·天 / 持久化 P99）。**不得**用 `deleted_at`/`valid_from`
+    /// 推：那两个是快照语义，与墙上时钟无关。
+    #[prost(uint64, tag = "17")]
+    pub committed_at_ms: u64,
 }
 
 impl FileManifest {

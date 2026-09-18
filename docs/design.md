@@ -627,7 +627,7 @@ async fn ingest_loop(
 **触发条件**（任一满足即 flush）：
 - 行数 >= `rows_threshold`（按表配置，默认 10,000）
 - 距窗口开始 >= `time_threshold`（默认 5s）
-- **整分钟对齐 + Jitter**：`flush_at = window_start + hash(shard+table) % 60s`（防惊群，ADR-10）
+- **整分钟对齐 → 窗口关闭封口 → 相位分散 flush**：`flush_at = seal_time + max_flush_delay + hash(instance,table,shard,window) % spread`（防惊群，ADR-10 v12；量级 T8 定案 `md=0` / `spread=30s`）
 - **绝对空闲超时兜底**：5 分钟（防定时器 bug 导致无限滞留）
 
 ```rust
@@ -1271,10 +1271,12 @@ disk_high_watermark = 0.80        # 【v11】磁盘保护水位
 
 [ingest]
 default_format = "vortex"          # vortex | parquet（回退开关）
-rows_threshold = 10000
-time_threshold = "5s"
-idle_timeout = "5m"                # 绝对空闲兜底
-flush_jitter_seconds = 60          # 【v8】防惊群
+rows_threshold = 500000            # seal 触发（S1-10；对低吞吐表不触发，文件由窗口驱动）
+bytes_threshold_mb = 128           # seal 触发（内存口径）
+time_threshold_secs = 5            # 最短驻留地板（不是 seal 时刻）
+max_flush_delay_secs = 0           # 【v12/T8】seal → flush 宽限期（0 = 封口即到期）
+flush_phase_spread_secs = 30       # 【v12/T8】确定性相位分散上限（替代 v8 的随机 jitter）
+# flush_jitter_seconds 已在 S1 实现中删除（随机 jitter 让持久化上界不可预测）
 
 [ingest.idempotency]
 ttl = "24h"

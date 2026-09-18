@@ -146,7 +146,7 @@ java -cp "$JAR:scripts" dbeaver_jdbc_probe
 - **无事务**：单语句自动提交，`BEGIN/COMMIT/ROLLBACK` 为 no-op；
 - **trust 鉴权**：`[sql.mysql].users` 非空仅告警，当前不做口令校验——请按网络隔离部署；
 - **写后可查（读己之写）**：`INSERT` 成功即落 WAL；攒批线程在一个扫描周期（`[ingest].scan_interval_ms`，
-  默认 100ms）内把该批数据发布到 store 层的**内存分片**，查询立即可见 —— **不再受 Flush Jitter（≤60s）
+  默认 100ms）内把该批数据发布到 store 层的**内存分片**，查询立即可见 —— **不再受 flush 相位分散（默认 ≤30s）
   与查询缓存 TTL（默认 30s）影响**（`docs/plan.md` §4.5 / `docs/design.md` §7.4）；
   数据落对象存储（Parquet + Manifest）仍按攒批窗口进行，落盘后进入快照隔离 / Compaction 语义；
   回执的 `expected_visible_in_secs` = 该扫描周期上界；
