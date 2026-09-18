@@ -515,6 +515,25 @@ async fn main() {
     }
     println!("封口时水位档位        : {by_pressure:?}");
 
+    // ---- 逐文件时间线导出（多节点聚合用）----
+    // 单进程只能给出"本节点"的提交时刻；跨节点要的是**全局**时间线
+    // （= 未来 Meta 需要承受的瞬时提交峰值）。各节点各写一份 CSV，由
+    // `scripts/bench_multi.sh` 合并后再分桶。
+    // 格式：committed_at_ms,rows,file_size,seal_reason
+    if let Ok(path) = std::env::var("YUNTUN_BENCH_DUMP") {
+        let mut out = String::from("committed_at_ms,rows,file_size,seal_reason\n");
+        for f in &files {
+            out.push_str(&format!(
+                "{},{},{},{}\n",
+                f.committed_at_ms, f.row_count, f.file_size, f.seal_reason
+            ));
+        }
+        match std::fs::write(&path, out) {
+            Ok(()) => println!("时间线已导出        : {path}（{} 行）", files.len()),
+            Err(e) => eprintln!("dump 失败 {path}: {e}"),
+        }
+    }
+
     println!("---- P0 证据 ----");
     println!("写入                  : {sent_rows} rows in {write_secs:.1}s ({:.0} rows/s)，实际落盘 {rows} rows", sent_rows as f64 / write_secs);
     println!(
