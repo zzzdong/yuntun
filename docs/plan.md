@@ -194,7 +194,8 @@ standalone → server → ingest → chunk  → store → model
 | # | 决策项 | 现状 | 定案所需证据 | 期限 |
 |---|---|---|---|---|
 | **P0** ✅**已定案** | `flush_phase_spread_secs`（5s → 30s）与 `max_flush_delay_secs`（30s → 0） | **已改为 30s / 0**（`ingest` + `chunk` + `server` 默认值 + `yuntun.toml.example` + ADR-10 原文） | 100 shard / 500 行/秒（每 shard 300 行/分钟）实测（`operation-log §32`）：**提交带宽 ≈ spread**（配 5s 实测 4.86s）；**峰值提交 ≈ shards/spread**：spread=5 → **87 次/秒**（均值 2.4 的 36 倍），spread=30 → **10 次/秒**；`seal→committed` p99：现值 35.1s → **新值 31.4s（更好）**；宽限期不减少文件数（300 vs 301）→ 定案 `md=0/spread=30` **两个维度都优于现默认** | ✅ 阶段 2 首轮完成 |
-| **P0** ⏳**待测** | `rows_threshold` 默认 50 万是否合适 | 保持 50 万（**未改**） | 已测到半数：阈值触发时同一 (shard,窗口) 产出 **4 个文件**（T=5 万 + 5000 行/秒/shard）、单文件行数=阈值；低吞吐表（300 行/窗口/shard）**阈值永不触发**，文件数由 **shard×窗口** 决定（实测 100 shard 低吞吐表 = **20.7 万文件/天**，调阈值无效）。**缺 RowGroup 实测**（1KB 行 + 50 万行 ≈ 500MB 单文件的上界是否可接受）→ 按"先有实测再改默认值"**本期不改** | 阶段 2（RowGroup 专项） |
+| **P0** ✅**已定案** | `rows_threshold` 默认 50 万是否合适 | **保持 50 万 / 128MB（均不改）** | 1KB 行实测（`operation-log §33`）：账本口径 **885 B/行** → 128MB 在 **15.2 万行**触发、50 万行要到窄行表才轮到 → **宽行表先撞字节阈值**；高吞吐下两者都没轮到，**内存水位（Hard 80%）接管**（31~92 文件/窗口、`seal→committed` p99 37.5s）。**反证**：`bytes_threshold=32MB` 反而产出更小文件（4.2MB）→ "降阈值控文件大小"是错的。RowGroup 实测 = **每文件 1 个** | ✅ 阶段 2 完成 |
+| **P1** 🆕 | **内存水位是第五个 seal 触发器**（`enforce_pressure`），高吞吐下顶掉窗口对齐承诺；`chunk_mem_budget` 需按 `速率 × 归还延迟` 定容 | 水位达 Hard 即强制 seal 所有 open chunk | `operation-log §33.2/§33.3`：低速 2MB/s → Normal + 1 文件/窗口 ✅；高速 20MB/s → Hard + 31~92 文件/窗口 + p99 37.5s ❌（无读者 49.3s） | **R4 前**（否则分布式放大 N 倍） |
 | **P0** | `rows_threshold` 默认 50 万是否合适 | 已从 1 万提到 50 万（S1-10） | 高吞吐表（metrics/traces）的单文件大小与 RowGroup 收益；小文件数 | 阶段 2 首轮 |
 | **P2** | spill 复用（校验 WAL 引用一致则沿用副本）替代"丢弃重来" | 当前丢弃重来（正确但重启后重新编码） | 重启恢复耗时占比（大 WAL 场景） | 阶段 2 |
 | **P2** | `chunk_max_resident_secs`（60s）与 WAL 物理回收的关系 | 强制 seal+flush 已实现；segment 清理闸门仍是 R21 遗留 | WAL 磁盘占用峰值 vs 写入速率 | 阶段 2 |

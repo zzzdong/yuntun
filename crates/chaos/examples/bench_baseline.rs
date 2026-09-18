@@ -36,28 +36,79 @@ use yuntun_model::meta::{FileManifest, IngestConfig};
 use yuntun_model::ops::CreateTableRequest;
 use yuntun_model::IngestBatch;
 
-fn schema() -> arrow::datatypes::SchemaRef {
-    Arc::new(Schema::new(vec![
+/// `pad` = 行宽（payload 列字节数）。1KB 行是 metrics/traces 的现实形态
+/// （`bench.rs` 的 12 列 schema ≈ 1KB/行）—— **P0 ② 的结论对行宽极敏感**：
+/// `bytes_threshold(128MB)` 是 Arrow **内存**口径，宽行会先撞它而不是 `rows_threshold`。
+fn schema(pad: usize) -> arrow::datatypes::SchemaRef {
+    let mut fields = vec![
         Field::new("event_time", DataType::Int64, false),
         Field::new("value", DataType::Float64, false),
         Field::new("host", DataType::Utf8, false),
-    ]))
+    ];
+    if pad > 0 {
+        fields.push(Field::new("payload", DataType::Utf8, false));
+    }
+    Arc::new(Schema::new(fields))
 }
 
-fn make_batch(seed: usize, rows: usize, base_ms: i64) -> arrow::record_batch::RecordBatch {
-    arrow::record_batch::RecordBatch::try_new(
-        schema(),
-        vec![
-            Arc::new(Int64Array::from(
-                (0..rows).map(|i| base_ms + i as i64).collect::<Vec<_>>(),
-            )),
-            Arc::new(Float64Array::from(
-                (0..rows).map(|i| (i % 100) as f64 / 10.0).collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(vec![format!("host-{seed}"); rows])),
-        ],
-    )
-    .unwrap()
+fn make_batch(
+    seed: usize,
+    rows: usize,
+    base_ms: i64,
+    pad: usize,
+) -> arrow::record_batch::RecordBatch {
+    let mut cols: Vec<arrow::array::ArrayRef> = vec![
+        Arc::new(Int64Array::from(
+            (0..rows).map(|i| base_ms + i as i64).collect::<Vec<_>>(),
+        )),
+        Arc::new(Float64Array::from(
+            (0..rows).map(|i| (i % 100) as f64 / 10.0).collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(vec![format!("host-{seed}"); rows])),
+    ];
+    if pad > 0 {
+        let base = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_.";
+        // ⚠️ 必须**不可压缩**：第一版用 `(seed*7+i*3+j) % 64` 生成 → 每 64 字符一个周期，
+        // ZSTD 把它压成几十分之一，`file_size` 报出 0.0MB 这种假数据（P0 ② 会被彻底误导）。
+        // xorshift per-row + per-char，熵足够高；真实 JSON payload 半可压 —— 用不可压是**保守上界**。
+        let payloads: Vec<String> = (0..rows)
+            .map(|i| {
+                let mut h = (seed as u64 + 1)
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    ^ (i as u64 + 1).wrapping_mul(0x2545_F491_4F6C_DD1D);
+                let mut v = Vec::with_capacity(pad);
+                for _ in 0..pad {
+                    h ^= h << 13;
+                    h ^= h >> 7;
+                    h ^= h << 17;
+                    v.push(base[(h % 64) as usize]);
+                }
+                String::from_utf8(v).unwrap()
+            })
+            .collect();
+        cols.push(Arc::new(StringArray::from(payloads)));
+    }
+    arrow::record_batch::RecordBatch::try_new(schema(pad), cols).unwrap()
+}
+
+/// 进程峰值 RSS（KiB）：`VmHWM` 是**高水位**，正好用于"flush 深水区内存"这类问题。
+fn peak_rss_mib() -> f64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmHWM:"))
+                .and_then(|l| l.split_whitespace().nth(1)?.parse::<f64>().ok())
+        })
+        .map(|kib| kib / 1024.0)
+        .unwrap_or(0.0)
+}
+
+/// 实测单个文件的 RowGroup 数（读 footer，不靠"默认值应该是几"推断）。
+fn row_groups_of(bytes: &[u8]) -> Option<usize> {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    let r = SerializedFileReader::new(bytes::Bytes::copy_from_slice(bytes)).ok()?;
+    Some(r.metadata().num_row_groups())
 }
 
 fn now_ms() -> i64 {
@@ -132,6 +183,10 @@ async fn main() {
     let max_flush_delay = g(5, 30) as u64;
     let phase_spread = g(6, 5) as u64;
     let rows_threshold = g(7, 500_000) as u64;
+    let pad = g(8, 0) as usize;
+    let bytes_threshold_mb = g(9, 128) as usize;
+    // 是否有"读者"：见 §下方注释 —— 没有读者时 chunk 内存永不归还，测量的是背压而非阈值。
+    let reader = std::env::var("YUNTUN_BENCH_NO_READER").is_err();
 
     let dir = yuntun_testkit::TestDir::disk("bench-baseline");
     let wal_dir = dir.join("wal").to_string_lossy().to_string();
@@ -142,7 +197,7 @@ async fn main() {
         .create_table(CreateTableRequest {
             name: "base".into(),
             namespace: yuntun_model::ops::DEFAULT_SCHEMA.into(),
-            schema: schema(),
+            schema: schema(pad),
             partition_cols: vec![],
             default_format: "parquet".into(),
             ingest_config: IngestConfig {
@@ -160,6 +215,8 @@ async fn main() {
     let ingestor = Arc::new(Ingestor::new(
         IngestorConfig {
             rows_threshold: rows_threshold as usize,
+            // P0 ②：字节阈值（**Arrow 内存口径**）与行数阈值谁先触发，决定"500 万行"是否有意义
+            bytes_threshold: bytes_threshold_mb * 1024 * 1024,
             time_threshold_secs: 5,
             max_flush_delay_secs: max_flush_delay,
             // 不变量：max_resident > max_flush_delay + phase_spread
@@ -171,7 +228,7 @@ async fn main() {
         },
         wal,
         catalog.clone(),
-        store,
+        store.clone(),
     ));
     let shutdown = CancellationToken::new();
     let _acc = ingestor.clone().spawn_accumulator(shutdown.clone());
@@ -180,8 +237,66 @@ async fn main() {
     println!(
         "---- 配置 ----\nsecs={secs} shards={shards} batch_rows={batch_rows} batches/s={batches_per_sec} \
          => {rows_per_sec} rows/s\nmax_flush_delay={max_flush_delay}s phase_spread={phase_spread}s \
-         rows_threshold={rows_threshold}\n(每 shard 约 {:.0} 行/分钟 → 典型低吞吐表)",
+         rows_threshold={rows_threshold} bytes_threshold={bytes_threshold_mb}MB pad={pad}B(行宽≈{}B)\n\
+         (每 shard 约 {:.0} 行/分钟)",
+        pad + 30,
         rows_per_sec as f64 * 60.0 / shards as f64
+    );
+
+    // 探针：**账本口径**（`get_array_memory_size`）的每行字节数。
+    // P0 ② 的核心是"两个阈值谁先触发"，而它完全由这个数决定 —— 不能靠"800B payload ≈ 830B/行"想当然。
+    {
+        let probe = make_batch(0, batch_rows, now_ms(), pad);
+        let mem = probe.get_array_memory_size();
+        println!(
+            "账本口径              : {:.0} B/行（单批 {} 行 = {:.1} MB）→ bytes_threshold 将在约 {} 行触发，\
+             rows_threshold 在 {} 行触发 → **谁先谁定**",
+            mem as f64 / batch_rows as f64,
+            batch_rows,
+            mem as f64 / 1e6,
+            bytes_threshold_mb * 1024 * 1024 / (mem / batch_rows).max(1),
+            rows_threshold
+        );
+    }
+
+    // ⚠️ **必须模拟读者**：`ChunkStore::reclaim`（归还 Flushed chunk 的内存）**只被读侧调用**
+    // （`query/src/cache.rs`：按"查询缓存已追上的快照"回收）。没有读者时账本只增不减 →
+    // 压力升到 Hard → `enforce_pressure` **强制 seal**，于是文件大小由**内存压力**决定
+    // 而不是由 `rows_threshold`/窗口决定（第一版就是这么测出 27k 行/文件的假象，
+    // 而 885B/行 时 bytes_threshold 本应允许 151k 行）。
+    // 用 `YUNTUN_BENCH_NO_READER=1` 可复现"无读者"路径（它本身就是个生产现象：写多读少的
+    // 节点会小文件化 + spill IO + seal→committed 超出承诺上界）。
+    let stop_reader = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let peak_used = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let peak_pressure = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reader_handle = {
+        let chunks = ingestor.chunks();
+        let catalog = catalog.clone();
+        let stop = stop_reader.clone();
+        let peak_used = peak_used.clone();
+        let peak_pressure = peak_pressure.clone();
+        tokio::spawn(async move {
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                let snap = catalog.current_snapshot().await;
+                if reader {
+                    chunks.reclaim(snap);
+                }
+                let st = chunks.stats();
+                peak_used.fetch_max(st.resident_bytes, std::sync::atomic::Ordering::SeqCst);
+                let tier = match st.pressure {
+                    yuntun_chunk::Pressure::Normal => 0,
+                    yuntun_chunk::Pressure::Soft => 1,
+                    yuntun_chunk::Pressure::Hard => 2,
+                    yuntun_chunk::Pressure::Reject => 3,
+                };
+                peak_pressure.fetch_max(tier, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+    };
+    println!(
+        "读侧消费              : {}（chunk 内存归还只由读侧触发）",
+        if reader { "有（模拟客户端每 200ms 拉取）" } else { "**无**（复现写多读少路径）" }
     );
 
     let t_start = Instant::now();
@@ -193,7 +308,7 @@ async fn main() {
     let mut ingest_failed = 0usize;
     while Instant::now() < deadline {
         let shard = format!("s{}", seed % shards);
-        let b = make_batch(seed, batch_rows, now_ms());
+        let b = make_batch(seed, batch_rows, now_ms(), pad);
         match ingestor
             .ingest(IngestBatch {
                 table: "base".into(),
@@ -219,6 +334,8 @@ async fn main() {
             tokio::time::sleep(d).await;
         }
     }
+    stop_reader.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = reader_handle.await;
     let write_secs = t_start.elapsed().as_secs_f64();
 
     // 排水：等到提交数不再增长（窗口是整分钟的，最后一个窗口要在关闭后才 seal）
@@ -343,6 +460,25 @@ async fn main() {
         );
     }
 
+    let mut bytes_per_file: Vec<i64> = files.iter().map(|f| f.file_size as i64).collect();
+    bytes_per_file.sort_unstable();
+
+    // RowGroup 实测（读 footer）：`yuntun-format` 的 Parquet 写入**没设** `max_row_group_size`
+    // → 用 crate 默认；一次 `writer.write(batch)` 写入整批 → 行数不足默认上限时**整文件 = 1 个 RowGroup**。
+    // 这直接决定"文件级剪枝"还是"组级剪枝"，也决定写入期内存（编码缓冲 + 输入批同时在场）。
+    let mut rg_report = Vec::new();
+    for f in files.iter().rev().take(3) {
+        if let Ok(b) = yuntun_store::get_bytes(store.as_ref(), &f.file_path).await {
+            let n = row_groups_of(&b);
+            rg_report.push(format!(
+                "rows={} size={:.1}MB row_groups={}",
+                f.row_count,
+                b.len() as f64 / 1e6,
+                n.map(|x| x.to_string()).unwrap_or_else(|| "?".into())
+            ));
+        }
+    }
+
     println!("---- P0 证据 ----");
     println!("写入                  : {sent_rows} rows in {write_secs:.1}s ({:.0} rows/s)，实际落盘 {rows} rows", sent_rows as f64 / write_secs);
     println!(
@@ -373,6 +509,24 @@ async fn main() {
         pct(&seal_to_commit, 0.5),
         pct(&seal_to_commit, 0.99),
         seal_to_commit.last().copied().unwrap_or(0)
+    );
+    println!(
+        "单文件字节            : min/p50/max = {:.1} / {:.1} / {:.1} MB（bytes_threshold={bytes_threshold_mb}MB，Arrow 内存口径）",
+        bytes_per_file.first().copied().unwrap_or(0) as f64 / 1e6,
+        pct(&bytes_per_file, 0.5) as f64 / 1e6,
+        bytes_per_file.last().copied().unwrap_or(0) as f64 / 1e6
+    );
+    println!("RowGroup 实测         : {}", rg_report.join(" | "));
+    println!(
+        "进程峰值 RSS (VmHWM)  : {:.0} MiB（含 chunk 常驻 + 编码缓冲 + 输出缓冲）",
+        peak_rss_mib()
+    );
+    println!(
+        "chunk 内存水位峰值    : {:.0} MiB / {} MiB（resident_bytes）；最高背压档 = {}",
+        peak_used.load(std::sync::atomic::Ordering::SeqCst) as f64 / 1048576.0,
+        512,
+        ["Normal", "Soft(60%)", "Hard(80%)", "Reject(95%)"]
+            [peak_pressure.load(std::sync::atomic::Ordering::SeqCst).min(3)]
     );
     println!(
         "窗口数                : {}（{}）",

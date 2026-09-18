@@ -73,7 +73,8 @@ MySQL 端口 **trust 无鉴权**（按网络隔离部署）；MySQL 轨结果集
 | D7 | 幂等预筛位置 | **ingest 入口**（写 WAL 之前）；命中即 `duplicate=true`、不写 WAL | `commit_files` 只接受单个 `client_request_id`，而一个 chunk 聚合多个键 → 提交层无法按键集合去重（属 R3 状态机） |
 | D8 | Catalog 快照 | **每查询取一次不可变快照**（`Arc` 共享），规划到 scan 全程复用 | 不是性能优化而是**正确性要求**：DataFusion 的 provider 是同步 trait、规划期反复调用，读会变的结构会让同一次查询的 plan 与 scan 看到两个版本 |
 | D9 | 幂等键独立存储 | 键**不随 FileManifest 生命周期消失**（compaction 删除原文件后重试仍幂等） | 否则合并后客户端重试 = 再写一份（静默重复） |
-| D10 | `rows_threshold` | ⏳ **未定案**（保持 50 万） | 缺 RowGroup 实测；见 §5.4 与 §6 第 1 项 |
+| D10 | `rows_threshold` / `bytes_threshold` | **均保持 50 万 / 128MB（定案：不改）** | 实测**两者都不触发**：宽行表（885B/行）先撞 128MB（≈15 万行），高吞吐下再被**内存水位**接管；反证：把 `bytes_threshold` 降到 32MB 反而产出更小文件（4.2MB vs 16.4MB）→ "降阈值=控文件大小"是错的。详见 `operation-log §33` |
+| D11 | **chunk 预算定容规则** | `chunk_mem_budget ≳ 写入速率 × (seal→committed + 读侧 reclaim 周期)` | 实测 20MB/s 下 resident ~470MB → 归还延迟 ≈23.5s；而承诺上界 30s 意味着 20MB/s 需要 ~600MB > 默认 512MB → **压力必然先于阈值介入**（`operation-log §33.3`） |
 
 **规则**：以上任何一项要改，必须先在 `operation-log` 里附**实测数据**（`plan.md §2.2` 的"先有实测再改默认值"）。
 
@@ -86,6 +87,7 @@ MySQL 端口 **trust 无鉴权**（按网络隔离部署）；MySQL 轨结果集
 | 单元 / 集成 | **214 passed / 0 failed**；184 个测试函数；`clippy --workspace --all-targets` 0 警告 | `cargo test --workspace` |
 | chaos（真实磁盘 + 跨重启 + 并发） | **11/11** 场景；进程中抓出**五个真缺陷** | `crates/chaos` 模块文档 + `operation-log §27–§31` |
 | 性能基线 | 提交时刻分布 / 峰值提交数 / `seal→committed` / 文件数·天 / 单文件行数 | `operation-log §32`（`bench_baseline`） |
+| 阈值与背压基线 | 账本口径 B/行 / 内存水位峰值 / 背压档 / RowGroup 数 / 单文件字节 | `operation-log §33`（同程序，`pad`/`bytes_threshold`/读者开关） |
 | 吞吐 | `bench.rs`（E1 目标 8w 行/秒） | `crates/chaos/examples/bench.rs` |
 
 **五个真缺陷（都"不报错、只产出错数据"，功能测试全绿时抓到的）**：
@@ -124,11 +126,22 @@ MySQL 端口 **trust 无鉴权**（按网络隔离部署）；MySQL 轨结果集
 chaos 已 11/11，但**基线压测只覆盖单进程**：真多节点 CommitFiles 瞬时并发、真实 S3 PUT 绝对延迟、
 内存曲线时序、离群提交归因（`operation-log §32.4`）均未测。
 
-### 5.4 P0 未定案项（唯一卡住 M1 的）
+### 5.4 P0 已全部定案；新增 P1：**内存水位是未被声明的第五个 seal 触发器**
 
-`rows_threshold = 50 万`：已测到"阈值触发后同一 (shard,窗口) 产出 4 个文件、单文件行数 = 阈值"，
-以及"低吞吐表阈值**永不触发**、文件数由 `shard × 窗口` 决定（100 shard → **20.7 万文件/天**）"；
-**缺** RowGroup 实测（1KB 行 × 50 万行 ≈ **500MB 单文件**上界是否可接受）。
+`plan_flush` 里有三条文档未写的触发路径，其中 **`enforce_pressure`（水位 ≥ Hard 80% → 强制 seal 所有 open chunk）**
+在高吞吐下**主导** seal 决策，导致两条架构承诺同时失效（`operation-log §33.2`）：
+
+| 承诺 | 低速（2MB/s） | 高速（20MB/s） |
+|---|---|---|
+| 每窗口每 shard ≤1 文件（ADR-10 目标） | ✅ 1 | ❌ **31 ~ 92** |
+| 持久化上界 = 窗口关闭 + `md` + `spread`（30s） | ✅ 9.8s | ❌ **37.5s**（无读者 49.3s） |
+
+根因链：**`reclaim`（归还 Flushed chunk 内存）全仓只被读侧调用**（`query/src/cache.rs`）
+→ 写多读少时账本只增不减 → 水位到 Hard → 压力 seal 接管。定容规则见 D11。
+（残余疑点：高速档水位长期 ~92%，读者每 200ms `reclaim` 也未压下去 —— 是读侧被饿死还是 `reclaim` 条件不成立，**未区分，不臆断**。）
+
+另：Parquet 写入**未设 `max_row_group_size`** → 实测 5.5k~27k 行的文件**都是 1 个 RowGroup**
+→ **剪枝粒度 = 文件**（当前 12~16MB 尚可，若到 128MB 则偏粗）。
 
 ---
 
@@ -136,8 +149,9 @@ chaos 已 11/11，但**基线压测只覆盖单进程**：真多节点 CommitFil
 
 | # | 事项 | 准入 / 验收 | 为什么是这个顺序 |
 |---|---|---|---|
-| 1 | **P0 ② RowGroup 专项** | 1KB 行 schema 下测单文件大小 / RowGroup 收益 / 内存峰值 → 定 `rows_threshold` | 它是 M1 的最后一项（chaos 11/11 ✅、基线 ✅、D1–D5 ✅），M1 是阶段 3 的准入门槛 |
-| 2 | **真多节点基线压测** | 多进程/多机 CommitFiles 瞬时并发 + 真实 S3 延迟；同时补内存曲线时序 | 单进程测量把"节点内 flush 串行"与"跨节点并发"混在一起（比值可迁移、绝对量级不可）→ R4 前必须有真实量级 |
+| 1 | **内存水位驱动 seal 的处置**（新 P1，接替原 P0 ②） | 三选一：提高 `chunk_mem_budget`（按 D11 定容）／让 reclaim 不依赖读侧（独立回收线程或按时间归还）／显式承认高吞吐下文件数与窗口解耦并改 ADR-10 措辞。**验收**：20MB/s 单 shard 下每窗口每 shard ≤1 文件、`seal→committed` p99 ≤ `md+spread` | P0 ①/②/③ 已全部定案，这一项是**新发现且直接推翻两条承诺**，必须排在 R4 之前（否则分布式下会被放大 N 倍） |
+| 2 | `max_row_group_size` 专项 | 显式设定（实测现状 = 整文件 1 组）→ 需测 RowGroup 大小对扫描剪枝/压缩率/写入内存的影响 | 与上一项同批：它决定"文件内能否跳读"，与文件大小互为约束 |
+| 3 | **真多节点基线压测** | 多进程/多机 CommitFiles 瞬时并发 + 真实 S3 延迟；同时补内存曲线时序 | 单进程测量把"节点内 flush 串行"与"跨节点并发"混在一起（比值可迁移、绝对量级不可）→ R4 前必须有真实量级 |
 | 3 | **R3：metanode 独立 + raft** | M3：3 节点写入不中断 + metanode 全量重启后 Catalog 与重启前一致 | Catalog 逻辑**零改动**（R2 已把访问形态按远程定义），只换状态机宿主；先做控制平面是因为数据平面已就绪 |
 | 4 | **R4：datanode 化 + 冷热边界** | M4：多 datanode 并发写 + 查询结果**与单节点串行精确相等**（对拍，硬要求） | 这一步才消费 `source_instance` → 消灭缺口 §5.1-1（重复计数） |
 | 5 | **R5：分布式并发查询** | M5：fanout 下对拍继续成立；查询中杀节点行为符合声明 | 依赖 R4 的分片归属 |

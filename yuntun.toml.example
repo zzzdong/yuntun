@@ -37,6 +37,13 @@ spill_dir = "./data/spill"
 instance_id = "standalone"
 # 内存硬分区（架构 §2.8）：两块预算**互不抢占**。
 # chunk 区必须保底，否则一个大基数 GROUP BY 就能把写入压垮。
+#
+# ⚠️ 定容规则（operation-log §33.3 实测得出）：
+#   chunk_mem_budget ≳ 写入速率 × (seal→committed + 读侧 reclaim 周期)
+# 因为 Flushed chunk 的内存**只由读侧归还**（query 侧 reclaim，I4）：写多读少时账本只增不减，
+# 水位升到 Hard(80%) 后 `enforce_pressure` 会**强制 seal**，于是文件大小由水位决定而与
+# 窗口/阈值无关（实测 20MB/s 时 resident ~470MB → 归还延迟 ≈23.5s；而承诺上界 30s
+# 意味着 20MB/s 需要 ~600MB > 512MB，压力必然先介入）。
 mem_budget_mb = 512
 # query 执行区：超限直接返回错误，绝不抢占 chunk 区。
 query_mem_budget_mb = 512
@@ -57,7 +64,12 @@ default_format = "parquet"
 # ---- seal 触发（架构 §2.2 / §5.4 / ADR-10）----
 # 行数阈值：让 RowGroup 一次成型（S1-10 建议 50–100 万行量级）
 rows_threshold = 500000
-# 字节阈值（MB，内存口径）
+# 字节阈值（MB，**Arrow 内存口径**，不是编码后字节）
+# ⚠️ 实测（operation-log §33）：与 rows_threshold 是"谁先触发谁定"，而两者都可能轮不到 ——
+#   高吞吐下 **chunk 内存水位（Hard 80%）会先接管**并强制 seal（文件数与窗口解耦）。
+#   宽行（1KB/行）时账本口径 ≈885 B/行 → 本值 128MB ≈ 15 万行先于 50 万行触发。
+#   ⚠️ **不要**为了"减小文件"而调低本值：实测降到 32MB 反而产出更小文件（4.2MB vs 16.4MB），
+#   因为压力比阈值先介入。要控文件大小，先按下面 [chunk] 的定容规则处理水位。
 bytes_threshold_mb = 128
 # 最短驻留地板（秒）：创建后至少这么久才允许因"窗口关闭"而 seal。
 # 【不是 seal 时刻】时间维度的 seal 触发是**到达分钟窗口关闭**（ADR-10 整分钟对齐）；

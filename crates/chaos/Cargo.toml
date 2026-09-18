@@ -19,6 +19,9 @@ tokio-util = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
+bytes = { workspace = true }
+# T8 RowGroup 实测：读 parquet footer 数 RowGroup，而不是假设"默认值应该是几"
+parquet = { workspace = true }
 
 [dev-dependencies]
 yuntun-testkit = { path = "../testkit" }
