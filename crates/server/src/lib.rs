@@ -50,6 +50,11 @@ pub struct ChunkMetrics {
     /// 背压水位（比例）
     pub pressure_ratio: f64,
     pub pressure: String,
+    /// 因内存水位跳过相位分散而提前 flush 的累计次数。
+    ///
+    /// > 0 = **ADR-10 的削峰正在让位**（文件数与窗口的对应关系仍在，但提交时刻不再均匀分散）。
+    /// 运维据此区分"Meta/S3 尖峰是配置问题还是负载超设计"，不暴露它就只能在尖峰里猜。
+    pub phase_yielded_flushes: u64,
 }
 
 /// WAL 指标。
@@ -132,6 +137,7 @@ pub async fn collect_metrics(
             budget_bytes: ledger.limit(),
             pressure_ratio: ledger.ratio(),
             pressure: format!("{:?}", cs.pressure),
+            phase_yielded_flushes: cs.phase_yielded_flushes,
         },
         wal: WalMetrics {
             synced_seq: wal.synced_seq(),
@@ -401,6 +407,7 @@ pub fn spawn_metrics_log(
                 chunk_budget_mb = m.chunk.budget_bytes / (1024 * 1024),
                 pressure = %m.chunk.pressure,
                 pressure_pct = (m.chunk.pressure_ratio * 100.0) as u64,
+                phase_yielded = m.chunk.phase_yielded_flushes,
                 wal_synced_seq = m.wal.synced_seq,
                 wal_absorbed_seq = m.wal.absorbed_seq,
                 wal_backlog = m.wal.backlog_records,

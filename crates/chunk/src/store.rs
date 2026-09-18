@@ -115,6 +115,12 @@ pub struct FlushPlan {
     pub spill: Vec<ChunkId>,
     /// 已到期、需要 flush 的 chunk（sealed / spilled）
     pub flush: Vec<ChunkId>,
+    /// 其中**因内存水位而提前 flush（相位分散让位）**的个数。
+    ///
+    /// 这个数字必须能观测：它变大的时候，"每窗口每 shard ≤1 文件 + 确定性上界"仍在，
+    /// 但 **ADR-10 的削峰目标临时失效**（提交又聚集起来了）。不暴露它的话，
+    /// 运维只能在 Meta/S3 尖峰里猜原因。
+    pub phase_yielded: usize,
 }
 
 /// 背压执行动作（诊断 / 打点用）。
@@ -186,6 +192,11 @@ pub struct ChunkStoreStats {
     pub resident_bytes: usize,
     pub ledger_limit: usize,
     pub pressure: Pressure,
+    /// 因内存水位而**跳过相位分散**提前 flush 的次数（累计）。
+    ///
+    /// > 0 表示"削峰正在让位"：文件数与窗口的对应关系仍然成立，但提交时刻不再均匀分散。
+    /// 运维看这个值就知道 Meta/S3 的尖峰是配置问题还是负载超设计。
+    pub phase_yielded_flushes: u64,
 }
 
 #[derive(Debug, Default)]
@@ -205,6 +216,8 @@ pub struct ChunkStore {
     version: AtomicU64,
     next_id: AtomicU64,
     wal_segment: AtomicU64,
+    /// 因内存水位跳过相位分散而提前 flush 的累计次数（见 [`ChunkStoreStats::phase_yielded_flushes`]）
+    phase_yielded: AtomicU64,
     inner: Mutex<Inner>,
 }
 
@@ -215,6 +228,7 @@ impl ChunkStore {
             cfg,
             ledger,
             version: AtomicU64::new(0),
+            phase_yielded: AtomicU64::new(0),
             next_id: AtomicU64::new(0),
             wal_segment: AtomicU64::new(0),
             inner: Mutex::new(Inner::default()),
@@ -579,9 +593,20 @@ impl ChunkStore {
     /// ⚠️ **不变量**：`max_resident > max_flush_delay + phase_spread`。
     /// 否则硬兜底会早于正常到期时刻触发，**绕过相位分散** → 所有实例重新在同一秒 flush
     /// （ADR-10 的惊群问题复活）。配置侧应保证该关系（见 `Config` 校验）。
+    /// ⚠️ **相位分散在内存紧张时让位**（S1 后补的实测结论，`operation-log §34`）：
+    ///
+    /// 相位分散的代价是"已 sealed 的数据要在内存里等到相位到期"——
+    /// 在途数据 ≈ `写入速率 × (max_flush_delay + spread)`。20 MB/s × 30s = 600 MB > 默认预算 512 MB
+    /// → 水位必然爬到 Hard → `enforce_pressure` **强制 seal open chunk**（同一窗口产出多个文件）
+    /// 并 spill（无谓的本地 IO）。
+    ///
+    /// 既然两种失效不可兼得，就让**软目标（削峰）**让位于**硬承诺（每窗口每 shard ≤1 文件 + 持久化上界）**：
+    /// 水位 ≥ Soft 时，已 sealed 的 chunk 立即 flush（不等相位），内存随"提交 + 回收"释放。
+    /// 让位次数记入 [`FlushPlan::phase_yielded`]，可观测。
     pub fn plan_flush(&self, now_ms: u64) -> FlushPlan {
         let policy = &self.cfg.policy;
         let max_resident_ms = policy.max_resident.as_millis() as u64;
+        let phase_yields = !matches!(self.pressure(), Pressure::Normal);
         let mut plan = FlushPlan::default();
         let inner = self.inner.lock().unwrap();
         for c in inner.chunks.values() {
@@ -601,8 +626,15 @@ impl ChunkStore {
 
             // 本轮会被 seal 的 chunk 也可同轮 flush（调用方顺序：seal → spill → flush）
             let flushable = matches!(c.state, ChunkState::Sealed | ChunkState::Spilled);
-            let due = open_too_long || sealed_too_long || now_ms >= self.flush_due_at(c);
+            let phase_due = now_ms >= self.flush_due_at(c);
+            // 内存紧张时相位让位：已 sealed 的立即 flush（只提前，不延后 → 上界语义不变）
+            let yielded = phase_yields && flushable && !phase_due;
+            let due = open_too_long || sealed_too_long || phase_due || yielded;
             if (flushable || seal_due) && !c.in_backoff(now_ms) && due {
+                if yielded {
+                    plan.phase_yielded += 1;
+                    self.phase_yielded.fetch_add(1, Ordering::SeqCst);
+                }
                 plan.flush.push(c.id);
             }
         }
@@ -811,6 +843,7 @@ impl ChunkStore {
             resident_bytes: self.ledger.used(),
             ledger_limit: self.ledger.limit(),
             pressure: self.pressure(),
+            phase_yielded_flushes: self.phase_yielded.load(Ordering::SeqCst),
         };
         for c in inner.chunks.values() {
             match c.state {
@@ -1263,6 +1296,64 @@ mod tests {
             .map(|b| b.num_rows())
             .sum();
         assert_eq!(rows, 3);
+    }
+
+    /// 内存紧张时**相位分散让位**：已 sealed 的 chunk 立即 flush（而不是等到 Hard 档
+    /// 去强制 seal open chunk + spill —— 那才会破坏"每窗口每 shard ≤1 文件"）。
+    ///
+    /// 两个分支都要断言，否则测不出"让位"这件事：
+    /// - 水位 Normal：相位未到 → 不 flush（削峰目标生效）；
+    /// - 水位 ≥ Soft：同一个 chunk 立刻 flush，并计入 `phase_yielded_flushes`（可观测）。
+    #[test]
+    fn phase_yield_flushes_sealed_chunk_early_only_under_pressure() {
+        let policy = SealPolicy {
+            rows_threshold: 4,
+            bytes_threshold: usize::MAX,
+            min_resident: Duration::ZERO,
+            max_flush_delay: Duration::ZERO,
+            max_resident: Duration::from_secs(3600),
+            phase_spread: Duration::from_secs(30),
+        };
+        // 先量出这一批的真实账本占用（不靠"4×8 字节"猜）
+        let probe = fixture("chunk-yield-probe", policy.clone(), 1 << 20);
+        let out = probe
+            .store
+            .append(key(), 1, schema(), 0, vec![batch(vec![1, 2, 3, 4])], 1_000)
+            .unwrap();
+        assert!(out.sealed.is_some(), "行数阈值应触发 seal");
+        let used = probe.store.stats().resident_bytes;
+        assert!(used > 0);
+
+        // ① 水位充裕（预算 = 已用的 16 倍）→ Normal → 相位未到不得 flush
+        let normal = fixture("chunk-yield-normal", policy.clone(), used * 16);
+        let _ = normal
+            .store
+            .append(key(), 1, schema(), 0, vec![batch(vec![1, 2, 3, 4])], 1_000)
+            .unwrap();
+        let p = normal.store.plan_flush(1_001); // 刚 seal，相位还差 30s
+        assert!(p.flush.is_empty(), "内存充裕时相位分散必须生效");
+        assert_eq!(p.phase_yielded, 0);
+
+        // ② 水位紧张（预算 = 已用的 4/3 → 75% ∈ [60%,80%) = Soft）→ 立即 flush
+        let tight = fixture("chunk-yield-soft", policy, used * 4 / 3);
+        let out2 = tight
+            .store
+            .append(key(), 1, schema(), 0, vec![batch(vec![1, 2, 3, 4])], 1_000)
+            .unwrap();
+        let id = out2.chunk_id;
+        assert!(matches!(tight.store.pressure(), Pressure::Soft | Pressure::Hard));
+        let p = tight.store.plan_flush(1_001);
+        assert_eq!(p.flush, vec![id], "水位 ≥ Soft 时相位让位，已 sealed 的必须立即 flush");
+        assert_eq!(p.phase_yielded, 1);
+        assert_eq!(
+            tight.store.stats().phase_yielded_flushes,
+            1,
+            "让位次数必须可观测（运维据此判断削峰是否失效）"
+        );
+        // 已 expired 的 chunk 不算让位（正常到期不破坏削峰）
+        let p = tight.store.plan_flush(1_000 + 30_001);
+        assert!(p.flush.contains(&id));
+        assert_eq!(p.phase_yielded, 0, "正常到期不是让位");
     }
 
     #[test]

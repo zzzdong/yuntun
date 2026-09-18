@@ -529,6 +529,10 @@ async fn main() {
             [peak_pressure.load(std::sync::atomic::Ordering::SeqCst).min(3)]
     );
     println!(
+        "相位让位次数          : {}（> 0 = 内存水位迫使提前 flush，削峰临时失效；0 = 削峰生效）",
+        ingestor.chunk_stats().phase_yielded_flushes
+    );
+    println!(
         "窗口数                : {}（{}）",
         windows.len(),
         windows.keys().cloned().collect::<Vec<_>>().join(", ")

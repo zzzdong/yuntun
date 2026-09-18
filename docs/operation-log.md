@@ -1940,3 +1940,70 @@ chunk_mem_budget  ≳  写入速率 × (seal→committed + 读侧 reclaim 周期
 | 4 | 真多节点 + 真实 S3 的绝对速率 | R4 前 | 本轮的**机制**与**定容规则**可迁移，绝对速率（2 MB/s vs 20 MB/s 的分界）不可 |
 
 ---
+
+---
+
+## 34. 内存水位处置（第一步）：相位分散让位 + **下调 §33 的结论**（2026-09-18）
+
+### 34.0 本轮落地
+
+| # | 内容 |
+|---|---|
+| 1 | **已实现**：内存水位 ≥ Soft 时"相位分散让位"——已 sealed 的 chunk 立即 flush，不再等到 Hard 档去 `enforce_pressure` **强制 seal open chunk**（后者才会把同一窗口拆成多个文件）+ spill（无谓本地 IO） |
+| 2 | **可观测**：新增 `ChunkStoreStats::phase_yielded_flushes` + `FlushPlan::phase_yielded` + metrics 打点字段 `phase_yielded` + 压测输出 |
+| 3 | **测试**：`chunk::phase_yield_flushes_sealed_chunk_early_only_under_pressure`（两个分支都断言：Normal 时**不得**让位、≥Soft 时**必须**立即 flush 且计数 +1；反向验证已做——关掉让位即红） |
+| 4 | ⚠️ **但它在真实高吞吐场景里没有触发**（见 §34.2），因此**没有**解决"27000 行/文件"现象 |
+
+### 34.1 先纠正 §33 的一处结论（我自己的判断被实测推翻）
+
+§33.3 我写"水位 ≈ 写入速率 × `spread`（相位窗口内数据）"。**这个因果是错的**，依据是本轮补做的对照实验
+（同一负载 20 MB/s、单 shard、1KB 行）：
+
+| 配置 | `seal→committed` p99 | 水位峰值 / 档位 | 单文件行数 | 每(shard,窗口)文件数 |
+|---|---|---|---|---|
+| `spread=30` | **28.6 ~ 37.5 s** | 437~470 MiB / **Hard** | 27,000 | 26 ~ 31 |
+| `spread=5` | **6.6 s** | 403 MiB / **Soft** | **27,000（没变）** | **32（没变）** |
+
+→ `spread` 只影响**延迟与压力档位**（这两项变好很明显：6.6s vs 30+s、Soft vs Hard），
+**完全不影响文件大小**。所以"相位窗口内数据"不是文件大小的决定因素；
+而**低速档（2 MB/s）一切正常**（1 文件/窗口、Normal、9.8s）说明机制与速率强相关。
+
+**结论下调**：`resident ≈ 写入速率 × (写入→flush 的滞留)` 这个量级判断仍成立
+（滞留含"窗口对齐等待 + md + spread"），但**"谁把 chunk 切小到 24 MB"仍未证实** ——
+`rows_threshold`(50万) 与 `bytes_threshold`(128MB，账本口径 885B/行 ⇒ 15.2 万行)
+**都解释不了 27000 行**，`enforce_pressure` 是候选但 §34.2 显示它也不是直接原因。
+
+### 34.2 为什么"相位让位"没触发（`phase_yielded = 0`）
+
+`plan_flush` 里的 `phase_yields` 取自**调用瞬间**的水位。实测该场景最高档是 Hard，
+但 `plan_flush` 的取样点常落在 `enforce_pressure` 刚刚 spill 完、水位回落到 Normal 之后
+→ `phase_yields = false` → 让位逻辑不生效。
+
+**这个"没触发"本身就是证据**：水位在 Soft/Hard 与 Normal 之间高频振荡（spill 立刻把水位压回去，
+写入又立刻填上来），而振荡的**周期**决定了 open chunk 能长多大 —— 与"27000 行"这个稳定的数字
+是否同源，**需要下一步的观测才能回答**（见 §34.3）。
+
+### 34.3 下一步（唯一能终结这个问题的动作）：**把 seal 原因变成可观测量**
+
+现在"为什么这个 chunk 被 seal"**在运行时不可见**：`SealReason { Rows, Bytes, WindowClosed, SchemaChanged }`
+只在 `store.rs` 内部产生，不落 WAL、不落 manifest、不进指标。于是所有推断都只能靠"排除法 + 速率算术"，
+这正是本轮两次结论修正的原因。
+
+具体做法（下一步第一件事）：
+1. `FileManifest` 增 `seal_reason`（tag 18）+ `sealed_rows`（或复用 `row_count`）；
+2. 顺带记录**封口时的水位档位**（`pressure_at_seal`），这是区分"阈值触发"与"压力触发"的唯一硬证据；
+3. 压测按 seal 原因分组统计 → **直接读出**各原因的占比与行数分布，不再靠排除法。
+
+> 在这之前，`status.md` 里"内存水位是第五个 seal 触发器"应标注为**候选**而非结论。
+
+### 34.4 本轮仍成立的事实（可直接用）
+
+| # | 事实 | 依据 |
+|---|---|---|
+| 1 | **`spread` 是延迟/压力的强杠杆**：20 MB/s 下 5s → 6.6s、30s → 28.6~37.5s | §34.1 对照实验 |
+| 2 | **低速（2 MB/s）完全符合设计**：1 文件/窗口、Normal、上界 9.8s | §33.2 |
+| 3 | **内存紧张时相位应当让位**（而不是等 Hard 强封 open chunk）——逻辑正确、已测、已可观测，只是本轮负载没触发 | §34.0 |
+| 4 | **`reclaim` 本身没问题**（有确定性测试断言 `freed > 0`，且 server 侧有后台 `spawn_cache_refresh` 会推进缓存并回收）→ §33.5 的"归还失效"疑虑**排除** | 本轮核查 |
+| 5 | RowGroup = 1 个/文件（未设 `max_row_group_size`） | §33.4 |
+
+---
