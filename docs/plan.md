@@ -536,6 +536,10 @@ SQL `INSERT` 返回成功时数据仅落 WAL（与 Flight DoPut 语义一致）�
 
 ### 7.2 R3：metanode 独立 + raft（≈3–4 周）
 
+> 📌 **设计与分步计划已定稿**（2026-09-19）：[`metanode-design.md`](metanode-design.md)
+> —— raft 库选型与逃生门、`CatalogState` 抽取纪律、快照与保留策略、proto 草案、
+> S3-0~S3-7 步骤/回滚点、M3 验收矩阵、8 条风险（按"是否静默错数据"排序）。
+
 | ID | 内容 | 说明 |
 |---|---|---|
 | T11.1 | 新增 `yuntun-meta`：fjall 实现 `raft-rs::Storage` | Catalog 逻辑零改动，只换状态机宿主 |

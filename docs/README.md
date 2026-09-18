@@ -12,6 +12,7 @@
 | 知道**架构为什么这样设计**、有哪些 ADR | [`architecture.md`](architecture.md)（12 个 ADR + 域设计） |
 | 知道**模块边界、接口契约、数据结构、状态机、配置项** | [`design.md`](design.md) |
 | 知道**从现状到分布式目标态该怎么改、按什么顺序** | [`refactor.md`](refactor.md)（S0–S6 / R0–R6） |
+| 想知道 **R3（metanode + raft）怎么设计、怎么排期、验收与风险** | [`metanode-design.md`](metanode-design.md)（**R3 设计与计划，待开工**） |
 | 知道 **chunk 层（数据平面）的目标态** | [`architecture-with-chunk.md`](architecture-with-chunk.md) |
 | 知道**多协议 SQL 接入**怎么设计 | [`sql-access-design.md`](sql-access-design.md) |
 | 知道 **DELETE/UPDATE（未实现）**怎么设计 | [`delta-dml-design.md`](delta-dml-design.md) |
