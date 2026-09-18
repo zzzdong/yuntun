@@ -1,8 +1,11 @@
 # Yuntun v2 分布式改造指南（从现状到目标态）
 
-> 目标态定义见：`yuntun-v2-架构设计.md`
+> **版本**：v1.1 ｜ **日期**：2026-09-18（v1.1：补版本头与步骤状态；S1/S2 已完成标注）
+> 目标态定义见：`architecture-with-chunk.md`（chunk 层目标态）+ `architecture.md` v12
 > 本文回答：**现有代码怎么改、按什么顺序改、每步怎么验收、哪里能回滚**
-> 适用：main 分支（2026-09-17 由 v2 改名；standalone 已跑通、100+ 测试、WAL 权威/攒批/Parquet+Manifest 已闭环）
+> 适用：main 分支（standalone 已跑通、**214 用例全绿**、WAL 权威/攒批/Parquet+Manifest 已闭环；
+> **数据平面（S1）与 Catalog 访问形态（S2）已完成**，S3–S6 未开始）
+> **现状与下一步**见 [`status.md`](status.md)；冲突裁决顺序见 [`README.md`](README.md)
 
 ---
 
@@ -73,7 +76,9 @@ S0 收尾 ──► S1 chunk ──► S2 catalog ──► S3 metanode ──�
 | S0 前置收尾 | 部分（chaos 11 场景尚未补齐；基线压测未入库） | 与 S1 可并行；**S1 已在未完成 S0 的情况下先行落地**（理由：数据平面是地基，且 S1 的正确性由单测 + 既有回归覆盖，不依赖压测基线） |
 | **S1 chunk 层** | ✅ **已完成 2026-09-15** | 落地 crate `yuntun-chunk`；189 tests / 0 failed；对照审查与 5 处回改见 `docs/operation-log.md §25` |
 | S1 收尾（残余） | 待办 | S1-11 观测指标、spill 复用、相位分散量级定案（P0，见 `plan.md §2.2`） |
-| S2 … S6 | 未开始 | — |
+| **S2 Catalog 访问形态** | ✅ **已完成 2026-09-17**（7/8，余 S2-8 随 R3） | 版本分组 / 增量 delta / 不可变快照 / 抽象补位（`operation-log §26`） |
+| S2 收尾（残余） | 待办 | S2-8 本地缓存持久化（R3 后）、S2-10 TTL 降级为纯兜底 |
+| S3 … S6 | 未开始 | 见 `status.md §6`（P0 ② 与真多节点压测是前置） |
 
 ---
 

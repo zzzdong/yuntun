@@ -1,6 +1,8 @@
 # Yuntun v2 分布式架构设计（目标态）
 
-> 状态：已决策 / 待实现
+> 状态：已决策 / **部分实现**（数据平面 S1 + Catalog 访问形态 S2 已落地，见 [`status.md`](status.md)）
+> **与 `architecture.md` 的关系**：`architecture.md` **v12** 是主架构（含 12 个 ADR 与域设计）；
+> 本文是其中"chunk 层 + 分布式目标态"的展开。两者冲突时以 `architecture.md` v12 + [`status.md`](status.md) 为准。
 > 关联：`docs/architecture.md`、`docs/design.md`、`docs/plan.md`、`chunk-store-design.md`
 > 决策日期：2026-09-14
 
@@ -287,16 +289,23 @@ datanode-X 侧:
 
 **两者是独立约束，不得合成一个**。可见性绑 WAL，持久化绑 WAL 回收与文件数。
 
-### 5.3 ⚠️ flush jitter 必须重构
+### 5.3 flush jitter 重构（✅ 已实现；量级已于 2026-09-18 定案）
+
+> **限定语（`plan.md §2.4-2` 登记）**：seal 触发是**窗口对齐**的 —— 时间维度看"分钟窗口是否关闭"
+> （`now >= window_end`），**不是**"创建后 N 秒"。`time_threshold_secs` 只是**最短驻留地板**，
+> 不单独作为 seal 时刻（否则低吞吐表会在一个窗口内产出十余个小文件）。
 
 现有 `flush_jitter_secs = 60`（ADR-10 防惊群）意味着 flush 延迟在 `time_threshold_secs(5) + jitter(60)` ≈ 65s 内不可预测，会污染持久化上界。
 
-改为**确定性相位偏移**：
+改为**确定性相位偏移**（已落地）：
 
 ```
-flush_deadline = seal_time + max_flush_delay              // 确定
-actual_flush   = flush_deadline + hash(instance) % 5s     // 相位分散，防惊群
+flush_deadline = seal_time + max_flush_delay + hash(instance, table, shard, window) % spread
 ```
+
+**量级定案（T8 基线，`operation-log §32`；ADR-10 已修订为 v12）**：
+`max_flush_delay = 0`（实测它不减少文件数、只推迟持久化）、`spread = 30s`
+（实测带宽 ≈ spread；峰值提交 100 shard 下 5s → 87 次/秒、30s → 10 次/秒）。
 
 到期时间确定、各实例仍分散、且可预测。
 

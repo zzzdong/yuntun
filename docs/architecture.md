@@ -1,8 +1,9 @@
 # 通用直写数据湖架构设计
 
-> **版本**：v10（实现路径收敛版）
-> **日期**：2026-08-31
-> **状态**：已整合四轮外部评审意见（6 份评审报告），并落实**组件选型收敛**，**可进入阶段 0 编码**
+> **版本**：**v12**（v12.4 为最新修订；正文版本演进与文末落款已对齐 —— 此前头部写 v10、文末写 v11，属版本漂移）
+> **日期**：2026-08-31（v12 修订：2026-09-09；**2026-09-18：ADR-10 正式修订 + 现状基线建立**）
+> **状态**：v12 已实现并**实际运行**（standalone 可用；数据平面地基完成）。
+> **本文描述设计意图与 ADR**；**今天实际是什么样**以 [`status.md`](status.md) 为准，证据见 [`operation-log.md`](operation-log.md)。
 >
 > **版本演进**
 > - **v7 相对 v6**：整合评审修正（幂等键、SLA 分级等）+ 新增 DataFusion 集成技术路线（第 8 章）+ Schema 演进设计（第 6 章）
@@ -166,6 +167,8 @@ yuntun/
 │   ├── yuntun-proto/       # 元数据 / WAL 消息（prost 手写；阶段 3 启用 tonic-build）
 │   ├── yuntun-wal/         # 自实现 WAL（segment+CRC）+ 事件流重建 BatchState
 │   ├── yuntun-store/       # 对象存储抽象（S3/MinIO/本地 FS）
+│   ├── yuntun-chunk/       # ★ S1 新增：热数据缓冲（Open→Sealed→Spilled→Flushed→Released）
+│   │                       #   + 内存账本/背压阶梯 + 内存硬分区 + spill（IPC+LZ4+CRC）
 │   ├── yuntun-format/      # Parquet（默认）/ Vortex（feature flag）+ Schema 适配
 │   ├── yuntun-catalog/     # Catalog 纯逻辑（无网络）
 │   ├── yuntun-ingest/       # 写入管线（RecordBatch → WAL → 攒批 → flush 状态机）
@@ -186,10 +189,11 @@ yuntun/
 **依赖方向严格单向**：
 
 ```
-standalone → server → ingest  → wal     → model
-                    → query   → catalog → model
+standalone → server → ingest  → chunk   → store → model
+                    → query   → chunk, store, catalog, format
+                              → wal     → model
                     → catalog → store, format
-                    → compaction → catalog, store, format
+                    → compaction → catalog, store, format（经 CatalogOps trait，不依赖具体类型）
 client → （仅依赖 arrow-flight，可独立编译，不依赖 server）
 ```
 
@@ -229,6 +233,16 @@ client → （仅依赖 arrow-flight，可独立编译，不依赖 server）
 ### ADR-3：多节点 Ingestor 互不感知
 
 **理由**：Ingestor 的 WAL 是**本地独占**的（自实现 segment 文件，单进程访问）。与其自建跨节点复制协议，不如明确"节点独立"模型。
+
+**节点私有状态 = 两处，缺一不可**（S1 落 chunk 层后补齐；备份 / 迁移 / 盘满排查都要知道）：
+
+| 私有状态 | 默认位置 | 说明 |
+|---|---|---|
+| **WAL 目录** | `{wal.dir}/shard={shard_id}/` | segment 文件 + 组提交 fsync；`batch_id` 幂等主键、崩溃恢复的权威来源 |
+| **spill 目录** | `[chunk].spill_dir`（默认 `./data/spill`） | 内存压力卸载的 Arrow IPC(LZ4)+CRC 副本。**必须在本地磁盘** —— 走网络比不卸载更慢；它也是"换机器后数据不完整"的原因之一 |
+
+其余一切都是**可重建**的：Catalog（重启由本地 WAL 重放 DDL 重建，R3 后由 raft snapshot 重建）、
+chunk 内存态（由 WAL 的 `synced_seq` 之下重放）。
 
 ### ADR-4：batch_id 用随机 UUIDv7 + BatchStateStore 状态机
 
@@ -2349,7 +2363,9 @@ Arc 克隆 = 共享同一份数据，而非拷贝
 
 ---
 
-**文档结束 · v11（终审通过，GO for 阶段 0）**
+**文档结束 · v12（v12.4；ADR-10 已于 2026-09-18 正式修订，见 §4 ADR-10 与 `operation-log §32`）**
+
+> 本文件与其它文档的关系见 [`docs/README.md`](README.md)；**现状以 [`status.md`](status.md) 为准**。
 
 > **阶段 0 第一周 PoC（4 项）**：
 > 1. §5.3 **自实现 WAL 原型** —— segment、CRC、**`synced_offset`**、组提交 fsync、崩溃恢复

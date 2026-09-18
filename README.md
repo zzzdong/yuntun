@@ -4,8 +4,11 @@
 对外暴露 **Arrow Flight SQL（gRPC）** 与 **MySQL wire（:3306）** 两个 SQL 协议端口，
 两者共用同一套 SQL 语义实现（`crates/sql`）。
 
-> 详细设计见 [`docs/`](docs/)：`plan.md`（任务书 v2.0 / 阶段划分）、`architecture.md`、
-> `design.md`、`sql-access-design.md`（多协议接入）、`operation-log.md`（实施日志）。
+> **现状与下一步**见 [`docs/status.md`](docs/status.md)（唯一现状入口）；
+> 文档索引与冲突裁决顺序见 [`docs/README.md`](docs/README.md)。
+> 设计文档：[`plan.md`](docs/plan.md)（任务书 v2.2 / 阶段划分）、`architecture.md`（架构 + ADR）、
+> `design.md`（详细设计）、`refactor.md`（分布式改造指南）、`sql-access-design.md`（多协议接入）、
+> `operation-log.md`（实施日志与证据）。
 
 ---
 

@@ -1,11 +1,15 @@
-# yuntun — 开发计划任务书 v2.1（chunk 层落地后的路线）
+# yuntun — 开发计划任务书 v2.2（质量与性能收尾 → 分布式化）
 
-> **依据**：《通用直写数据湖架构设计 v11》（`architecture.md`）+《详细设计文档 v1.0》（`design.md`）
+> **依据**：《通用直写数据湖架构设计 v12》（`architecture.md`）+《详细设计文档 v1.2》（`design.md`）
 > + **《架构设计（含 chunk 层）》（`architecture-with-chunk.md`，下文简称 **chunk 版架构**）**
 > + **《重构路线 S0–S6》（`refactor.md`）**
 > + **《阶段 0 实现操作日志》§25**（2026-09-15，chunk 层落地与对既有设计的逐条对照审查）
-> **版本**：v2.1
-> **日期**：2026-09-15
+> **版本**：v2.2
+> **日期**：2026-09-18
+>
+> **v2.2 相对 v2.1 的核心变更**：T8 基线压测入库 + **P0 ①/③ 定案**（`max_flush_delay_secs=0`、
+> `flush_phase_spread_secs=30`）并**正式修订 ADR-10**（v12）；chaos **11/11**；P0 ② `rows_threshold`
+> 因缺 RowGroup 实测**保持未定案**（`operation-log §31/§32`）。**现状总览见 [`status.md`](status.md)**。
 > **适用范围**：阶段 1（Standalone 完备）、**阶段 1.5（数据平面地基，已完成）**、
 > 阶段 2（质量与性能）、阶段 3（分布式化）、阶段 4（规模化）
 >
@@ -213,11 +217,11 @@ chunk_max_resident_secs > max_flush_delay_secs + flush_phase_spread_secs
 | # | 项 | 目标文档 | 期限 |
 |---|---|---|---|
 | 1 | ~~**ADR-10 正式修订**~~ ✅ **已完成**（v12）：锚点 `seal_time`、确定性相位、量级 `md=0`/`spread=30s` + 定案实测表；并明确"每窗口每 shard ≤1 文件"不是硬不变量（阈值触发/延迟到达会破） | `architecture.md` §4 + `design.md` §5.3/§11 | ✅ 已完成 |
-| 2 | crate 图补 `yuntun-chunk`：`model → store → chunk → ingest → server`，`query → store` | `architecture.md` §3.2 | 同上 |
-| 3 | **节点私有状态清单**：WAL 目录 + **spill 目录**（ADR-3"WAL 本地独占"的边界需含 spill；备份/迁移/盘满排查都要知道） | `architecture.md` §5.3 / README | 同上 |
-| 4 | **ADR-9 / README 已知限制**：`best_effort` 的 RPO 由"≤jitter 60s"变为"窗口关闭 + max_flush_delay" | `architecture.md` §4 / README §4 | 同上 |
-| 5 | `architecture-with-chunk.md` §5.3 补限定语"seal 触发是**窗口对齐**的" | `architecture-with-chunk.md` | 立即（见 §2.4-2） |
-| 6 | 详细设计 §11 配置清单同步 `[chunk]` 段与移除的 `flush_jitter_secs` / `idle_timeout` | `design.md` §11 | 阶段 2 |
+| 2 | ~~crate 图补 `yuntun-chunk`~~ ✅ 已完成（`architecture.md` §3.2 已补 crate 列表 + 依赖方向） | `architecture.md` §3.2 | ✅ |
+| 3 | ~~**节点私有状态清单**~~ ✅ 已完成（ADR-3 处补了 WAL 目录 + spill 目录表，并写明"其余一切可重建"） | `architecture.md` §4 ADR-3 | ✅ |
+| 4 | **ADR-9 / README 已知限制**：`best_effort` 的 RPO 口径 = "窗口关闭 + `max_flush_delay` + `spread`"（默认 ≤90s；实测见 `operation-log §32`），并加限定语"延迟到达的批次可能再多一个窗口" | `architecture.md` §4 / README | 阶段 2 |
+| 5 | ~~`architecture-with-chunk.md` §5.3 补限定语"seal 触发是窗口对齐的"~~ ✅ 已完成（顺便标了量级定案与与 `architecture.md` v12 的关系） | `architecture-with-chunk.md` | ✅ |
+| 6 | ~~详细设计 §11 配置清单同步~~ ✅ `[ingest]` 段已改（含删除 `flush_jitter_seconds`）；**欠**：`[chunk]` 段与 `idle_timeout` 待整段重写 | `design.md` §11 | 部分完成 |
 
 ### 2.4 阶段 1.5 WBS：数据平面地基（chunk 层）—— ✅ 已完成
 
