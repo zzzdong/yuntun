@@ -9,20 +9,19 @@
 //!   阶段 0 单节点实现为自增序号，阶段 1 切换零业务改动
 
 use arrow::datatypes::SchemaRef;
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use yuntun_model::error::LakeError;
-use yuntun_model::meta::{
-    compute_stats_lite, FileManifest, FileStatus, IdempotencyRecord, SchemaVersion, TableMeta,
-};
+use yuntun_model::meta::{compute_stats_lite, FileManifest, IdempotencyRecord, TableMeta};
 use yuntun_model::ops::{
-    qualified_name, split_qualified, validate_schema_name, validate_table_name, CatalogVersion,
-    CommitFilesRequest, CommitFilesResponse, CreateTableRequest, EvolveSchemaRequest,
-    EvolveSchemaResponse, ManifestDelta, DEFAULT_SCHEMA,
+    qualified_name, split_qualified, CatalogVersion, CommitFilesRequest, CommitFilesResponse,
+    CreateTableRequest, EvolveSchemaRequest, EvolveSchemaResponse, ManifestDelta,
 };
-use yuntun_model::schema::{apply_change, SchemaChangeKind};
+use yuntun_model::schema::SchemaChangeKind;
+
+pub mod state;
+
+pub use state::CatalogState;
 
 /// Catalog 操作契约（详细设计 §3.3）。
 /// 阶段 1：同一 trait 由 `GrpcCatalogClient` 实现。
@@ -128,30 +127,13 @@ fn now_secs() -> u64 {
 ///
 /// 即使阶段 0 单节点，写操作也走 `apply` 语义（last_applied_index 单调递增），
 /// 读操作走 `read_index` 语义，为阶段 1 切换 Raft 铺路（§13.2）。
+/// 单进程 Catalog **宿主**：`RwLock<CatalogState>` + 取时钟 + trait 转发。
+///
+/// 语义全部在 [`CatalogState`]（纯状态机，`metanode-design.md §4.1`）：本类型只做三件事
+/// ——加锁、取时间、把结果发出去。R3 的 metanode 会把**同一份** `CatalogState` 交给 raft 驱动，
+/// 所以这里**不得出现任何业务分支**（否则 standalone 与分布式会分叉，R2 的 `if distributed` 禁令）。
 pub struct MemoryCatalog {
-    /// 表标识（全限定 `schema.table`）→ TableMeta
-    tables: RwLock<HashMap<String, TableMeta>>,
-    /// schema（MySQL 的 database）注册表；至少含 `public`
-    namespaces: RwLock<HashSet<String>>,
-    /// (qualified_table, version) -> SchemaVersion（版本链）
-    schemas: RwLock<HashMap<(String, u64), SchemaVersion>>,
-    /// batch_id -> FileManifest
-    files: RwLock<HashMap<String, FileManifest>>,
-    /// 幂等键独立存储（【v8 修正 1】与 FileManifest 生命周期解耦，§7.3.1）
-    idempotency: RwLock<HashMap<String, IdempotencyRecord>>,
-    /// 单调递增快照号（§6.3）
-    snapshot_version: AtomicU64,
-    /// 已 apply 的变更数（Raft 线性化抽象，T3.5）
-    last_applied: AtomicU64,
-    /// 结构变更计数（表 / schema / schema 演进）—— 缓存**全量重建**的触发器（S2-5）
-    schema_ver: AtomicU64,
-    /// 文件清单变更计数 —— 缓存**增量刷新**的触发器（S2-5）
-    manifest_ver: AtomicU64,
-    /// 每个表最后一次文件清单变更的 `manifest_ver`（S2-7 增量接口的数据来源）。
-    ///
-    /// 用"每表最后变更版本"而不是 append-only 日志：查询是 O(表数) 而不是 O(变更数)，
-    /// 且不会无界增长；表被删时同步移除（删表走 schema_ver → 调用方全量重建）。
-    table_manifest_ver: RwLock<HashMap<String, u64>>,
+    state: RwLock<CatalogState>,
 }
 
 impl Default for MemoryCatalog {
@@ -163,54 +145,30 @@ impl Default for MemoryCatalog {
 impl MemoryCatalog {
     pub fn new() -> Self {
         Self {
-            tables: RwLock::new(HashMap::new()),
-            namespaces: RwLock::new(HashSet::from([DEFAULT_SCHEMA.to_string()])),
-            schemas: RwLock::new(HashMap::new()),
-            files: RwLock::new(HashMap::new()),
-            idempotency: RwLock::new(HashMap::new()),
-            snapshot_version: AtomicU64::new(1),
-            last_applied: AtomicU64::new(0),
-            schema_ver: AtomicU64::new(0),
-            manifest_ver: AtomicU64::new(0),
-            table_manifest_ver: RwLock::new(HashMap::new()),
+            state: RwLock::new(CatalogState::new()),
         }
     }
 
-    /// 幂等键 TTL 清理（后台定时调用；TTL 自 committed_at 起算，§7.3.1 修正 2）。
+    /// 只读借用状态机（测试 / 运维；变更一律走 [`CatalogOps`]）。
+    pub fn with_state<R>(&self, f: impl FnOnce(&CatalogState) -> R) -> R {
+        f(&self.state.read().unwrap())
+    }
+
+    /// 幂等键 TTL 清理（后台定时调用；TTL 自 `committed_at` 起算，§7.3.1 修正 2）。
+    ///
+    /// `now` 由**宿主**取：R3 下这会变成一个**显式 op** —— 否则各副本按各自墙钟在不同时刻清理
+    /// → 状态分叉（而这种分叉极难复现）。
     pub fn sweep_expired_idempotency(&self, ttl_secs: u64) -> usize {
-        let now = now_secs();
-        let mut map = self.idempotency.write().unwrap();
-        let before = map.len();
-        map.retain(|_, r| now.saturating_sub(r.committed_at) < ttl_secs);
-        before - map.len()
-    }
-
-    /// 结构变更：推进 `schema_ver`（缓存全量重建）。
-    fn bump_schema_ver(&self) -> u64 {
-        self.schema_ver.fetch_add(1, Ordering::SeqCst) + 1
-    }
-
-    /// 文件清单变更：推进 `manifest_ver` 并记下该表的最后变更版本（缓存增量刷新）。
-    fn bump_manifest_ver(&self, table: &str) -> u64 {
-        let v = self.manifest_ver.fetch_add(1, Ordering::SeqCst) + 1;
-        self.table_manifest_ver
+        self.state
             .write()
             .unwrap()
-            .insert(normalize_table(table), v);
-        v
+            .sweep_expired_idempotency(ttl_secs, now_secs())
     }
 
-    /// 【修复】原子推进快照号并返回新值。
-    ///
-    /// 快照号**必须严格单调**：文件可见性依赖 `valid_from <= snapshot`。
-    /// 此前 `commit_files / commit_compaction / drop_shard` 用 `load() + 1` 再 `store()`，
-    /// 与并发的 `drop_table`（`fetch_add`）交错时，晚到的 `store` 会把更大的快照号
-    /// **覆盖回小值** → 已提交文件（`valid_from > snapshot`）在中途"永久不可见"，
-    /// 直到下一次推进快照。统一改为原子的 `fetch_add`，返回各操作唯一的递增值。
-    fn next_snapshot(&self) -> u64 {
-        self.snapshot_version.fetch_add(1, Ordering::SeqCst) + 1
+    /// 状态机的规范编码（快照口径 + **确定性对拍**用，见 [`CatalogState::encode_canonical`]）。
+    pub fn encode_canonical(&self) -> Vec<u8> {
+        self.state.read().unwrap().encode_canonical()
     }
-
 }
 
 #[async_trait::async_trait]
@@ -218,386 +176,121 @@ impl CatalogOps for MemoryCatalog {
     // ---------------------------------------------------------- schema
 
     async fn create_schema(&self, name: &str) -> Result<(), LakeError> {
-        validate_schema_name(name)?;
-        let mut ns = self.namespaces.write().unwrap();
-        if !ns.insert(name.to_string()) {
-            return Err(LakeError::SchemaAlreadyExists(name.to_string()));
-        }
-        drop(ns);
-        self.bump_schema_ver();
-        self.last_applied.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+        self.state.write().unwrap().create_schema(name)
     }
 
     async fn drop_schema(&self, name: &str) -> Result<(), LakeError> {
-        if name == DEFAULT_SCHEMA {
-            return Err(LakeError::Other(format!(
-                "default schema {DEFAULT_SCHEMA:?} cannot be dropped"
-            )));
-        }
-        if !self.schema_exists(name).await? {
-            return Err(LakeError::SchemaNotFound(name.to_string()));
-        }
-        // 非空 schema 拒绝删除（MySQL ER_DB_DROP_EXISTS 语义）
-        if self
-            .tables
-            .read()
-            .unwrap()
-            .values()
-            .any(|t| t.schema_name() == name)
-        {
-            return Err(LakeError::SchemaNotEmpty(name.to_string()));
-        }
-        self.namespaces.write().unwrap().remove(name);
-        self.bump_schema_ver();
-        self.last_applied.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+        self.state.write().unwrap().drop_schema(name)
     }
 
     async fn list_schemas(&self) -> Result<Vec<String>, LakeError> {
-        let mut v: Vec<String> = self.namespaces.read().unwrap().iter().cloned().collect();
-        v.sort();
-        Ok(v)
+        Ok(self.state.read().unwrap().list_schemas())
     }
 
     async fn schema_exists(&self, name: &str) -> Result<bool, LakeError> {
-        Ok(self.namespaces.read().unwrap().contains(name))
+        Ok(self.state.read().unwrap().schema_exists(name))
     }
 
     // ---------------------------------------------------------- 表
 
     async fn create_table(&self, req: CreateTableRequest) -> Result<TableMeta, LakeError> {
-        validate_table_name(&req.name)?;
-        let ns_name = req.schema_name().to_string();
-        validate_schema_name(&ns_name)?;
-        if !self.schema_exists(&ns_name).await? {
-            return Err(LakeError::SchemaNotFound(ns_name));
-        }
-        let qualified = req.qualified_name();
-        let mut tables = self.tables.write().unwrap();
-        if tables.contains_key(&qualified) {
-            return Err(LakeError::TableAlreadyExists(qualified));
-        }
-        let meta = TableMeta {
-            name: req.name.clone(),
-            namespace: ns_name,
-            current_schema_version: 1,
-            partition_cols: req.partition_cols,
-            default_format: req.default_format,
-            ingest_config: Some(req.ingest_config),
-            created_at: now_secs(),
-            arrow_schema: yuntun_model::meta::serialize_schema(&req.schema),
-            table_template: 1, // General
-        };
-        self.schemas.write().unwrap().insert(
-            (qualified.clone(), 1),
-            SchemaVersion {
-                version: 1,
-                arrow_schema: meta.arrow_schema.clone(),
-                change_kind: 0,
-                created_at: now_secs(),
-                change_desc: "initial schema".into(),
-            },
-        );
-        tables.insert(qualified, meta.clone());
-        self.bump_schema_ver();
-        self.last_applied.fetch_add(1, Ordering::SeqCst);
-        Ok(meta)
+        // ⚠️ 时钟在**宿主**取：状态机内读钟会让副本状态分叉（`state.rs` 纪律 1）
+        let now = now_secs();
+        self.state.write().unwrap().create_table(req, now)
     }
 
-    /// `name` = 全限定标识 `schema.table`（无 `.` 时按默认 schema 解析，兼容旧数据）。
     async fn get_table(&self, name: &str) -> Result<Option<TableMeta>, LakeError> {
-        let (ns, table) = split_qualified(name);
-        Ok(self
-            .tables
-            .read()
-            .unwrap()
-            .get(&qualified_name(ns, table))
-            .cloned())
+        Ok(self.state.read().unwrap().get_table(name))
     }
 
     async fn list_tables(&self) -> Result<Vec<TableMeta>, LakeError> {
-        Ok(self.tables.read().unwrap().values().cloned().collect())
+        Ok(self.state.read().unwrap().list_tables())
     }
 
-    /// Schema 演进（OCC，C8 —— 唯一的乐观锁作用点，详细设计 §8.2）。
     async fn evolve_schema(
         &self,
         req: EvolveSchemaRequest,
     ) -> Result<EvolveSchemaResponse, LakeError> {
-        let key = normalize_table(&req.table);
-        let mut tables = self.tables.write().unwrap();
-        let table = tables
-            .get_mut(&key)
-            .ok_or_else(|| LakeError::TableNotFound(key.clone()))?;
-
-        // 【唯一乐观锁点】
-        if table.current_schema_version != req.expected_version {
-            let actual = table.current_schema_version;
-            let new_schema = table.schema()?;
-            return Err(LakeError::SchemaChanged {
-                actual_version: actual,
-                new_schema,
-            });
-        }
-
-        // 按类型提升格应用变更（§8.1）
-        let old_schema = table.schema()?;
-        let new_schema = apply_change(&old_schema, &req.change)?;
-        let new_version = table.current_schema_version + 1;
-
-        self.schemas.write().unwrap().insert(
-            (key.clone(), new_version),
-            SchemaVersion {
-                version: new_version,
-                arrow_schema: yuntun_model::meta::serialize_schema(&new_schema),
-                change_kind: req.change.kind() as u32,
-                created_at: now_secs(),
-                change_desc: req.change.describe(),
-            },
-        );
-        table.current_schema_version = new_version;
-        table.arrow_schema = yuntun_model::meta::serialize_schema(&new_schema);
-        self.bump_schema_ver();
-        self.last_applied.fetch_add(1, Ordering::SeqCst);
-
-        Ok(EvolveSchemaResponse {
-            new_schema,
-            version: new_version,
-        })
+        let now = now_secs();
+        self.state.write().unwrap().evolve_schema(req, now)
     }
 
     async fn table_schema(&self, name: &str) -> Result<Option<(SchemaRef, u64)>, LakeError> {
-        let tables = self.tables.read().unwrap();
-        Ok(match tables.get(&normalize_table(name)) {
-            Some(t) => Some((t.schema()?, t.current_schema_version)),
-            None => None,
-        })
+        self.state.read().unwrap().table_schema(name)
     }
 
-    /// CommitFiles 幂等实现（详细设计 §6.4 / §7.3）。
-    ///
-    /// C8：不校验 schema version —— 不同文件可有不同 schema_version，是设计允许的常态。
+    // ---------------------------------------------------------- 文件清单
+
     async fn commit_files(
         &self,
         req: CommitFilesRequest,
     ) -> Result<CommitFilesResponse, LakeError> {
-        // ① batch_id 幂等检查
-        {
-            let files = self.files.read().unwrap();
-            if files.contains_key(&req.batch_id) {
-                // 幂等：已提交过，返回成功（不报错）
-                return Ok(CommitFilesResponse {
-                    accepted: false,
-                    snapshot: self.snapshot_version.load(Ordering::SeqCst),
-                    commit_index: self.last_applied.load(Ordering::SeqCst),
-                });
-            }
-        }
-
-        // ② client_request_id 唯一索引检查（§7.3 Meta 层全局去重）
-        if let Some(key) = &req.client_request_id {
-            let mut idem = self.idempotency.write().unwrap();
-            if idem.contains_key(key) {
-                return Ok(CommitFilesResponse {
-                    accepted: false,
-                    snapshot: self.snapshot_version.load(Ordering::SeqCst),
-                    commit_index: self.last_applied.load(Ordering::SeqCst),
-                });
-            }
-            idem.insert(
-                key.clone(),
-                IdempotencyRecord {
-                    client_request_id: key.clone(),
-                    batch_id: req.batch_id.clone(),
-                    committed_at: now_secs(),
-                },
-            );
-        }
-
-        // ③ 分配快照号并落 Manifest（原子推进，见 next_snapshot）
-        let next = self.next_snapshot();
-        let mut files = self.files.write().unwrap();
-        if files.contains_key(&req.batch_id) {
-            // 并发下 batch_id 重复（写锁竞态）—— 幂等返回
-            return Ok(CommitFilesResponse {
-                accepted: false,
-                snapshot: self.snapshot_version.load(Ordering::SeqCst),
-                commit_index: self.last_applied.load(Ordering::SeqCst),
-            });
-        }
-        for mut f in req.files {
-            f.valid_from = next;
-            f.status = FileStatus::Active as u32;
-            f.batch_id = req.batch_id.clone();
-            f.schema_version = req.schema_version;
-            f.shard = req.shard.clone();
-            f.time_window = req.time_window.clone();
-            // 归一化为全限定表标识（多 schema：跨 schema 同名表必须区分）
-            f.table = normalize_table(&req.table);
-            f.client_request_id = req.client_request_id.clone().unwrap_or_default();
-            files.insert(req.batch_id.clone(), f);
-        }
-        drop(files);
-        self.bump_manifest_ver(&req.table);
-        self.last_applied.fetch_add(1, Ordering::SeqCst);
-
-        Ok(CommitFilesResponse {
-            accepted: true,
-            snapshot: next,
-            commit_index: self.last_applied.load(Ordering::SeqCst),
-        })
+        let now = now_secs();
+        self.state.write().unwrap().commit_files(req, now)
     }
 
-    /// 快照可见性过滤（详细设计 §6.3）：
-    /// 文件可见 ⟺ valid_from <= query_snapshot AND (deleted_at == 0 OR query_snapshot < deleted_at)
     async fn list_visible_files(
         &self,
         table: &str,
         snapshot: u64,
         shard_filter: Option<&str>,
     ) -> Result<Vec<FileManifest>, LakeError> {
-        let key = normalize_table(table);
-        let files = self.files.read().unwrap();
-        Ok(files
-            .values()
-            .filter(|f| normalize_table(&f.table) == key)
-            .filter(|f| shard_filter.is_none_or(|s| f.shard == s))
-            .filter(|f| f.visible_at(snapshot))
-            .cloned()
-            .collect())
+        Ok(self
+            .state
+            .read()
+            .unwrap()
+            .list_visible_files(table, snapshot, shard_filter))
     }
 
-    /// L1 分片移除（§6.3）：整 shard 文件 deleted_at = current_snapshot + 1。
     async fn drop_shard(&self, table: &str, shard: &str) -> Result<u64, LakeError> {
-        let next = self.next_snapshot();
-        let key = normalize_table(table);
-        let mut files = self.files.write().unwrap();
-        let mut n = 0u64;
-        for f in files.values_mut() {
-            if normalize_table(&f.table) == key && f.shard == shard && f.deleted_at == 0 {
-                f.deleted_at = next;
-                n += 1;
-            }
-        }
-        drop(files);
-        self.bump_manifest_ver(&key);
-        self.last_applied.fetch_add(1, Ordering::SeqCst);
-        Ok(n)
+        Ok(self.state.write().unwrap().drop_shard(table, shard))
     }
 
-    /// 删除表（S1.7）：表 + Schema 版本链 + 文件 Manifest 一并移除。
-    ///
-    /// 数据文件本身不动 —— Manifest 移除后 S3 对象成为孤儿，
-    /// 由孤儿清理循环（batch_id 对账 + 静置期）回收（plan §4.3）。
     async fn drop_table(&self, name: &str) -> Result<(), LakeError> {
-        let key = normalize_table(name);
-        let mut tables = self.tables.write().unwrap();
-        if tables.remove(&key).is_none() {
-            return Err(LakeError::TableNotFound(key));
-        }
-        drop(tables);
-        self.schemas
-            .write()
-            .unwrap()
-            .retain(|(t, _), _| *t != key);
-        self.files
-            .write()
-            .unwrap()
-            .retain(|_, f| normalize_table(&f.table) != key);
-        self.snapshot_version.fetch_add(1, Ordering::SeqCst);
-        // 结构与清单都变了：schema_ver 让缓存全量重建，manifest_ver 兜一层增量消费者
-        self.bump_schema_ver();
-        self.bump_manifest_ver(&key);
-        self.last_applied.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+        self.state.write().unwrap().drop_table(name)
     }
 
     async fn check_idempotency(&self, key: &str) -> Result<Option<String>, LakeError> {
-        Ok(self
-            .idempotency
-            .read()
-            .unwrap()
-            .get(key)
-            .map(|r| r.batch_id.clone()))
+        Ok(self.state.read().unwrap().check_idempotency(key))
     }
 
     async fn record_idempotency(&self, rec: IdempotencyRecord) -> Result<(), LakeError> {
-        let mut idem = self.idempotency.write().unwrap();
-        idem.entry(rec.client_request_id.clone()).or_insert(rec);
+        self.state.write().unwrap().record_idempotency(rec);
         Ok(())
     }
 
     async fn current_snapshot(&self) -> u64 {
-        self.snapshot_version.load(Ordering::SeqCst)
+        self.state.read().unwrap().current_snapshot()
     }
 
     async fn read_index(&self) -> u64 {
-        self.last_applied.load(Ordering::SeqCst)
+        self.state.read().unwrap().read_index()
     }
 
     async fn version(&self) -> CatalogVersion {
-        CatalogVersion {
-            schema_ver: self.schema_ver.load(Ordering::SeqCst),
-            manifest_ver: self.manifest_ver.load(Ordering::SeqCst),
-        }
+        self.state.read().unwrap().version()
     }
 
     async fn manifest_delta(&self, since_manifest_ver: u64) -> Result<ManifestDelta, LakeError> {
-        let current = self.manifest_ver.load(Ordering::SeqCst);
-        if since_manifest_ver >= current {
-            return Ok(ManifestDelta::default());
-        }
-        let map = self.table_manifest_ver.read().unwrap();
-        let mut changed_tables: Vec<String> = map
-            .iter()
-            .filter(|(_, v)| **v > since_manifest_ver)
-            .map(|(t, _)| t.clone())
-            .collect();
-        changed_tables.sort();
-        Ok(ManifestDelta {
-            changed_tables,
-            full_reload_required: false,
-        })
+        Ok(self.state.read().unwrap().manifest_delta(since_manifest_ver))
     }
 
     // ---------------------------------------------------------- compaction / 运维
 
-    /// Compaction 提交（L2，§6.3）：旧文件标记 `deleted_at`，新文件 `valid_from = snapshot+1`，
-    /// 一次原子完成；并推进受影响表的 `manifest_ver`（供缓存增量刷新）。
     async fn commit_compaction(
         &self,
         old_batch_ids: &[String],
         new_files: Vec<FileManifest>,
     ) -> Result<u64, LakeError> {
-        let next = self.next_snapshot();
-        let mut touched: HashSet<String> = HashSet::new();
-        let mut files = self.files.write().unwrap();
-        // 先确认旧文件仍可见（避免与并发 drop_shard 冲突时错误复活数据）
-        for id in old_batch_ids {
-            if let Some(f) = files.get_mut(id) {
-                if f.deleted_at == 0 {
-                    f.deleted_at = next;
-                }
-                touched.insert(normalize_table(&f.table));
-            }
-        }
-        for mut nf in new_files {
-            nf.valid_from = next;
-            nf.status = FileStatus::Active as u32;
-            touched.insert(normalize_table(&nf.table));
-            files.insert(nf.batch_id.clone(), nf);
-        }
-        drop(files);
-        self.last_applied.fetch_add(1, Ordering::SeqCst);
-        for t in &touched {
-            self.bump_manifest_ver(t);
-        }
-        Ok(next)
+        Ok(self
+            .state
+            .write()
+            .unwrap()
+            .commit_compaction(old_batch_ids, new_files))
     }
 
     async fn known_batch_ids(&self) -> Result<Vec<String>, LakeError> {
-        Ok(self.files.read().unwrap().keys().cloned().collect())
+        Ok(self.state.read().unwrap().known_batch_ids())
     }
 }
 
@@ -629,6 +322,7 @@ pub fn change_kind_value(kind: SchemaChangeKind) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use yuntun_model::ops::DEFAULT_SCHEMA;
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
     use yuntun_model::ops::CreateTableRequest;
@@ -787,6 +481,7 @@ mod tests {
             table: table.into(),
             batch_id: batch_id.into(),
             client_request_id: None,
+            client_request_ids: vec![],
             shard: "s0".into(),
             time_window: "w".into(),
             files: vec![FileManifest {
@@ -971,6 +666,7 @@ mod tests {
                 table: "audit".into(),
                 batch_id: "b1".into(),
                 client_request_id: None,
+                client_request_ids: vec![],
                 shard: "s0".into(),
                 time_window: "w1".into(),
                 files: vec![manifest("b1", "yuntun/audit/f1.parquet")],
@@ -1004,6 +700,7 @@ mod tests {
             table: "audit".into(),
             batch_id: "b1".into(),
             client_request_id: None,
+            client_request_ids: vec![],
             shard: "s0".into(),
             time_window: "w".into(),
             files: vec![manifest("b1", "yuntun/audit/f1.parquet")],
@@ -1046,6 +743,7 @@ mod tests {
             table: "audit".into(),
             batch_id: "b1".into(),
             client_request_id: Some("client-key-1".into()),
+            client_request_ids: vec![],
             shard: "s0".into(),
             time_window: "w1".into(),
             files: vec![manifest("b1", "yuntun/audit/f1.parquet")],
@@ -1065,6 +763,7 @@ mod tests {
             .commit_files(CommitFilesRequest {
                 batch_id: "b2".into(),
                 client_request_id: Some("client-key-1".into()),
+                client_request_ids: vec![],
                 files: vec![manifest("b2", "yuntun/audit/f2.parquet")],
                 ..req
             })
@@ -1115,6 +814,7 @@ mod tests {
             table: "audit".into(),
             batch_id: "b1".into(),
             client_request_id: None,
+            client_request_ids: vec![],
             shard: "s0".into(),
             time_window: "w".into(),
             files: vec![manifest("b1", "p1")],
@@ -1137,6 +837,7 @@ mod tests {
             table: "audit".into(),
             batch_id: "old".into(),
             client_request_id: None,
+            client_request_ids: vec![],
             shard: "s0".into(),
             time_window: "w".into(),
             files: vec![manifest("old", "yuntun/audit/old.parquet")],
@@ -1179,6 +880,7 @@ mod tests {
             table: "audit".into(),
             batch_id: "new".into(),
             client_request_id: None,
+            client_request_ids: vec![],
             shard: "s0".into(),
             time_window: "w".into(),
             files: vec![manifest("new", "yuntun/audit/new.parquet")],
@@ -1225,6 +927,7 @@ mod tests {
                         table: "keep".into(),
                         batch_id: format!("b{i}"),
                         client_request_id: None,
+                        client_request_ids: vec![],
                         shard: "s0".into(),
                         time_window: "w".into(),
                         files: vec![manifest(&format!("b{i}"), &format!("p{i}"))],

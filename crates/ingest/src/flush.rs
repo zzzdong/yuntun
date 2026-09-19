@@ -231,6 +231,10 @@ pub async fn flush_chunk_with_id(
             // 幂等的实际拦点是 `Ingestor::ingest` 的入口预筛（§7.3 第一层）；
             // "提交时按键集合去重"要等 R3 状态机（refactor.md S3-5）。
             client_request_id: None,
+            // ⚠️ 键集合尚未接线（R3 S3-5 剩余）：chunk 目前不记录它聚合了哪些幂等键。
+            // 因此**权威去重仍靠 ingest 入口预筛**（§27）；接线后这里传 chunk 的键集合，
+            // Catalog 侧即可按键集合去重（关闭 §27.5 遗留 #1）。
+            client_request_ids: vec![],
             shard: input.shard.shard.clone(),
             time_window: input.shard.window.clone(),
             files,
@@ -304,6 +308,7 @@ pub async fn recommit_into_catalog(
             table: table.to_string(),
             batch_id: st.batch_id.clone(),
             client_request_id: st.client_request_id.clone(),
+            client_request_ids: vec![], // 恢复重提交：原键集合丢失（见 §27.5 遗留）
             shard: st.shard.clone(),
             time_window: st.time_window.clone(),
             files,

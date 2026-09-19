@@ -95,6 +95,15 @@ pub struct CommitFilesRequest {
     pub batch_id: String,
     /// 客户端幂等键（唯一索引，可空）
     pub client_request_id: Option<String>,
+    /// **本次提交携带的幂等键集合**（R3 S3-5，关闭 `operation-log §27.5` 遗留 #1）。
+    ///
+    /// 为什么需要它：一个 chunk 会聚合**多条带不同键的 Data 记录**，
+    /// 而提交层此前只能接受**单个**键 → 无法按键集合去重，只能靠 ingest 入口预筛兜底
+    /// （`flush.rs` 里当时刻意传 `None` 就是为此）。权威去重在 Catalog（R3 起在 raft 状态机）。
+    ///
+    /// 语义：集合中**任一**键已登记 → 整次提交判为重复（`accepted=false`），不重复落 manifest。
+    /// 空 = 该批次无键（不参与去重）。
+    pub client_request_ids: Vec<String>,
     pub shard: String,
     pub time_window: String,
     pub files: Vec<FileManifest>,

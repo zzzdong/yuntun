@@ -158,7 +158,7 @@ fn encode_parquet(batch: &arrow::record_batch::RecordBatch) -> Result<Vec<u8>, L
         .set_compression(parquet::basic::Compression::ZSTD(
             parquet::basic::ZstdLevel::default(),
         ))
-        .set_max_row_group_size(MAX_ROWS_PER_ROW_GROUP)
+        .set_max_row_group_row_count(Some(MAX_ROWS_PER_ROW_GROUP))
         .build();
     let mut buf = Vec::with_capacity(1024);
     let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props))

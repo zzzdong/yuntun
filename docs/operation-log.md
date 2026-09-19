@@ -2160,3 +2160,61 @@ RowGroup 实测 : rows=150000 row_groups=3 | rows=150000 row_groups=3 | rows=605
 | 4 | 内存曲线**时序**（本轮到目前只有峰值） | 阶段 2 | 打点已具备（`chunk_stats`），需要按 1s 采样导出 |
 
 ---
+
+---
+
+## 38. R3 开工第一切片：`CatalogState` 纯状态机抽出 + **四处非确定性**（2026-09-19）
+
+按 [`metanode-design.md`](metanode-design.md) 的开工顺序，先做最高风险项 **S3-2**（`CatalogState` 抽取），
+它无外部依赖且能在早期暴露"副本静默分叉"。
+
+### 38.1 落地
+
+| 位置 | 改动 |
+|---|---|
+| **新** `catalog/src/state.rs` | `CatalogState`：纯状态机（无锁 / 无时钟 / 无 IO）。容器全部 `BTreeMap`/`BTreeSet`，版本号是**普通 `u64` 字段**（不再是 `AtomicU64`：多副本各自 `++` 会在乱序 apply 时分叉）；变更方法签名一律 `(&mut self, …, now_secs: u64)` —— **时间由调用方传入** |
+| `catalog/src/lib.rs` | `MemoryCatalog` 退化为**宿主**：`RwLock<CatalogState>` + 取钟 + trait 转发（语义零改动）。R3 的 metanode 会把同一份 `CatalogState` 交给 raft 驱动 |
+| `model/src/ops.rs` | `CommitFilesRequest.client_request_ids: Vec<String>`（**键集合**，S3-5 的接口部分）：集合中**任一**键已登记即整次判重（关闭 `§27.5` 遗留 #1 的接口侧） |
+| `format/src/lib.rs` | `set_max_row_group_size` → `set_max_row_group_row_count(Some(_))`（§36 的上游弃用更名） |
+
+### 38.2 抽出的过程中抓到**四处真实存在的非确定性**（都已修）
+
+| # | 位置（抽出前） | 后果 | 修法 |
+|---|---|---|---|
+| 1 | `create_table`：`TableMeta.created_at = now_secs()` | 各副本 `created_at` 不同 → **状态逐字节不一致**（M3 直接失败） | 时间由调用方传入 |
+| 2 | `create_table`：`SchemaVersion.created_at = now_secs()` | 同上（版本链分叉） | 同上 |
+| 3 | `evolve_schema`：`SchemaVersion.created_at = now_secs()` | 同上 | 同上 |
+| 4 | `commit_compaction`：用 **`HashSet<String>`** 收集受影响表，再**按其迭代序分配 `manifest_ver`** | **不同副本把同一个 `manifest_ver` 分给不同的表** → delta 语义静默错位（最难查的一类） | 改 `BTreeSet`（有序） |
+
+> 值得强调的是：这四处**在今天也是"能跑、测试全绿"的** —— 它们只在"多副本 apply 同一串 op"时才暴露。
+> 这正是设计里把"确定性纪律"排在第一风险（R3-1）的原因。
+
+### 38.3 确定性防线：规范编码 + 对拍用例
+
+- `CatalogState::encode_canonical()`：把**所有影响后续行为的字段**（两组版本号、快照号、每表最后变更版本、
+  版本链与幂等记录的时间戳、文件清单）按**键序**编码。少一个字段，对拍就会漏掉一类分叉。
+- 5 个用例（`catalog/src/state.rs::tests`）：
+  1. `same_op_sequence_yields_byte_identical_state` —— 同一串 op（含相同时间戳）在两台状态机上 → **逐字节相同**（R3-1 的防线）；
+  2. `state_records_carried_timestamps_not_local_clock` —— 断言记录的是**传入值**；
+  3. `compaction_version_assignment_is_order_independent` —— 建表顺序不同但内容相同 → 状态编码相同（专打第 4 处 `HashSet`）；
+  4. `commit_files_dedups_on_key_set` —— 键集合去重（任一键命中即整次判重、不落 manifest）；
+  5. `idempotency_sweep_uses_carried_now` —— TTL 清理的时间也由调用方传入。
+- **反证已做**：把 `create_table` 改回"状态机自己取钟"（写死 `999_999_999`）→ 用例 2 立刻失败
+  （`left: 999999999, right: 42`），已恢复。
+- ⚠️ **诚实说明**：用例 3 对第 4 处的捕获是**概率性**的（`HashSet` 两个元素、随机种子下的迭代序约各半），
+  所以那条纪律**不能只靠测试守**，必须靠"状态里禁用无序容器"的结构性约束（`state.rs` 文件头四条纪律）。
+
+### 38.4 本轮**没做**（明确记账，避免"看起来完成了"）
+
+| # | 未做项 | 归属 | 说明 |
+|---|---|---|---|
+| 1 | **键集合的实际接线** | S3-5 剩余 | `flush.rs` 仍传空集合（chunk 目前不记录它聚合了哪些幂等键）。**权威去重仍靠 ingest 入口预筛** —— 已在 `flush.rs` 写明，不留静默空值 |
+| 2 | proto / tonic-build | S3-0 | 未开始（需新增依赖） |
+| 3 | raft 接入 / metanode 进程 | S3-1 / S3-3 | 未开始 |
+| 4 | 快照的 prost 版本 | S3-3 | 现为文本规范编码（语义等价，S3-3 换 prost 时用例可继续用） |
+
+### 38.5 验证
+
+`cargo test --workspace`：**222 passed / 0 failed**（新增 5 个用例）；`clippy --all-targets` 0 警告。
+
+---

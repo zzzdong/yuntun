@@ -35,6 +35,7 @@ async fn commit(c: &MemoryCatalog, table: &str, batch_id: &str) {
         table: table.into(),
         batch_id: batch_id.into(),
         client_request_id: None,
+        client_request_ids: vec![],
         shard: "s0".into(),
         time_window: "w".into(),
         files: vec![FileManifest {

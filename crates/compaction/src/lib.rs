@@ -403,6 +403,7 @@ mod tests {
                     table: "t".into(),
                     batch_id: bid.clone(),
                     client_request_id: None,
+                    client_request_ids: vec![],
                     shard: "s0".into(),
                     time_window: "w1".into(),
                     files: vec![FileManifest {

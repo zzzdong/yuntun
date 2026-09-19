@@ -241,7 +241,7 @@ message ProposeResponse {
 |---|---|---|---|
 | **S3-0** | proto 定义 + `tonic-build`（`T10.8`）：把现有手写 prost struct 迁到 `.proto` 生成 | 编解码 round-trip；与现有 `CommitFilesRequest` 字段**逐个对齐**的兼容测试 | 保留手写 struct（双份并存一个 commit） |
 | **S3-1** | **raft PoC（选型闸门）**：3 节点进程内集群，写/读/kill leader/快照/安装 | 3 节点写入不中断；kill leader 后 30s 内恢复；快照可安装 | 换 openraft（§4.2 逃生门） |
-| **S3-2** | `CatalogState` 抽取（§4.1）+ `apply` 单测 + **确定性对拍** | 既有 catalog 用例全绿；**同一串 op 在两个独立实例上 apply → 序列化逐字节相同** | 保留 `MemoryCatalog` 旧结构（新结构并行存在） |
+| **S3-2** | `CatalogState` 抽取（§4.1）+ **确定性对拍** | ✅ **第一切片已落地**（`operation-log §38`）：`CatalogState` 抽出、抓到并修掉**四处真实非确定性**（3 处状态机读钟 + 1 处 `HashSet` 决定版本分配序）、`encode_canonical` + 5 个对拍用例（含反证）。**余**：键集合接线（S3-5）、快照 prost 版（S3-3） | 已保留 `MemoryCatalog` 作为宿主（语义零改动） |
 | **S3-3** | `yuntun-meta` 进程 + `MetaService`（Propose/Prefetch/Delta/Status/Join）+ fjall | 单节点 metanode 可独立启动；重启后状态一致 | — |
 | **S3-4** | `RemoteCatalog`（`CatalogOps` 的 gRPC 实现）+ standalone 装配（本地传输、1 节点 raft） | **既有 217 用例全绿**（standalone 不回归）；`if distributed` 分支为零 | 切回 `MemoryCatalog`（装配层开关） |
 | **S3-5** | 幂等权威迁 SM + **键集合**去重（§4.5，含 `§27.5` 遗留 #1） | 双写者同键 → 只生效一次（**含反面断言**） | — |

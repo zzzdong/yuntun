@@ -539,6 +539,8 @@ SQL `INSERT` 返回成功时数据仅落 WAL（与 Flight DoPut 语义一致）�
 > 📌 **设计与分步计划已定稿**（2026-09-19）：[`metanode-design.md`](metanode-design.md)
 > —— raft 库选型与逃生门、`CatalogState` 抽取纪律、快照与保留策略、proto 草案、
 > S3-0~S3-7 步骤/回滚点、M3 验收矩阵、8 条风险（按"是否静默错数据"排序）。
+> **进度**：**S3-2 第一切片已落地**（`operation-log §38`）—— `CatalogState` 纯状态机抽出、
+> 四处非确定性（3 处状态机读钟 + 1 处 `HashSet` 定版本分配序）已修、`encode_canonical` + 5 个对拍用例（含反证）。
 
 | ID | 内容 | 说明 |
 |---|---|---|
