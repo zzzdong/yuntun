@@ -60,6 +60,13 @@ message Op {
     DropTableOp    drop_table    = 3;
     CommitFilesOp  commit_files  = 4;
     CreateTableOp  create_table  = 5;
+    DropSchemaOp   drop_schema   = 6;
+    EvolveSchemaOp evolve_schema = 7;
+    DropShardOp    drop_shard    = 8;
+    CompactionOp   compaction    = 9;
+    // 幂等"认领"（写入前登记键）。**必须是 op**：认领一旦只存在本地，
+    // 并发同键请求会双双通过预筛各写一份（见 pipeline.rs 的认领注释）。
+    IdempotencyOp  idempotency   = 10;
   }
 }
 
@@ -273,3 +280,65 @@ message RaftResponse {
   // 未交付的原因（对端未运行 / 不是成员）—— 日志与指标用
   string reason    = 2;
 }
+
+// ---------------------------------------------------------------- op 镜像（S3-4 第二批）
+
+message DropSchemaOp {
+  string name = 1;
+}
+
+// Schema 演进（OCC：`expected_version` 不符 → FAILED_PRECONDITION）。
+message EvolveSchemaOp {
+  string           table            = 1;
+  SchemaChangeMsg  change           = 2;
+  uint64           expected_version = 3;
+}
+
+// 单个 Schema 变更。
+//
+// **用 oneof 而不是「kind + 松散字段」**：后者允许非法组合（如 kind=AddColumn 却带 `to`），
+// 而那种消息**编码成功**、只在应用时才炸 —— 属于把错误推到最晚发现。
+message SchemaChangeMsg {
+  oneof kind {
+    // `Field` 与 `DataType` 都用 **Arrow IPC** 携带（见 `op.rs` 的说明）：
+    // 复用 `CreateTableOp.arrow_schema_ipc` 那一套编码，不发明第二套。
+    bytes         add_column_field_ipc = 1;
+    WidenTypeMsg  widen_type           = 2;
+    DropColumnMsg drop_column          = 3;
+  }
+}
+
+message WidenTypeMsg {
+  string column       = 1;
+  // 目标类型：**单字段 schema 的 Arrow IPC**（`arrow::DataType` 没有 prost 表示，
+  // 而它本身能被 schema IPC 无损表达）
+  bytes  to_type_ipc  = 2;
+}
+
+message DropColumnMsg {
+  string column = 1;
+}
+
+message DropShardOp {
+  string table = 1;
+  string shard = 2;
+}
+
+// Compaction 提交（L2）：旧批次标记删除 + 新文件 `valid_from = snapshot+1`，一次原子完成。
+message CompactionOp {
+  repeated string          old_batch_ids = 1;
+  repeated FileManifestMsg new_files     = 2;
+}
+
+// 幂等记录（认领 / 提交后登记）。
+message IdempotencyOp {
+  IdempotencyRecordMsg record = 1;
+}
+
+message IdempotencyRecordMsg {
+  string client_request_id = 1;
+  // 空串 = 已认领、批次尚未落盘（见 `CatalogOps::record_idempotency` 的语义）
+  string batch_id          = 2;
+  uint64 committed_at      = 3;
+}
+

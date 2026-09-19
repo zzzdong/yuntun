@@ -15,7 +15,12 @@
 use std::sync::Arc;
 
 use yuntun_catalog::CatalogState;
-use yuntun_model::meta::{ColumnStatLite, FileManifest, IngestConfig, StatisticsLite, TableMeta};
+use arrow::datatypes::{DataType, Field, Schema};
+use yuntun_model::meta::{
+    ColumnStatLite, FileManifest, IdempotencyRecord, IngestConfig, StatisticsLite, TableMeta,
+};
+use yuntun_model::ops::EvolveSchemaRequest;
+use yuntun_model::schema::SchemaChange;
 use yuntun_model::ops::{CommitFilesRequest, CreateTableRequest};
 
 // `encode_to_vec` / `decode`：prost 的 trait 方法（匿名导入，避免与 pb 别名混淆）
@@ -45,6 +50,29 @@ pub enum StateOp {
         request: CommitFilesRequest,
         now_ms: u64,
     },
+    DropSchema {
+        name: String,
+        now_ms: u64,
+    },
+    EvolveSchema {
+        request: EvolveSchemaRequest,
+        now_ms: u64,
+    },
+    DropShard {
+        table: String,
+        shard: String,
+        now_ms: u64,
+    },
+    Compaction {
+        old_batch_ids: Vec<String>,
+        new_files: Vec<FileManifest>,
+        now_ms: u64,
+    },
+    /// 幂等**认领**（写入前的登记）。
+    RecordIdempotency {
+        record: IdempotencyRecord,
+        now_ms: u64,
+    },
 }
 
 // `CreateTableRequest` 里有 `SchemaRef`（`Arc<Schema>`）—— `Arc` 未使用会告警
@@ -54,10 +82,18 @@ use Arc as _ArcAlias;
 impl StateOp {
     pub fn now_ms(&self) -> u64 {
         match self {
+            // ⚠️ 每个 op **都必须**自带 `now_ms`（纪律 1：状态机不读钟）。
+            //    这条 match 是穷尽的 —— 加新 op 时编译器会强制你把它带进来，
+            //    漏带的话"apply 读墙钟"就会在各副本间静默分叉。
             StateOp::CreateSchema { now_ms, .. }
             | StateOp::CreateTable { now_ms, .. }
             | StateOp::DropTable { now_ms, .. }
-            | StateOp::CommitFiles { now_ms, .. } => *now_ms,
+            | StateOp::CommitFiles { now_ms, .. }
+            | StateOp::DropSchema { now_ms, .. }
+            | StateOp::EvolveSchema { now_ms, .. }
+            | StateOp::DropShard { now_ms, .. }
+            | StateOp::Compaction { now_ms, .. }
+            | StateOp::RecordIdempotency { now_ms, .. } => *now_ms,
         }
     }
 }
@@ -101,6 +137,34 @@ pub fn decode_op(op: &pb::Op) -> Result<StateOp, MetaError> {
                 .ok_or_else(|| MetaError::BadRequest("commit_files.request 为空".into()))?;
             StateOp::CommitFiles {
                 request: commit_request_from_proto(msg)?,
+                now_ms,
+            }
+        }
+        pb::op::Kind::DropSchema(d) => StateOp::DropSchema {
+            name: d.name.clone(),
+            now_ms,
+        },
+        pb::op::Kind::EvolveSchema(e) => StateOp::EvolveSchema {
+            request: evolve_schema_from_proto(e)?,
+            now_ms,
+        },
+        pb::op::Kind::DropShard(d) => StateOp::DropShard {
+            table: d.table.clone(),
+            shard: d.shard.clone(),
+            now_ms,
+        },
+        pb::op::Kind::Compaction(c) => StateOp::Compaction {
+            old_batch_ids: c.old_batch_ids.clone(),
+            new_files: c.new_files.iter().map(manifest_from_proto).collect(),
+            now_ms,
+        },
+        pb::op::Kind::Idempotency(i) => {
+            let msg = i
+                .record
+                .as_ref()
+                .ok_or_else(|| MetaError::BadRequest("idempotency.record 为空".into()))?;
+            StateOp::RecordIdempotency {
+                record: idempotency_record_from_proto(msg),
                 now_ms,
             }
         }
@@ -308,6 +372,112 @@ pub fn table_meta_from_proto(m: &pb::TableMeta) -> Result<TableMeta, MetaError> 
     })
 }
 
+// ---------------------------------------------------------------- 新 op 的逐字段转换
+
+/// `arrow::Field` → Arrow IPC（**单字段 schema**）。
+///
+/// 为什么不发明"字段编码"：`CreateTableOp.arrow_schema_ipc` 已经是 Arrow IPC，
+/// 再引入一套只会得到"两份必然漂移的定义"。代价是编码里带了 schema 名这类无意义信息，
+/// 解码侧忽略它。
+fn field_to_ipc(f: &Field) -> Vec<u8> {
+    yuntun_model::meta::serialize_schema(&Schema::new(vec![f.clone()]).into())
+}
+
+/// IPC → `arrow::Field`。**必须恰好 1 个字段**：0 或 2 个都是协议层垃圾，
+/// 放过去会让"增列"变成一个说不清的动作。
+fn field_from_ipc(bytes: &[u8]) -> Result<Field, MetaError> {
+    let s = yuntun_model::meta::deserialize_schema(bytes)
+        .map_err(|e| MetaError::BadRequest(format!("add_column 的字段 IPC 解不开：{e}")))?;
+    if s.fields().len() != 1 {
+        return Err(MetaError::BadRequest(format!(
+            "add_column 的字段 IPC 必须含恰好 1 个字段，实际 {}",
+            s.fields().len()
+        )));
+    }
+    Ok(s.field(0).clone())
+}
+
+/// `arrow::DataType` → IPC（单字段 schema 携带）。
+fn type_to_ipc(t: &DataType) -> Vec<u8> {
+    field_to_ipc(&Field::new("_", t.clone(), true))
+}
+
+fn type_from_ipc(bytes: &[u8]) -> Result<DataType, MetaError> {
+    Ok(field_from_ipc(bytes)?.data_type().clone())
+}
+
+pub fn schema_change_to_proto(c: &SchemaChange) -> pb::SchemaChangeMsg {
+    use pb::schema_change_msg::Kind;
+    pb::SchemaChangeMsg {
+        kind: Some(match c {
+            SchemaChange::AddColumn { field } => Kind::AddColumnFieldIpc(field_to_ipc(field)),
+            SchemaChange::WidenType { column, to } => Kind::WidenType(pb::WidenTypeMsg {
+                column: column.clone(),
+                to_type_ipc: type_to_ipc(to),
+            }),
+            SchemaChange::DropColumn { column } => {
+                Kind::DropColumn(pb::DropColumnMsg { column: column.clone() })
+            }
+        }),
+    }
+}
+
+pub fn schema_change_from_proto(m: &pb::SchemaChangeMsg) -> Result<SchemaChange, MetaError> {
+    use pb::schema_change_msg::Kind;
+    let kind = m
+        .kind
+        .as_ref()
+        .ok_or_else(|| MetaError::BadRequest("SchemaChangeMsg.kind 为空".into()))?;
+    Ok(match kind {
+        Kind::AddColumnFieldIpc(b) => SchemaChange::AddColumn {
+            field: field_from_ipc(b)?,
+        },
+        Kind::WidenType(w) => SchemaChange::WidenType {
+            column: w.column.clone(),
+            to: type_from_ipc(&w.to_type_ipc)?,
+        },
+        Kind::DropColumn(d) => SchemaChange::DropColumn {
+            column: d.column.clone(),
+        },
+    })
+}
+
+pub fn evolve_schema_to_proto(r: &EvolveSchemaRequest) -> pb::EvolveSchemaOp {
+    pb::EvolveSchemaOp {
+        table: r.table.clone(),
+        change: Some(schema_change_to_proto(&r.change)),
+        expected_version: r.expected_version,
+    }
+}
+
+pub fn evolve_schema_from_proto(p: &pb::EvolveSchemaOp) -> Result<EvolveSchemaRequest, MetaError> {
+    let change = p
+        .change
+        .as_ref()
+        .ok_or_else(|| MetaError::BadRequest("evolve_schema.change 为空".into()))?;
+    Ok(EvolveSchemaRequest {
+        table: p.table.clone(),
+        change: schema_change_from_proto(change)?,
+        expected_version: p.expected_version,
+    })
+}
+
+pub fn idempotency_record_to_proto(r: &IdempotencyRecord) -> pb::IdempotencyRecordMsg {
+    pb::IdempotencyRecordMsg {
+        client_request_id: r.client_request_id.clone(),
+        batch_id: r.batch_id.clone(),
+        committed_at: r.committed_at,
+    }
+}
+
+pub fn idempotency_record_from_proto(m: &pb::IdempotencyRecordMsg) -> IdempotencyRecord {
+    IdempotencyRecord {
+        client_request_id: m.client_request_id.clone(),
+        batch_id: m.batch_id.clone(),
+        committed_at: m.committed_at,
+    }
+}
+
 pub fn apply(state: &mut CatalogState, op: &StateOp) -> Result<ApplyOutcome, MetaError> {
     let now = op.now_ms();
     match op {
@@ -343,6 +513,42 @@ pub fn apply(state: &mut CatalogState, op: &StateOp) -> Result<ApplyOutcome, Met
                 return Ok(ApplyOutcome { accepted: false });
             }
             state.drop_table(name).map_err(MetaError::from_lake)?;
+            Ok(ApplyOutcome { accepted: true })
+        }
+        StateOp::DropSchema { name, .. } => {
+            // 幂等：schema 不存在 = 目标状态已达成（`accepted=false` 而不是错误）
+            if !state.schema_exists(name) {
+                return Ok(ApplyOutcome { accepted: false });
+            }
+            state.drop_schema(name).map_err(MetaError::from_lake)?;
+            Ok(ApplyOutcome { accepted: true })
+        }
+        StateOp::EvolveSchema { request, .. } => {
+            // OCC：`expected_version` 不符 → 报错（**不能**静默当成成功 —— 那是 DDL 丢失）
+            state
+                .evolve_schema(request.clone(), now / 1000)
+                .map_err(MetaError::from_lake)?;
+            Ok(ApplyOutcome { accepted: true })
+        }
+        StateOp::DropShard { table, shard, .. } => {
+            // 幂等：没有任何文件被标记删除（`n == 0`）= 无事可做
+            let n = state.drop_shard(table, shard);
+            Ok(ApplyOutcome { accepted: n > 0 })
+        }
+        StateOp::Compaction {
+            old_batch_ids,
+            new_files,
+            ..
+        } => {
+            state.commit_compaction(old_batch_ids, new_files.clone());
+            Ok(ApplyOutcome { accepted: true })
+        }
+        StateOp::RecordIdempotency { record, .. } => {
+            // 幂等：键已存在 → 不覆盖（`or_insert` 语义），并如实回 `accepted=false`
+            if state.check_idempotency(&record.client_request_id).is_some() {
+                return Ok(ApplyOutcome { accepted: false });
+            }
+            state.record_idempotency(record.clone());
             Ok(ApplyOutcome { accepted: true })
         }
         StateOp::CommitFiles { request, .. } => {
@@ -595,6 +801,220 @@ mod tests {
         };
         let e = table_meta_from_proto(&bad).expect_err("不一致必须拒绝");
         assert!(format!("{e}").contains("不一致"), "{e}");
+    }
+
+
+    /// `SchemaChange` 三个变体的镜像必须**逐字段无损**。
+    ///
+    /// 为什么挑「带时区的 Timestamp」和「Decimal」这两种：它们最容易被"看起来合理"的
+    /// 简化编码搞坏（丢掉时区/精度），而丢掉之后**照样能跑**，只是语义悄悄变了。
+    #[test]
+    fn schema_change_mirror_covers_all_three_variants() {
+        use arrow::datatypes::TimeUnit;
+        let cases = vec![
+            SchemaChange::AddColumn {
+                field: Field::new("score", DataType::Decimal128(18, 4), true),
+            },
+            SchemaChange::WidenType {
+                column: "ts".into(),
+                to: DataType::Timestamp(TimeUnit::Microsecond, Some("Asia/Shanghai".into())),
+            },
+            SchemaChange::DropColumn {
+                column: "old".into(),
+            },
+        ];
+        for c in cases {
+            let back = schema_change_from_proto(&schema_change_to_proto(&c))
+                .unwrap_or_else(|e| panic!("往返失败：{c:?} → {e}"));
+            assert_eq!(back, c, "SchemaChange 往返不一致");
+        }
+
+        // ---- 非法载荷必须**拒绝**，不能"尽力解释" ----
+        // ① 空 kind
+        let e = schema_change_from_proto(&pb::SchemaChangeMsg { kind: None }).unwrap_err();
+        assert!(format!("{e}").contains("kind"), "{e}");
+
+        // ② add_column 的载荷不是「恰好 1 个字段」（0 字段）
+        let empty_schema: std::sync::Arc<Schema> = std::sync::Arc::new(Schema::new(Vec::<Field>::new()));
+        let empty = yuntun_model::meta::serialize_schema(&empty_schema);
+        let e = schema_change_from_proto(&pb::SchemaChangeMsg {
+            kind: Some(pb::schema_change_msg::Kind::AddColumnFieldIpc(empty)),
+        })
+        .unwrap_err();
+        assert!(format!("{e}").contains("恰好 1 个字段"), "{e}");
+    }
+
+    /// 另外 4 个新 op（`drop_schema`/`drop_shard`/`compaction`/`idempotency`）的镜像与解码。
+    #[test]
+    fn new_op_mirrors_are_lossless_and_decodable() {
+        let now = 1_700_000_000_000u64;
+
+        // ① evolve_schema：OCC 版本必须带过去（丢了就退化成"永远成功"）
+        let req = EvolveSchemaRequest {
+            table: "public.cpu".into(),
+            change: SchemaChange::DropColumn {
+                column: "x".into(),
+            },
+            expected_version: 7,
+        };
+        let back = evolve_schema_from_proto(&evolve_schema_to_proto(&req)).unwrap();
+        assert_eq!(back.table, req.table);
+        assert_eq!(back.change, req.change);
+        assert_eq!(back.expected_version, 7, "OCC 版本丢了 → DDL 变成无条件覆盖");
+
+        // ② idempotency：**空 batch_id 有语义**（已认领、批次未落盘），不能被"补默认值"
+        let rec = IdempotencyRecord {
+            client_request_id: "key-1".into(),
+            batch_id: String::new(),
+            committed_at: 1_700_000_000,
+        };
+        assert_eq!(idempotency_record_from_proto(&idempotency_record_to_proto(&rec)), rec);
+
+        // ③ 五个新分支都要能被 `decode_op` 解出来，且带上 op 的时间（纪律 1）
+        let decode = |kind: pb::op::Kind, what: &str| {
+            let op = pb::Op {
+                now_ms: now,
+                kind: Some(kind),
+            };
+            let d = decode_op(&op).unwrap_or_else(|e| panic!("{what} 解码失败：{e}"));
+            assert_eq!(d.now_ms(), now, "{what} 丢了 op 时间 → apply 会去读墙钟");
+            d
+        };
+        assert!(matches!(
+            decode(pb::op::Kind::DropSchema(pb::DropSchemaOp { name: "a".into() }), "drop_schema"),
+            StateOp::DropSchema { .. }
+        ));
+        assert!(matches!(
+            decode(
+                pb::op::Kind::DropShard(pb::DropShardOp {
+                    table: "public.cpu".into(),
+                    shard: "s0".into()
+                }),
+                "drop_shard"
+            ),
+            StateOp::DropShard { .. }
+        ));
+        let f = rich_request().files[0].clone();
+        match decode(
+            pb::op::Kind::Compaction(pb::CompactionOp {
+                old_batch_ids: vec!["b1".into(), "b2".into()],
+                new_files: vec![manifest_to_proto(&f)],
+            }),
+            "compaction",
+        ) {
+            StateOp::Compaction {
+                old_batch_ids,
+                new_files,
+                ..
+            } => {
+                assert_eq!(old_batch_ids, vec!["b1".to_string(), "b2".to_string()]);
+                assert_eq!(new_files, vec![f], "compaction 的新文件必须逐字段无损");
+            }
+            other => panic!("解错了分支：{other:?}"),
+        }
+        assert!(matches!(
+            decode(
+                pb::op::Kind::Idempotency(pb::IdempotencyOp {
+                    record: Some(idempotency_record_to_proto(&rec))
+                }),
+                "idempotency"
+            ),
+            StateOp::RecordIdempotency { .. }
+        ));
+
+        // ④ 缺 `record` 的幂等 op 必须报错（不能当空操作 —— 那等于让客户端"认领成功"）
+        let e = decode_op(&pb::Op {
+            now_ms: now,
+            kind: Some(pb::op::Kind::Idempotency(pb::IdempotencyOp { record: None })),
+        })
+        .unwrap_err();
+        assert!(format!("{e}").contains("record"), "{e}");
+    }
+
+
+    /// 新 op 的**幂等语义**：重复执行 → `accepted=false`（**不是**错误）。
+    ///
+    /// 为什么这条重要：客户端会重试，raft 重启后还会**重放**已提交日志 ——
+    /// 重放时若把"已经做过"当错误，副本会在重启后直接起不来（fatal）。
+    #[test]
+    fn new_ops_are_idempotent_on_replay() {
+        let mut sm = sm_with_table();
+        let now = 1_700_000_000_000u64;
+        let rec = IdempotencyRecord {
+            client_request_id: "k1".into(),
+            batch_id: String::new(),
+            committed_at: 1,
+        };
+
+        // ① 幂等认领：第一次 true，第二次命中（false），且**不覆盖**已有记录
+        let first = apply(
+            &mut sm,
+            &StateOp::RecordIdempotency {
+                record: rec.clone(),
+                now_ms: now,
+            },
+        )
+        .unwrap();
+        assert!(first.accepted);
+        let again = apply(
+            &mut sm,
+            &StateOp::RecordIdempotency {
+                record: IdempotencyRecord {
+                    batch_id: "later-batch".into(),
+                    ..rec.clone()
+                },
+                now_ms: now,
+            },
+        )
+        .unwrap();
+        assert!(!again.accepted, "重复认领必须命中（accepted=false）");
+        assert_eq!(
+            sm.check_idempotency("k1"),
+            Some(String::new()),
+            "命中时**不得覆盖**已有记录（否则认领会变成\"刷新\"，掩盖并发双写）"
+        );
+
+        // ② drop_shard：没有文件可删 → false（幂等，不是错误）
+        let d = apply(
+            &mut sm,
+            &StateOp::DropShard {
+                table: "public.cpu".into(),
+                shard: "s-nope".into(),
+                now_ms: now,
+            },
+        )
+        .unwrap();
+        assert!(!d.accepted);
+
+        // ③ drop_schema：不存在 → false；删除存在且为空的 → true；再删 → false
+        let f = apply(
+            &mut sm,
+            &StateOp::DropSchema {
+                name: "nope".into(),
+                now_ms: now,
+            },
+        )
+        .unwrap();
+        assert!(!f.accepted, "删不存在的 schema 必须幂等（false 而非错误）");
+        sm.create_schema("tmp").unwrap();
+        assert!(apply(
+            &mut sm,
+            &StateOp::DropSchema {
+                name: "tmp".into(),
+                now_ms: now
+            }
+        )
+        .unwrap()
+        .accepted);
+        assert!(!apply(
+            &mut sm,
+            &StateOp::DropSchema {
+                name: "tmp".into(),
+                now_ms: now
+            }
+        )
+        .unwrap()
+        .accepted);
     }
 
 }

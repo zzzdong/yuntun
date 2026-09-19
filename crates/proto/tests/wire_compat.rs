@@ -277,10 +277,47 @@ fn propose_request_roundtrips_for_every_op_variant() {
         op::Kind::CommitFiles(CommitFilesOp {
             request: Some(to_msg(&rich_commit_request())),
         }),
+        op::Kind::CreateTable(CreateTableOp {
+            name: "cpu".into(),
+            namespace: "public".into(),
+            arrow_schema_ipc: vec![1, 2, 3],
+            default_format: "parquet".into(),
+            partition_cols: vec!["dt".into()],
+            ingest_config: vec![],
+        }),
+        // ---- S3-4 第二批（`operation-log §53`）----
+        op::Kind::DropSchema(DropSchemaOp {
+            name: "analytics".into(),
+        }),
+        op::Kind::EvolveSchema(EvolveSchemaOp {
+            table: "public.cpu".into(),
+            change: Some(SchemaChangeMsg {
+                kind: Some(schema_change_msg::Kind::DropColumn(DropColumnMsg {
+                    column: "x".into(),
+                })),
+            }),
+            expected_version: 7,
+        }),
+        op::Kind::DropShard(DropShardOp {
+            table: "public.cpu".into(),
+            shard: "s0".into(),
+        }),
+        op::Kind::Compaction(CompactionOp {
+            old_batch_ids: vec!["b1".into()],
+            new_files: vec![to_manifest(&FileManifest::default())],
+        }),
+        op::Kind::Idempotency(IdempotencyOp {
+            record: Some(IdempotencyRecordMsg {
+                client_request_id: "k1".into(),
+                // 空 batch_id 有语义（已认领、批次未落盘）
+                batch_id: String::new(),
+                committed_at: 1_700_000_000,
+            }),
+        }),
     ];
     assert_eq!(
         variants.len(),
-        3,
+        9,
         "分支数变了：请把新分支加进来，并更新 meta.proto 的迁移进度表"
     );
     for kind in variants {

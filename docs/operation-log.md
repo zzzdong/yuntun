@@ -3314,3 +3314,57 @@ CLI 层拦的是"人手打错"，`MetaNode::open` 拦的是"API 调用方漏了"
 | 4 | 切装配点 | 一行；但只有 1–3 完成后才可能全绿 |
 
 ---
+
+---
+
+## 53. R3 S3-4（第二件·下半之一）：补齐其余 **5 个 op 的 proto 镜像**（2026-09-20）
+
+### 53.0 本轮做了什么
+
+`RemoteCatalog` 的写路径必须先有「op 的线上形状」。补齐 5 个：
+**DropSchema / EvolveSchema / DropShard / Compaction / Idempotency（认领）**；
+`Op.kind` 的分支数 **4 → 9**，并同步更新了分支守护测试（它如期要求「显式确认」）。
+
+### 53.1 两个设计决定（都有理由，不是风格）
+
+1. **`SchemaChange` 用 `oneof`**，而不是「`kind` + 松散字段」：后者允许**非法组合**
+   （如 `kind=AddColumn` 却带 `to`），而那种消息**照样编码成功** —— 错误被推到最晚才发现
+   （应用时才炸，且可能只在某一个副本上炸）。
+2. **`Field` / `DataType` 用 Arrow IPC 携带**（编成「单字段 schema」）：
+   `CreateTableOp.arrow_schema_ipc` 已经是 Arrow IPC，再发明一套「字段编码」只会得到
+   **两份必然漂移的定义**。代价是编码里带了 schema 名这类无意义信息 —— 解码侧忽略它，
+   并**强制恰好 1 个字段**（0 或 2 个都是协议层垃圾，放过去会让「增列」变成一个说不清的动作）。
+
+### 53.2 幂等「认领」为什么**必须**是 op
+
+`pipeline.rs` 在 WAL fsync 成功后立刻 `record_idempotency`（`batch_id` 为**空串** =
+「已认领、批次尚未落盘」）—— 这是拦住「**并发同键请求双双通过预筛、各写一份 Data**」的那道闸。
+它若只存在本地，换主/日志重放后认领就没了，闸门形同虚设 → **必须是 op**（`IdempotencyOp`）。
+镜像里**空 `batch_id` 的语义被保住**（用例钉住：不能被补成默认值）。
+
+### 53.3 实测抓到的三处（都是编译器/用例主动拦下的）
+
+| # | 现象 | 教训 |
+|---|---|---|
+| 1 | 加 `StateOp` 变体后，`now_ms()` 的 `match` **立刻编译失败** | 穷尽 `match` 是「**每个 op 必须自带请求时间**」的强制器（纪律 1：状态机不读钟）—— 漏带就会让各副本按各自墙钟分叉 |
+| 2 | 反证：把 `expected_version` 写死 0 | 用例精确报「OCC 版本丢了 → DDL 变成无条件覆盖」（丢版本 = DDL 退化成无条件覆盖，静默） |
+| 3 | `Schema::new(vec![])` 类型无法推断（`Fields` 有两个 `From<Vec<_>>`） | 类型标注要写清（`Vec::<Field>::new()`） |
+
+### 53.4 验证
+
+- `op` 模块 **8 条**（3 条新增：`SchemaChange` 三变体无损 + 非法载荷拒绝；5 个新 op 的镜像与解码；
+  新 op 的**幂等语义** —— 重放/重试必须 `accepted=false`，否则重启重放会把「已经做过」当错误 → 起不来）
+- `wire_compat` 分支守护 **4 → 9**（守护测试如期要求显式确认 —— 这就是它存在的意义）
+- 全量 **296 passed / 0 failed**（59 targets；日志无 `Blocking waiting for file lock`，可采信）；
+  clippy 0（改动 crate）
+
+### 53.5 遗留（下一件）
+
+| # | 项 | 说明 |
+|---|---|---|
+| 1 | **`RemoteCatalog` 本体** | 写走 `Propose`（现在 9 个 op 分支都有线形了）、读走 `Prefetch`/`Delta` |
+| 2 | 文件/清单级读载荷（`list_visible_files` 等） | `Prefetch` 载荷现在只到「表 + schema」 |
+| 3 | 幂等的**读**路径（`check_idempotency`/`known_batch_ids`） | 按 §3.2 是「本地键集合快路径」，需定形它与 SM 权威的关系（S3-5 已把键集合从 WAL 派生） |
+| 4 | 切装配点 | 最后一行，改完靠既有用例全绿验收 |
+
+---
