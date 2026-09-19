@@ -190,7 +190,17 @@ impl NodeHandle {
     }
 
     /// 清单增量（`Delta` RPC）：只报"自 `since` 起变过的表"。
-    pub fn delta(&self, since_manifest_ver: u64) -> yuntun_proto::meta::DeltaResponse {
+    /// 清单增量（`Delta` RPC）。
+    ///
+    /// ⚠️ **结构变更也要算"要全量"**：`changed_tables` 只覆盖**manifest 级**变化
+    /// （每表 `manifest_ver` 推进），而 `create_table`/`drop_table` 只动 `schema_ver`
+    /// —— 新建的表**不在 `changed_tables` 里**。少这一条，客户端做增量刷新就会
+    /// **静默丢掉刚建的表**（`RemoteCatalog` 实测踩过，见 `§55.1`）。
+    pub fn delta(
+        &self,
+        since_manifest_ver: u64,
+        since_schema_ver: u64,
+    ) -> yuntun_proto::meta::DeltaResponse {
         let st = self.sm.lock().unwrap();
         let v = st.version();
         let d = st.manifest_delta(since_manifest_ver);
@@ -198,7 +208,7 @@ impl NodeHandle {
             schema_ver: v.schema_ver,
             manifest_ver: v.manifest_ver,
             changed_tables: d.changed_tables,
-            full_reload: d.full_reload_required,
+            full_reload: d.full_reload_required || since_schema_ver != v.schema_ver,
         }
     }
 
@@ -252,6 +262,24 @@ impl NodeHandle {
         // 也让"客户端缓存打补丁"的路径可复现。
         files.sort_by(|a, b| (&a.table, &a.batch_id).cmp(&(&b.table, &b.batch_id)));
 
+        // 幂等键集合：**只在全量刷新时给**，并有条数上限。
+        // 上限是必须的：键集合随写入增长（TTL 内），全量重放一个十万级的列表会把
+        // "刷新"变成一次大传输。超限时**明确告警**并截断（截断只影响快路径命中率，不影响正确性）。
+        const MAX_KEYS: usize = 10_000;
+        let keys = if full {
+            let mut k = st.idempotency_keys();
+            if k.len() > MAX_KEYS {
+                eprintln!(
+                    "[meta] 幂等键 {} 条超过载荷上限 {MAX_KEYS}：本次只发前 {MAX_KEYS} 条                      （只影响客户端快路径命中率，不影响正确性 —— 权威仍在状态机）",
+                    k.len()
+                );
+                k.truncate(MAX_KEYS);
+            }
+            k
+        } else {
+            Vec::new()
+        };
+
         yuntun_proto::meta::PrefetchResponse {
             schema_ver: v.schema_ver,
             manifest_ver: v.manifest_ver,
@@ -267,6 +295,7 @@ impl NodeHandle {
                     .collect(),
                 // 整体替换语义（客户端据此丢弃已删 schema）
                 namespaces: st.list_schemas(),
+                idempotency_keys: keys,
             }),
             full_reload: full,
         }
@@ -1067,6 +1096,7 @@ fn apply_committed(
                 // 逐 op 的结果形状待定（operation-log §45.4）；关键数字已在上面几个字段
                 result: Vec::new(),
                 snapshot: st.current_snapshot(),
+                affected: o.affected,
             }),
             Err(e) => Err(e),
         };

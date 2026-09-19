@@ -343,12 +343,18 @@ fn propose_response_carries_both_version_numbers() {
         manifest_ver: 9,
         result: vec![1],
         snapshot: 100,
+        affected: 3,
     };
     let back = roundtrip(&resp);
     assert_eq!(back.schema_ver, 7, "schema_ver 必须带");
     assert_eq!(back.manifest_ver, 9, "manifest_ver 必须带");
     assert_eq!(back.revision, 42);
     assert_eq!(back.snapshot, 100);
+    assert_eq!(
+        back.affected, 3,
+        "`affected` 必须过线：远端客户端算不出这个数（删分片标记了几个文件），\
+         缺了它 `drop_shard -> u64` 只能给 1/0"
+    );
     assert!(back.accepted);
 }
 

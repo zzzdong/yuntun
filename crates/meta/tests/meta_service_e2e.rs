@@ -155,6 +155,7 @@ async fn propose_status_delta_over_real_grpc() {
     let d = client
         .delta(pb::DeltaRequest {
             since_manifest_ver: 0,
+            since_schema_ver: 0,
         })
         .await
         .expect("delta 应当成功")
@@ -163,6 +164,35 @@ async fn propose_status_delta_over_real_grpc() {
     assert!(
         d.changed_tables.iter().any(|t| t.contains("cpu")),
         "自版本 0 以来 public.cpu 变过：{d:?}"
+    );
+
+    // ---- Delta 的**结构变更**信号（`§57`）：水位给"当前"→ 无变化；给旧 schema 版本 → 要全量 ----
+    //
+    // 这条盯的是一个**静默丢表**的坑：`changed_tables` 只覆盖 manifest 级变化，
+    // 新建/删表只体现在 `schema_ver` 上 —— 客户端照"有变化就增量"做，会丢掉刚建的表。
+    let same = client
+        .delta(pb::DeltaRequest {
+            since_manifest_ver: d.manifest_ver,
+            since_schema_ver: d.schema_ver,
+        })
+        .await
+        .expect("delta 应当成功")
+        .into_inner();
+    assert!(
+        !same.full_reload,
+        "水位已是最新时不该要求全量重建：{same:?}"
+    );
+    let stale = client
+        .delta(pb::DeltaRequest {
+            since_manifest_ver: d.manifest_ver,
+            since_schema_ver: 0, // schema 版本落后（少了建表这次结构变更）
+        })
+        .await
+        .expect("delta 应当成功")
+        .into_inner();
+    assert!(
+        stale.full_reload,
+        "schema 版本落后时必须要求全量重建（否则会**静默丢掉结构变更**）：{stale:?}"
     );
 
     // ---- 未实现的方法必须明确 UNIMPLEMENTED ----
@@ -399,6 +429,10 @@ async fn prefetch_carries_file_deltas_including_tombstones() {
     )
     .await;
     assert!(r.accepted, "删分片应当生效（确有文件被标记）");
+    assert_eq!(
+        r.affected, 1,
+        "**精确条数**必须随提交过线（`affected`）：远端自己算不出来，给 1/0 会让调用方对账失真"
+    );
 
     let delta = prefetch_at(&mut client, before_delete).await;
     let files = delta.payload.as_ref().unwrap().files.clone();

@@ -72,7 +72,10 @@ impl pb::meta_server::Meta for MetaService {
         req: Request<pb::DeltaRequest>,
     ) -> Result<Response<pb::DeltaResponse>, Status> {
         // 只查内存里的版本表（O(表数)），非常快，不需要阻塞线程池
-        Ok(Response::new(self.node.delta(req.into_inner().since_manifest_ver)))
+        let r = req.into_inner();
+        Ok(Response::new(
+            self.node.delta(r.since_manifest_ver, r.since_schema_ver),
+        ))
     }
 
     async fn status(

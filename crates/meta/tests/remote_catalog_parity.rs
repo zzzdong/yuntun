@@ -216,10 +216,11 @@ async fn remote_and_memory_catalogs_agree_on_the_same_ops() {
     // ---- ⑥ 删分片 → b1 变墓碑 ----
     let rd = remote.drop_shard("public.cpu", "s0").await.expect("远端删分片");
     let md = memory.drop_shard("public.cpu", "s0").await.expect("本地删分片");
-    assert!(
-        rd > 0 && md > 0,
-        "两边都应报告「有文件被标记」（远端只能给 1/0，见 RemoteCatalog 的注释）"
+    assert_eq!(
+        rd, md,
+        "删分片的**精确条数**也必须一致（`affected` 随提交过线；远端的 1/0 那套已废弃）"
     );
+    assert!(md > 0, "本次删分片确实应标记到文件：{md}");
     // 这一条是**对拍的关键**：现在看不到 b1，但**旧快照下仍要看到它**
     agree!("drop_shard", remote, memory, old_snapshot);
     let now = observed(&remote, old_snapshot).await;
@@ -285,6 +286,20 @@ async fn remote_and_memory_catalogs_agree_on_the_same_ops() {
             .is_none()
     );
 
+    // ---- ⑩ 幂等键集合**过线**：新起的客户端没写过任何键，只能从全量载荷里学 ----
+    //
+    // 这条盯的是"新进程的预筛命中率"：学不到键，每个别人的重复请求都会白写一次 WAL
+    // 再去 SM 去重（正确性不受影响，但那是纯浪费）。
+    let fresh: Arc<dyn CatalogOps> =
+        Arc::new(RemoteCatalog::connect(vec![addr.to_string()]).expect("新实例"));
+    // 先触发一次刷新（真实路径里由首个读/周期刷新触发）—— 快路径**本身不打网络**，
+    // 所以"刚构造完就问"必然空集：这是契约，不是 bug（见 `check_idempotency` 的文档）。
+    let _ = fresh.version().await;
+    assert!(
+        fresh.check_idempotency("k-b1").await.unwrap().is_some(),
+        "刷新之后，新实例必须能从**全量刷新载荷**里学到已有的幂等键"
+    );
+
     // 快路径**漏判**也必须安全：远端直接重放同一个提交 → 由 SM 去重（`accepted=false`）。
     // 这条才是"快路径只是加速"的可验证形式 —— 快路径本身答错不影响正确性。
     let dup = remote
@@ -295,6 +310,32 @@ async fn remote_and_memory_catalogs_agree_on_the_same_ops() {
         !dup.accepted,
         "同键同批次的重复提交必须是幂等命中（accepted=false），而不是重复落盘"
     );
+
+    // ---- ⑪ 保留窗口：过旧的快照必须**拒绝**（而不是少读几个文件）----
+    let tight: Arc<dyn CatalogOps> = Arc::new(
+        RemoteCatalog::connect(vec![addr.to_string()])
+            .expect("连接")
+            .with_file_retention(1),
+    );
+    // 先正常写一笔（把快照推上去），再让它刷新一次以推进下界
+    tight
+        .commit_files(commit("public.cpu", "b3", "k-b3", "s2"))
+        .await
+        .expect("提交 b3");
+    let _ = tight.list_visible_files("public.cpu", u64::MAX, None).await;
+    let e = tight
+        .list_visible_files("public.cpu", 0, None)
+        .await
+        .expect_err("早于保留下界的快照必须被拒绝");
+    assert!(
+        format!("{e}").contains("早于"),
+        "拒绝原因应当说清是「快照过旧」（而不是含糊的 internal）：{e}"
+    );
+    // 而"现在"仍然可查
+    tight
+        .list_visible_files("public.cpu", u64::MAX, None)
+        .await
+        .expect("当前快照必须可查");
 
     server.abort();
 }

@@ -427,6 +427,14 @@ impl CatalogState {
     }
 
     /// 登记幂等键（**已存在则保留首次** —— 重试不覆盖权威记录）。
+    /// 全部幂等键（**排序**）。
+    ///
+    /// 给远端客户端做"启动时把键集合拉过来"用：否则新起的 datanode 只知道**自己**写过的键
+    /// （快路径命中率低 → 每个重复请求都白写一次 WAL 再去 SM 去重）。
+    pub fn idempotency_keys(&self) -> Vec<String> {
+        self.idempotency.keys().cloned().collect()
+    }
+
     pub fn record_idempotency(&mut self, rec: IdempotencyRecord) {
         self.idempotency
             .entry(rec.client_request_id.clone())

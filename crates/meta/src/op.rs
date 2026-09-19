@@ -103,6 +103,36 @@ impl StateOp {
 pub struct ApplyOutcome {
     /// `false` = 幂等命中（不重复应用；**不是**错误）
     pub accepted: bool,
+    /// 本次应用**影响了多少实体**（删分片 = 被标记的文件数；提交 = 文件数；DDL = 1）。
+    ///
+    /// 为什么要有它：远端客户端拿不到这个数（`accepted` 只有真假），
+    /// 于是 `CatalogOps::drop_shard -> u64` 在远程形态下只能给 1/0 —— 调用方按它做对账会失真。
+    /// 精确计数必须**跟着提交一起过线**（在 SM 里算，而不是在客户端猜）。
+    pub affected: u64,
+}
+
+impl ApplyOutcome {
+    pub fn new(accepted: bool, affected: u64) -> Self {
+        Self {
+            accepted,
+            affected: if accepted { affected } else { 0 },
+        }
+    }
+
+    /// 幂等命中（没改动任何东西）
+    pub fn hit() -> Self {
+        Self::new(false, 0)
+    }
+
+    /// 成功且影响 1 个实体（DDL 类）
+    pub fn one() -> Self {
+        Self::new(true, 1)
+    }
+
+    /// 成功且影响 `n` 个实体；`n == 0` → 视为"无事可做"（`accepted=false`）
+    pub fn with_count(n: u64) -> Self {
+        Self::new(n > 0, n)
+    }
 }
 
 // ---------------------------------------------------------------- proto → 进程内
@@ -495,12 +525,12 @@ pub fn apply(state: &mut CatalogState, op: &StateOp) -> Result<ApplyOutcome, Met
     match op {
         StateOp::CreateSchema { name, .. } => {
             if state.schema_exists(name) {
-                return Ok(ApplyOutcome { accepted: false });
+                return Ok(ApplyOutcome::hit());
             }
             state
                 .create_schema(name)
                 .map_err(MetaError::from_lake)?;
-            Ok(ApplyOutcome { accepted: true })
+            Ok(ApplyOutcome::one())
         }
         StateOp::CreateTable { request, .. } => {
             // ⚠️ 幂等判断必须用**归一化后的表身份**（`schema.table`）：
@@ -513,39 +543,39 @@ pub fn apply(state: &mut CatalogState, op: &StateOp) -> Result<ApplyOutcome, Met
                 format!("{}.{}", request.namespace, request.name)
             };
             if state.get_table(&qualified).is_some() {
-                return Ok(ApplyOutcome { accepted: false });
+                return Ok(ApplyOutcome::hit());
             }
             state
                 .create_table(request.clone(), now)
                 .map_err(MetaError::from_lake)?;
-            Ok(ApplyOutcome { accepted: true })
+            Ok(ApplyOutcome::one())
         }
         StateOp::DropTable { name, .. } => {
             if state.get_table(name).is_none() {
-                return Ok(ApplyOutcome { accepted: false });
+                return Ok(ApplyOutcome::hit());
             }
             state.drop_table(name).map_err(MetaError::from_lake)?;
-            Ok(ApplyOutcome { accepted: true })
+            Ok(ApplyOutcome::one())
         }
         StateOp::DropSchema { name, .. } => {
             // 幂等：schema 不存在 = 目标状态已达成（`accepted=false` 而不是错误）
             if !state.schema_exists(name) {
-                return Ok(ApplyOutcome { accepted: false });
+                return Ok(ApplyOutcome::hit());
             }
             state.drop_schema(name).map_err(MetaError::from_lake)?;
-            Ok(ApplyOutcome { accepted: true })
+            Ok(ApplyOutcome::one())
         }
         StateOp::EvolveSchema { request, .. } => {
             // OCC：`expected_version` 不符 → 报错（**不能**静默当成成功 —— 那是 DDL 丢失）
             state
                 .evolve_schema(request.clone(), now / 1000)
                 .map_err(MetaError::from_lake)?;
-            Ok(ApplyOutcome { accepted: true })
+            Ok(ApplyOutcome::one())
         }
         StateOp::DropShard { table, shard, .. } => {
             // 幂等：没有任何文件被标记删除（`n == 0`）= 无事可做
             let n = state.drop_shard(table, shard);
-            Ok(ApplyOutcome { accepted: n > 0 })
+            Ok(ApplyOutcome::with_count(n))
         }
         StateOp::Compaction {
             old_batch_ids,
@@ -553,23 +583,30 @@ pub fn apply(state: &mut CatalogState, op: &StateOp) -> Result<ApplyOutcome, Met
             ..
         } => {
             state.commit_compaction(old_batch_ids, new_files.clone());
-            Ok(ApplyOutcome { accepted: true })
+            // affected = 本次写入的新文件数（调用方按它算"合并产出"）
+            Ok(ApplyOutcome::new(true, new_files.len() as u64))
         }
         StateOp::RecordIdempotency { record, .. } => {
             // 幂等：键已存在 → 不覆盖（`or_insert` 语义），并如实回 `accepted=false`
             if state.check_idempotency(&record.client_request_id).is_some() {
-                return Ok(ApplyOutcome { accepted: false });
+                return Ok(ApplyOutcome::hit());
             }
             state.record_idempotency(record.clone());
-            Ok(ApplyOutcome { accepted: true })
+            Ok(ApplyOutcome::one())
         }
         StateOp::CommitFiles { request, .. } => {
             let resp = state
                 .commit_files(request.clone(), now)
                 .map_err(MetaError::from_lake)?;
-            Ok(ApplyOutcome {
-                accepted: resp.accepted,
-            })
+            // affected = 本次**实际落盘**的文件数（幂等命中 = 0，与 `accepted` 一致）
+            Ok(ApplyOutcome::new(
+                resp.accepted,
+                if resp.accepted {
+                    request.files.len() as u64
+                } else {
+                    0
+                },
+            ))
         }
     }
 }

@@ -160,6 +160,11 @@ message ProposeResponse {
   bytes  result       = 5;
   // 本次提交分配的 Catalog 快照号（读己之写用）
   uint64 snapshot     = 6;
+  // 本次应用**影响了多少实体**（删分片 = 被标记的文件数；提交 = 文件数；DDL = 1；幂等命中 = 0）
+  //
+  // 由状态机算出来跟着提交过线：远端客户端无法自己算这个数，缺了它
+  // `drop_shard -> u64` 在远程形态下只能给 1/0（调用方对账会失真）。
+  uint64 affected     = 7;
 }
 
 // ---------------------------------------------------------------- 读路径
@@ -205,6 +210,12 @@ message PrefetchPayload {
   // 文件级增量（**含墓碑**：`deleted_at > since_snapshot` 的也要发）。
   // 只发"当前可见"会让客户端永远删不掉已删文件 → 查询读到已删数据（静默）。
   repeated FileEntry files  = 2;
+  // 幂等键集合（**只在全量刷新时给**，且有条数上限）。
+  //
+  // 为什么值得给：客户端的幂等预筛是**本地加速**（权威在 SM），新建的进程只知道自己写过的键
+  // → 每个"别人写过的键"的重复请求都会白写一次 WAL 再去 SM 去重。
+  // 为什么只在全量给：增量刷新没有"键的版本号"，逐次全发会让每次刷新都搬一遍大集合。
+  repeated string idempotency_keys = 4;
 }
 
 message FileEntry {
@@ -228,6 +239,9 @@ message TableMeta {
 
 message DeltaRequest {
   uint64 since_manifest_ver = 1;
+  // 客户端持有的 **schema 版本**。服务端据此判断"对面缺结构变更" →
+  // `full_reload = true`（新建/删除表**不体现在 manifest 级差异里**，只体现在 schema 版本上）。
+  uint64 since_schema_ver   = 2;
 }
 
 message DeltaResponse {

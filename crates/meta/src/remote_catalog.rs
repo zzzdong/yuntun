@@ -68,6 +68,8 @@ struct Cache {
     files: BTreeMap<String, FileManifest>,
     /// 做过一次全量刷新（在此之前缓存是不可信的，读必须等）
     primed: bool,
+    /// 墓碑回收的下界：**早于它的快照不可查**（见 `RemoteCatalog::file_retention`）
+    file_floor: u64,
 }
 
 /// `CatalogOps` 的 gRPC 实现。
@@ -77,8 +79,12 @@ pub struct RemoteCatalog {
     /// 轮换游标：写失败就换下一个地址（不依赖任何"谁是 leader"的客户端状态）
     cursor: AtomicUsize,
     cache: RwLock<Cache>,
-    /// 幂等**本地快路径**（只含本客户端写过的键；见模块文档）
+    /// 幂等**本地快路径**（本客户端写过的键 ∪ 全量刷新时拿到的键；见模块文档）
     local_keys: Mutex<HashSet<String>>,
+    /// 文件缓存的**保留窗口**（快照数）。`u64::MAX` = 保留全部墓碑（默认，最安全）。
+    ///
+    /// 调小它 = 省内存，但**早于 `snapshot - 窗口` 的快照查询会被拒绝**（见 `apply` 的注释）。
+    file_retention: u64,
 }
 
 impl RemoteCatalog {
@@ -86,6 +92,10 @@ impl RemoteCatalog {
     ///
     /// 用 `connect_lazy`：**不在构造期连接** —— 装配时 metanode 可能还没起来
     /// （standalone 就是同进程先后启动），连接交给第一次 RPC。
+    ///
+    /// ⚠️ 但**构造本身**仍要求在 tokio 运行时上下文里调用：lazy connector 会把自己
+    /// 注册到当前 runtime。这条约束是实测得到的（单测里用 `#[test]` 会 panic：
+    /// "there is no reactor running"）。
     pub fn connect(addrs: Vec<String>) -> Result<Self, LakeError> {
         if addrs.is_empty() {
             return Err(LakeError::Other(
@@ -105,11 +115,22 @@ impl RemoteCatalog {
             cursor: AtomicUsize::new(0),
             cache: RwLock::new(Cache::default()),
             local_keys: Mutex::new(HashSet::new()),
+            // 默认**不回收任何墓碑**：回收会限制可查的旧快照，必须是显式选择
+            file_retention: u64::MAX,
         })
     }
 
     pub fn addrs(&self) -> &[String] {
         &self.addrs
+    }
+
+    /// 设置文件缓存保留窗口（快照数）。窗口内的墓碑保留，窗口外回收。
+    ///
+    /// ⚠️ 回收后，**早于窗口下界的快照查询会被拒绝**（不是返回错数据）—— 这是刻意的：
+    /// 宁可让调用方知道"这段历史不可查"，也不能少读文件（少读 = 静默错结果）。
+    pub fn with_file_retention(mut self, snapshots: u64) -> Self {
+        self.file_retention = snapshots.max(1);
+        self
     }
 
     fn client(&self, i: usize) -> MetaClient<Channel> {
@@ -178,11 +199,18 @@ impl RemoteCatalog {
         Err(last.unwrap_or_else(|| LakeError::Other("没有可用的 metanode（Status）".into())))
     }
 
-    async fn delta(&self, since_manifest_ver: u64) -> Result<pb::DeltaResponse, LakeError> {
+    async fn delta(
+        &self,
+        since_manifest_ver: u64,
+        since_schema_ver: u64,
+    ) -> Result<pb::DeltaResponse, LakeError> {
         let mut last: Option<LakeError> = None;
         for i in 0..self.clients.len() {
             let mut c = self.client(i);
-            let req = pb::DeltaRequest { since_manifest_ver };
+            let req = pb::DeltaRequest {
+                since_manifest_ver,
+                since_schema_ver,
+            };
             match tokio::time::timeout(READ_TIMEOUT, c.delta(req)).await {
                 Ok(Ok(r)) => return Ok(r.into_inner()),
                 Ok(Err(st)) => last = Some(map_status(st)),
@@ -240,7 +268,25 @@ impl RemoteCatalog {
             Vec::new()
         } else {
             // 变了哪些表：`Delta` 只回名字（够用 —— 表元数据由下一步按名拉）
-            self.delta(c_manifest).await?.changed_tables
+            //
+            // 同时把 `schema_ver` 一起给服务端：**结构变更**（新建/删表）不体现在
+            // manifest 级差异里，服务端据此回 `full_reload`（`§55.1` 那个坑的服务端修复）。
+            let d = self.delta(c_manifest, c_schema).await?;
+            if d.full_reload {
+                // 服务端明确要求重建：直接走全量（不必先问"哪些表变了"）
+                let full_resp = self
+                    .prefetch(pb::PrefetchRequest {
+                        since_schema_ver: 0,
+                        since_manifest_ver: 0,
+                        full: true,
+                        tables: Vec::new(),
+                        since_snapshot: 0,
+                    })
+                    .await?;
+                self.apply(full_resp, &[], true);
+                return Ok(());
+            }
+            d.changed_tables
         };
         let req = if full {
             pb::PrefetchRequest {
@@ -326,6 +372,13 @@ impl RemoteCatalog {
             }
         }
 
+        // 幂等键：全量刷新时把服务端的键集合并进本地快路径
+        //（**只并、不替换**：替换会忘掉"自己刚写过但服务端还没全量刷新到"的键）
+        if !payload.idempotency_keys.is_empty() {
+            let mut keys = self.local_keys.lock().unwrap();
+            keys.extend(payload.idempotency_keys.iter().cloned());
+        }
+
         // 文件：upsert（**墓碑保留** —— 见 `Cache::files` 的注释）
         for f in &payload.files {
             if let Some(m) = f.manifest.as_ref() {
@@ -340,6 +393,19 @@ impl RemoteCatalog {
         c.manifest_ver = resp.manifest_ver;
         c.snapshot = resp.snapshot;
         c.primed = true;
+
+        // ---- 保留窗口：回收"已经不可能再被查询"的墓碑 ----
+        //
+        // 墓碑是 MVCC 必需（旧快照要能看到当时还活着的文件），所以**默认全部保留**
+        // （`file_retention = u64::MAX`）。配了窗口才回收：水位以下的墓碑删掉，
+        // 并把 `floor` 抬起来 —— 之后**早于 floor 的快照查询必须拒绝**，
+        // 否则"文件不再出现"会被误读成"它从没存在过" → 查询少读数据（**静默错**）。
+        let new_floor = c.snapshot.saturating_sub(self.file_retention);
+        if new_floor > c.file_floor {
+            c.files
+                .retain(|_, f| !(f.deleted_at != 0 && f.deleted_at <= new_floor));
+            c.file_floor = new_floor;
+        }
     }
 
     /// 读之前先刷新（最佳努力：失败不阻断读，用旧缓存 + 让上层按陈旧窗口处理）。
@@ -608,10 +674,11 @@ impl CatalogOps for RemoteCatalog {
             }
         }
         self.refresh_best_effort().await;
-        let snapshot = self.cached(|c| c.snapshot);
         Ok(CommitFilesResponse {
             accepted: r.accepted,
-            snapshot,
+            // 用**响应里**的快照号（权威）：读缓存可能已被别的写推进，那样 commit 的
+            // "读己之写"水位就会偏高 → 查询会以为数据已可见
+            snapshot: r.snapshot,
             commit_index: r.revision,
         })
     }
@@ -623,6 +690,15 @@ impl CatalogOps for RemoteCatalog {
         shard_filter: Option<&str>,
     ) -> Result<Vec<FileManifest>, LakeError> {
         self.refresh().await?;
+        // 保留窗口之下：**拒绝**而不是"可能少几个文件"
+        //（少读文件 = 静默错结果；拒绝至少是显式的）
+        let floor = self.cached(|c| c.file_floor);
+        if snapshot < floor {
+            return Err(LakeError::Other(format!(
+                "快照 {snapshot} 早于文件缓存保留下界 {floor}：这段历史的墓碑已回收，\
+                 请用 ≥ {floor} 的快照查询（或用 with_file_retention 放大窗口）"
+            )));
+        }
         let key = normalize(table);
         let mut out: Vec<FileManifest> = self.cached(|c| {
             c.files
@@ -649,9 +725,9 @@ impl CatalogOps for RemoteCatalog {
             })
             .await?;
         self.refresh_best_effort().await;
-        // ⚠️ 精确条数过不了线（`ProposeResponse` 只有 `accepted`）；调用方目前只判"有没有生效"。
-        //    要精确条数得让 `ApplyOutcome` 带上计数（登记在 operation-log 遗留）。
-        Ok(if r.accepted { 1 } else { 0 })
+        // 精确条数由状态机算出来、随 `affected` 过线（`§57`）：
+        // 远端**不能**自己算（它看不到文件的删除动作），猜一个数会让调用方对账失真。
+        Ok(r.affected)
     }
 
     // ---------------------------------------------------------------- Compaction / 运维
@@ -680,9 +756,14 @@ impl CatalogOps for RemoteCatalog {
 
     // ---------------------------------------------------------------- 幂等
     async fn check_idempotency(&self, key: &str) -> Result<Option<String>, LakeError> {
-        // 本地快路径（权威在 SM）：只回"我知道的键"。
-        // 返回空 `batch_id` 是刻意的 —— 调用方只用 `is_some()`（见 `pipeline.rs` 的预筛），
-        // 真要 batch_id 得把它放进载荷（登记在遗留）。
+        // 本地快路径（权威在 SM）：只回"我知道的键"，**刻意不打网络** ——
+        // 它被调用在写路径的入口（每个批次一次），为它加一次探测就把它自己的意义抵消了。
+        //
+        // 键集合的来源：① 自己写过的（`commit_files`/`record_idempotency`）；
+        // ② **全量刷新**时装填的服务端键集。所以进程刚起来时集合可能是空的 ——
+        // 那时的"未命中"会走到 `Propose`，由 SM 去重（正确性不受影响，只是白写一次 WAL）。
+        //
+        // 返回空 `batch_id` 是刻意的 —— 调用方只用 `is_some()`（见 `pipeline.rs` 的预筛）；
         Ok(self
             .local_keys
             .lock()
@@ -727,7 +808,8 @@ impl CatalogOps for RemoteCatalog {
 
     async fn manifest_delta(&self, since_manifest_ver: u64) -> Result<ManifestDelta, LakeError> {
         // `Delta` 是给客户端**定点问**用的（比拉全量载荷便宜），直接用
-        let d = self.delta(since_manifest_ver).await?;
+        let c_schema = self.cached(|c| c.schema_ver);
+        let d = self.delta(since_manifest_ver, c_schema).await?;
         Ok(ManifestDelta {
             changed_tables: d.changed_tables,
             full_reload_required: d.full_reload,
@@ -794,4 +876,71 @@ mod tests {
         assert_eq!(normalize("public.cpu"), "public.cpu");
         assert_eq!(normalize("analytics.cpu"), "analytics.cpu");
     }
+
+    /// 文件缓存的**保留窗口**：窗口内保留墓碑，窗口外回收，且**下界被记住**。
+    ///
+    /// 为什么这条要单独测：回收墓碑本身"看起来只是省内存"，但**少一个墓碑**会让
+    /// `visible_at(旧快照)` 从 false 翻成 true → 旧快照查询会读到**已删数据**。
+    /// 所以回收必须与"拒绝过旧快照"成对出现 —— 这个不变量在这里钉住。
+    // 必须 `tokio::test`：`connect` 里的 lazy connector 会注册到**当前 runtime**，
+    // 所以即使"不真连"，构造也要求在运行时上下文里（见 `connect` 的文档）。
+    #[tokio::test]
+    async fn file_tombstones_are_reclaimed_only_within_the_window() {
+        let cat = RemoteCatalog::connect(vec!["127.0.0.1:1".into()])
+            .expect("connect 不需要真连（lazy）")
+            .with_file_retention(10);
+
+        let resp = |snapshot: u64, deleted_at: u64, valid_from: u64| {
+            let manifest = op::manifest_to_proto_pub(&FileManifest {
+                batch_id: "b1".into(),
+                table: "public.cpu".into(),
+                shard: "s0".into(),
+                valid_from,
+                deleted_at,
+                ..Default::default()
+            });
+            pb::PrefetchResponse {
+                schema_ver: 1,
+                manifest_ver: 1,
+                snapshot,
+                full_reload: false,
+                payload: Some(pb::PrefetchPayload {
+                    tables: Vec::new(),
+                    files: vec![pb::FileEntry {
+                        batch_id: "b1".into(),
+                        manifest: Some(manifest),
+                    }],
+                    namespaces: vec!["public".into()],
+                    idempotency_keys: Vec::new(),
+                }),
+            }
+        };
+
+        // 快照 100，墓碑 deleted_at=95：离水位 5 < 窗口 10 → **保留**
+        cat.apply(resp(100, 95, 1), &[], true);
+        {
+            let c = cat.cache.read().unwrap();
+            assert_eq!(c.files.len(), 1, "窗口内的墓碑必须保留");
+            assert_eq!(c.file_floor, 90, "下界 = snapshot - 窗口");
+            assert!(c.file_floor <= 95, "下界不该越过还在窗口内的墓碑");
+        }
+
+        // 快照推到 200：deleted_at=95 ≤ 下界 190 → **回收**，下界抬到 190
+        cat.apply(resp(200, 95, 1), &[], true);
+        {
+            let c = cat.cache.read().unwrap();
+            assert!(c.files.is_empty(), "窗口外的墓碑应当被回收");
+            assert_eq!(c.file_floor, 190);
+        }
+
+        // 默认（不配窗口）**永不回收** —— 安全优先
+        let keep = RemoteCatalog::connect(vec!["127.0.0.1:1".into()]).unwrap();
+        keep.apply(resp(10_000, 1, 1), &[], true);
+        assert_eq!(
+            keep.cache.read().unwrap().files.len(),
+            1,
+            "默认必须保留全部墓碑（回收会限制可查的旧快照，必须是显式选择）"
+        );
+    }
+
 }
