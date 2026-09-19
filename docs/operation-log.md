@@ -879,6 +879,10 @@ prepared SELECT `fetch` 为空——单次运行 0~100% 失败，被日志/代�
 
 - `PacketFramedReader::poll_read`：交付量按 `queued_packet_len()`（包边界）截断，
   绝不混入下一个包的字节；探针日志移到整包交付点（消除旧实现"多包一次读时丢日志"）。
+> 补充（`§49`）：仓里曾有一份 `vendor/opensrv-mysql` —— 它与 crates.io 的 0.7.0 **逐字节相同**、
+> 也**从未接线**，已于 2026-09-19 删除。**上游这个 UAF 的绕过一直只在本节的 sqlwire 侧**，
+> 不存在"fork 过 opensrv"这回事。
+
 - 握手版本串单一事实源：`yuntun-sql::shim::MYSQL_VERSION`（`8.0.32-yuntun`），
   `MysqlBackend::version()` 覆写之（原先回 opensrv 默认 `5.1.10-alpha-msql-proxy`，
   与 `SHOW VARIABLES` 不一致，且 5.1.x 会让按版本分支的驱动/ORM 误判能力）。
@@ -3039,5 +3043,42 @@ raft 的"等应用到状态机"是**阻塞**的（`recv_timeout`）。直接在�
 | 3 | 其余 op 的 proto 镜像（`result`/`payload` 逐 op 定形） | S3-0 余 |
 | 4 | 两个时钟统一（`now_ms` 与状态机时钟） | S3-4 |
 | 5 | 快照**触发与保留**策略（现在只有"按需压缩"） | S3-3 余 |
+
+---
+
+---
+
+## 49. 清理：删除未接线的 `vendor/opensrv-mysql`（2026-09-19）
+
+### 49.1 结论
+
+`vendor/opensrv-mysql`（544K，`.gitignore` 已忽略、未被 git 跟踪）已删除。**零功能影响**，
+两条独立证据：
+
+| 证据 | 结果 |
+|---|---|
+| 是否被构建引用 | 全仓唯一的 opensrv 依赖是 `crates/sqlwire/Cargo.toml` 的 `opensrv-mysql = "0.7"`（**走 registry**）。根 `Cargo.toml`、`.cargo/`（不存在）、用户级 cargo 配置里**都没有** `[patch.crates-io]` / `paths` / `directory = "vendor"` 之类的接线 |
+| 与上游是否一致 | `diff -rq` 与"文件清单 md5"**双双**显示它与 `~/.cargo/registry/src/*/opensrv-mysql-0.7.0` **逐字节相同** —— 即这份 vendor **连一处补丁都没有** |
+
+### 49.2 为什么值得记（避免后来者误判）
+
+`§22` 记着上游 opensrv-mysql **0.7.0** 的 `PacketReader::next_async` 释放后使用
+（上游 #66 / PR #67，**只修在 git**，crates.io 仍是 2024-02 的 0.7.0）。看到 `vendor/opensrv-mysql`
+很容易以为"我们 fork 了一份来打这个补丁"——**并不是**：`§22.3` 的绕过**全部在 `sqlwire`**
+（`PacketFramedReader::poll_read` 按**包边界**截断），一行都没改 opensrv。
+
+所以这次删除**不会**让 §22 的上游问题回来 —— 它从来没被这份 vendor 挡住过（删除前后，
+构建用的都是 registry 上那份未打补丁的 0.7.0）。
+
+若将来真要 patch 上游，正确形态是 **`[patch.crates-io]` + 在文档里写明补了什么**
+（上游问题在 0.7 已定位到具体文件行，patch 是可做的；本次只是不做）。
+`.gitignore` 的 `/vendor/` **保留**：真 vendor 时它仍是忽略目录，记得 `git add -f`，
+否则补丁不会进仓库（那等于"本地修好了、别人拉下来还是坏的"）。
+
+### 49.3 验证
+
+`cargo test -p yuntun-sqlwire -p yuntun-server -p yuntun-standalone`：**30 passed / 0 failed**
+（覆盖 MySQL wire 链路：握手 / prepared / 二进制行编码 / `SET`·`USE`·`SHOW` 拦截 / 错误码映射）；
+`git status` 干净（该目录本就未跟踪）。
 
 ---
