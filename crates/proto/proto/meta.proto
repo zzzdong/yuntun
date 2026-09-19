@@ -20,8 +20,9 @@
 // |---|---|
 // | `CreateSchema` | ✅ |
 // | `DropTable` | ✅ |
+// | `CreateTable`（含 `partition_cols` / `ingest_config`） | ✅ |
 // | `CommitFiles`（含 `FileManifest` / `StatisticsLite` / `ColumnStatLite`） | ✅（设计 §6 点名的那一项） |
-// | `CreateTable` / `EvolveSchema` / `DropShard` / `Compaction` / 租约 | ⏳ 后续增量 |
+// | `EvolveSchema` / `DropShard` / `Compaction` / 租约 | ⏳ 后续增量 |
 //
 // 未迁移的 op 目前**不进**这个 proto（而不是留个没有编解码的 `bytes` 字段 —— 那种占位会
 // 让下一位实现者以为"已经有格式了"）。`wire_compat.rs` 里有一条断言分支数的用例：
@@ -55,6 +56,7 @@ message Op {
     CreateSchemaOp create_schema = 2;
     DropTableOp    drop_table    = 3;
     CommitFilesOp  commit_files  = 4;
+    CreateTableOp  create_table  = 5;
   }
 }
 
@@ -64,6 +66,18 @@ message CreateSchemaOp {
 
 message DropTableOp {
   string name = 1;
+}
+
+// 与 `ops::CreateTableRequest` 逐字段对齐。
+message CreateTableOp {
+  string name            = 1;
+  string namespace       = 2;
+  // Arrow IPC 的 schema 字节（复用 `serialize_schema`，避免双重编码）
+  bytes  arrow_schema_ipc = 3;
+  string default_format  = 4;
+  repeated string partition_cols = 5;
+  // `IngestConfig`（它本身就是 prost 消息，直接带编码字节）
+  bytes  ingest_config   = 6;
 }
 
 // 与 `ops::CommitFilesRequest` **逐字段对齐**（设计 §6 的 S3-0 验收项）。

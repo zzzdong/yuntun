@@ -35,10 +35,14 @@
 //! raft 消息直接经 `std::sync::mpsc` 传递（**不序列化**）—— 生产实现要走 gRPC，
 //! 但那是 S3-0/S3-3 的事，与选型无关。
 
+pub mod error;
 pub mod fjall_storage;
+pub mod op;
 pub mod storage;
 
+pub use error::MetaError;
 pub use fjall_storage::FjallStorage;
+pub use op::{apply, decode_op, StateOp};
 pub use storage::MetaStorage;
 
 use std::collections::{HashMap, VecDeque};
@@ -54,134 +58,31 @@ use raft::StateRole;
 use protobuf::Message as PbMessage;
 
 use yuntun_catalog::CatalogState;
-use yuntun_model::ops::{CreateTableRequest, DEFAULT_SCHEMA};
+use prost::Message as _;
 
 /// 三节点的固定成员表（PoC 用常量；生产由 `--init` / `Join` 决定）。
 pub const PEERS: [u64; 3] = [1, 2, 3];
 
-/// PoC 的 op 编码（**S3-0 会换成 proto 定义的 `CatalogOp`**）。
-///
-/// 关键点不在编码，而在**时间戳由 op 携带**：状态机内不得读钟，否则各副本
-/// apply 同一串 op 会得到不同状态（`catalog/src/state.rs` 纪律 1）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PocOp {
-    CreateSchema { name: String, now_ms: u64 },
-    CreateTable { name: String, now_ms: u64 },
-    Commit { table: String, batch_id: String, rows: u64, now_ms: u64 },
-}
-
-impl PocOp {
-    /// 文本编码（PoC 够用；生产用 proto）。
-    pub fn encode(&self) -> Vec<u8> {
-        let s = match self {
-            PocOp::CreateSchema { name, now_ms } => format!("schema\t{name}\t{now_ms}"),
-            PocOp::CreateTable { name, now_ms } => format!("table\t{name}\t{now_ms}"),
-            PocOp::Commit {
-                table,
-                batch_id,
-                rows,
-                now_ms,
-            } => format!("commit\t{table}\t{batch_id}\t{rows}\t{now_ms}"),
-        };
-        s.into_bytes()
-    }
-
-    pub fn decode(data: &[u8]) -> Option<Self> {
-        let s = std::str::from_utf8(data).ok()?;
-        let mut it = s.split('\t');
-        match it.next()? {
-            "schema" => Some(PocOp::CreateSchema {
-                name: it.next()?.to_string(),
-                now_ms: it.next()?.parse().ok()?,
-            }),
-            "table" => Some(PocOp::CreateTable {
-                name: it.next()?.to_string(),
-                now_ms: it.next()?.parse().ok()?,
-            }),
-            "commit" => Some(PocOp::Commit {
-                table: it.next()?.to_string(),
-                batch_id: it.next()?.to_string(),
-                rows: it.next()?.parse().ok()?,
-                now_ms: it.next()?.parse().ok()?,
-            }),
-            _ => None,
-        }
-    }
-}
-
-/// **状态机接缝**：把 op 应用到 [`CatalogState`]。
-///
-/// 这个函数就是 R3 的全部"业务" —— 它是纯的（无锁、无时钟、无 IO），
-/// 因此**两个候选 raft 库都不需要为它改一行**。返回 `false` 表示该 op 在语义上被拒
-/// （如重复键/已存在），但仍属于"已提交"（幂等语义由状态机自己保证）。
-pub fn apply_op(state: &mut CatalogState, op: &PocOp) -> bool {
-    match op {
-        PocOp::CreateSchema { name, now_ms } => {
-            // 已存在视为成功（幂等重试语义，与 CatalogOps 一致：重复 DDL 报错，
-            // 但这里 PoC 只关心"确定性 apply"，故忽略 AlreadyExists）
-            let _ = now_ms;
-            let exists = state.schema_exists(name);
-            if exists {
-                return true;
-            }
-            state.create_schema(name).is_ok()
-        }
-        PocOp::CreateTable { name, now_ms } => {
-            if state.get_table(name).is_some() {
-                return true;
-            }
-            state
-                .create_table(
-                    CreateTableRequest {
-                        name: name.clone(),
-                        namespace: DEFAULT_SCHEMA.into(),
-                        schema: poc_schema(),
-                        partition_cols: vec![],
-                        default_format: "parquet".into(),
-                        ingest_config: yuntun_model::meta::IngestConfig::standard(),
-                    },
-                    *now_ms,
-                )
-                .is_ok()
-        }
-        PocOp::Commit {
-            table,
-            batch_id,
-            rows,
-            now_ms,
-        } => {
-            let req = yuntun_model::ops::CommitFilesRequest {
-                table: table.clone(),
-                batch_id: batch_id.clone(),
-                client_request_id: None,
-                client_request_ids: vec![],
-                shard: "s0".into(),
-                time_window: "w0".into(),
-                files: vec![yuntun_model::meta::FileManifest {
-                    file_path: format!("p/{batch_id}.parquet"),
-                    row_count: *rows,
-                    ..Default::default()
-                }],
-                schema_version: 1,
-                row_count: *rows,
-            };
-            state.commit_files(req, *now_ms).map(|r| r.accepted).unwrap_or(false)
-        }
-    }
-}
-
-fn poc_schema() -> arrow::datatypes::SchemaRef {
-    Arc::new(arrow::datatypes::Schema::new(vec![
-        arrow::datatypes::Field::new("ts", arrow::datatypes::DataType::Int64, false),
-    ]))
-}
+// op 的**编码与应用**已迁到生产路径：见 [`crate::op`]（proto `Op` → `StateOp` → 状态机）。
+//
+// 这里原本是 PoC 的文本编码（`PocOp` + `apply_op`）。S3-0/S3-3 之后它被真正的协议取代，
+// 故**删除**而不是留着 —— 两套 op 编码并存，久了没人分得清哪套是权威（而且日志里的
+// payload 只能有一套：它必须与 gRPC 面同构，否则"线上发的"和"盘上存的"会对不上）。
 
 /// 发给节点的命令。
+///
+/// `Propose` 与 `Stop` 大小差异大（前者带完整 op + 回复通道），但这是**控制通道**：
+/// 节点每秒至多收到几十条，为省几十字节而 `Box` 反而多一次分配与间接跳转。
+/// 故显式放行该 lint（而不是默默让它挂着）。
+#[allow(clippy::large_enum_variant)]
 enum Command {
-    /// 提议一个 op；`reply` 在**该 op 被应用到状态机**时收到它。
+    /// 提议一个 op；`reply` 在**该 op 被应用到状态机**时收到结果。
+    ///
+    /// 回复里带 raft index 与两组版本号（`metanode-design §5` 的 `ProposeResponse`），
+    /// 错误则按约定 3 映射（见 [`crate::MetaError`] 的 `From<MetaError> for tonic::Status`）。
     Propose {
-        op: PocOp,
-        reply: SyncSender<Result<(), String>>,
+        op: yuntun_proto::meta::Op,
+        reply: SyncSender<Result<yuntun_proto::meta::ProposeResponse, MetaError>>,
     },
     /// 停止该节点（模拟崩溃：线程退出、消息不再收发）。
     Stop,
@@ -330,8 +231,15 @@ impl Cluster {
         None
     }
 
-    /// 向当前 leader 提议一个 op，等它被**应用**（超时返回 Err）。
-    pub fn propose(&self, op: PocOp, timeout: Duration) -> Result<(), String> {
+    /// 向当前 leader 提议一个 op，等它被**应用**后返回结果。
+    ///
+    /// 找不到 leader / 等应用超时 → [`MetaError::NoQuorum`]（**可重试**：客户端应换节点重试
+    /// —— 设计 §5 约定 3 明确要求，G2「写入不中断」依赖它）。
+    pub fn propose(
+        &self,
+        op: yuntun_proto::meta::Op,
+        timeout: Duration,
+    ) -> Result<yuntun_proto::meta::ProposeResponse, MetaError> {
         // 直接问每个节点"你是不是 leader"，把命令投给 leader 的邮箱。
         // 生产实现里这里就是 `Meta.Propose` RPC（非 leader 返回带 leader hint 的错误）。
         let deadline = Instant::now() + timeout;
@@ -349,14 +257,14 @@ impl Cluster {
                         op: op.clone(),
                         reply: reply_tx,
                     })
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| MetaError::Storage(format!("命令通道断开：{e}")))?;
                 return match reply_rx.recv_timeout(timeout) {
                     Ok(r) => r,
-                    Err(e) => Err(format!("等应用超时/断开：{e}")),
+                    Err(_) => Err(MetaError::NoQuorum),
                 };
             }
             if Instant::now() >= deadline {
-                return Err("没有 leader".into());
+                return Err(MetaError::NotLeader { leader_hint: 0 });
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -494,7 +402,9 @@ fn spawn_node(
         *role.lock().unwrap() = raw.raft.state;
 
         // 已提议但尚未应用的 op（按提议顺序配对；只有 leader 会有内容）
-        let mut pending: VecDeque<SyncSender<Result<(), String>>> = VecDeque::new();
+        let mut pending: VecDeque<
+            SyncSender<Result<yuntun_proto::meta::ProposeResponse, MetaError>>,
+        > = VecDeque::new();
         let mut last_tick = Instant::now();
         let tick_every = Duration::from_millis(10);
 
@@ -517,15 +427,19 @@ fn spawn_node(
                         if raw.raft.state == StateRole::Leader {
                             // 顺序很重要：**先提议成功再入队**，否则队列与日志条目会错位
                             // （错位会让"应用 A 的 op 却回复了 B 的等待者" —— 静默错配）。
-                            match raw.propose(vec![], op.encode()) {
+                            // 日志 payload = proto `Op` 的编码（**权威 op 格式**：
+                            // 与 gRPC 面同构，"线上发的"和"盘上存的"是同一份定义）
+                            match raw.propose(vec![], op.encode_to_vec()) {
                                 Ok(()) => pending.push_back(reply),
                                 Err(e) => {
-                                    let _ = reply.send(Err(e.to_string()));
+                                    let _ = reply.send(Err(MetaError::Storage(
+                                        format!("raft propose 失败：{e}"),
+                                    )));
                                 }
                             }
                         } else {
-                            // 生产实现：这里返回带 leader hint 的错误，客户端重试（design §5 约定 4）
-                            let _ = reply.send(Err("not leader".into()));
+                            // 非 leader：必须可重试（约定 3）。生产实现在这里带上 leader hint。
+                            let _ = reply.send(Err(MetaError::NotLeader { leader_hint: 0 }));
                         }
                     }
                     Err(TryRecvError::Empty) => break,
@@ -677,7 +591,9 @@ fn apply_committed(
     sm: &Arc<Mutex<CatalogState>>,
     storage: &FjallStorage,
     applied: &Arc<Mutex<u64>>,
-    pending: &mut VecDeque<SyncSender<Result<(), String>>>,
+    pending: &mut VecDeque<
+        SyncSender<Result<yuntun_proto::meta::ProposeResponse, MetaError>>,
+    >,
 ) {
     for entry in entries {
         // **先按 raft 索引报告已应用位置**（含 no-op / ConfChange —— 它们也占索引，
@@ -702,15 +618,54 @@ fn apply_committed(
             }
             continue;
         }
-        let Some(op) = PocOp::decode(&entry.data) else {
-            eprintln!("[meta:{id}] undecodable op {:?}", entry.data);
-            continue;
+        // 日志 payload = proto `Op`（**权威 op 格式**：与 gRPC 面同构）。
+        // "已提交但解不开"是致命配置错误：各副本都会在这里同样失败（确定性 ✓），
+        // 但必须**大声记录**——静默跳过会让状态机落后于日志而没人知道。
+        let op = match prost::Message::decode(&entry.data[..]) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!(
+                    "[meta:{id}] 已提交的 op 无法解码（entry {}）：{e}",
+                    entry.index
+                );
+                if let Some(reply) = pending.pop_front() {
+                    let _ = reply.send(Err(MetaError::BadRequest(format!("op 解码失败：{e}"))));
+                }
+                continue;
+            }
         };
-        let ok = apply_op(&mut sm.lock().unwrap(), &op);
+        let state_op = match crate::op::decode_op(&op) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("[meta:{id}] op 语义非法（entry {}）：{e}", entry.index);
+                if let Some(reply) = pending.pop_front() {
+                    let _ = reply.send(Err(e));
+                }
+                continue;
+            }
+        };
+        let mut st = sm.lock().unwrap();
+        let outcome = crate::op::apply(&mut st, &state_op);
+        // 响应：revision = raft index（权威位置）+ **两组**版本号（约定 2）+ 快照号。
+        // 注意：状态机内部仍按 op 计数自增 `last_applied`（standalone 语义），
+        // 副本层的坐标由 `storage.set_applied(entry.index)` 单独维护 —— 两者别混用（§42.3）。
+        let resp = match outcome {
+            Ok(o) => Ok(yuntun_proto::meta::ProposeResponse {
+                accepted: o.accepted,
+                revision: entry.index,
+                schema_ver: st.version().schema_ver,
+                manifest_ver: st.version().manifest_ver,
+                // 逐 op 的结果形状待定（operation-log §45.4）；关键数字已在上面几个字段
+                result: Vec::new(),
+                snapshot: st.current_snapshot(),
+            }),
+            Err(e) => Err(e),
+        };
+        drop(st);
         *applied.lock().unwrap() = entry.index;
         // leader 才持有等待者；换主后旧队列为空 → 跳过
         if let Some(reply) = pending.pop_front() {
-            let _ = reply.send(if ok { Ok(()) } else { Err("op rejected".into()) });
+            let _ = reply.send(resp);
         }
     }
 }

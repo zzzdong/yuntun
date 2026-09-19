@@ -557,7 +557,9 @@ SQL `INSERT` 返回成功时数据仅落 WAL（与 Flight DoPut 语义一致）�
 > 并抓到「`applied` 是派生量、必须按快照 index 重置」与「持久化失败即停机」两条纪律。
 > **S3-0（proto/tonic）第一切片已落地**（`operation-log §45`）：`Meta` 服务面冻结；op 面已迁移 3 个，
 > round-trip + **与 `CommitFilesRequest` 逐字段对齐**均有用例与反证；手写结构一个没动（设计 §6 的回滚点）。
-> 遗留（S3-3）：进程化（`MetaService` 实现 + `--init` + 其余 op 的镜像）、两个时钟统一、
+> **op 生产路径已接线**（`operation-log §46`）：proto `Op` 成为唯一权威编码（日志 payload 与 gRPC 面同构）、
+> 错误码映射按约定 3 落地、三个集群用例改跑生产路径。
+> 遗留（S3-3）：进程化（`MetaService` 实现 + `--init` + gRPC 端到端 + 其余 op 的镜像）、两个时钟统一、
 > 快照触发/保留策略、真崩溃注入（子进程）。
 > **S3-1 选型闸门已过**（`operation-log §40`）：三节点收敛 + kill leader 不丢已提交数据 + 样板 124 行
 > → **保留 raft-rs**（openraft 降级为备选）；余 S3-1b 快照安装 + 日志压缩。

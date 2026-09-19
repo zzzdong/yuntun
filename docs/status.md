@@ -94,6 +94,7 @@ MySQL 端口 **trust 无鉴权**（按网络隔离部署）；MySQL 轨结果集
 | R3 快照编解码 | 帧头+块 CRC 三层保护（任一偏移截断/任一字节翻转都检出）；载荷无损 + 11 维度覆盖；严格拒绝非法载荷 | `operation-log §41` + `model/src/snapshot.rs` |
 | R3 快照安装（S3-1b） | **机制**：自实现 `Storage`（`MemStorage` 不可用）+ 帧/载荷双重校验 + 安装路径 + 反证（不还原状态机 → installs=1 但状态不一致）；**重启语义**：`Config.applied` 必须报（否则 raft 重放 → 静默分叉，反证成立） | `operation-log §42` + `crates/meta/src/storage.rs` |
 | R3 快照安装（遗留） | **集成层稳定触发未拿到**：同一场景出现过 `installs=0 但已收敛`（leader 发出已压缩的条目 `first=8` 却有 `append 6..7`）→ 归因中；正路 = S3-6 成员变更 / S3-3 真实触发策略 | `operation-log §42.4b` / §42.7 |
+| **R3 op 生产路径（S3-3）** | proto `Op` 为唯一权威编码（日志 payload 同构）；`StateOp`/`decode_op`/`apply` + 双向转换器；错误码映射（约定 3，穷尽 match）；集群用例跑生产路径 | `operation-log §46` + `crates/meta/src/{op,error}.rs` |
 | **R3 gRPC 面（S3-0）** | `Meta` 服务面（Propose/Prefetch/Delta/Status/Join）冻结；op 面已迁移 3 个（含 `CommitFiles` 全字段镜像）；6 条 wire-compat 用例（round-trip + 逐字段对齐 + 反证） | `operation-log §45` + `crates/proto/` |
 | **R3 节点装配 + M3/G1** | 集群切到落盘版（`kill`=释放句柄、`restart`=从盘重开）；`open_with_state` 从快照+日志**重建状态机**；**全量重启后 Catalog 逐字节一致**（反证成立）；`applied` 是派生量（按快照 index 重置）、持久化失败即停机 | `operation-log §44` + `raft_poc.rs` |
 | R3 落盘存储（S3-3 第一件） | `FjallStorage`：键布局 + 先盘后缓存 + **原子批（把"产物↔压缩位置"不变量交给存储保证）** + fsync 分级；5 条测试（3 条跨 reopen、1 条不伪造、1 条覆盖写）；反证成立 | `operation-log §43` + `crates/meta/src/fjall_storage.rs` |
@@ -168,7 +169,7 @@ window_closed    files= 3
 | 2 | 让文件数可预期：`bytes_threshold` 是否随速率自适应，或暴露"目标文件行数"配置 | 用户设的是字节、观测到的是行数，口径不直观 | 属易用性/可运维性 |
 | 3 | `max_row_group_size` 专项 | 显式设定（实测现状 = 整文件 1 组）→ 需测 RowGroup 大小对扫描剪枝/压缩率/写入内存的影响 | 与文件大小互为约束 |
 | 4 | ~~真多节点基线压测~~ ✅ **本机多进程已完成**（`operation-log §37`） | 4 节点 × 20k rows/s：全局峰值 **9 次/秒**、`pressure` 主导 60%、相位让位 2~3 次/节点生效 | **剩余**：R3 后打同一 Meta 的真并发（唯一的硬门槛）+ 真实 S3/MinIO + 跨机 + 内存曲线时序 |
-| 3 | **R3：metanode 独立 + raft**（**设计已定稿** → [`metanode-design.md`](metanode-design.md)） | M3：3 节点写入不中断 + metanode 全量重启后 Catalog **逐字节一致** + standalone 不回归（217 用例全绿、`if distributed` 零命中） | 语义零改动（R2 已把访问形态按远程定义），只换状态机宿主；**进行中**：**S3-2 第一切片已落地**（`CatalogState` + 4 处非确定性已修 + 对拍防线，`§38`）；**S3-5 键集合去重已接线**（键集合从 WAL 派生；修掉"认领≠重复"语义坑，`§39`）；**S3-1 闸门已过**（raft-rs 保留，`§40`）；**选型闸门 4 项通过 + 快照机制通过**（`§40`/`§42`；集成层稳定触发为遗留）；**节点装配已完成、M3/G1 判据在 PoC 层通过**（`§44`：全量重启后逐字节一致）+ **落盘存储**（`§43`）；**S3-0 第一切片已落地**（`§45`）；**余 S3-3 进程化（`MetaService` 实现 + `--init` + 其余 op 的镜像）+ 两个时钟统一 + 快照触发/保留策略 + 真崩溃注入（子进程）** |
+| 3 | **R3：metanode 独立 + raft**（**设计已定稿** → [`metanode-design.md`](metanode-design.md)） | M3：3 节点写入不中断 + metanode 全量重启后 Catalog **逐字节一致** + standalone 不回归（217 用例全绿、`if distributed` 零命中） | 语义零改动（R2 已把访问形态按远程定义），只换状态机宿主；**进行中**：**S3-2 第一切片已落地**（`CatalogState` + 4 处非确定性已修 + 对拍防线，`§38`）；**S3-5 键集合去重已接线**（键集合从 WAL 派生；修掉"认领≠重复"语义坑，`§39`）；**S3-1 闸门已过**（raft-rs 保留，`§40`）；**选型闸门 4 项通过 + 快照机制通过**（`§40`/`§42`；集成层稳定触发为遗留）；**节点装配已完成、M3/G1 判据在 PoC 层通过**（`§44`：全量重启后逐字节一致）+ **落盘存储**（`§43`）；**S3-0 第一切片已落地**（`§45`）+ **op 生产路径已接线**（`§46`）；**余 S3-3 进程化（`MetaService` 实现 + `--init` + gRPC 端到端）+ 其余 op 的镜像 + 两个时钟统一 + 快照触发/保留策略 + 真崩溃注入（子进程）** |
 | 4 | **R4：datanode 化 + 冷热边界** | M4：多 datanode 并发写 + 查询结果**与单节点串行精确相等**（对拍，硬要求） | 这一步才消费 `source_instance` → 消灭缺口 §5.1-1（重复计数） |
 | 5 | **R5：分布式并发查询** | M5：fanout 下对拍继续成立；查询中杀节点行为符合声明 | 依赖 R4 的分片归属 |
 | 6 | **R6：compaction / GC 全局化** | M6：文件数收敛 + **开 GC 的多节点压测零误删** + 租约可接管 | 最后做：它需要前四步提供的一致性基础 |

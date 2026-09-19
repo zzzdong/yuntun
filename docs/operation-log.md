@@ -2808,3 +2808,78 @@ error[E0433]: cannot find `ProstCodec` in `codec`
 | 3 | 错误码映射（约定 3：`FAILED_PRECONDITION` / `UNAVAILABLE` + leader hint）需要 `MetaService` 实现时逐条落 | S3-3 |
 
 ---
+
+---
+
+## 46. R3 S3-3（第三件）：op 生产路径接线 —— proto `Op` 成为唯一权威编码（2026-09-19）
+
+### 46.0 交付
+
+| 位置 | 内容 |
+|---|---|
+| `crates/meta/src/op.rs`（**新**） | `StateOp` + `decode_op`（proto `Op` → 进程内）+ `apply`（纯函数）+ **双向**边界转换器 |
+| `crates/meta/src/error.rs`（**新**） | `MetaError` + **gRPC 错误码映射**（约定 3）+ `retryable()` |
+| `crates/meta/src/lib.rs` | 集群的 op 路径换成 proto：`Command::Propose{op: meta::Op, reply: ProposeResponse \| MetaError}`；日志 payload = **proto `Op` 编码**；`Cluster::propose` 返回 `ProposeResponse` |
+| `crates/proto/proto/meta.proto` | 补 `CreateTableOp`（迁移进度 4/… ） |
+
+**并且**：三个集群用例已改为直接构造 proto `Op`（不再是测试专用的 op 编码）——
+也就是说 `converges` / `kill leader` / **M3 全量重启** 这些用例现在跑的就是**生产路径**。
+
+### 46.1 三个决定
+
+**① 日志 payload 必须与 gRPC 面同构，所以删掉了 PoC 的文本编码（`PocOp`）。**
+留着它会变成"线上发的"与"盘上存的"两套定义 —— 换主或跨版本重启时就是灾难。
+现在日志里存的就是 proto `Op` 的编码：**一份定义、一处演进**。
+
+**② `now_ms` 放在 op 上，不是 `apply()` 的参数。**
+后者会诱导实现者在里面取"现在"（S3-2 抓到的四类非确定性之一）。放在 op 上，
+时间随 op 传播，各副本 apply 同一串 op 得到同一状态 —— 且这条有测试守着。
+
+**③ 状态机内的 op 级计数与副本层坐标**（呼应 `§42.3`）**别混用**：
+`storage.set_applied(entry.index)` 维护的是**副本层**（raft 索引，压缩/快照元数据用它），
+而 `CatalogState.last_applied` 仍是 **op 计数**（standalone 语义）。代码里点明了这一点，
+免得后来者以为两者是一回事。
+
+### 46.2 实测撞到的一个真问题：幂等判断必须用**归一化表身份**
+
+`CreateTable` 的幂等判断原本写成 `state.get_table(&request.name)` —— 而请求里的 `name`
+可能是裸名（`cpu`），状态机内部存的是全限定名（`public.cpu`）→ **永远查不到** →
+重复建表不再是 `accepted=false`（幂等命中），而是 `TableAlreadyExists` **错误**。
+幂等语义要求前者（客户端重试必须成功）。已按状态机的归一化规则（裸名补 `namespace`）
+对齐。**这类"身份没归一化"的错，只有在重复提交时才会暴露** —— 也就是崩溃重试那条路。
+
+### 46.3 错误码映射（约定 3 的落地）
+
+| 情形 | 码 | 可重试 | 附加信息 |
+|---|---|---|---|
+| 非 leader | `UNAVAILABLE` | ✅ | metadata `leader-hint` |
+| 无 quorum / 等应用超时 | `UNAVAILABLE` | ✅ | — |
+| OCC 版本不符（含 `SchemaChanged`） | `FAILED_PRECONDITION` | ✅ | metadata `actual-version` |
+| 请求不合法（op 解不开、键缺失/too long） | `INVALID_ARGUMENT` | ❌ | — |
+| 表/schema 不存在 | `NOT_FOUND` | ❌ | — |
+| 已存在 | `ALREADY_EXISTS` | ❌ | — |
+| 背压（内存/磁盘水位） | `RESOURCE_EXHAUSTED` | ✅（退避） | — |
+| 落盘/内部故障 | `INTERNAL` | ❌ | 节点应**停机** |
+
+映射用**穷尽 `match`**（新加错误变体若不映射，编译就过不去），另有一条用例专门遍历
+若干错误断言"绝不能映射成 `Ok`"。
+
+### 46.4 一条被我写错的测试（记录下来）
+
+我原本想用 `CreateSchema` 证明"`now_ms` 进状态"，结果**失败**：
+`create_schema` **不记录时间**（schema 注册表只有名字）→ 两个不同时间戳的状态**相同**，
+断言自然不成立。改用 `commit_files`（幂等记录里落 `committed_at`）后，且加了反向断言
+（**同一时刻**的同一 op 必须得到同一状态）——后者顺带证明"状态机里没读钟"。
+
+教训：**要证明"A 进入状态"，得先确认 A 在该路径上真的被记录**；否则测的是空气。
+
+### 46.5 遗留
+
+| # | 项 | 归属 |
+|---|---|---|
+| 1 | `MetaService`（tonic trait 实现）+ 服务启动/`--init` bootstrap + 真 gRPC 端到端用例 | S3-3 下一步（**RPC 面与 op 路径都已就绪**） |
+| 2 | 其余 op 的镜像（`EvolveSchema` 三个变体 / `DropShard` / `Compaction` / 租约） | S3-3 |
+| 3 | `ProposeResponse.result` 的逐 op 形状 | S3-3 |
+| 4 | 生产侧把 `NodeHandle` 暴露给 gRPC 层（现集群内部结构已具备） | S3-3 下一步 |
+
+---

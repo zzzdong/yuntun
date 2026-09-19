@@ -5360,11 +5360,14 @@ dependencies = [
  "arrow",
  "bytes",
  "fjall",
+ "prost",
  "protobuf",
  "raft",
  "slog",
+ "tonic",
  "yuntun-catalog",
  "yuntun-model",
+ "yuntun-proto",
 ]
 
 [[package]]

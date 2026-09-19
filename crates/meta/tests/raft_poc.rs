@@ -8,7 +8,69 @@
 
 use std::time::Duration;
 
-use yuntun_meta::{PocOp, PEERS};
+use yuntun_meta::PEERS;
+use yuntun_proto::meta as pb;
+
+// ---------------------------------------------------------------- op 构造助手
+//
+// 用例现在直接用 **gRPC 面的 op 类型**（proto `Op`）—— 也就是说这些集群用例跑的就是
+// 生产路径（日志 payload 与线上同构），不再有一套"只在测试里存在"的 op 编码。
+
+fn create_schema_op(name: &str, now: u64) -> pb::Op {
+    pb::Op {
+        now_ms: now,
+        kind: Some(pb::op::Kind::CreateSchema(pb::CreateSchemaOp {
+            name: name.into(),
+        })),
+    }
+}
+
+fn create_table_op(name: &str, now: u64) -> pb::Op {
+    let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("ts", arrow::datatypes::DataType::Int64, false),
+    ]));
+    pb::Op {
+        now_ms: now,
+        kind: Some(pb::op::Kind::CreateTable(pb::CreateTableOp {
+            name: name.into(),
+            namespace: "public".into(),
+            arrow_schema_ipc: yuntun_model::meta::serialize_schema(&schema),
+            default_format: "parquet".into(),
+            partition_cols: vec![],
+            ingest_config: {
+                use prost::Message as _;
+                yuntun_model::meta::IngestConfig::standard().encode_to_vec()
+            },
+        })),
+    }
+}
+
+fn commit_op(table: &str, batch_id: &str, rows: u64, now: u64) -> pb::Op {
+    use prost::Message as _;
+    let req = pb::CommitFilesRequestMsg {
+        table: table.into(),
+        batch_id: batch_id.into(),
+        client_request_id: None,
+        client_request_ids: vec![],
+        shard: "s0".into(),
+        time_window: "w1".into(),
+        files: vec![pb::FileManifestMsg {
+            file_path: format!("p/{batch_id}.parquet"),
+            batch_id: batch_id.into(),
+            row_count: rows,
+            ..Default::default()
+        }],
+        schema_version: 1,
+        row_count: rows,
+    };
+    let _ = req.encode_to_vec();
+    pb::Op {
+        now_ms: now,
+        kind: Some(pb::op::Kind::CommitFiles(pb::CommitFilesOp {
+            request: Some(req),
+        })),
+    }
+}
 
 /// 等待上限。
 ///
@@ -19,28 +81,12 @@ use yuntun_meta::{PocOp, PEERS};
 /// 所以放宽上限；与 `docs/status.md` 里 chaos 用例放宽到 60s 是同一处理。
 const T: Duration = Duration::from_secs(60);
 
-fn ops() -> Vec<PocOp> {
+fn ops() -> Vec<pb::Op> {
     vec![
-        PocOp::CreateSchema {
-            name: "analytics".into(),
-            now_ms: 1_000,
-        },
-        PocOp::CreateTable {
-            name: "cpu".into(),
-            now_ms: 1_001,
-        },
-        PocOp::Commit {
-            table: "public.cpu".into(),
-            batch_id: "b1".into(),
-            rows: 10,
-            now_ms: 1_002,
-        },
-        PocOp::Commit {
-            table: "public.cpu".into(),
-            batch_id: "b2".into(),
-            rows: 20,
-            now_ms: 1_003,
-        },
+        create_schema_op("analytics", 1_000),
+        create_table_op("cpu", 1_001),
+        commit_op("public.cpu", "b1", 10, 1_002),
+        commit_op("public.cpu", "b2", 20, 1_003),
     ]
 }
 
@@ -131,12 +177,7 @@ fn leader_kill_reelects_and_keeps_committed_ops() {
     // 新 leader 必须能继续接活（写入不中断）
     cluster
         .propose(
-            PocOp::Commit {
-                table: "public.cpu".into(),
-                batch_id: "b3".into(),
-                rows: 30,
-                now_ms: 1_004,
-            },
+            commit_op("public.cpu", "b3", 30, 1_004),
             T,
         )
         .expect("新 leader 必须能继续提交");
@@ -200,19 +241,13 @@ fn follower_behind_catches_up_via_snapshot() {
     // 建 schema/表（PoC 的 op 语义：commit 要求表已存在）
     cluster
         .propose(
-            PocOp::CreateSchema {
-                name: "analytics".into(),
-                now_ms: 1_000,
-            },
+            create_schema_op("analytics", 1_000),
             T,
         )
         .expect("建 schema");
     cluster
         .propose(
-            PocOp::CreateTable {
-                name: "cpu".into(),
-                now_ms: 1_001,
-            },
+            create_table_op("cpu", 1_001),
             T,
         )
         .expect("建表");
@@ -220,12 +255,7 @@ fn follower_behind_catches_up_via_snapshot() {
     let mut now = 2_000u64;
     let mut op = |batch: &str| {
         now += 1;
-        PocOp::Commit {
-            table: "public.cpu".into(),
-            batch_id: batch.into(),
-            rows: 1,
-            now_ms: now,
-        }
+        commit_op("public.cpu", batch, 1, now)
     };
     for b in ["pre1", "pre2"] {
         cluster.propose(op(b), T).expect("压缩前写入");
@@ -354,19 +384,13 @@ fn full_cluster_restart_keeps_state_byte_identical() {
 
     cluster
         .propose(
-            PocOp::CreateSchema {
-                name: "analytics".into(),
-                now_ms: 1_000,
-            },
+            create_schema_op("analytics", 1_000),
             T,
         )
         .expect("建 schema");
     cluster
         .propose(
-            PocOp::CreateTable {
-                name: "cpu".into(),
-                now_ms: 1_001,
-            },
+            create_table_op("cpu", 1_001),
             T,
         )
         .expect("建表");
@@ -375,12 +399,7 @@ fn full_cluster_restart_keeps_state_byte_identical() {
         now += 1;
         cluster
             .propose(
-                PocOp::Commit {
-                    table: "public.cpu".into(),
-                    batch_id: b.into(),
-                    rows: 1,
-                    now_ms: now,
-                },
+                commit_op("public.cpu", b, 1, now),
                 T,
             )
             .expect("写入");
@@ -427,12 +446,7 @@ fn full_cluster_restart_keeps_state_byte_identical() {
     now += 1;
     cluster
         .propose(
-            PocOp::Commit {
-                table: "public.cpu".into(),
-                batch_id: "after_restart".into(),
-                rows: 1,
-                now_ms: now,
-            },
+            commit_op("public.cpu", "after_restart", 1, now),
             T,
         )
         .expect("重启后应能继续提交");

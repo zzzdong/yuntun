@@ -8,6 +8,10 @@ license.workspace = true
 yuntun-model = { path = "../model" }
 yuntun-catalog = { path = "../catalog" }
 arrow = { workspace = true }
+# gRPC 面（S3-0）：op 类型与错误码映射
+yuntun-proto = { path = "../proto" }
+prost = { workspace = true }
+tonic = { workspace = true }
 # S3-1 PoC（选型闸门）：raft-rs 是**候选实现**，选型结论见 docs/metanode-design.md §4.2
 # 与 docs/operation-log.md §40。若最终选 openraft，换的是本 crate 的内部实现，
 # 对 `CatalogState`（状态机）与上层接口无影响 —— 这正是先做 S3-2 的原因。
@@ -19,3 +23,10 @@ bytes = { workspace = true }
 # S3-3：metanode 的落盘存储（键值 + 原子批 + fsync）
 fjall = "3"
 slog = "2"
+
+[dev-dependencies]
+# 集成测试要自己构造 proto op 与 arrow schema（它们不在 crate 的公开 API 里）
+arrow = { workspace = true }
+prost = { workspace = true }
+yuntun-model = { path = "../model" }
+yuntun-proto = { path = "../proto" }
