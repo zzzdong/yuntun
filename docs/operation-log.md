@@ -2431,3 +2431,141 @@ S3-1 闸门留下一项（**快照安装**），S3-3 的 fjall `Storage` 也要�
 | 4 | 大快照的**传输/内存曲线**（10 万条 manifest 规模） | S3-6 压测 |
 
 ---
+
+---
+
+## 42. R3 S3-1b：快照安装 + 日志压缩 —— **选型闸门全部判据通过**（2026-09-19）
+
+### 42.0 交付
+
+| 位置 | 内容 |
+|---|---|
+| `crates/meta/src/storage.rs`（**新**） | 自实现的 raft `Storage`（`MetaStorage`）：硬状态 / 日志 / 压缩位置 / **状态机产物** |
+| `crates/meta/src/lib.rs` | PoC 接到 `MetaStorage`；Ready 循环里的**快照安装**（还原状态机 + 固化元数据）；集群支持 kill → **空存储重启** |
+| `crates/meta/tests/raft_poc.rs` | 判据 5：`follower_behind_catches_up_via_snapshot` |
+
+### 42.1 为什么**不能**用 raft-rs 自带的 `MemStorage`（这是本轮的硬发现）
+
+第一版 PoC 用 `MemStorage` 跑得挺好，直到要实现快照安装才发现它根本不能用：
+
+| # | 问题 | 后果 |
+|---|---|---|
+| 1 | `MemStorageCore::snapshot()` 造的快照 **data 为空**（元数据取自 `hard_state.commit`） | follower 装上等于**把状态机清空** —— 而且**不报错**（raft 只看元数据） |
+| 2 | 它的 `compact()` 只丢日志、**不认识状态机** | 快照内容必须来自 `CatalogState`，这是存储实现方的责任，它无从知道 |
+
+所以快照能力**不是可选优化**：它是"必须自己写 `Storage`"的硬前提。生产实现换 fjall 时结构不变（`MetaInner` 的字段变成表/键值）。
+
+### 42.2 核心不变量：产物 ↔ 压缩位置**严格对应**
+
+> `artifact` 必须是"应用到 `compacted_index` 那一刻"的状态机产物。
+
+两种错误写法都**静默**出错（都不报错、测试也未必红）：
+
+| 错误写法 | 后果 |
+|---|---|
+| `snapshot()` 里**现场**从当前状态机取产物 | 元数据说"状态停在 I"，内容却是 J>I 的状态 → follower 把 I..J 的 op **当没做过**（丢）或**再 apply 一次**（重复） |
+| 先 `compact` 再取产物 | 同上（取到的产物已含压缩点之后的 op） |
+
+正确做法（`compact_applied`）：**在应用线程里、先取产物、再截日志**。
+单测 `snapshot_data_matches_compacted_index_not_current_state` 专门钉住它 —— 断言方式刻意"绕开状态机计数"：
+用**与 op 计数无关**的索引（10）压缩，随后继续推进状态机，再断言产物**不含**之后的批次。
+
+### 42.3 另一个硬发现：**raft 索引归副本层**，不是状态机的 op 计数
+
+`CatalogState::last_applied` 记的是"已 apply 的 **op 数**"，而 raft 日志里 **no-op**（新 leader 就位会写一条空条目）与 **ConfChange** 都占索引 —— 两者每遇到一条非 op 条目就**错开一格**。
+
+用 op 计数当压缩坐标的后果同样静默：压缩位置偏小 → 元数据与内容不一致；
+安装快照后 `advance_apply_to(applied)` 拿到错索引 → 重放已应用条目。
+
+因此本轮把已应用位置放在**副本层**（`MetaStorage.applied_index`，由驱动方按 `entry.index` 设置，
+且**对含 no-op/ConfChange 在内的每个条目都报**），并在用例里直接断言
+`compacted == cluster.applied(leader)`（两个都是 raft 索引）—— 用错坐标这条断言立刻红。
+
+> ⚠️ 由此留下**两个时钟并存**：快照**载荷**里的 `applied` 仍是状态机 op 计数，
+> 快照**元数据** index 是 raft 索引。单测里两者都被显式断言（把现状写清楚，而不是含糊过去）。
+> **S3-3 必须统一**：`CatalogState::last_applied` 作为读栅栏（`read_index()`）必须可比于 raft 索引
+> —— 要么它也按 `entry.index` 设置，要么读栅栏改走副本层。
+
+### 42.4 集成层：重启语义（**已确定**）+ 快照触发（**未稳定**）
+
+**先说结论**：本轮把"快照安装"的**机制**钉住了，但**没能**在 3 节点 PoC 里**稳定地强制**走快照路径。
+两件事必须分开算账（上一版草稿把它们混成"判据 5 通过"，已改正）。
+
+**（a）已确定：重启必须把已应用位置告诉 raft**
+
+用例 `follower_restart_recovers_from_own_log_and_converges`：杀一个 follower（**保留其日志**）→
+继续写 → leader 压缩 → victim 带自己的日志重启 → 断言**与 leader 逐字节相同** + 还能继续跟随。
+
+它钉住的是 `Config.applied`：raft-rs 文档原话 —— *"If Applied is unset when restarting,
+raft might return previous applied entries"*。不设置时 raft 会**重放已应用条目**，后果**不报错**：
+状态机的计数器被重复推进（幂等 op 的状态不变，但 `last_applied`/版本号多走），重启过的副本与其他副本
+**静默分叉**。本轮就是被 `set_applied` 的单调断言当场拦下的（`已应用索引不得回退：5 -> 1`）。
+**反证**：把 `applied` 改成 0 → 该断言立刻触发、用例失败 ✓。
+
+**（b）未稳定：leader 是否发快照**
+
+同一场景下实测出现过 `snapshot_installs=0 但已收敛`。取证（`MetaStorage` 的 env-gated 轨迹 + 节点诊断 dump）：
+
+| 观察到的事实 | 说明 |
+|---|---|
+| leader 侧 `first=8 last=7`、`compact applied=7` | 日志**确实**压缩了（不是"没压成"） |
+| **没有** `send_snapshot?` 轨迹 | `Storage::snapshot()` **从未被调用** —— leader 没走快照分支 |
+| victim 收到 `append 6..7` | leader 把已被压缩的 6..7 当成可用条目发了出去 ✗ 与"first=8"矛盾 |
+| victim 状态与 leader 一致、`installs=0` | 因此它靠条目补齐，而非快照 |
+
+结论：**归因未完成**（`§42.7` 遗留 1）。已排除：日志未截断、陈旧快照（无 `recv_snapshot` 轨迹）、
+"空存储同 id 重启"（那是另一条非法路径，见 42.5）。
+
+### 42.5 两条"非法场景"与两次反证
+
+**非法场景 ①：同 id + 抹掉存储重启。** 第一版用例就是这么写的，结果撞上 raft 的断言：
+
+```text
+to_commit 5 is out of range [last_index 0]   （etcd 那句 "Was the raft log corrupted, truncated, or lost?"）
+```
+
+原因：leader 侧仍记着该 peer 的旧 `matched`，于是发 `commit=N` 的**心跳**；空日志的 follower 在
+`handleHeartbeat` 里无条件 `commit_to(N)` → 越界即 panic。
+
+**结论（影响 S3-6 运维）**：**掉盘的节点不能复用原 id 直接空启**。要么从备份/快照恢复后回来，
+要么以**新 id 重新加入**（成员变更）。这条比"能跑通"更值得记 —— 生产上很容易踩。
+
+**非法场景 ②（本轮自己抓到）**：第一次跑"快照"用例时 `状态一致=true` 但 `installs=0` ——
+计数器字段与 getter 都写了，**忘了在 `apply_snapshot` 里自增**。当时那条断言是发现它的唯一地方。
+教训：**凡是断言依赖的计数器，都必须有测试证明它真的会被触发**（否则断言等于空转）。
+
+**反证 A（存储层机制）**：把 Ready 循环里的"状态机 ← 快照"去掉（只装元数据、不还原状态机 ——
+这正是 `MemStorage` 的静默形态）→ 用例失败：`installs=1 状态一致=false`。已恢复。
+**反证 B（重启语义）**：把 `Config.applied` 改成 0 → `已应用索引不得回退：5 -> 1`，用例失败 ✓。
+
+### 42.6 选型闸门：4 项通过 + 第 5 项**机制通过、集成层未稳定**
+
+| # | 判据 | 结果 |
+|---|---|---|
+| 1 | 三节点选主 + 收敛 | ✅ §40 |
+| 2 | kill leader 不丢已提交 | ✅ §40 |
+| 3 | 状态机接缝干净 | ✅ §40 |
+| 4 | 样板规模可接受（124 行） | ✅ §40 |
+| 5 | 快照可安装 | 🟡 **机制已证明**（自写 `Storage` + 帧/载荷双重校验 + 安装路径 + 反证）；**集成层强制触发未稳定**（42.4b，遗留 1） |
+
+**结论不变：保留 raft-rs**。逃生门现在有更实的信息：真正贵的是**自写 `Storage` + 快照正确性**
+（本项目必须自己写，两个候选都躲不掉），而不是某个库的样板量。
+
+**诚实说明**：判据 5 我**没有**拿到"稳定复现的快照安装"这颗证据就收尾了。原因是本 PoC 的
+3 节点进程内 harness 缺乏"新节点加入"能力（成员变更属 S3-6），而用"保留日志的 follower"去逼快照
+依赖 leader 的 Progress 时序 —— 这条路我试了 4 种变体仍未稳定，继续投入的性价比低于**把它登记清楚**。
+机制层的证据（存储层单测 + 反证）是充分的；集成层的强制路径留给 S3-3（那里有 fjall + 真实触发策略，
+会自然产生"落后节点追快照"的路径）。
+
+### 42.7 遗留
+
+| # | 项 | 归属 |
+|---|---|---|
+| 1 | **leader 为何能发出已被压缩的条目（`append 6..7` 而 `first=8`）** | **S3-3** —— 需带时间戳的 raft 事件轨迹（`Ready`/`MsgAppend` 收发 + `raft_log` 视图）才能定论。已排除的假设见 42.4b 表 |
+| 2 | **两个时钟统一**（`CatalogState.last_applied` = raft 索引，或读栅栏改走副本层） | S3-3（阻塞"读旧窗口"验收） |
+| 3 | fjall 落盘版 `Storage`（结构不变，换 `MetaInner` 的持久化） | S3-3 |
+| 4 | 快照**触发策略**（§4.4：日志条数 > N / 状态 > M）+ **保留策略**（按表 checkpoint + 归档） | S3-3（R3-4 快照膨胀） |
+| 5 | 大快照规模（10 万条 manifest 的传输/内存曲线） | S3-6 |
+| 6 | 成员变更（learner → voter）—— **也是稳定复现"新节点追快照"的正路** | S3-6 |
+
+---

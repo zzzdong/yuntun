@@ -16,18 +16,28 @@
 //! | 2 | kill leader 后**已提交数据不丢** | `leader_kill_reelects_and_keeps_committed_ops` |
 //! | 3 | **状态机接缝干净**：`CatalogState` 原样被驱动，不需要为 raft 改它 | 本文件 `apply_op`（无分支、无时钟、无 IO） |
 //! | 4 | 样板规模可接受 | 本文件行数 + 需自实现的 Storage/传输量 |
+//! | 5 | **快照可安装**（字段落后 + 日志已压缩时靠快照追上） | `follower_behind_catches_up_via_snapshot`（S3-1b） |
 //!
-//! # 为什么用 `MemStorage` 而不是 fjall
+//! # 为什么不用 `MemStorage`
 //!
-//! 选型闸门关心的是**集成成本**（Ready 循环、消息路由、状态机接缝、成员与快照接口），
-//! 而不是存储引擎。真正要自实现的 `Storage`（fjall 后端）在**两个候选下工作量相同**，
-//! 所以 PoC 用 raft-rs 自带的 `MemStorage` 把闸门问题隔离出来。
-//! （生产实现里 `Storage` 必须落盘：`RaftState`（term/vote/commit）+ 日志条目 + 快照。）
+//! 第一版 PoC 用的是 raft-rs 自带 `MemStorage`。做快照安装时发现它**不能用于真实场景**：
+//!
+//! 1. 它的 `snapshot()` 造出的快照 **data 为空**（元数据取自 `hard_state.commit`）→
+//!    follower 装上等于**把状态机清空**，且不报错；
+//! 2. 它的 `compact()` 只丢日志、**不认识状态机** —— 快照内容必须来自 `CatalogState`，
+//!    这是存储实现方的责任。
+//!
+//! 于是改为自实现 [`storage::MetaStorage`]（内存版；S3-3 换 fjall，结构不变）。
+//! 这本身也是闸门的收获：**真正要自写的 Storage 不是"可选优化"，是快照能力的硬前提**。
 //!
 //! # 进程内传输
 //!
 //! raft 消息直接经 `std::sync::mpsc` 传递（**不序列化**）—— 生产实现要走 gRPC，
 //! 但那是 S3-0/S3-3 的事，与选型无关。
+
+pub mod storage;
+
+pub use storage::MetaStorage;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
@@ -37,7 +47,6 @@ use std::time::{Duration, Instant};
 
 use raft::eraftpb::{Entry, EntryType, Message, Snapshot};
 use raft::prelude::*;
-use raft::storage::MemStorage;
 use raft::StateRole;
 // `ConfChange::merge_from_bytes` 来自 protobuf trait（raft-rs 0.7 默认 protobuf 编解码）
 use protobuf::Message as PbMessage;
@@ -180,10 +189,14 @@ enum Command {
 struct NodeState {
     /// 该节点的状态机（**唯一**被 raft 提交序驱动的实例）
     sm: Arc<Mutex<CatalogState>>,
+    /// 该节点的 raft 存储（日志 + 硬状态 + 快照产物）
+    storage: MetaStorage,
     /// 当前角色（Leader/Follower/Candidate）—— 由运行线程更新
     role: Arc<Mutex<StateRole>>,
     /// 已应用的 raft 索引
     applied: Arc<Mutex<u64>>,
+    /// 内部状态快照（测试诊断用；S3-6 的观测接口雏形）
+    debug: Arc<Mutex<String>>,
     cmd_tx: Sender<Command>,
 }
 
@@ -194,49 +207,100 @@ impl NodeState {
     fn canonical(&self) -> Vec<u8> {
         self.sm.lock().unwrap().encode_canonical()
     }
+    fn debug(&self) -> String {
+        self.debug.lock().unwrap().clone()
+    }
 }
 
-/// 三节点 raft 集群（进程内、内存存储）。
+/// 三节点 raft 集群（进程内；存储 = [`MetaStorage`] 内存版）。
+///
+/// 为什么要把 `receivers` / `handles` 收在结构里：S3-1b 的用例需要**杀掉一个 follower
+/// 再用空存储重启**（模拟"落后到只能靠快照追赶"）。邮箱是稳定身份，线程与存储才是可重建的。
 pub struct Cluster {
     nodes: HashMap<u64, NodeState>,
-    handles: Vec<thread::JoinHandle<()>>,
+    mailboxes: HashMap<u64, Sender<Message>>,
+    receivers: HashMap<u64, Receiver<Message>>,
+    /// 线程退出时会把**邮箱交还**（见 `spawn_node` 返回值）——
+    /// 否则 `kill` 之后就再也起不回同一个 id（receiver 随线程一起被丢掉）。
+    handles: HashMap<u64, thread::JoinHandle<Receiver<Message>>>,
+    /// 被 kill 的节点（**保留其存储与状态机**）—— 见 [`Cluster::restart`]。
+    stopped: HashMap<u64, NodeState>,
 }
 
 impl Cluster {
-    /// 启动 `PEERS` 里的所有节点（1 起三节点组：`create_raft_leader` 语义手工构造）。
+    /// 启动 `PEERS` 里的所有节点（三节点组）。
     pub fn start() -> Self {
         // 每个节点一个邮箱（不序列化，直接传 `Message`）
-        let mut txs: HashMap<u64, Sender<Message>> = HashMap::new();
-        let mut rxs: HashMap<u64, Receiver<Message>> = HashMap::new();
+        let mut mailboxes: HashMap<u64, Sender<Message>> = HashMap::new();
+        let mut receivers: HashMap<u64, Receiver<Message>> = HashMap::new();
         for id in PEERS {
             let (tx, rx) = mpsc::channel();
-            txs.insert(id, tx);
-            rxs.insert(id, rx);
+            mailboxes.insert(id, tx);
+            receivers.insert(id, rx);
         }
-
-        let mut nodes = HashMap::new();
-        let mut handles = Vec::new();
+        let mut c = Cluster {
+            nodes: HashMap::new(),
+            mailboxes,
+            receivers,
+            handles: HashMap::new(),
+            stopped: HashMap::new(),
+        };
         for id in PEERS {
-            let rx = rxs.remove(&id).unwrap();
-            let mailboxes = txs.clone();
-            let sm = Arc::new(Mutex::new(CatalogState::new()));
-            let role = Arc::new(Mutex::new(StateRole::Follower));
-            let applied = Arc::new(Mutex::new(0u64));
-            let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
-
-            nodes.insert(
-                id,
-                NodeState {
-                    sm: sm.clone(),
-                    role: role.clone(),
-                    applied: applied.clone(),
-                    cmd_tx,
-                },
-            );
-            handles.push(spawn_node(id, rx, mailboxes, sm, role, applied, cmd_rx));
+            c.spawn(id);
         }
-        // 等选主（心跳 3 tick × 10ms = 30ms；选举超时 10 tick = 100ms 量级）
-        Cluster { nodes, handles }
+        c
+    }
+
+    /// 起一个新节点（新状态机 + 空存储）。`receivers` 里必须有它的邮箱。
+    fn spawn(&mut self, id: u64) {
+        let sm = Arc::new(Mutex::new(CatalogState::new()));
+        let storage = MetaStorage::new_for(id, sm.clone(), PEERS.to_vec());
+        let role = Arc::new(Mutex::new(StateRole::Follower));
+        let applied = Arc::new(Mutex::new(0u64));
+        let debug = Arc::new(Mutex::new(String::new()));
+        self.spawn_with(id, sm, storage, role, applied, debug);
+    }
+
+    /// 用**既有**的状态机与存储起线程（重启路径）。
+    fn spawn_with(
+        &mut self,
+        id: u64,
+        sm: Arc<Mutex<CatalogState>>,
+        storage: MetaStorage,
+        role: Arc<Mutex<StateRole>>,
+        applied: Arc<Mutex<u64>>,
+        debug: Arc<Mutex<String>>,
+    ) {
+        let rx = self
+            .receivers
+            .remove(&id)
+            .unwrap_or_else(|| panic!("节点 {id} 已在运行（邮箱被占用）"));
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
+        self.handles.insert(
+            id,
+            spawn_node(
+                id,
+                rx,
+                self.mailboxes.clone(),
+                sm.clone(),
+                storage.handle(),
+                role.clone(),
+                applied.clone(),
+                debug.clone(),
+                cmd_rx,
+            ),
+        );
+        self.nodes.insert(
+            id,
+            NodeState {
+                sm,
+                storage,
+                role,
+                applied,
+                debug,
+                cmd_tx,
+            },
+        );
     }
 
     /// 等到选出 leader（返回其 id）；超时返回 `None`。
@@ -283,11 +347,72 @@ impl Cluster {
         }
     }
 
-    /// 杀掉一个节点（线程退出 = 进程内最接近"节点崩溃"的形态）。
+    /// 杀掉一个节点线程（进程内最接近"节点崩溃"的形态）。**保留其存储与状态机** ——
+    /// 真实崩溃后重启也是从自己的盘上恢复，而不是"从零开始"。
     pub fn kill(&mut self, id: u64) {
         if let Some(n) = self.nodes.remove(&id) {
             let _ = n.cmd_tx.send(Command::Stop);
+            self.stopped.insert(id, n);
         }
+        if let Some(h) = self.handles.remove(&id) {
+            if let Ok(rx) = h.join() {
+                self.receivers.insert(id, rx);
+            }
+        }
+    }
+
+    /// 重启一个已 kill 的节点：**带着它自己的日志与状态机**回来（崩溃恢复的形态）。
+    ///
+    /// # ⚠️ 为什么不是"空存储 + 同 id"
+    ///
+    /// 那个做法是 **raft 的非法操作**，会直接撞上 raft 的断言：
+    /// `to_commit N is out of range [last_index 0]`（etcd 那句 "Was the raft log corrupted,
+    /// truncated, or lost?"）。原因是 leader 侧仍记着该 peer 的 `matched`（旧位置），
+    /// 于是发**心跳**带 commit=N —— 空日志的 follower 在 `handleHeartbeat` 里
+    /// 无条件 `commit_to(N)`，越界即 panic。
+    ///
+    /// 结论（写进文档，影响 S3-6 的运维）：**掉盘的节点不能复用原 id 直接空启**；
+    /// 要么从备份/快照恢复后回来，要么以**新 id 重新加入**（成员变更）。
+    pub fn restart(&mut self, id: u64) {
+        assert!(
+            !self.nodes.contains_key(&id),
+            "节点 {id} 还在运行，先 kill 再 restart"
+        );
+        let n = self
+            .stopped
+            .remove(&id)
+            .unwrap_or_else(|| panic!("节点 {id} 没有可恢复的存储（只 kill 过的节点能 restart）"));
+        self.spawn_with(id, n.sm, n.storage, n.role, n.applied, n.debug);
+    }
+
+    /// 触发某节点**压缩到已应用位置**（会生成快照产物并丢掉老日志）。
+    pub fn compact(&self, id: u64) -> Option<u64> {
+        self.nodes.get(&id).map(|n| n.storage.compact_applied())
+    }
+
+    /// 某节点安装过的快照数（>0 说明它**确实靠快照**追上，而不是靠日志）。
+    pub fn snapshot_installs(&self, id: u64) -> Option<usize> {
+        self.nodes.get(&id).map(|n| n.storage.installs())
+    }
+
+    /// 打印所有存活节点的内部状态（失败诊断用）。
+    pub fn dump(&self) -> String {
+        let mut ids: Vec<u64> = self.nodes.keys().copied().collect();
+        ids.sort_unstable();
+        ids.iter()
+            .map(|id| {
+                format!(
+                    "  节点 {id}: {}\n",
+                    self.nodes[id].debug().replace('\n', " | ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    /// 某节点已压缩到的 index。
+    pub fn compacted_index(&self, id: u64) -> Option<u64> {
+        self.nodes.get(&id).map(|n| n.storage.compacted_index())
     }
 
     /// 存活节点数（= 多数判定用）。
@@ -311,21 +436,24 @@ impl Drop for Cluster {
         for n in self.nodes.values() {
             let _ = n.cmd_tx.send(Command::Stop);
         }
-        for h in self.handles.drain(..) {
-            let _ = h.join();
+        for (_, h) in self.handles.drain() {
+            let _ = h.join(); // 退出时交还的邮箱在此丢弃（集群正在析构）
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_node(
     id: u64,
     mailbox: Receiver<Message>,
     mailboxes: HashMap<u64, Sender<Message>>,
     sm: Arc<Mutex<CatalogState>>,
+    storage: MetaStorage,
     role: Arc<Mutex<StateRole>>,
     applied: Arc<Mutex<u64>>,
+    debug: Arc<Mutex<String>>,
     cmd_rx: Receiver<Command>,
-) -> thread::JoinHandle<()> {
+) -> thread::JoinHandle<Receiver<Message>> {
     thread::spawn(move || {
         let logger = raft::default_logger();
         let cfg = Config {
@@ -334,11 +462,17 @@ fn spawn_node(
             heartbeat_tick: 3,
             // 预投票：减少被隔离节点反复打断 leader（生产实现必须开）
             pre_vote: true,
+            // ⚠️ **重启必须告诉 raft 已应用到哪**，否则它会重放已应用条目
+            // （raft-rs `Config::applied` 文档原话："If Applied is unset when restarting,
+            // raft might return previous applied entries"）。重放的后果**不报错**：
+            // 状态机的计数器被重复推进（幂等 op 的状态不变，但 `last_applied`/版本号会多走），
+            // 于是重启过的副本与其他副本**静默分叉** —— 本轮实测就是被 `set_applied` 的
+            // 单调断言拦下的（storage.rs `assert!(index >= inner.applied_index)`）。
+            applied: storage.applied_index(),
             ..Default::default()
         };
-        // 初始成员：三节点组（生产由 `--init` 决定，扩容走 learner → voter）
-        let storage = MemStorage::new_with_conf_state((PEERS.to_vec(), vec![]));
-        let mut raw = RawNode::new(&cfg, storage, &logger).expect("raw node");
+        // `RawNode` 拿走存储所有权；应用侧继续用 `storage` 句柄（同一份内部状态）
+        let mut raw = RawNode::new(&cfg, storage.handle(), &logger).expect("raw node");
         *role.lock().unwrap() = raw.raft.state;
 
         // 已提议但尚未应用的 op（按提议顺序配对；只有 leader 会有内容）
@@ -346,7 +480,7 @@ fn spawn_node(
         let mut last_tick = Instant::now();
         let tick_every = Duration::from_millis(10);
 
-        loop {
+        'node: loop {
             // ① 收消息
             loop {
                 match mailbox.try_recv() {
@@ -354,13 +488,13 @@ fn spawn_node(
                         let _ = raw.step(msg);
                     }
                     Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => return,
+                    Err(TryRecvError::Disconnected) => break 'node,
                 }
             }
             // ② 命令
             loop {
                 match cmd_rx.try_recv() {
-                    Ok(Command::Stop) => return,
+                    Ok(Command::Stop) => break 'node,
                     Ok(Command::Propose { op, reply }) => {
                         if raw.raft.state == StateRole::Leader {
                             // 顺序很重要：**先提议成功再入队**，否则队列与日志条目会错位
@@ -377,7 +511,7 @@ fn spawn_node(
                         }
                     }
                     Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => return,
+                    Err(TryRecvError::Disconnected) => break 'node,
                 }
             }
             // ③ tick
@@ -386,6 +520,36 @@ fn spawn_node(
                 last_tick = Instant::now();
             }
             *role.lock().unwrap() = raw.raft.state;
+
+            // 诊断快照（每轮刷新；PoC 用，S3-6 会有正式的 metrics 接口）
+            {
+                let mut prs: Vec<String> = raw
+                    .raft
+                    .prs()
+                    .iter()
+                    .map(|(id, pr)| {
+                        format!(
+                            "peer{id}(next={},matched={},state={:?},active={})",
+                            pr.next_idx,
+                            pr.matched,
+                            pr.state,
+                            pr.recent_active
+                        )
+                    })
+                    .collect();
+                prs.sort();
+                *debug.lock().unwrap() = format!(
+                    "role={:?} term={} first={} last={} commit={} applied={} log_applied={} {}",
+                    raw.raft.state,
+                    raw.raft.term,
+                    raw.raft.raft_log.first_index(),
+                    raw.raft.raft_log.last_index(),
+                    raw.raft.raft_log.committed,
+                    *applied.lock().unwrap(),
+                    raw.raft.raft_log.applied,
+                    prs.join(" ")
+                );
+            }
 
             // ④ Ready 循环
             if raw.has_ready() {
@@ -396,27 +560,35 @@ fn spawn_node(
                         let _ = tx.send(msg);
                     }
                 }
-                // 快照：**必须**在 advance 前安装（若为默认快照则跳过）。
+                // 快照安装：**必须**在 advance 前完成（else raft 会认为已稳定）。
                 //
-                // 本 PoC 不触发 compaction（没有新节点追日志的场景），所以这里只断言形状：
-                // 真正的"快照安装"在 S3-1b / S3-3 测（需要 `compact()` + 新成员加入）。
-                // 说明：`CatalogState` 的**反序列化**属 S3-3（现只有 `encode_canonical`，
-                // 快照格式要用 prost + 分块 CRC，见 metanode-design §4.4）。
+                // 两步缺一不可：
+                //   ① 状态机 ← 快照内容（`restore_snapshot` 做帧+载荷双重校验；
+                //      损坏/截断**拒绝安装**而不是装半个）；
+                //   ② 存储 ← 快照元数据（此后 `first_index`/`term` 由它决定）。
                 if *rd.snapshot() != Snapshot::default() {
-                    eprintln!("[meta:{id}] 收到快照（PoC 未实现安装；见 S3-1b/S3-3）");
+                    let snap = rd.snapshot().clone();
+                    let restored = CatalogState::restore_snapshot(snap.get_data())
+                        .unwrap_or_else(|e| panic!("[meta:{id}] 快照损坏，拒绝安装：{e}"));
+                    *sm.lock().unwrap() = restored;
+                    storage.apply_snapshot(snap);
                 }
-                // 落盘（这里进 MemStorage；生产 = fjall append + hardstate）
-                let store = raw.raft.raft_log.store.clone();
-                if let Err(e) = store.wl().append(rd.entries()) {
-                    eprintln!("[meta:{id}] persist entries failed: {e}");
-                    return;
-                }
+                // 落盘（内存版；生产 = fjall：条目追加 + 硬状态）
+                storage.append(rd.entries());
                 if let Some(hs) = rd.hs() {
-                    store.wl().set_hardstate(hs.clone());
+                    storage.set_hard_state(hs.clone());
                 }
                 // 应用已提交条目
                 let committed = rd.take_committed_entries();
-                apply_committed(id, &mut raw, committed, &sm, &applied, &mut pending);
+                apply_committed(
+                    id,
+                    &mut raw,
+                    committed,
+                    &sm,
+                    &storage,
+                    &applied,
+                    &mut pending,
+                );
                 // 持久化后的消息（follower 的 append 响应等）
                 for msg in rd.take_persisted_messages() {
                     if let Some(tx) = mailboxes.get(&msg.to) {
@@ -426,7 +598,7 @@ fn spawn_node(
                 // ② advance：拿到 commit index 与下一批可应用条目
                 let mut light = raw.advance(rd);
                 if let Some(commit) = light.commit_index() {
-                    store.wl().mut_hard_state().set_commit(commit);
+                    storage.set_commit(commit);
                 }
                 for msg in light.take_messages() {
                     if let Some(tx) = mailboxes.get(&msg.to) {
@@ -434,23 +606,37 @@ fn spawn_node(
                     }
                 }
                 let committed = light.take_committed_entries();
-                apply_committed(id, &mut raw, committed, &sm, &applied, &mut pending);
+                apply_committed(
+                    id,
+                    &mut raw,
+                    committed,
+                    &sm,
+                    &storage,
+                    &applied,
+                    &mut pending,
+                );
                 raw.advance_apply();
             }
             thread::sleep(Duration::from_millis(2));
         }
+        // 退出时交还邮箱：让同一 id 可以被重新启动（S3-1b 的"落后节点重启"场景）
+        mailbox
     })
 }
 
 fn apply_committed(
     id: u64,
-    raw: &mut RawNode<MemStorage>,
+    raw: &mut RawNode<MetaStorage>,
     entries: Vec<Entry>,
     sm: &Arc<Mutex<CatalogState>>,
+    storage: &MetaStorage,
     applied: &Arc<Mutex<u64>>,
     pending: &mut VecDeque<SyncSender<Result<(), String>>>,
 ) {
     for entry in entries {
+        // **先按 raft 索引报告已应用位置**（含 no-op / ConfChange —— 它们也占索引，
+        // 漏报会让压缩位置与日志错开一格）。刻意放在 `continue` 之前。
+        storage.set_applied(entry.index);
         // 空条目 = 新 leader 的就位条目（无 op）
         if entry.data.is_empty() {
             continue;
@@ -462,8 +648,7 @@ fn apply_committed(
                 continue;
             }
             if let Ok(cs) = raw.apply_conf_change(&cc) {
-                let store = raw.raft.raft_log.store.clone();
-                store.wl().set_conf_state(cs);
+                storage.set_conf_state(cs);
             }
             continue;
         }

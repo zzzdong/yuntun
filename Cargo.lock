@@ -5190,6 +5190,7 @@ name = "yuntun-meta"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "bytes",
  "protobuf",
  "raft",
  "slog",

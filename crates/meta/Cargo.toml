@@ -14,4 +14,6 @@ arrow = { workspace = true }
 raft = "0.7"
 # `ConfChange::merge_from_bytes` 需要 protobuf 的 Message trait（raft-rs 0.7 默认 protobuf 编解码）
 protobuf = "2"
+# raft 的 `Snapshot::set_data` / `get_data` 用 `Bytes`
+bytes = { workspace = true }
 slog = "2"

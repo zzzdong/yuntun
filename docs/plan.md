@@ -547,6 +547,10 @@ SQL `INSERT` 返回成功时数据仅落 WAL（与 Flight DoPut 语义一致）�
 > → **保留 raft-rs**（openraft 降级为备选）。
 > **快照编解码已落地**（`operation-log §41`）：帧格式（帧头+块 CRC 三层保护）+ `CatalogState` 无损载荷
 > + 11 维度覆盖测试（专防"加字段忘加进快照"）→ S3-1b / S3-3 的共同前置已就绪。
+> **S3-1b 快照机制已落地**（`operation-log §42`）：自实现 `Storage`（`MemStorage` 不可用：快照 data 为空）、
+> 帧/载荷双重校验、安装路径 + 反证；并修掉重启必须报 `Config.applied`（否则 raft 重放 → 静默分叉）。
+> **未拿到**：集成层"稳定触发快照"（`§42.4b` 归因中）—— 正路是 S3-6 成员变更 / S3-3 真实触发策略。
+> 遗留（S3-3）：两个时钟统一（状态机 applied 语义）、fjall 落盘、快照触发/保留策略。
 > **S3-1 选型闸门已过**（`operation-log §40`）：三节点收敛 + kill leader 不丢已提交数据 + 样板 124 行
 > → **保留 raft-rs**（openraft 降级为备选）；余 S3-1b 快照安装 + 日志压缩。
 

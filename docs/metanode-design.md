@@ -172,7 +172,7 @@ impl CatalogState { pub fn apply(&mut self, revision: u64, op: &CatalogOp) -> Op
 | 内容 | `CatalogState` 的 prost 编码（含**两组版本号**、每表最后变更版本、幂等索引） | 少任何一项都会让 follower 的 delta 语义失真。✅ **载荷已实现 2026-09-19**：`CatalogStateSnapshot`（11 字段**逐字段无损**；`encode_canonical` **不是**快照格式、别混用）。防线 = `snapshot_covers_every_state_dimension`（逐一改动 11 个维度、断言快照字节必变）—— 专防"加字段忘加进快照"（那种漏法会让换主/重启**静默回退**）。重建**拒绝**而非"尽力恢复"（键重复/缺 `public`/空条目一律报错；`operation-log §41.7`） |
 | 格式 | 顶部带 `format_version` + `revision` 头，后跟分块 payload（每块可独立校验 CRC） | 与 WAL 的 tearing 教训一致（`§29.1`）：**部分接收必须能被识别**。✅ **已实现 2026-09-19**：`model/src/snapshot.rs`（帧头 CRC + 块 CRC + 总长一致**三层**；实测"任一偏移截断/任一字节翻转"都检出）。⚠️ 校验顺序是 **magic → 帧头 CRC → 版本**：先报版本会把"文件损坏"误诊成"版本不支持"（`operation-log §41.6`） |
 | 触发 | 日志条数 > `N`（默认 10 万）或状态 > `M`（默认 256MB） | "现在就定上界"（`refactor.md §6.2`） |
-| 安装 | 落临时目录 → 校验 → 原子替换 → 更新 `applied_index` | 崩溃安全；安装期间**服务不停**（旧状态继续服务） |
+| 安装 | 落临时目录 → 校验 → 原子替换 → 更新 `applied_index` | 崩溃安全；安装期间**服务不停**（旧状态继续服务）。✅ **PoC 已实现 2026-09-19**（`operation-log §42`）：Ready 循环里"还原状态机 + 固化元数据"两步缺一不可 —— 只装元数据不还原状态机 = `MemStorage` 那种**静默空状态**（反证：`installs=1 状态一致=false`）。⚠️ **集成层的稳定触发未拿到**（`§42.4b`）：同一场景出现过 `installs=0 但已收敛`，即 leader 把已压缩的条目发了出去（`first=8` 却有 `append 6..7`）→ 归因中；稳定复现"追快照"的正路是 **S3-6 的成员变更**（新节点加入）或 S3-3 的真实触发策略。⚠️ 两个关键点：① `Storage` **必须自实现**（`MemStorage` 的快照 data 为空、`compact()` 不认识状态机）；② 压缩坐标是 **raft 索引**（副本层），不是状态机的 op 计数（no-op/ConfChange 也占索引 → 会错开一格） |
 | **保留策略** | manifest 条目**不无限增长**：按表保留 `checkpoint`（每窗口/每天一个基线）+ 近期条目；归档旧条目到对象存储（路径进 SM） | 否则 snapshot 必然膨胀到传不动（这是 `§6.2` 点名的高成本补救项） |
 
 ### 4.5 D5：幂等键（跨进程 + 键集合）
@@ -245,7 +245,7 @@ message ProposeResponse {
 | 步 | 内容 | 验收（必须能跑） | 回滚点 |
 |---|---|---|---|
 | **S3-0** | proto 定义 + `tonic-build`（`T10.8`）：把现有手写 prost struct 迁到 `.proto` 生成 | 编解码 round-trip；与现有 `CommitFilesRequest` 字段**逐个对齐**的兼容测试 | 保留手写 struct（双份并存一个 commit） |
-| **S3-1** | **raft PoC（选型闸门）**：3 节点进程内集群，写/读/kill leader/快照/安装 | ✅ **闸门已过**（`operation-log §40`）：三节点收敛（规范编码逐字节相同）、kill leader 后存活节点当选且 b1/b2/b3 不丢、反证成立（切断消息路由则两条用例都失败）、样板 124 行 → **保留 raft-rs**。**余**：S3-1b 快照安装 + 日志压缩 | openraft 降级为备选（仅在 S3-3 样板失控时） |
+| **S3-1** | **raft PoC（选型闸门）**：3 节点进程内集群，写/读/kill leader/快照/安装 | **4 项通过 + 第 5 项机制通过**（`operation-log §40` + **§42**）：三节点收敛、kill leader 不丢已提交、接缝干净、样板 124 行、**快照机制已证明**（自写 `Storage` + 帧/载荷双重校验 + 安装路径 + 反证）；**gate 第 5 项的"集成层稳定触发"未拿到**（`§42.4b`/`§42.7` 遗留 1）→ 仍**保留 raft-rs** | 逃生门已降级：真正贵的是**自写 `Storage` + 快照正确性**（两个候选都躲不掉），而非某个库的样板量 |
 | **S3-2** | `CatalogState` 抽取（§4.1）+ **确定性对拍** | ✅ **第一切片已落地**（`operation-log §38`）：`CatalogState` 抽出、抓到并修掉**四处真实非确定性**（3 处状态机读钟 + 1 处 `HashSet` 决定版本分配序）、`encode_canonical` + 5 个对拍用例（含反证）。**余**：键集合接线（S3-5）、快照 prost 版（S3-3） | 已保留 `MemoryCatalog` 作为宿主（语义零改动） |
 | **S3-3** | `yuntun-meta` 进程 + `MetaService`（Propose/Prefetch/Delta/Status/Join）+ fjall | 单节点 metanode 可独立启动；重启后状态一致 | — |
 | **S3-4** | `RemoteCatalog`（`CatalogOps` 的 gRPC 实现）+ standalone 装配（本地传输、1 节点 raft） | **既有 217 用例全绿**（standalone 不回归）；`if distributed` 分支为零 | 切回 `MemoryCatalog`（装配层开关） |
