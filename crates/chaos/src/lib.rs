@@ -128,7 +128,44 @@ async fn build(
     store_root: &std::path::Path,
     tables: &[(&str, arrow::datatypes::SchemaRef, bool)],
 ) -> Setup {
-    build_with_delay(wal_dir, store_root, tables, 0).await
+    build_tuned(wal_dir, store_root, tables, 1, 0).await
+}
+
+/// 完整夹具：`rows_threshold` 与 `max_flush_delay_secs` 均可控。
+///
+/// 为什么需要可调 `rows_threshold`：夹具默认 1 —— 每条批次一进 chunk 就 seal，
+/// 于是"**一个 chunk 聚合多个幂等键**"这种形态**根本造不出来**（每条 Data 记录各自成 chunk）。
+/// 要验证提交层的键集合去重（`operation-log §39`），必须让多条不同键的记录落进同一个 chunk。
+#[cfg(test)]
+async fn build_tuned(
+    wal_dir: &std::path::Path,
+    store_root: &std::path::Path,
+    tables: &[(&str, arrow::datatypes::SchemaRef, bool)],
+    rows_threshold: usize,
+    max_flush_delay_secs: u64,
+) -> Setup {
+    build_full_with_wal(
+        wal_dir,
+        store_root,
+        tables,
+        rows_threshold,
+        max_flush_delay_secs,
+        yuntun_wal::WalConfig::for_dir(wal_dir),
+    )
+    .await
+}
+
+/// 兼容入口：默认 `rows_threshold = 1`（既有用例的语义），转调 [`build_full_with_wal`]。
+#[cfg(test)]
+#[allow(dead_code)]
+async fn build_full(
+    wal_dir: &std::path::Path,
+    store_root: &std::path::Path,
+    tables: &[(&str, arrow::datatypes::SchemaRef, bool)],
+    max_flush_delay_secs: u64,
+    wal_cfg: yuntun_wal::WalConfig,
+) -> Setup {
+    build_full_with_wal(wal_dir, store_root, tables, 1, max_flush_delay_secs, wal_cfg).await
 }
 
 /// 同 [`build`]，但可指定"seal → flush 宽限期"。
@@ -143,10 +180,11 @@ async fn build_with_delay(
     tables: &[(&str, arrow::datatypes::SchemaRef, bool)],
     max_flush_delay_secs: u64,
 ) -> Setup {
-    build_full(
+    build_full_with_wal(
         wal_dir,
         store_root,
         tables,
+        1,
         max_flush_delay_secs,
         yuntun_wal::WalConfig::for_dir(wal_dir),
     )
@@ -158,10 +196,11 @@ async fn build_with_delay(
 /// 磁盘水位与批次超时这两类场景**必须**能压小 `segment_max_size`（逼出轮转）
 /// 与 `monitor_interval`（否则要等 60s 一轮），所以需要这个入口。
 #[cfg(test)]
-async fn build_full(
+async fn build_full_with_wal(
     wal_dir: &std::path::Path,
     store_root: &std::path::Path,
     tables: &[(&str, arrow::datatypes::SchemaRef, bool)],
+    rows_threshold: usize,
     max_flush_delay_secs: u64,
     wal_cfg: yuntun_wal::WalConfig,
 ) -> Setup {
@@ -191,7 +230,7 @@ async fn build_full(
     .unwrap();
     let wal = yuntun_wal::writer::WalWriter::open(wal_cfg, 0).await.unwrap();
     let cfg = IngestorConfig {
-        rows_threshold: 1,
+        rows_threshold,
         time_threshold_secs: 0,
         max_flush_delay_secs,
         // 不变量：驻留硬兜底必须晚于正常 flush 到期（plan.md §2.2）
@@ -2194,5 +2233,92 @@ async fn orphan_cleanup_spares_known_and_inflight_files() {
     );
     grace_shutdown.cancel();
     let _ = grace_cleaner.await;
+    shutdown.cancel();
+}
+
+// ---------------------------------------------------------------- 幂等键集合（S3-5）
+
+/// 造一个 N 行的批次（真实 payload 无关，只关心行数与键）。
+#[cfg(test)]
+fn batch_of(rows: usize, v: i64) -> arrow::record_batch::RecordBatch {
+    arrow::record_batch::RecordBatch::try_new(
+        schema(),
+        vec![
+            Arc::new(Int64Array::from(vec![v; rows])),
+            Arc::new(StringArray::from(vec![Some("a"); rows])),
+        ],
+    )
+    .unwrap()
+}
+
+/// `operation-log §27.5` 遗留 #1 的关闭验证（R3 S3-5）：**一个 chunk 聚合多个幂等键**时，
+/// 提交层必须把**每一个**键都登记进 Catalog。
+///
+/// 为什么重要：重启后 `resume_recovered` 会**从 WAL 重建键索引**（§27）。若提交时只登记了
+/// 一部分，未被登记的键在重建后就"消失"了 —— 同键重试会**再写一份数据**（静默重复计数）。
+///
+/// 构造是**确定性**的（不靠时序碰运气）：
+/// 1. `rows_threshold = 100`：第一条（3 行）进 chunk 后**不会** seal；
+/// 2. **先写两条（不同键）再启动攒批循环** → 循环一次吸收两条 → 必然落在**同一个 chunk**
+///    （合计 123 行 ≥ 100 → 在第二条后 seal）；
+/// 3. flush 到期即执行（夹具 `max_flush_delay = 0`、`spread = 0`）。
+///
+/// 断言的是**权威侧**（Catalog 的幂等索引），不是"没报错"。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn commit_registers_every_key_of_a_multi_key_chunk() {
+    let _gate = CHAOS_GATE.lock().await;
+    let wal_dir = tmpdir("wal-multikey");
+    let store_root = tmpdir("store-multikey");
+    let setup = build_tuned(&wal_dir, &store_root, &[("mk", schema(), false)], 100, 0).await;
+
+    // ① 攒批循环**尚未启动**：两条批次会被同一次吸收
+    setup
+        .ingestor
+        .ingest(IngestBatch {
+            table: "mk".into(),
+            shard_key: "s0".into(),
+            record_batch: batch_of(3, 1_000),
+            idempotency_key: Some("mk-a".into()),
+            received_at: std::time::SystemTime::now(),
+        })
+        .await
+        .unwrap();
+    setup
+        .ingestor
+        .ingest(IngestBatch {
+            table: "mk".into(),
+            shard_key: "s0".into(),
+            record_batch: batch_of(120, 1_001),
+            idempotency_key: Some("mk-b".into()),
+            received_at: std::time::SystemTime::now(),
+        })
+        .await
+        .unwrap();
+
+    // ② 启动攒批 → 一次吸收两条 → 一个 chunk（123 行 ≥ 阈值）→ 一次提交携带两个键
+    let shutdown = CancellationToken::new();
+    let _acc = setup.ingestor.clone().spawn_accumulator(shutdown.clone());
+
+    let files = wait_visible_files(&setup, "public.mk", "s0", 1).await;
+    assert_eq!(files.len(), 1, "两条批次必须落在同一个 chunk（否则本用例没测到键集合）");
+    assert_eq!(files[0].row_count, 123, "该文件应含两个批次的全部行");
+
+    // ③ 权威断言：**两个键都在 Catalog 里**（提交层按键集合登记）
+    for k in ["mk-a", "mk-b"] {
+        assert!(
+            setup.catalog.check_idempotency(k).await.unwrap().is_some(),
+            "键 {k} 必须由**提交层**登记：否则重启按 WAL 重建索引时会漏掉它，同键重试=重复写"
+        );
+    }
+    // ④ 反面：不在集合里的键不该命中（防止"任何键都判重"这种过头实现）
+    assert!(
+        setup
+            .catalog
+            .check_idempotency("mk-not-in-set")
+            .await
+            .unwrap()
+            .is_none(),
+        "未参与本次提交的键不得被判重"
+    );
     shutdown.cancel();
 }

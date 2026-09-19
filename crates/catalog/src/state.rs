@@ -269,6 +269,14 @@ impl CatalogState {
 
         // ② 幂等键唯一索引检查（§7.3 Meta 层全局去重）；
         //    `client_request_ids` 是**键集合**（一个 chunk 可聚合多个键，§27.5 遗留 #1）
+        //
+        // ⚠️ **"已被认领" ≠ "重复提交"** —— 这里必须区分两种存在形态（否则会把正常写入判重、
+        // 数据永远不落 manifest；R3 S3-5 接线时正是被 chaos 用例当场抓到）：
+        //
+        // | 记录形态 | 含义 | 处理 |
+        // |---|---|---|
+        // | `batch_id` **为空** | ingest 入口在 WAL fsync 后**认领**了该键（§27：防并发同键双写），或**重启后从 WAL 重建**的索引 | **补全**为本批次 —— 这正是本次提交要落盘的数据 |
+        // | `batch_id` 非空且**不是本批次** | 另一个**已提交**批次占用了该键 | 整次判重（`accepted=false`） |
         let keys: Vec<String> = req
             .client_request_ids
             .iter()
@@ -276,11 +284,14 @@ impl CatalogState {
             .chain(req.client_request_id.clone())
             .collect();
         for key in &keys {
-            if self.idempotency.contains_key(key) {
-                return Ok(self.dup_commit_response());
+            if let Some(rec) = self.idempotency.get(key) {
+                if !rec.batch_id.is_empty() && rec.batch_id != req.batch_id {
+                    return Ok(self.dup_commit_response());
+                }
             }
         }
         for key in &keys {
+            // 认领 → 补全 `committed_at` 以提交时刻为准（TTL 自提交起算，§7.3.1 修正 2）
             self.idempotency.insert(
                 key.clone(),
                 IdempotencyRecord {
@@ -717,6 +728,37 @@ mod tests {
             .unwrap();
         assert!(!r2.accepted, "键集合中任一键命中即整次判重");
         assert_eq!(st.files.len(), before, "判重不得落 manifest");
+    }
+
+    /// **"已被认领" ≠ "重复提交"**（S3-5 接线时被 chaos 用例当场抓到的语义坑）。
+    ///
+    /// ingest 入口在 WAL fsync 后会**认领**键（`batch_id` 留空，§27：防并发同键双写）；
+    /// 重启后从 WAL 重建的索引也是空 `batch_id`。若把"已认领"当"重复"，
+    /// **manifest 永不落盘**（写入返回成功但数据永远不可见），且恢复路径 100% 失败。
+    #[test]
+    fn claimed_key_is_completed_at_commit_not_rejected() {
+        let mut st = CatalogState::new();
+        st.create_table(create_table_req("cpu"), 1).unwrap();
+        // 认领（模拟 ingest 入口在 fsync 后的登记：batch_id 为空）
+        st.record_idempotency(IdempotencyRecord {
+            client_request_id: "k".into(),
+            batch_id: String::new(),
+            committed_at: 5,
+        });
+        // 提交：必须**成功**，并把记录补全为真实 batch_id
+        let r = st
+            .commit_files(commit_req("public.cpu", "b1", &["k"]), 10)
+            .unwrap();
+        assert!(r.accepted, "已被认领 ≠ 重复：必须补全并落 manifest");
+        assert_eq!(st.check_idempotency("k").unwrap(), "b1");
+        assert_eq!(st.files.len(), 1, "文件必须真的落下来");
+
+        // 另一个批次再用同一个键 → 这次**才是**重复
+        let r2 = st
+            .commit_files(commit_req("public.cpu", "b2", &["k"]), 11)
+            .unwrap();
+        assert!(!r2.accepted, "被已提交批次占用的键才算重复");
+        assert_eq!(st.files.len(), 1, "判重不得落第二个文件");
     }
 
     /// 幂等键 TTL 清理的时间也由调用方传入（R3 下必须是显式 op，否则各副本清理时刻不同）。

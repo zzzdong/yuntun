@@ -182,6 +182,9 @@ pub async fn flush_chunk_with_id(
     deps.wal.append(s3written.clone()).await?;
     deps.tracker.observe(&s3written);
 
+    // ④.5 收集本批次的**幂等键集合**（§27.5 遗留 #1）
+    let keys = collect_idempotency_keys(deps, wal_seq_range.start, wal_seq_range.end)?;
+
     // ⑤ 提交 Meta（幂等，§6.4）
     //
     // 提交时刻**在构造 manifest 时打点**（= 发出提交请求的时刻，误差 = CommitFiles 往返）；
@@ -225,16 +228,12 @@ pub async fn flush_chunk_with_id(
         .commit_files(CommitFilesRequest {
             table: input.shard.table.clone(),
             batch_id: batch_id.clone(),
-            // ⚠️ 这里刻意是 None：**一个 chunk 可能聚合多个幂等键**（多条 Data 记录），
-            // 而 `commit_files` 只接受单个 `client_request_id` —— 填任何一个都是错的
-            //（会把别的键的数据也标记成那个键的批次）。
-            // 幂等的实际拦点是 `Ingestor::ingest` 的入口预筛（§7.3 第一层）；
-            // "提交时按键集合去重"要等 R3 状态机（refactor.md S3-5）。
+            // 单键字段刻意留 None：**一个 chunk 通常聚合多个幂等键**（多条 Data 记录），
+            // 没有"那个键"可填；权威语义在下面的**键集合**（R3 S3-5）。
             client_request_id: None,
-            // ⚠️ 键集合尚未接线（R3 S3-5 剩余）：chunk 目前不记录它聚合了哪些幂等键。
-            // 因此**权威去重仍靠 ingest 入口预筛**（§27）；接线后这里传 chunk 的键集合，
-            // Catalog 侧即可按键集合去重（关闭 §27.5 遗留 #1）。
-            client_request_ids: vec![],
+            // **本批次覆盖的幂等键集合**（从 WAL 派生，见 `collect_idempotency_keys`）：
+            // 集合中任一键已登记 → Catalog 侧整次判重（§27.5 遗留 #1 的关闭方式）。
+            client_request_ids: keys,
             shard: input.shard.shard.clone(),
             time_window: input.shard.window.clone(),
             files,
@@ -308,7 +307,11 @@ pub async fn recommit_into_catalog(
             table: table.to_string(),
             batch_id: st.batch_id.clone(),
             client_request_id: st.client_request_id.clone(),
-            client_request_ids: vec![], // 恢复重提交：原键集合丢失（见 §27.5 遗留）
+            // 恢复重提交同样从 WAL 派生键集合（`BatchState.wal_seq_range` 一直在记）。
+            // ⚠️ 尽力而为：若该区间所在的 WAL 段已被回收，则只能退回 `batch_id` 幂等
+            //（数据不会重复写，只是"同键重试"可能漏判 —— 属已知边界）。
+            client_request_ids: collect_idempotency_keys(deps, st.wal_seq_range.0, st.wal_seq_range.1)
+                .unwrap_or_default(),
             shard: st.shard.clone(),
             time_window: st.time_window.clone(),
             files,
@@ -384,6 +387,40 @@ pub fn payload_row_count(p: &DataPayload) -> u64 {
     arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(&p.batch_ipc), None)
         .map(|r| r.filter_map(|b| b.ok()).map(|b| b.num_rows() as u64).sum())
         .unwrap_or(0)
+}
+
+/// 收集 `[from, to)` 区间内所有 Data 记录的**幂等键**（去重 + 排序）。
+///
+/// # 为什么从 WAL 派生，而不是让 chunk 记着
+///
+/// WAL 是**唯一写入事实**（ADR-3），chunk 只是它的内存视图。若在 chunk 里再存一份键集合，
+/// 就出现了**第二个真相来源** —— 两者不一致时没有任何依据判定谁对（本项目的 §27/§28 类缺陷
+/// 全都是这种"两份状态"造成的）。所以键集合在**提交这一刻**从 WAL 现算：代价是该批次 WAL
+/// 区间的一次扫描（段文件刚写过，通常都在页缓存里），收益是不会不一致。
+///
+/// # 与 ingest 入口预筛的关系
+///
+/// 入口预筛（§7.3 第一层）是**快路径**：能在写 WAL 之前就判掉重复请求。
+/// 这里是**权威层**：一个 chunk 聚合多条 Data 记录、各带自己的键，提交层必须按键集合去重
+/// —— 否则"同一键被两个不同批次带到同一个 chunk"时无人拦得住（`commit_files` 此前只接受
+/// 单个 `client_request_id`，填任何一个都是错的：会把别的键的数据标记成那个键的批次）。
+fn collect_idempotency_keys(
+    deps: &FlushDeps,
+    from: u64,
+    to: u64,
+) -> Result<Vec<String>, LakeError> {
+    use std::collections::BTreeSet;
+    let reader = yuntun_wal::reader::WalReader::new(deps.wal.shard_dir());
+    // BTreeSet：去重 + 有序 → 提交内容确定（不依赖哈希序，见 catalog/state.rs 纪律 2）
+    let mut keys: BTreeSet<String> = BTreeSet::new();
+    for (_, rec) in reader.scan_range(from, to)? {
+        if let Record::Data(p) = rec {
+            if !p.client_request_id.is_empty() {
+                keys.insert(p.client_request_id);
+            }
+        }
+    }
+    Ok(keys.into_iter().collect())
 }
 
 async fn write_to_object_store(

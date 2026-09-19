@@ -244,7 +244,7 @@ message ProposeResponse {
 | **S3-2** | `CatalogState` 抽取（§4.1）+ **确定性对拍** | ✅ **第一切片已落地**（`operation-log §38`）：`CatalogState` 抽出、抓到并修掉**四处真实非确定性**（3 处状态机读钟 + 1 处 `HashSet` 决定版本分配序）、`encode_canonical` + 5 个对拍用例（含反证）。**余**：键集合接线（S3-5）、快照 prost 版（S3-3） | 已保留 `MemoryCatalog` 作为宿主（语义零改动） |
 | **S3-3** | `yuntun-meta` 进程 + `MetaService`（Propose/Prefetch/Delta/Status/Join）+ fjall | 单节点 metanode 可独立启动；重启后状态一致 | — |
 | **S3-4** | `RemoteCatalog`（`CatalogOps` 的 gRPC 实现）+ standalone 装配（本地传输、1 节点 raft） | **既有 217 用例全绿**（standalone 不回归）；`if distributed` 分支为零 | 切回 `MemoryCatalog`（装配层开关） |
-| **S3-5** | 幂等权威迁 SM + **键集合**去重（§4.5，含 `§27.5` 遗留 #1） | 双写者同键 → 只生效一次（**含反面断言**） | — |
+| **S3-5** | 幂等权威迁 SM + **键集合**去重（§4.5，含 `§27.5` 遗留 #1） | ✅ **已接线**（`operation-log §39`）：键集合从 WAL 派生、两条提交路径都带上；过程中抓到并修掉"**认领 ≠ 重复**"语义坑（把认领当重复会让 manifest 永不落盘 + 恢复 100% 失败）。**余**：SM 内持久化（S3-3，现仍是 MemoryCatalog 宿主） | — |
 | **S3-6** | 3 节点集群运维：bootstrap / Join / 快照调参 / 观测（leader/term/applied/lag） | `Status` 可读；follower lag 可观测；快照安装不停服 | — |
 | **S3-7** | **M3 验收 + 混沌**（§8） | 见 §8 矩阵 | — |
 

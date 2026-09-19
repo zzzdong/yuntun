@@ -2218,3 +2218,63 @@ RowGroup 实测 : rows=150000 row_groups=3 | rows=150000 row_groups=3 | rows=605
 `cargo test --workspace`：**222 passed / 0 failed**（新增 5 个用例）；`clippy --all-targets` 0 警告。
 
 ---
+
+---
+
+## 39. R3 S3-5 接线：键集合去重真正生效 —— 并抓到"认领 ≠ 重复"这个语义坑（2026-09-19）
+
+### 39.0 落地
+
+| 位置 | 改动 |
+|---|---|
+| `ingest/src/flush.rs` | 新增 `collect_idempotency_keys(deps, from, to)`：从 **WAL** 派生本批次的幂等键集合（去重 + 排序）；`flush_chunk` 与 `recommit_into_catalog` 两条提交路径都接上；`client_request_id`（单键字段）保持 `None`，权威语义移到键集合 |
+| `catalog/src/state.rs` | `commit_files` 的键集合判定改为**区分三种形态**（见 §39.1） |
+| `chaos/src/lib.rs` | 夹具加 `build_tuned(rows_threshold, delay)`：默认夹具 `rows_threshold=1` → 每条批次一进 chunk 就 seal，**造不出"一个 chunk 聚合多个键"**，键集合路径根本测不到 |
+
+**为什么从 WAL 派生而不是让 chunk 记着**：WAL 是**唯一写入事实**（ADR-3），chunk 只是它的内存视图。
+在 chunk 里再存一份键集合就出现**第二个真相来源** —— 两者不一致时没有任何依据判定谁对
+（本项目 §27/§28 那类缺陷全是"两份状态"造成的）。代价是该批次 WAL 区间的一次扫描
+（段文件刚写过，通常都在页缓存里），收益是**不可能不一致**。
+
+### 39.1 抓到的语义坑：**"已被认领" ≠ "重复提交"**
+
+接线后**既有用例 `idempotency_survives_compaction` 当场变红**（0 文件 —— flush 再也没落盘）。
+根因是两层幂等机制的语义冲突：
+
+| 层 | 时机 | 记录形态 |
+|---|---|---|
+| 入口预筛（§27） | ingest **WAL fsync 之后**立刻登记（防并发同键双写） | `batch_id` **留空** = "已认领、批次尚未落盘" |
+| 提交层（本次接线） | flush 提交 manifest | 期望"键不存在" |
+
+若提交层把"键已存在"一律当重复 → **manifest 永不落盘**：写入返回成功，但数据**永远不可见**；
+更糟的是**恢复路径 100% 失败**（重启后从 WAL 重建的索引 `batch_id` 也是空的）。
+
+**修法（三种形态分开处理）**：
+
+| 记录形态 | 含义 | 处理 |
+|---|---|---|
+| `batch_id` **为空** | ingest 认领（§27），或重启后从 WAL 重建的索引 | **补全**为本批次并落盘 —— 这正是本次提交要写的**数据** |
+| `batch_id` 非空且 ≠ 本批次 | 另一个**已提交**批次占用该键 | 整次判重（`accepted=false`） |
+| 不存在 | 正常路径 | 登记并落盘 |
+
+**恰好一次由状态机串行化保证**：两个并发同键请求都写出了 Data（§27 的竞态窗口），
+它们各自提交时，**先提交的那个补全认领**，后提交的看到非空 `batch_id` → 判重 ✓
+（单机靠 `RwLock`，R3 靠 raft 日志序 —— 两种宿主都串行）。
+
+### 39.2 测试
+
+| 用例 | 断言 |
+|---|---|
+| `chaos::commit_registers_every_key_of_a_multi_key_chunk`（端到端） | **构造确定性**：`rows_threshold=100` → 先写两条不同键（3 行 + 120 行）**再启动攒批循环** → 必然同一次吸收 → **一个 chunk、两个键**；断言**两个键都在 Catalog 里** + 不在集合里的键**不**命中 |
+| `catalog::claimed_key_is_completed_at_commit_not_rejected`（状态机） | 认领态提交必须**成功且补全** `batch_id`；另一个批次再用同键才判重；判重不得落第二个文件 |
+| 既有 `idempotency_survives_compaction` | 恢复绿（它变红正是本次的发现手段） |
+
+### 39.3 遗留
+
+| # | 项 | 说明 |
+|---|---|---|
+| 1 | WAL 段回收后无法恢复键集合 | `recommit_into_catalog` 尽力而为：段被回收时退回 `batch_id` 幂等（数据不会重复写，只是"同键重试"可能漏判）——已知边界，已就地注明 |
+| 2 | 键集合的**可观测性** | 尚未进指标（可考虑在 metrics 里加"本次提交携带键数"的分布，用于判断 chunk 聚合度） |
+| 3 | `BatchPendingPayload.client_request_id` 仍是单键 | 它只用于恢复期的批次追踪；权威键集合在 Catalog。若将来需要按批次反查键集合，应改为从 WAL 派生（同一原则） |
+
+---
