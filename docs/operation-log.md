@@ -2883,3 +2883,63 @@ error[E0433]: cannot find `ProstCodec` in `codec`
 | 4 | 生产侧把 `NodeHandle` 暴露给 gRPC 层（现集群内部结构已具备） | S3-3 下一步 |
 
 ---
+
+---
+
+## 47. R3 S3-3（第四件）：`MetaService` 落地 —— metanode 可被远端调用（2026-09-19）
+
+### 47.0 交付
+
+| 位置 | 内容 |
+|---|---|
+| `crates/meta/src/service.rs`（**新**） | `MetaService`（tonic 实现）+ `serve()`（可绑定 `127.0.0.1:0` 让内核分配端口） |
+| `crates/meta/src/lib.rs` | `NodeStatus`（**结构化**节点状态）+ `NodeHandle`（提案/状态/增量）+ `Cluster::handle()` |
+| `crates/meta/tests/meta_service_e2e.rs`（**新**） | **真** gRPC 端到端：TCP + HTTP/2 + raft + 状态机 + 回包 |
+
+至此 metanode 的链路是通的：`MetaClient` → HTTP/2 → `MetaService` → `NodeHandle` → raft 提案
+→ 应用到 `CatalogState` → `ProposeResponse` 回客户端。**RPC 面 + op 路径 + 服务层都齐了**。
+
+### 47.1 三条写进代码的纪律
+
+**① 阻塞的提案必须丢进阻塞线程池。**
+raft 的"等应用到状态机"是**阻塞**的（`recv_timeout`）。直接在一个 `async fn` 里等，会占住 tokio
+工作线程 —— **一个被拖住的提案就能把整个服务拖停**（连 `Status` 这种快读都进不来）。
+所以 `propose` 走 `tokio::task::spawn_blocking`；`status`/`delta` 只查内存，留在 async 里。
+
+**② 结构化状态与诊断串分开。**
+`NodeStatus`（字段）给程序读，`debug: String` 给人读。**别去 parse 诊断串** ——
+那个字符串的格式会随打印习惯改名，而调用方不会知道。
+
+**③ 未实现的方法必须明确 `UNIMPLEMENTED`，不许假装成功。**
+`Prefetch`（载荷形状属 S3-4）与 `Join`（成员变更属 S3-6）都返回 `Unimplemented`，
+并说明"归属哪一步"。用例专门断言这一点（**反证**：让 `Join` 返回一个空的成功响应 →
+用例立刻红，客户端会以为成员已变更）。
+
+### 47.2 端到端用例覆盖了什么
+
+| 交互 | 断言 |
+|---|---|
+| 正常写入（建 schema / 建表 / 提交） | `accepted=true`、回包带 **raft index** 与两组版本号 |
+| **幂等重试**（同键同 batch 再提一次） | HTTP 成功但 `accepted=false`（**不是**错误 —— 客户端重试必须成功） |
+| `Status` | `node_id`/`leader_id` 指向 leader、`last_index >= applied_index >= 0`、版本串一致 |
+| `Delta`（`since=0`） | 报出变过的表（`public.cpu`） |
+| `Prefetch` / `Join` | `UNIMPLEMENTED`（不许假装成功） |
+
+### 47.3 leader hint 现在是真的
+
+提案路径的非 leader 分支改为回报 `raw.raft.leader_id`（而不是 0）；集群层找不到 leader 时
+也会尽力从各节点状态里挑一个已知 hint。客户端据此**直接重试到正确节点**（约定 3 的可重试性
+才有意义 —— 否则"可重试"等于"盲试"）。
+
+### 47.4 遗留
+
+| # | 项 | 归属 |
+|---|---|---|
+| 1 | **CLI / `--init` bootstrap**：现在能"程序内起服务"，还不能"作为进程独立启动并指定端口/目录" | S3-3 收尾 |
+| 2 | 多节点部署形态（每节点地址表 / 静态成员 / 加入流程） | S3-3 收尾 + S3-6 |
+| 3 | `Prefetch` 载荷形状 | S3-4 |
+| 4 | `Join` 与成员变更 | S3-6 |
+| 5 | 其余 op 的镜像（`EvolveSchema` 三变体 / `DropShard` / `Compaction` / 租约） | S3-3 收尾 |
+| 6 | 真崩溃注入（子进程）/ 两个时钟统一 / 快照触发保留策略 | 见 §44.4 / §42.3 |
+
+---

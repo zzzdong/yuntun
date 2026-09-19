@@ -38,11 +38,13 @@
 pub mod error;
 pub mod fjall_storage;
 pub mod op;
+pub mod service;
 pub mod storage;
 
 pub use error::MetaError;
 pub use fjall_storage::FjallStorage;
 pub use op::{apply, decode_op, StateOp};
+pub use service::{serve, MetaService};
 pub use storage::MetaStorage;
 
 use std::collections::{HashMap, VecDeque};
@@ -98,9 +100,99 @@ struct NodeState {
     role: Arc<Mutex<StateRole>>,
     /// 已应用的 raft 索引
     applied: Arc<Mutex<u64>>,
-    /// 内部状态快照（测试诊断用；S3-6 的观测接口雏形）
+    /// 内部状态快照（测试诊断用；打印给人看的字符串）
     debug: Arc<Mutex<String>>,
+    /// **结构化**状态（给程序读：`Status` RPC 直接由它构造，见 [`NodeHandle::status`]）
+    status: Arc<Mutex<NodeStatus>>,
     cmd_tx: Sender<Command>,
+}
+
+/// 节点的**结构化**状态（每轮循环刷新）。
+///
+/// 与 `debug: String` 的分工：那个是给人看的诊断串（失败时打印），这个是**给程序读**的字段。
+/// 别去 parse 诊断串 —— 那会随打印格式改名而悄悄坏掉。
+#[derive(Debug, Clone, Default)]
+pub struct NodeStatus {
+    pub node_id: u64,
+    pub role: String,
+    pub term: u64,
+    /// 0 = 未知（客户端据此重试到正确节点）
+    pub leader_id: u64,
+    pub commit_index: u64,
+    pub applied_index: u64,
+    pub snapshot_index: u64,
+    pub first_index: u64,
+    pub last_index: u64,
+}
+
+/// 单个节点的句柄（gRPC 服务层用；`Clone` 只克隆几个 `Arc`/`Sender`，很便宜）。
+#[derive(Clone)]
+pub struct NodeHandle {
+    id: u64,
+    status: Arc<Mutex<NodeStatus>>,
+    sm: Arc<Mutex<CatalogState>>,
+    storage: FjallStorage,
+    cmd_tx: Sender<Command>,
+}
+
+impl NodeHandle {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// 运维状态（`Status` RPC 的返回）。
+    pub fn status(&self) -> yuntun_proto::meta::StatusResponse {
+        let s = self.status.lock().unwrap();
+        yuntun_proto::meta::StatusResponse {
+            node_id: s.node_id,
+            role: s.role.clone(),
+            term: s.term,
+            leader_id: s.leader_id,
+            commit_index: s.commit_index,
+            applied_index: s.applied_index,
+            snapshot_index: s.snapshot_index,
+            first_index: s.first_index,
+            last_index: s.last_index,
+            version: yuntun_proto::PROTO_VERSION.into(),
+        }
+    }
+
+    /// 向**本节点**提议一个 op。非 leader → [`MetaError::NotLeader`]（带 leader hint，可重试）。
+    pub fn propose(
+        &self,
+        op: yuntun_proto::meta::Op,
+        timeout: Duration,
+    ) -> Result<yuntun_proto::meta::ProposeResponse, MetaError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.cmd_tx
+            .send(Command::Propose {
+                op,
+                reply: reply_tx,
+            })
+            .map_err(|e| MetaError::Storage(format!("命令通道断开：{e}")))?;
+        match reply_rx.recv_timeout(timeout) {
+            Ok(r) => r,
+            Err(_) => Err(MetaError::NoQuorum),
+        }
+    }
+
+    /// 清单增量（`Delta` RPC）：只报"自 `since` 起变过的表"。
+    pub fn delta(&self, since_manifest_ver: u64) -> yuntun_proto::meta::DeltaResponse {
+        let st = self.sm.lock().unwrap();
+        let v = st.version();
+        let d = st.manifest_delta(since_manifest_ver);
+        yuntun_proto::meta::DeltaResponse {
+            schema_ver: v.schema_ver,
+            manifest_ver: v.manifest_ver,
+            changed_tables: d.changed_tables,
+            full_reload: d.full_reload_required,
+        }
+    }
+
+    /// 本节点的存储（诊断；S3-6 观测会用）
+    pub fn storage(&self) -> &FjallStorage {
+        &self.storage
+    }
 }
 
 impl NodeState {
@@ -169,7 +261,11 @@ impl Cluster {
         let role = Arc::new(Mutex::new(StateRole::Follower));
         let applied = Arc::new(Mutex::new(0u64));
         let debug = Arc::new(Mutex::new(String::new()));
-        self.spawn_with(id, sm, storage, role, applied, debug);
+        let status = Arc::new(Mutex::new(NodeStatus {
+            node_id: id,
+            ..Default::default()
+        }));
+        self.spawn_with(id, sm, storage, role, applied, debug, status);
     }
 
     /// 某节点的存储目录。
@@ -178,6 +274,10 @@ impl Cluster {
     }
 
     /// 用给定的状态机与存储起线程。
+    ///
+    /// 参数多是**有意**的：这里就是把一个节点的全部运行期句柄显式交出去，
+    /// 收进结构体反而会掩盖"谁共享了什么"。与 `spawn_node` 同款处理。
+    #[allow(clippy::too_many_arguments)]
     fn spawn_with(
         &mut self,
         id: u64,
@@ -186,6 +286,7 @@ impl Cluster {
         role: Arc<Mutex<StateRole>>,
         applied: Arc<Mutex<u64>>,
         debug: Arc<Mutex<String>>,
+        status: Arc<Mutex<NodeStatus>>,
     ) {
         let rx = self
             .receivers
@@ -203,6 +304,7 @@ impl Cluster {
                 role.clone(),
                 applied.clone(),
                 debug.clone(),
+                status.clone(),
                 cmd_rx,
             ),
         );
@@ -214,6 +316,7 @@ impl Cluster {
                 role,
                 applied,
                 debug,
+                status,
                 cmd_tx,
             },
         );
@@ -264,7 +367,14 @@ impl Cluster {
                 };
             }
             if Instant::now() >= deadline {
-                return Err(MetaError::NotLeader { leader_hint: 0 });
+                // 谁都不是 leader：尽可能给出已知的 leader hint（0 = 未知）
+                let hint = self
+                    .nodes
+                    .values()
+                    .map(|n| n.status.lock().unwrap().leader_id)
+                    .find(|id| *id != 0)
+                    .unwrap_or(0);
+                return Err(MetaError::NotLeader { leader_hint: hint });
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -311,6 +421,17 @@ impl Cluster {
             n.storage
                 .compact_applied()
                 .unwrap_or_else(|e| panic!("压缩落盘失败：{e}"))
+        })
+    }
+
+    /// 取某节点的句柄（gRPC 服务层用）。
+    pub fn handle(&self, id: u64) -> Option<NodeHandle> {
+        self.nodes.get(&id).map(|n| NodeHandle {
+            id,
+            status: n.status.clone(),
+            sm: n.sm.clone(),
+            storage: n.storage.handle(),
+            cmd_tx: n.cmd_tx.clone(),
         })
     }
 
@@ -378,6 +499,7 @@ fn spawn_node(
     role: Arc<Mutex<StateRole>>,
     applied: Arc<Mutex<u64>>,
     debug: Arc<Mutex<String>>,
+    status: Arc<Mutex<NodeStatus>>,
     cmd_rx: Receiver<Command>,
 ) -> thread::JoinHandle<Receiver<Message>> {
     thread::spawn(move || {
@@ -438,8 +560,11 @@ fn spawn_node(
                                 }
                             }
                         } else {
-                            // 非 leader：必须可重试（约定 3）。生产实现在这里带上 leader hint。
-                            let _ = reply.send(Err(MetaError::NotLeader { leader_hint: 0 }));
+                            // 非 leader：必须可重试（约定 3），并带上 **leader hint** ——
+                            // 客户端据此直接重试到正确节点，而不是盲目轮询（G2 的"写入不中断"靠它）。
+                            let _ = reply.send(Err(MetaError::NotLeader {
+                                leader_hint: raw.raft.leader_id,
+                            }));
                         }
                     }
                     Err(TryRecvError::Empty) => break,
@@ -470,6 +595,18 @@ fn spawn_node(
                     })
                     .collect();
                 prs.sort();
+                {
+                    let mut st = status.lock().unwrap();
+                    st.node_id = id;
+                    st.role = format!("{:?}", raw.raft.state);
+                    st.term = raw.raft.term;
+                    st.leader_id = raw.raft.leader_id;
+                    st.commit_index = raw.raft.raft_log.committed;
+                    st.applied_index = *applied.lock().unwrap();
+                    st.snapshot_index = storage.compacted_index();
+                    st.first_index = raw.raft.raft_log.first_index();
+                    st.last_index = raw.raft.raft_log.last_index();
+                }
                 *debug.lock().unwrap() = format!(
                     "role={:?} term={} first={} last={} commit={} applied={} log_applied={} {}",
                     raw.raft.state,

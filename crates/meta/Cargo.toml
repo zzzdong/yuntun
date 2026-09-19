@@ -12,6 +12,9 @@ arrow = { workspace = true }
 yuntun-proto = { path = "../proto" }
 prost = { workspace = true }
 tonic = { workspace = true }
+# gRPC 服务层：tokio 运行时 + futures（把 accept 循环包成 Stream）
+tokio = { workspace = true }
+futures = { workspace = true }
 # S3-1 PoC（选型闸门）：raft-rs 是**候选实现**，选型结论见 docs/metanode-design.md §4.2
 # 与 docs/operation-log.md §40。若最终选 openraft，换的是本 crate 的内部实现，
 # 对 `CatalogState`（状态机）与上层接口无影响 —— 这正是先做 S3-2 的原因。
@@ -30,3 +33,5 @@ arrow = { workspace = true }
 prost = { workspace = true }
 yuntun-model = { path = "../model" }
 yuntun-proto = { path = "../proto" }
+tonic = { workspace = true }
+tokio = { workspace = true }
