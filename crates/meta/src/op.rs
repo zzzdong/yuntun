@@ -224,6 +224,12 @@ pub fn commit_request_from_proto(m: &pb::CommitFilesRequestMsg) -> Result<Commit
     })
 }
 
+/// 公开包装：`RemoteCatalog` 把载荷还原成模型对象时要用
+/// （逐字段镜像的**唯一实现**留在本模块，别处不再写第二份）。
+pub fn manifest_from_proto_pub(m: &pb::FileManifestMsg) -> FileManifest {
+    manifest_from_proto(m)
+}
+
 fn manifest_from_proto(m: &pb::FileManifestMsg) -> FileManifest {
     FileManifest {
         file_path: m.file_path.clone(),

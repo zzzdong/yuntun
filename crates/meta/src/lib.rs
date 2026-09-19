@@ -39,6 +39,7 @@ pub mod cli;
 pub mod error;
 pub mod fjall_storage;
 pub mod op;
+pub mod remote_catalog;
 pub mod service;
 pub mod storage;
 pub mod transport;
@@ -47,6 +48,7 @@ pub use cli::Args;
 pub use error::{MetaError, MetaNodeError};
 pub use fjall_storage::FjallStorage;
 pub use op::{apply, decode_op, StateOp};
+pub use remote_catalog::RemoteCatalog;
 pub use service::{serve, MetaService};
 pub use storage::MetaStorage;
 pub use transport::{
@@ -263,6 +265,8 @@ impl NodeHandle {
                         manifest: Some(crate::op::manifest_to_proto_pub(f)),
                     })
                     .collect(),
+                // 整体替换语义（客户端据此丢弃已删 schema）
+                namespaces: st.list_schemas(),
             }),
             full_reload: full,
         }

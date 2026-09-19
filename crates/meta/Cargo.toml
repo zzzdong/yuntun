@@ -16,6 +16,8 @@ yuntun-catalog = { path = "../catalog" }
 arrow = { workspace = true }
 # gRPC 面（S3-0）：op 类型与错误码映射
 yuntun-proto = { path = "../proto" }
+# `CatalogOps` 是 async trait（用 `#[async_trait]` 桥接）
+async-trait = { workspace = true }
 clap = { workspace = true }
 prost = { workspace = true }
 tonic = { workspace = true }

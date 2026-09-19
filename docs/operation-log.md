@@ -3433,3 +3433,74 @@ valid_from > since                      → 水位之后**新增**的
 | 4 | 切装配点 | 最后一行，靠既有用例全绿验收 |
 
 ---
+
+---
+
+## 55. R3 S3-4（第二件·下半之三）：`RemoteCatalog` 落地 —— **与 `MemoryCatalog` 对拍一致**（2026-09-20）
+
+### 55.0 本轮做了什么
+
+| # | 交付物 | 说明 |
+|---|---|---|
+| 1 | `RemoteCatalog` | `CatalogOps` 的 gRPC 实现：**写** = `Propose`（+ 换主重试）／**读** = 本地缓存 + **版本驱动刷新** |
+| 2 | 错误保真 | `MetaError → Status` 补**机器可读** `err-kind`/`err-subject` metadata + 反向映射 `map_status` |
+| 3 | **对拍** | 同一串操作打两个实现，逐项比较可观测状态（9 步） |
+
+### 55.1 对拍抓到的真 bug：**结构变更必须走全量**
+
+`Delta.changed_tables` 是 **manifest 级**的（只列 `table_manifest_ver` 推进过的表），
+而 `create_table`/`drop_table` 只动 `schema_ver` —— **新建的表根本不在 `changed_tables` 里**。
+
+照「版本变了就走增量」的直觉写，客户端会**静默丢掉刚建的表**：
+现象就是"远端建表后读不到"（对拍里一建表就红，而单跑 `MetaService` 的用例是绿的 ——
+因为那条路径从没走过"增量刷新"）。
+
+**修法**：客户端把 `schema_ver` 变化当作「结构变更」信号 → 走全量。
+**为什么不让服务端判断**：`DeltaRequest` 只带 `since_manifest_ver`，**不带客户端的 `schema_ver`**，
+服务端无从知道对面缺哪些结构变更 → 信号只能由客户端从探测结果里取（它本来就知道自己的版本）。
+（登记遗留：给 `DeltaRequest` 加 `since_schema_ver`，省掉客户端每次结构变更的全量。）
+
+### 55.2 错误保真为什么必须（不是锦上添花）
+
+远程路径上 `Status → LakeError` 一旦退化成 `Other`，SQL 层的错误码会**整体退化**
+（用户看到 500 而不是 1051「表不存在」），而**没有任何测试会红**。所以这一层单独加固：
+
+| 侧 | 做法 | 用哪种测试钉住 |
+|---|---|---|
+| 服务端 | 错误身份放进 **metadata**（`err-kind` + `err-subject`），而不是只塞 message | 「每个可分支错误都带 kind」 |
+| 客户端 | 用 metadata 反查（**不 parse 诊断串** —— 文案一改就静默坏）| 「`LakeError → Status → LakeError` **保形**」|
+
+`SchemaChanged` 是特例：它的 `new_schema` 是 `Arc<Schema>`，**过不了线** →
+远端在**冲突时多读一次**当前 schema 还原成同形错误（额外往返只发生在冲突路径上）。
+
+### 55.3 幂等快路径的口径（"安全"要可验证）
+
+本地只记**自己写过的键**（含 `commit_files` 自带的键）。**漏判是安全的**：走到 `Propose`，由 SM 去重。
+对拍把这条写成可执行断言：重放同一个提交 → `accepted=false` —— **快路径答错不影响正确性**。
+
+### 55.4 对拍比什么（判据清单）
+
+schemas｜tables（全限定名 + 格式 + schema 版本 + 字段数）｜两组版本号｜快照号｜
+`u64::MAX` 下可见文件｜**旧快照**下可见文件（MVCC：墓碑必须还在）｜OCC 冲突的形状｜
+「表已存在」「表不存在」的错误类别 ✓
+
+刻意**不比**的：`created_at`/`committed_at` 等时间戳 —— 本地实现读自己的钟，远端用 op 里带的时间，
+**本就该不同**（纪律 1：时间随 op 走），拉进对拍只会得到噪声断言。
+
+### 55.5 验证
+
+- `RemoteCatalog` 单测 2（错误保形 / 表名归一化）+ `error.rs` 新用例（kind+subject 全覆盖）
+- 对拍用例 1（9 步 × 6 个维度）
+- 全量 **301 passed / 0 failed**（60 targets；日志无锁等待）；clippy 0（改动 crate）
+
+### 55.6 遗留（**R3 收口的最后一步**）
+
+| # | 项 | 说明 |
+|---|---|---|
+| 1 | **切装配点** | `server` 里那一行：起一个**进程内 1 节点 `MetaNode`**（设计 §3.3 的"本地传输"）+ `RemoteCatalog::connect(loopback)`；保留**装配层开关**（设计指定的回滚点：切回 `MemoryCatalog`）。判据：既有用例全绿 |
+| 2 | `DeltaRequest` 加 `since_schema_ver` | 让服务端能判断结构变更 → 免掉客户端每次结构变更的全量（见 55.1）|
+| 3 | `ProposeResponse` 加 `affected` | 精确 `drop_shard` 条数（现在远端只能给 1/0）|
+| 4 | 幂等键集合进载荷 | 现在本地快路径只知道自己的键（安全但会多走一次 `Propose`）|
+| 5 | 文件缓存的保留窗口/GC | 墓碑只增不减（MVCC 需要它们，但要有界）|
+
+---

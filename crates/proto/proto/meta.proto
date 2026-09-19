@@ -200,6 +200,8 @@ message PrefetchResponse {
 // 后续要加 manifest / 文件级增量时只加字段，不动 `PrefetchResponse` 的形状。
 message PrefetchPayload {
   repeated TableMeta tables = 1;
+  // schema 名（**每次刷新整体替换**：删掉的 schema 必须消失，否则远端 `USE db` 还能切进去）
+  repeated string namespaces = 3;
   // 文件级增量（**含墓碑**：`deleted_at > since_snapshot` 的也要发）。
   // 只发"当前可见"会让客户端永远删不掉已删文件 → 查询读到已删数据（静默）。
   repeated FileEntry files  = 2;

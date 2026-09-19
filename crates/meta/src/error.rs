@@ -80,54 +80,111 @@ impl From<MetaError> for tonic::Status {
             }
             s
         };
+        // **机器可读的错误身份**（`err-kind` + `err-subject`）。
+        //
+        // 为什么必须有（而不是让客户端去 parse message）：`RemoteCatalog` 要把
+        // `Status` 还原成 `LakeError`（否则 SQL 层再也分不清「表不存在」与「其他失败」，
+        // 错误码会退化成一律 500）。而 parse message 属于"依赖诊断文案"，
+        // 文案一改就静默坏掉（`NodeStatus` 那边已经吃过这个教训）。
+        let with_kind = |mut s: tonic::Status, kind: &'static str, subject: String| {
+            s.metadata_mut()
+                .insert("err-kind", kind.parse().expect("ascii kind"));
+            // 只在**确有 subject**时才插这个键（不搞 "_" 哨兵）：
+            // 客户端一句 `md.get("err-subject")` 就能区分"有"与"没有"。
+            if !subject.is_empty() {
+                if let Ok(v) = subject.parse() {
+                    s.metadata_mut().insert("err-subject", v);
+                }
+            }
+            s
+        };
         match e {
-            MetaError::NotLeader { leader_hint } => with_hint(
-                tonic::Status::unavailable(format!("not leader (leader hint {leader_hint})")),
-                "leader-hint",
-                leader_hint.to_string(),
+            MetaError::NotLeader { leader_hint } => with_kind(
+                with_hint(
+                    tonic::Status::unavailable(format!("not leader (leader hint {leader_hint})")),
+                    "leader-hint",
+                    leader_hint.to_string(),
+                ),
+                "not-leader",
+                String::new(),
             ),
-            MetaError::NoQuorum => tonic::Status::unavailable("no quorum"),
-            MetaError::OccConflict { actual_version } => with_hint(
+            MetaError::NoQuorum => with_kind(
+                tonic::Status::unavailable("no quorum"),
+                "no-quorum",
+                String::new(),
+            ),
+            MetaError::OccConflict { actual_version } => with_kind(with_hint(
                 tonic::Status::failed_precondition(format!(
                     "schema version changed (actual {actual_version})"
                 )),
                 "actual-version",
                 actual_version.to_string(),
-            ),
+            ), "occ-conflict", String::new()),
             MetaError::BadRequest(m) => tonic::Status::invalid_argument(m),
             MetaError::Storage(m) => tonic::Status::internal(m),
             MetaError::Lake(e) => match e {
-                LakeError::TableNotFound(t) => tonic::Status::not_found(format!("table {t}")),
-                LakeError::SchemaNotFound(s) => tonic::Status::not_found(format!("schema {s}")),
-                LakeError::TableAlreadyExists(t) => {
-                    tonic::Status::already_exists(format!("table {t}"))
-                }
-                LakeError::SchemaAlreadyExists(s) => {
-                    tonic::Status::already_exists(format!("schema {s}"))
-                }
-                LakeError::SchemaNotEmpty(s) => {
-                    tonic::Status::failed_precondition(format!("schema {s} is not empty"))
-                }
-                LakeError::SchemaIncompatible(m) | LakeError::InvalidSchemaChange(m) => {
-                    tonic::Status::failed_precondition(m)
-                }
-                LakeError::SchemaChanged { actual_version, .. } => with_hint(
-                    tonic::Status::failed_precondition(format!(
-                        "schema changed, retry (actual {actual_version})"
-                    )),
-                    "actual-version",
-                    actual_version.to_string(),
+                LakeError::TableNotFound(t) => with_kind(
+                    tonic::Status::not_found(format!("table {t}")),
+                    "table-not-found",
+                    t.clone(),
                 ),
-                LakeError::IdempotencyKeyRequired => {
-                    tonic::Status::invalid_argument("idempotency key required")
-                }
-                LakeError::IdempotencyKeyTooLong => {
-                    tonic::Status::invalid_argument("idempotency key too long (max 256)")
-                }
-                LakeError::ResourceExhausted(m) => {
+                LakeError::SchemaNotFound(s) => with_kind(
+                    tonic::Status::not_found(format!("schema {s}")),
+                    "schema-not-found",
+                    s.clone(),
+                ),
+                LakeError::TableAlreadyExists(t) => with_kind(
+                    tonic::Status::already_exists(format!("table {t}")),
+                    "table-already-exists",
+                    t.clone(),
+                ),
+                LakeError::SchemaAlreadyExists(s) => with_kind(
+                    tonic::Status::already_exists(format!("schema {s}")),
+                    "schema-already-exists",
+                    s.clone(),
+                ),
+                LakeError::SchemaNotEmpty(s) => with_kind(
+                    tonic::Status::failed_precondition(format!("schema {s} is not empty")),
+                    "schema-not-empty",
+                    s.clone(),
+                ),
+                LakeError::SchemaIncompatible(m) => with_kind(
+                    tonic::Status::failed_precondition(m),
+                    "schema-incompatible",
+                    String::new(),
+                ),
+                LakeError::InvalidSchemaChange(m) => with_kind(
+                    tonic::Status::failed_precondition(m),
+                    "invalid-schema-change",
+                    String::new(),
+                ),
+                LakeError::SchemaChanged { actual_version, .. } => with_kind(
+                    with_hint(
+                        tonic::Status::failed_precondition(format!(
+                            "schema changed, retry (actual {actual_version})"
+                        )),
+                        "actual-version",
+                        actual_version.to_string(),
+                    ),
+                    "schema-changed",
+                    String::new(),
+                ),
+                LakeError::IdempotencyKeyRequired => with_kind(
+                    tonic::Status::invalid_argument("idempotency key required"),
+                    "idempotency-key-required",
+                    String::new(),
+                ),
+                LakeError::IdempotencyKeyTooLong => with_kind(
+                    tonic::Status::invalid_argument("idempotency key too long (max 256)"),
+                    "idempotency-key-too-long",
+                    String::new(),
+                ),
+                LakeError::ResourceExhausted(m) => with_kind(
                     // 背压：明确拒绝 + 可重试（客户端应退避）
-                    tonic::Status::resource_exhausted(m)
-                }
+                    tonic::Status::resource_exhausted(m),
+                    "resource-exhausted",
+                    String::new(),
+                ),
                 other => tonic::Status::internal(other.to_string()),
             },
         }
@@ -200,6 +257,97 @@ mod tests {
         assert_eq!(s.code(), Code::FailedPrecondition);
         assert_eq!(s.metadata().get("actual-version").unwrap(), "7");
         assert!(e.retryable(), "OCC 冲突要能重试（拉新版本再判）");
+    }
+
+    /// 每个**客户端可能要分支**的错误都必须带机器可读的 `err-kind`（+ 需要时 `err-subject`）。
+    ///
+    /// 为什么值得单独立一条：`RemoteCatalog` 要把 `Status` 还原成 `LakeError` ——
+    /// 少了 kind，它就只能一律返回 internal，SQL 层的错误码会整体退化（用户看到 500
+    /// 而不是「表不存在」）。而"字段少一个"这类问题**不会报错**，只会在远端变形。
+    #[test]
+    fn every_branchable_error_carries_a_machine_readable_kind() {
+        let cases: Vec<(MetaError, &str, Option<&str>)> = vec![
+            (
+                MetaError::NotLeader { leader_hint: 7 },
+                "not-leader",
+                None, // 版本/提示走各自的 metadata（`leader-hint`），不占用 subject
+            ),
+            (MetaError::NoQuorum, "no-quorum", None),
+            (
+                MetaError::OccConflict { actual_version: 3 },
+                "occ-conflict",
+                None, // 实际版本在 `actual-version` 里
+            ),
+            (
+                MetaError::from_lake(LakeError::TableNotFound("public.cpu".into())),
+                "table-not-found",
+                Some("public.cpu"),
+            ),
+            (
+                MetaError::from_lake(LakeError::SchemaNotFound("analytics".into())),
+                "schema-not-found",
+                Some("analytics"),
+            ),
+            (
+                MetaError::from_lake(LakeError::TableAlreadyExists("public.cpu".into())),
+                "table-already-exists",
+                Some("public.cpu"),
+            ),
+            (
+                MetaError::from_lake(LakeError::SchemaAlreadyExists("analytics".into())),
+                "schema-already-exists",
+                Some("analytics"),
+            ),
+            (
+                MetaError::from_lake(LakeError::SchemaNotEmpty("analytics".into())),
+                "schema-not-empty",
+                Some("analytics"),
+            ),
+            (
+                MetaError::from_lake(LakeError::InvalidSchemaChange("bad".into())),
+                "invalid-schema-change",
+                None,
+            ),
+            (
+                MetaError::from_lake(LakeError::SchemaChanged {
+                    actual_version: 9,
+                    new_schema: std::sync::Arc::new(arrow::datatypes::Schema::empty()),
+                }),
+                "schema-changed",
+                None, // 实际版本在 `actual-version` 里
+            ),
+            (
+                MetaError::from_lake(LakeError::IdempotencyKeyRequired),
+                "idempotency-key-required",
+                None,
+            ),
+            (
+                MetaError::from_lake(LakeError::IdempotencyKeyTooLong),
+                "idempotency-key-too-long",
+                None,
+            ),
+            (
+                MetaError::from_lake(LakeError::ResourceExhausted("busy".into())),
+                "resource-exhausted",
+                None,
+            ),
+        ];
+        for (e, kind, subject) in cases {
+            let st: tonic::Status = e.into();
+            let md = st.metadata();
+            assert_eq!(
+                md.get("err-kind").map(|v| v.to_str().unwrap()),
+                Some(kind),
+                "缺 err-kind（客户端无法还原错误类型）"
+            );
+            if let Some(want) = subject {
+                assert_eq!(
+                    md.get("err-subject").map(|v| v.to_str().unwrap()),
+                    Some(want),
+                    "err-subject 不对"
+                );
+            }
+        }
     }
 
     #[test]
