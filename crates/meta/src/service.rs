@@ -59,12 +59,12 @@ impl pb::meta_server::Meta for MetaService {
 
     async fn prefetch(
         &self,
-        _req: Request<pb::PrefetchRequest>,
+        req: Request<pb::PrefetchRequest>,
     ) -> Result<Response<pb::PrefetchResponse>, Status> {
-        // 形状未定就不猜（返回明确 UNIMPLEMENTED，而不是给个半成品载荷让客户端误用）
-        Err(Status::unimplemented(
-            "Prefetch 的载荷形状在 S3-4 定形（见 operation-log §45.4）",
-        ))
+        // 只读内存状态（O(表数)，且载荷只含被请求的表）—— 和 Delta/Status 一样不需要
+        // 阻塞线程池。**注意**：这里不查盘、不 raft、不等待，所以"读旧窗口"的口径
+        // 由客户端的 `cache_ttl` 决定（设计 §3.2），不在本层。
+        Ok(Response::new(self.node.prefetch(&req.into_inner())))
     }
 
     async fn delta(

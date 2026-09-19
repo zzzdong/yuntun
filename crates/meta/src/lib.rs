@@ -66,6 +66,7 @@ use raft::StateRole;
 use protobuf::Message as PbMessage;
 
 use yuntun_catalog::CatalogState;
+use yuntun_model::meta::TableMeta;
 use prost::Message as _;
 
 /// 三节点的固定成员表（PoC 用常量；生产由 `--init` / `Join` 决定）。
@@ -205,6 +206,41 @@ impl NodeHandle {
     /// `delivered=false`，让对端能统计出"发了但没人收"（见 `transport` 模块的计数说明）。
     pub fn deliver(&self, msg: Message) -> bool {
         self.raft_inbox.send(msg).is_ok()
+    }
+
+    /// 读：**版本探测 + 刷新载荷**（`Prefetch` RPC）。
+    ///
+    /// 语义的权威口径写在 proto（`PrefetchRequest` 上方那张表）—— 这里只落实它。
+    pub fn prefetch(
+        &self,
+        req: &yuntun_proto::meta::PrefetchRequest,
+    ) -> yuntun_proto::meta::PrefetchResponse {
+        let st = self.sm.lock().unwrap();
+        let v = st.version();
+
+        // 客户端版本**超前** = 它手里的不是本集群的状态（换过集群 / 被回滚 / 数据被换过）。
+        // 此时**必须**要求全量重建：静默返回空会让客户端以为"一切照旧"，
+        // 于是继续拿一份不属于本集群的缓存去规划查询 —— 错得**不报错**。
+        let ahead = req.since_schema_ver > v.schema_ver || req.since_manifest_ver > v.manifest_ver;
+        let full = req.full || ahead;
+
+        let tables: Vec<TableMeta> = if full {
+            st.list_tables()
+        } else {
+            // 只回**请求里存在**的表：请求了却不在载荷里 = 已删（这是契约的一部分，
+            // 所以不能"补空占位"—— 补了客户端就分不清"没请求"与"已删"）
+            req.tables.iter().filter_map(|t| st.get_table(t)).collect()
+        };
+
+        yuntun_proto::meta::PrefetchResponse {
+            schema_ver: v.schema_ver,
+            manifest_ver: v.manifest_ver,
+            snapshot: st.current_snapshot(),
+            payload: Some(yuntun_proto::meta::PrefetchPayload {
+                tables: tables.iter().map(crate::op::table_meta_to_proto).collect(),
+            }),
+            full_reload: full,
+        }
     }
 
     /// 本节点的存储（诊断；S3-6 观测会用）

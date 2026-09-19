@@ -157,19 +157,54 @@ message ProposeResponse {
 
 // ---------------------------------------------------------------- 读路径
 
+// 读：**版本探测 + 刷新载荷**（设计 §3.2：读不走 metanode，靠本地缓存 + 版本驱动刷新）。
+//
+// 载荷语义（S3-4 定形，**契约** —— 客户端的本地缓存靠它刷新）：
+//
+// | 请求 | 响应 |
+// |---|---|
+// | `tables` 为空 | 只回版本号，**载荷为空**（这就是"无变化零开销"那条路径） |
+// | `tables` 非空、`full=false` | 只含**请求里存在**的表；⚠️ 请求了却不在载荷里 = **该表已删**（客户端必须删本地条目） |
+// | `full=true` | **全部**表（忽略 `tables`），并置 `full_reload` |
+// | `since_*` 比当前**大**（客户端版本超前：换过集群 / 被回滚） | 全量 + `full_reload` |
+//
+// 最后一条是**保护**：静默返回空会让客户端以为"一切照旧"，于是继续拿一份
+// 不属于本集群的缓存去规划查询 —— 错得**不报错**。
 message PrefetchRequest {
   uint64 since_schema_ver   = 1;
   uint64 since_manifest_ver = 2;
   bool   full               = 3;  // true = 无视 since，要全量
+  // 要刷新的表（**全限定** `schema.table`）；空 = 只要版本号
+  repeated string tables    = 4;
 }
 
 message PrefetchResponse {
   uint64 schema_ver   = 1;
   uint64 manifest_ver = 2;
   uint64 snapshot     = 3;
-  // 表/清单载荷（S3-4 定形）
-  bytes  payload      = 4;
-  bool   full_reload  = 5;  // true = 客户端必须丢弃本地缓存（结构变更）
+  // 刷新载荷。用**消息**而不是 bytes：自描述，客户端不用再猜编码
+  PrefetchPayload payload = 4;
+  bool   full_reload  = 5;  // true = 客户端必须丢弃本地缓存（结构变更 / 版本超前）
+}
+
+// 刷新载荷。做成"一层壳 + repeated tables"而不是直接 `repeated TableMeta`：
+// 后续要加 manifest / 文件级增量时只加字段，不动 `PrefetchResponse` 的形状。
+message PrefetchPayload {
+  repeated TableMeta tables = 1;
+}
+
+// `TableMeta` 的线上镜像（逐字段对齐 `yuntun_model::meta::TableMeta`）。
+message TableMeta {
+  string name                    = 1;  // 全限定 `schema.table`
+  uint64 current_schema_version  = 2;
+  repeated string partition_cols = 3;
+  string default_format          = 4;  // "parquet" | "vortex"
+  bytes  arrow_schema            = 5;  // Arrow IPC（与 CreateTableOp 同一种编码）
+  // `optional`（proto3 presence）：**存在性有语义** —— `None`（"没配"）≠ 空配置
+  optional bytes ingest_config   = 6;
+  uint64 created_at              = 7;
+  uint32 table_template          = 8;
+  string namespace                = 9; // 空 = public（v1 数据兼容）
 }
 
 message DeltaRequest {

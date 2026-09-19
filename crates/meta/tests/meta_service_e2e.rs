@@ -10,7 +10,8 @@
 //! |---|---|
 //! | 正常写入（建 schema / 建表 / 提交） | 成功，且回应带 raft index 与版本号 |
 //! | **幂等重试**（同键重复提交） | 成功但 `accepted=false`（**不是**错误 —— 客户端重试必须成功） |
-//! | 未实现的方法（Prefetch/Join） | 明确 `UNIMPLEMENTED`（**不许**假装成功） |
+//! | 未实现的方法（Join） | 明确 `UNIMPLEMENTED`（**不许**假装成功） |
+//! | `Prefetch`（S3-4 已实现） | 见 `prefetch_payload_semantics`（版本探测 / 差量 / 全量 / 超前保护） |
 
 use std::time::Duration;
 
@@ -174,15 +175,143 @@ async fn propose_status_delta_over_real_grpc() {
         .await
         .expect_err("Join 尚未实现（属 S3-6）");
     assert_eq!(e.code(), tonic::Code::Unimplemented);
-    let e = client
-        .prefetch(pb::PrefetchRequest {
-            since_schema_ver: 0,
-            since_manifest_ver: 0,
-            full: true,
-        })
-        .await
-        .expect_err("Prefetch 载荷形状未定（属 S3-4）");
-    assert_eq!(e.code(), tonic::Code::Unimplemented);
+    server.abort();
+}
+
+/// `Prefetch` 的**载荷语义**（S3-4 定形）。
+///
+/// 单独立一条用例的理由：这套语义是**契约**（客户端本地缓存靠它刷新），
+/// 而它每一条错法都**不报错** —— 客户端只会"少刷新一次"或"拿错缓存"，
+/// 现象是查询结果与元数据悄悄不一致。所以四条分支逐条钉住。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prefetch_payload_semantics() {
+    let cluster = Cluster::start();
+    let leader = cluster.wait_leader(T).expect("三节点应选出 leader");
+    let node = cluster.handle(leader).expect("取 leader 句柄");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { yuntun_meta::serve(node, listener).await });
+    let mut client = connect(addr).await;
+
+    for op in [
+        create_schema_op("analytics", 1_000),
+        create_table_op("cpu", 1_001),
+        commit_op("b-pf", "key-pf", 7, 1_002),
+    ] {
+        let r = client
+            .propose(pb::ProposeRequest {
+                op: Some(op),
+                request_id: b"rid".to_vec(),
+                schema_ver: 0,
+            })
+            .await
+            .expect("提议成功")
+            .into_inner();
+        assert!(r.accepted);
+    }
+
+    let prefetch = |c: &mut MetaClient<tonic::transport::Channel>,
+                    since_schema: u64,
+                    since_manifest: u64,
+                    full: bool,
+                    tables: Vec<&'static str>| {
+        let mut c = c.clone();
+        let tables = tables.into_iter().map(|s| s.to_string()).collect();
+        async move {
+            c.prefetch(pb::PrefetchRequest {
+                since_schema_ver: since_schema,
+                since_manifest_ver: since_manifest,
+                full,
+                tables,
+            })
+            .await
+            .expect("prefetch 应当成功")
+            .into_inner()
+        }
+    };
+
+    // ---- ① 纯版本探测（tables 空）→ **零载荷**（设计 §3.2 的"无变化零开销"路径）----
+    let probe = prefetch(&mut client, 0, 0, false, vec![]).await;
+    assert!(
+        probe.payload.as_ref().expect("载荷字段应存在").tables.is_empty(),
+        "只要版本号时不该带表载荷（那会让'零开销'变成'每次搬全部元数据'）"
+    );
+    assert!(!probe.full_reload, "版本探测不该要求重建缓存");
+    // 两次结构变更（建 schema + 建表）→ schema_ver=2；提交只推 manifest_ver（设计 §6.3 两组版本号）
+    assert_eq!(probe.schema_ver, 2, "两组版本号都要给：{probe:?}");
+    assert!(probe.manifest_ver >= 1, "提交过文件 → manifest_ver >= 1");
+    assert!(probe.snapshot > 0, "快照号也要给（客户端据此对齐 manifest 语义）");
+
+    // ---- ② 版本没变（since = 当前）→ 版本号原样回，客户端据此**跳过刷新** ----
+    let same = prefetch(
+        &mut client,
+        probe.schema_ver,
+        probe.manifest_ver,
+        false,
+        vec![],
+    )
+    .await;
+    assert_eq!((same.schema_ver, same.manifest_ver), (probe.schema_ver, probe.manifest_ver));
+    assert!(same.payload.as_ref().unwrap().tables.is_empty());
+
+    // ---- ③ 差量：请求存在的表 → 只回它；请求不存在的表 → **不在载荷里**（= 已删）----
+    let delta = prefetch(
+        &mut client,
+        0,
+        0,
+        false,
+        vec!["public.cpu", "public.gone"],
+    )
+    .await;
+    let names: Vec<String> = delta
+        .payload
+        .as_ref()
+        .unwrap()
+        .tables
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+    assert_eq!(names, vec!["public.cpu".to_string()], "只回请求里**存在**的表：{names:?}");
+    assert!(!delta.full_reload);
+    let cpu = &delta.payload.as_ref().unwrap().tables[0];
+    assert_eq!(cpu.current_schema_version, 1, "建表即 version 1");
+    assert_eq!(cpu.default_format, "parquet");
+    assert_eq!(cpu.namespace, "public");
+    assert!(!cpu.arrow_schema.is_empty(), "Arrow schema 必须随载荷走（缓存要能解出 schema）");
+    assert!(cpu.ingest_config.is_some(), "有配置时必须带（optional 的存在性有语义）");
+
+    // ---- ④ full=true → 全部表（忽略 tables）+ 要求重建缓存 ----
+    let all = prefetch(&mut client, 0, 0, true, vec![]).await;
+    assert!(all.full_reload, "full=true 必须置 full_reload（客户端要丢本地缓存）");
+    let all_names: Vec<String> = all
+        .payload
+        .as_ref()
+        .unwrap()
+        .tables
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+    assert_eq!(all_names, vec!["public.cpu".to_string()]);
+
+    // ---- ⑤ 版本**超前**保护：客户端的版本比本集群新（换过集群/被回滚）----
+    // 这时**必须**要求全量重建。若静默返回空，客户端会以为"一切照旧"，
+    // 继续拿一份不属于本集群的缓存去规划查询 —— 错得不报错。
+    let ahead = prefetch(
+        &mut client,
+        probe.schema_ver + 100,
+        probe.manifest_ver,
+        false,
+        vec![],
+    )
+    .await;
+    assert!(
+        ahead.full_reload,
+        "客户端版本超前时必须要求全量重建，而不是回空载荷：{ahead:?}"
+    );
+    assert!(
+        !ahead.payload.as_ref().unwrap().tables.is_empty(),
+        "要求全量重建时应当顺手把全量载荷带上（否则客户端还得再发一次请求）"
+    );
 
     server.abort();
 }

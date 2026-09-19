@@ -15,8 +15,11 @@
 use std::sync::Arc;
 
 use yuntun_catalog::CatalogState;
-use yuntun_model::meta::{ColumnStatLite, FileManifest, IngestConfig, StatisticsLite};
+use yuntun_model::meta::{ColumnStatLite, FileManifest, IngestConfig, StatisticsLite, TableMeta};
 use yuntun_model::ops::{CommitFilesRequest, CreateTableRequest};
+
+// `encode_to_vec` / `decode`：prost 的 trait 方法（匿名导入，避免与 pb 别名混淆）
+use prost::Message as _;
 
 use crate::MetaError;
 use yuntun_proto::meta as pb;
@@ -251,6 +254,60 @@ fn manifest_to_proto(f: &FileManifest) -> pb::FileManifestMsg {
 ///
 /// 幂等语义与 standalone 路径一致：重复 DDL 视为已生效、重复 `commit_files` 返回
 /// `accepted = false`（幂等命中）—— **不是错误**（客户端重试必须成功）。
+/// `TableMeta`（状态机）→ proto（`Prefetch` 载荷）。
+///
+/// 逐字段搬，**不许省**：少一个字段意味着客户端的本地缓存里少一样东西，
+/// 而**不会有任何报错** —— 表现是"某个功能悄悄不生效"（本地难查、线上更难查）。
+pub fn table_meta_to_proto(m: &TableMeta) -> pb::TableMeta {
+    pb::TableMeta {
+        // ⚠️ 线上以**全限定名**为权威：模型里 `name` 是裸名、schema 在另一个字段，
+        // 而载荷的消费者拿这个名字当缓存键 —— 裸名会让 `public.cpu` 与 `analytics.cpu`
+        // 撞在一起（**静默**串表）。这条是实测抓出来的：第一版直接搬 `m.name`，
+        // 用例立刻在"请求 public.cpu 拿回名为 cpu 的条目"上变红。
+        name: m.qualified_name(),
+        current_schema_version: m.current_schema_version,
+        partition_cols: m.partition_cols.clone(),
+        default_format: m.default_format.clone(),
+        arrow_schema: m.arrow_schema.clone(),
+        // `Some(x)` → 编码字节；`None` → **不设字段**（`optional`，保住"没配"与"空配置"的区别）
+        ingest_config: m.ingest_config.as_ref().map(|c| c.encode_to_vec()),
+        created_at: m.created_at,
+        table_template: m.table_template,
+        // 冗余副本（模型里有这个字段），填**归一化后**的值，好让解码侧能交叉校验
+        namespace: m.schema_name().to_string(),
+    }
+}
+
+/// proto → `TableMeta`（`table_meta_to_proto` 的逆）。
+pub fn table_meta_from_proto(m: &pb::TableMeta) -> Result<TableMeta, MetaError> {
+    let (ns, name) = yuntun_model::ops::split_qualified(&m.name);
+    // 全限定名与 `namespace` 写的是**同一个事实**。不一致时必须报错：
+    // 静默取一个会让"名字"和"namespace"指向不同的表，而这种错**不报错**地传播。
+    if !m.namespace.is_empty() && m.namespace != ns {
+        return Err(MetaError::BadRequest(format!(
+            "TableMeta 的 name({}) 与 namespace({}) 不一致（两者必须是同一张表）",
+            m.name, m.namespace
+        )));
+    }
+    let ingest_config = match &m.ingest_config {
+        Some(bytes) => Some(IngestConfig::decode(bytes.as_slice()).map_err(|e| {
+            MetaError::BadRequest(format!("TableMeta.ingest_config 解不开：{e}"))
+        })?),
+        None => None,
+    };
+    Ok(TableMeta {
+        name: name.to_string(),
+        current_schema_version: m.current_schema_version,
+        partition_cols: m.partition_cols.clone(),
+        default_format: m.default_format.clone(),
+        arrow_schema: m.arrow_schema.clone(),
+        ingest_config,
+        created_at: m.created_at,
+        table_template: m.table_template,
+        namespace: ns.to_string(),
+    })
+}
+
 pub fn apply(state: &mut CatalogState, op: &StateOp) -> Result<ApplyOutcome, MetaError> {
     let now = op.now_ms();
     match op {
@@ -481,4 +538,63 @@ mod tests {
             "同 op 同时刻必须确定（状态机内不得读钟）"
         );
     }
+
+    /// `TableMeta` 的线上镜像必须**逐字段无损**（它是 `Prefetch` 载荷的内容）。
+    ///
+    /// 为什么单独立一条：少一个字段 = 客户端本地缓存里少一样东西，而**不会有任何报错** ——
+    /// 表现是"某个功能悄悄不生效"。另外两条语义也在这里钉住：
+    /// ① 线上以**全限定名**为权威（裸名会让 `public.cpu`/`analytics.cpu` 撞车）；
+    /// ② `ingest_config` 用 `optional` 保住"没配"与"空配置"的区别。
+    #[test]
+    fn table_meta_mirror_is_lossless_and_qualified() {
+        let mut m = TableMeta {
+            name: "cpu".into(),
+            namespace: "analytics".into(),
+            current_schema_version: 7,
+            partition_cols: vec!["dt".into(), "region".into()],
+            default_format: "vortex".into(),
+            arrow_schema: vec![1, 2, 3, 4],
+            ingest_config: Some(yuntun_model::meta::IngestConfig::standard()),
+            created_at: 1_700_000_000_000,
+            table_template: 2,
+        };
+
+        let p = table_meta_to_proto(&m);
+        assert_eq!(p.name, "analytics.cpu", "线上必须是全限定名（缓存键靠它唯一）");
+        assert_eq!(p.namespace, "analytics", "冗余副本要填归一化后的值（供解码侧交叉校验）");
+
+        let back = table_meta_from_proto(&p).expect("round-trip");
+        assert_eq!(back.name, m.name);
+        assert_eq!(back.namespace, m.namespace);
+        assert_eq!(back.current_schema_version, m.current_schema_version);
+        assert_eq!(back.partition_cols, m.partition_cols);
+        assert_eq!(back.default_format, m.default_format);
+        assert_eq!(back.arrow_schema, m.arrow_schema);
+        assert_eq!(back.created_at, m.created_at);
+        assert_eq!(back.table_template, m.table_template);
+        assert_eq!(back.ingest_config, m.ingest_config, "ingest_config 必须无损");
+
+        // ② `None` 不能被"补成"默认配置（optional 的存在性就是为这个）
+        m.ingest_config = None;
+        let p2 = table_meta_to_proto(&m);
+        assert!(
+            p2.ingest_config.is_none(),
+            "没配 ingest_config 时线上字段必须**不设**，而不是给一段空字节"
+        );
+        assert_eq!(
+            table_meta_from_proto(&p2).unwrap().ingest_config,
+            None,
+            "没配就要还原成 None（补一个 default 会让'没配'与'配了默认'再也分不开）"
+        );
+
+        // ③ 两个字段写同一个事实 → 不一致必须报错（静默取一个会让名字与 namespace 指向不同表）
+        let bad = pb::TableMeta {
+            name: "public.cpu".into(),
+            namespace: "analytics".into(),
+            ..Default::default()
+        };
+        let e = table_meta_from_proto(&bad).expect_err("不一致必须拒绝");
+        assert!(format!("{e}").contains("不一致"), "{e}");
+    }
+
 }

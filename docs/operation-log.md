@@ -3180,3 +3180,84 @@ CLI 层拦的是"人手打错"，`MetaNode::open` 拦的是"API 调用方漏了"
 | `crates/meta/tests/multi_node_grpc_e2e.rs`（新） | 3 节点真 gRPC：选主/复制/收敛/杀 leader/重选/继续写/幂等命中（**0.46s**） |
 
 ---
+
+---
+
+## 51. R3 S3-4（第一件）：读路径载荷定形 —— `Prefetch` 的语义与镜像（2026-09-20）
+
+### 51.0 本轮结论
+
+`§45.4` 明确归给 S3-4 的那一项（**`PrefetchResponse.payload` 的形状**）已落地，并**逐条有用例**：
+
+| 语义 | 用例断言 |
+|---|---|
+| 只要版本号（`tables` 空）→ **零载荷** | `payload.tables.is_empty()` |
+| 版本没变（`since` = 当前）→ 版本号原样回，客户端据此跳过刷新 | 版本相等 + 零载荷 |
+| 差量（`tables` 非空）→ 只回**请求里存在**的表；请求了却不在 = **已删** | `[public.cpu, public.gone]` → 只回 `public.cpu` |
+| `full=true` → 全部表 + `full_reload` | 载荷含全部表 |
+| **版本超前**（客户端比本集群新）→ 全量 + `full_reload` | `since = 当前+100` → 仍要求重建 |
+
+### 51.1 两条「为什么」（这套语义的错法都不报错，所以要写下来）
+
+1. **「请求了却不在载荷里」必须解释为「已删」** —— 所以载荷**只**能包含存在的表，
+   **不能**「补一个空占位」。补了客户端就再也分不清「我没请求它」与「它被删了」。
+2. **版本超前必须要求全量重建**，不能静默返回空：静默返回空会让客户端以为「一切照旧」，
+   继续拿一份**不属于本集群**的缓存去规划查询 —— 错得**不报错**。
+
+### 51.2 实测抓到的真问题：载荷里的 `name` 必须是**全限定**
+
+第一版转换直接搬 `model::TableMeta.name` —— 那是**裸名**（`cpu`），schema 在另一个字段里；
+而契约里写的是全限定名（`public.cpu`）。用例当场变红：
+**「请求 `public.cpu`，拿回名为 `cpu` 的条目」**。
+
+后果不是「名字不好看」：载荷的消费者拿它当**缓存键**，裸名会让
+`public.cpu` 与 `analytics.cpu` **撞成一条**（多 schema 下静默串表）。
+
+修法：
+
+- 编码：`name = m.qualified_name()`（全限定）+ `namespace = m.schema_name()`（冗余副本，供交叉校验）；
+- 解码：`split_qualified(&name)` 还原，并**校验** `namespace` 与全限定名一致 ——
+  不一致**报错**（两个字段写的是同一个事实，静默取一个会让「名字」与「namespace」指向不同的表）。
+
+### 51.3 `ingest_config` 为什么用 proto3 `optional`
+
+模型里是 `Option<IngestConfig>`，**存在性有语义**（「没配」≠「配了默认值」）。
+用普通 `bytes` 会把 `None` 与「空配置」混成同一个值 ✗ →
+改用 `optional bytes`（proto3 presence），并用一条「`None` 必须还原成 `None`」的用例钉住。
+
+### 51.4 交付物与验证
+
+| 位置 | 内容 |
+|---|---|
+| `crates/proto/proto/meta.proto` | `PrefetchRequest.tables`、`PrefetchPayload`（一层壳，便于以后加 manifest/文件级增量）、`TableMeta` 镜像 |
+| `crates/meta/src/op.rs` | `table_meta_to_proto` / `table_meta_from_proto` + **无损 round-trip 用例**（含 `optional` 存在性与「namespace 不一致必须拒绝」） |
+| `crates/meta/src/lib.rs` | `NodeHandle::prefetch`（落实语义：`full = req.full 或 版本超前`） |
+| `crates/meta/src/service.rs` | `Prefetch` 从 `UNIMPLEMENTED` 变为实现（只读内存状态，不需要阻塞线程池） |
+| `crates/meta/tests/meta_service_e2e.rs` | `prefetch_payload_semantics`（真 gRPC，五分支） |
+
+**反证**：去掉「版本超前保护」（`let ahead = false`）→ 用例 ⑤ 立刻红
+（客户端拿到「一切照旧」的空载荷 + `full_reload=false`）—— 正是要防的那种错。
+
+**验证**：meta 全绿；全量 **292 passed / 1 failed**，失败的是**已登记的 chaos 并行 flake**
+（全量里 37.5s，**隔离复跑 0.11s 通过**，`status.md` 已登记，根治属 T6.1）。
+
+### 51.5 一个观测口径的坑（差点让我误判）
+
+`cargo test --workspace` 的日志**会混**：被取消的命令留下的**后台 cargo 进程**
+会与后一次运行**同时写同一份日志**。据此我一度以为「某个 target 失败」
+（其实那个 target 是 passed，失败来自另一个进程的视角）。
+
+**判据**：日志开头出现 `Blocking waiting for file lock on build directory` = 当时**不止一个 cargo** 在跑
+→ 这份日志**不能**作为验收证据（本次实测：混过的日志 98 targets / 421 用例；干净全量是
+**59 targets / 293 用例**）。
+
+### 51.6 遗留
+
+| # | 项 | 归属 |
+|---|---|---|
+| 1 | **`RemoteCatalog`（`CatalogOps` 的 gRPC 实现）+ standalone 装配** —— 判据：既有用例全绿、`if distributed` 分支为零 | **S3-4 第二件（下一件）** |
+| 2 | 清单/文件级刷新进载荷（现在载荷只到「表元数据 + schema」，文件级走 `Delta`） | S3-4 余 |
+| 3 | 「落后太多必须全量」的**保留窗口**判定（现在只有 `full=true` 与「超前」两种信号） | §6.3 保留策略 |
+| 4 | 其余 op 的 proto 镜像（`DropSchema`/`EvolveSchema`/`DropShard`/`Compaction`） | S3-0 余 |
+
+---
