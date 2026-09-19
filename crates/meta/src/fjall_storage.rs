@@ -158,6 +158,62 @@ impl FjallStorage {
         self.clone()
     }
 
+    /// 状态机句柄（快照安装/压缩都要它）。
+    pub fn sm(&self) -> Arc<Mutex<CatalogState>> {
+        self.sm.clone()
+    }
+
+    /// 盘上那份快照覆盖到的 index（= 压缩位置）。**进程启动时 `Config.applied` 应取它**：
+    /// 状态机正是从这个快照恢复的，raft 只需重放它之后的条目。
+    pub fn snapshot_index(&self) -> u64 {
+        self.cache.lock().unwrap().compacted_index
+    }
+
+    /// **进程启动路径**：打开存储并把状态机从盘上重建出来。
+    ///
+    /// 重建规则（只有两条，必须都做对，否则重启后要么状态凭空少一半、要么基座错位）：
+    ///
+    /// | 盘上有快照 | 状态机 | `Config.applied` |
+    /// |---|---|---|
+    /// | 有（`compacted_index > 0`） | `restore_snapshot(产物)` | `compacted_index`（raft 重放其后条目） |
+    /// | 无 | 空状态机 | `0`（raft 从第 1 条开始重放全量日志） |
+    ///
+    /// ⚠️ 产物损坏时**报错**，绝不"当成没有快照、从空开始" —— 那会静默丢一半状态。
+    pub fn open_with_state(
+        dir: impl AsRef<Path>,
+        id: u64,
+        voters: Vec<u64>,
+    ) -> fjall::Result<(Self, Arc<Mutex<CatalogState>>)> {
+        let dir = dir.as_ref().to_path_buf();
+        // 先探测产物（`open` 需要一个状态机句柄，这里先给个占位，随后替换）
+        let probe = Arc::new(Mutex::new(CatalogState::new()));
+        let storage = Self::open(&dir, id, probe, voters)?;
+        let idx = storage.snapshot_index();
+        let sm = if idx == 0 {
+            Arc::new(Mutex::new(CatalogState::new()))
+        } else {
+            let bytes = storage
+                .ks
+                .get(artifact_key(idx))?
+                .ok_or_else(|| fjall::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("盘上记录了快照 index={idx} 但产物缺失：拒绝以空状态启动（会静默丢一半状态）"),
+                )))?;
+            let st = CatalogState::restore_snapshot(&bytes).map_err(|e| {
+                fjall::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("快照损坏：{e}"),
+                ))
+            })?;
+            Arc::new(Mutex::new(st))
+        };
+        let storage = Self { sm: sm.clone(), ..storage };
+        // 状态机在哪，`applied` 就该在哪（派生量按权威链重置，见 `reset_applied`）。
+        // 快照 index = 0 时重置为 0 → raft 会从日志第 1 条重放 ✓ 正是重建所需。
+        storage.reset_applied(idx)?;
+        Ok((storage, sm))
+    }
+
     pub fn installs(&self) -> usize {
         self.installs.load(Ordering::SeqCst)
     }
@@ -230,6 +286,22 @@ impl FjallStorage {
         write_msg(&self.ks, K_CONF_STATE, &cs)?;
         self.db.persist(PersistMode::SyncAll)?;
         self.cache.lock().unwrap().conf_state = cs;
+        Ok(())
+    }
+
+    /// **启动路径专用**：把已应用位置**重置**为 `index`（不做单调断言）。
+    ///
+    /// 为什么需要它：`applied_index` 是**随状态机走的派生量**，不是权威持久化状态 ——
+    /// 盘上留着的是"上一个进程那份内存状态已应用到哪"。而重启后状态机是**重建**出来的
+    /// （从快照，或从空 + 日志重放），它的位置由**快照 index** 决定，与上一个进程的
+    /// `applied` 无关。若沿用旧值，重建后的重放会撞上 `set_applied` 的单调断言
+    /// （实测：`已应用索引不得回退：5 -> 1`）。
+    ///
+    /// > 权威链只有一条：**快照（index + 产物）→ 其后日志重放**。
+    /// > `applied_index` 可以从它推出来，因此**崩溃后必须按它重置**。
+    fn reset_applied(&self, index: u64) -> fjall::Result<()> {
+        write_u64(&self.ks, K_APPLIED, index)?;
+        self.cache.lock().unwrap().applied_index = index;
         Ok(())
     }
 

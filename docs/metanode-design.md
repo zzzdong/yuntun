@@ -247,7 +247,7 @@ message ProposeResponse {
 | **S3-0** | proto 定义 + `tonic-build`（`T10.8`）：把现有手写 prost struct 迁到 `.proto` 生成 | 编解码 round-trip；与现有 `CommitFilesRequest` 字段**逐个对齐**的兼容测试 | 保留手写 struct（双份并存一个 commit） |
 | **S3-1** | **raft PoC（选型闸门）**：3 节点进程内集群，写/读/kill leader/快照/安装 | **4 项通过 + 第 5 项机制通过**（`operation-log §40` + **§42**）：三节点收敛、kill leader 不丢已提交、接缝干净、样板 124 行、**快照机制已证明**（自写 `Storage` + 帧/载荷双重校验 + 安装路径 + 反证）；**gate 第 5 项的"集成层稳定触发"未拿到**（`§42.4b`/`§42.7` 遗留 1）→ 仍**保留 raft-rs** | 逃生门已降级：真正贵的是**自写 `Storage` + 快照正确性**（两个候选都躲不掉），而非某个库的样板量 |
 | **S3-2** | `CatalogState` 抽取（§4.1）+ **确定性对拍** | ✅ **第一切片已落地**（`operation-log §38`）：`CatalogState` 抽出、抓到并修掉**四处真实非确定性**（3 处状态机读钟 + 1 处 `HashSet` 决定版本分配序）、`encode_canonical` + 5 个对拍用例（含反证）。**余**：键集合接线（S3-5）、快照 prost 版（S3-3） | 已保留 `MemoryCatalog` 作为宿主（语义零改动） |
-| **S3-3** | `yuntun-meta` 进程 + `MetaService`（Propose/Prefetch/Delta/Status/Join）+ fjall | 单节点 metanode 可独立启动；重启后状态一致。**进行中（2026-09-19）**：**落盘 `Storage`（fjall）已完成** —— 先盘后缓存 + **原子批（把"产物↔压缩位置"不变量交给存储保证）** + fsync 分级；5 条测试含 3 条跨 reopen（`operation-log §43`）。**余**：节点装配（把 PoC 从内存版切成 fjall 版）、两类时钟统一、快照触发/保留策略、真崩溃（子进程）注入 | — |
+| **S3-3** | `yuntun-meta` 进程 + `MetaService`（Propose/Prefetch/Delta/Status/Join）+ fjall | 单节点 metanode 可独立启动；重启后状态一致。**进行中（2026-09-19）**：**落盘 `Storage`（fjall）已完成**、**节点已切到落盘版且 M3 的 G1 判据在 PoC 层通过**（`§43`/`§44`）—— 先盘后缓存 + **原子批（把"产物↔压缩位置"不变量交给存储保证）** + fsync 分级；5 条测试含 3 条跨 reopen（`operation-log §43`）。**余**：节点装配（把 PoC 从内存版切成 fjall 版）、两类时钟统一、快照触发/保留策略、真崩溃（子进程）注入 | — |
 | **S3-4** | `RemoteCatalog`（`CatalogOps` 的 gRPC 实现）+ standalone 装配（本地传输、1 节点 raft） | **既有 217 用例全绿**（standalone 不回归）；`if distributed` 分支为零 | 切回 `MemoryCatalog`（装配层开关） |
 | **S3-5** | 幂等权威迁 SM + **键集合**去重（§4.5，含 `§27.5` 遗留 #1） | ✅ **已接线**（`operation-log §39`）：键集合从 WAL 派生、两条提交路径都带上；过程中抓到并修掉"**认领 ≠ 重复**"语义坑（把认领当重复会让 manifest 永不落盘 + 恢复 100% 失败）。**余**：SM 内持久化（S3-3，现仍是 MemoryCatalog 宿主） | — |
 | **S3-6** | 3 节点集群运维：bootstrap / Join / 快照调参 / 观测（leader/term/applied/lag） | `Status` 可读；follower lag 可观测；快照安装不停服 | — |
@@ -278,7 +278,7 @@ S3-0 与 S3-2 可并行（proto 与状态机抽取互不依赖）。
 | 验收项 | 用例 / 方法 | 判据 |
 |---|---|---|
 | 3 节点写入不中断 | 持续写入 + 随机 kill leader（每 20s） | 无写入失败；总计提交数 = 成功数 + 幂等命中数 |
-| 元数据不丢 | 全量重启 metanode（先 kill -9 leader） | 重启后 Catalog 序列化**逐字节等于**重启前（G1） |
+| 元数据不丢 | 全量重启 metanode（先 kill -9 leader） | 重启后 Catalog 序列化**逐字节等于**重启前（G1）。🟡 **PoC 层已通过**（`operation-log §44.1`）：三节点全量重启后逐字节一致（含「从快照恢复」与「全量重放」两条重建路径）+ 反证成立；**余**：真 `kill -9`（子进程级）注入 |
 | 幂等跨进程 | 两个 datanode 同键并发提交 | 只生效一次；行数不重复 |
 | 快照可安装 | 新 follower 加入（日志已被截断） | 安装成功；状态与 leader 一致；安装期间**旧状态仍可服务**。**前置已完成**（载荷+帧，`operation-log §41`）；**安装本身待做 = S3-1b** |
 | snapshot 上界 | 造 N 天 manifest（或 10 万条） | snapshot 大小线性可控；恢复时间有上界 |

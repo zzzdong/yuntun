@@ -191,8 +191,8 @@ enum Command {
 struct NodeState {
     /// 该节点的状态机（**唯一**被 raft 提交序驱动的实例）
     sm: Arc<Mutex<CatalogState>>,
-    /// 该节点的 raft 存储（日志 + 硬状态 + 快照产物）
-    storage: MetaStorage,
+    /// 该节点的 raft 存储（日志 + 硬状态 + 快照产物，**落盘**）
+    storage: FjallStorage,
     /// 当前角色（Leader/Follower/Candidate）—— 由运行线程更新
     role: Arc<Mutex<StateRole>>,
     /// 已应用的 raft 索引
@@ -214,7 +214,14 @@ impl NodeState {
     }
 }
 
-/// 三节点 raft 集群（进程内；存储 = [`MetaStorage`] 内存版）。
+/// 三节点 raft 集群（进程内；存储 = [`FjallStorage`] **落盘版**）。
+///
+/// # 为什么用落盘版而不是内存版
+///
+/// 内存版（[`MetaStorage`]）是**语义的定义处**（它的单测把不变量钉死），但用它做集群就无法
+/// 验证真正重要的一条：**进程重启后状态从盘上重建**（M3 的 G1）。切到落盘版后，`kill` 再
+/// `restart` 就是**真的崩溃恢复**：释放存储句柄（连带释放 fjall 目录锁）→ 重新打开目录 →
+/// 状态机由盘上的快照 + 日志重放**重建**（见 [`FjallStorage::open_with_state`]）。
 ///
 /// 为什么要把 `receivers` / `handles` 收在结构里：S3-1b 的用例需要**杀掉一个 follower
 /// 再用空存储重启**（模拟"落后到只能靠快照追赶"）。邮箱是稳定身份，线程与存储才是可重建的。
@@ -225,8 +232,8 @@ pub struct Cluster {
     /// 线程退出时会把**邮箱交还**（见 `spawn_node` 返回值）——
     /// 否则 `kill` 之后就再也起不回同一个 id（receiver 随线程一起被丢掉）。
     handles: HashMap<u64, thread::JoinHandle<Receiver<Message>>>,
-    /// 被 kill 的节点（**保留其存储与状态机**）—— 见 [`Cluster::restart`]。
-    stopped: HashMap<u64, NodeState>,
+    /// 各节点存储的根目录（每节点一个子目录；`Drop` 时清理）
+    root: std::path::PathBuf,
 }
 
 impl Cluster {
@@ -240,12 +247,13 @@ impl Cluster {
             mailboxes.insert(id, tx);
             receivers.insert(id, rx);
         }
+        let root = temp_root();
         let mut c = Cluster {
             nodes: HashMap::new(),
             mailboxes,
             receivers,
             handles: HashMap::new(),
-            stopped: HashMap::new(),
+            root,
         };
         for id in PEERS {
             c.spawn(id);
@@ -253,22 +261,27 @@ impl Cluster {
         c
     }
 
-    /// 起一个新节点（新状态机 + 空存储）。`receivers` 里必须有它的邮箱。
+    /// 起一个节点：**从盘打开存储**（首次 = 空；重启 = 从快照 + 日志重建状态机）。
     fn spawn(&mut self, id: u64) {
-        let sm = Arc::new(Mutex::new(CatalogState::new()));
-        let storage = MetaStorage::new_for(id, sm.clone(), PEERS.to_vec());
+        let (storage, sm) = FjallStorage::open_with_state(self.node_dir(id), id, PEERS.to_vec())
+            .unwrap_or_else(|e| panic!("打开节点 {id} 的存储失败：{e}"));
         let role = Arc::new(Mutex::new(StateRole::Follower));
         let applied = Arc::new(Mutex::new(0u64));
         let debug = Arc::new(Mutex::new(String::new()));
         self.spawn_with(id, sm, storage, role, applied, debug);
     }
 
-    /// 用**既有**的状态机与存储起线程（重启路径）。
+    /// 某节点的存储目录。
+    pub fn node_dir(&self, id: u64) -> std::path::PathBuf {
+        self.root.join(format!("node{id}"))
+    }
+
+    /// 用给定的状态机与存储起线程。
     fn spawn_with(
         &mut self,
         id: u64,
         sm: Arc<Mutex<CatalogState>>,
-        storage: MetaStorage,
+        storage: FjallStorage,
         role: Arc<Mutex<StateRole>>,
         applied: Arc<Mutex<u64>>,
         debug: Arc<Mutex<String>>,
@@ -354,7 +367,7 @@ impl Cluster {
     pub fn kill(&mut self, id: u64) {
         if let Some(n) = self.nodes.remove(&id) {
             let _ = n.cmd_tx.send(Command::Stop);
-            self.stopped.insert(id, n);
+            drop(n); // 释放存储句柄（含 fjall 目录锁），否则重启打不开同一目录
         }
         if let Some(h) = self.handles.remove(&id) {
             if let Ok(rx) = h.join() {
@@ -380,16 +393,17 @@ impl Cluster {
             !self.nodes.contains_key(&id),
             "节点 {id} 还在运行，先 kill 再 restart"
         );
-        let n = self
-            .stopped
-            .remove(&id)
-            .unwrap_or_else(|| panic!("节点 {id} 没有可恢复的存储（只 kill 过的节点能 restart）"));
-        self.spawn_with(id, n.sm, n.storage, n.role, n.applied, n.debug);
+        // 从自己的目录重新打开：状态机由盘上重建（不是「留着内存」）
+        self.spawn(id);
     }
 
     /// 触发某节点**压缩到已应用位置**（会生成快照产物并丢掉老日志）。
     pub fn compact(&self, id: u64) -> Option<u64> {
-        self.nodes.get(&id).map(|n| n.storage.compact_applied())
+        self.nodes.get(&id).map(|n| {
+            n.storage
+                .compact_applied()
+                .unwrap_or_else(|e| panic!("压缩落盘失败：{e}"))
+        })
     }
 
     /// 某节点安装过的快照数（>0 说明它**确实靠快照**追上，而不是靠日志）。
@@ -441,6 +455,8 @@ impl Drop for Cluster {
         for (_, h) in self.handles.drain() {
             let _ = h.join(); // 退出时交还的邮箱在此丢弃（集群正在析构）
         }
+        self.nodes.clear(); // 先放掉存储句柄（释放 fjall 目录锁），再删目录
+        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 
@@ -450,7 +466,7 @@ fn spawn_node(
     mailbox: Receiver<Message>,
     mailboxes: HashMap<u64, Sender<Message>>,
     sm: Arc<Mutex<CatalogState>>,
-    storage: MetaStorage,
+    storage: FjallStorage,
     role: Arc<Mutex<StateRole>>,
     applied: Arc<Mutex<u64>>,
     debug: Arc<Mutex<String>>,
@@ -470,7 +486,7 @@ fn spawn_node(
             // 状态机的计数器被重复推进（幂等 op 的状态不变，但 `last_applied`/版本号会多走），
             // 于是重启过的副本与其他副本**静默分叉** —— 本轮实测就是被 `set_applied` 的
             // 单调断言拦下的（storage.rs `assert!(index >= inner.applied_index)`）。
-            applied: storage.applied_index(),
+            applied: storage.snapshot_index(),
             ..Default::default()
         };
         // `RawNode` 拿走存储所有权；应用侧继续用 `storage` 句柄（同一份内部状态）
@@ -573,12 +589,18 @@ fn spawn_node(
                     let restored = CatalogState::restore_snapshot(snap.get_data())
                         .unwrap_or_else(|e| panic!("[meta:{id}] 快照损坏，拒绝安装：{e}"));
                     *sm.lock().unwrap() = restored;
-                    storage.apply_snapshot(snap);
+                    storage
+                        .apply_snapshot(snap)
+                        .unwrap_or_else(|e| fatal(id, "安装快照", e));
                 }
                 // 落盘（内存版；生产 = fjall：条目追加 + 硬状态）
-                storage.append(rd.entries());
+                storage
+                    .append(rd.entries())
+                    .unwrap_or_else(|e| fatal(id, "追加日志", e));
                 if let Some(hs) = rd.hs() {
-                    storage.set_hard_state(hs.clone());
+                    storage
+                        .set_hard_state(hs.clone())
+                        .unwrap_or_else(|e| fatal(id, "持久化硬状态", e));
                 }
                 // 应用已提交条目
                 let committed = rd.take_committed_entries();
@@ -600,7 +622,9 @@ fn spawn_node(
                 // ② advance：拿到 commit index 与下一批可应用条目
                 let mut light = raw.advance(rd);
                 if let Some(commit) = light.commit_index() {
-                    storage.set_commit(commit);
+                    storage
+                        .set_commit(commit)
+                        .unwrap_or_else(|e| fatal(id, "提交点落盘", e));
                 }
                 for msg in light.take_messages() {
                     if let Some(tx) = mailboxes.get(&msg.to) {
@@ -626,19 +650,41 @@ fn spawn_node(
     })
 }
 
+/// 持久化失败的处理：**停机**，不是重试也不是忽略。
+///
+/// raft 层"已持久化"的假设一旦被打破，继续跑就会把"已 ack 但没落盘"的数据当成安全的
+/// —— 那比停机危险得多。真实实现应把错误交给上层（记录 + 退出码），由运维决定恢复动作；
+/// PoC 用 panic 表达"绝不带病继续"。
+fn fatal(id: u64, what: &str, e: impl std::fmt::Debug) -> ! {
+    panic!("[meta:{id}] {what} 落盘失败：{e:?} —— 持久化失败必须停机，不能带病继续")
+}
+
+/// 集群临时根目录（每节点一个子目录；`Cluster::drop` 清理）。
+fn temp_root() -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("yuntun-meta-cluster-{nanos}"));
+    std::fs::create_dir_all(&root).expect("建集群目录");
+    root
+}
+
 fn apply_committed(
     id: u64,
-    raw: &mut RawNode<MetaStorage>,
+    raw: &mut RawNode<FjallStorage>,
     entries: Vec<Entry>,
     sm: &Arc<Mutex<CatalogState>>,
-    storage: &MetaStorage,
+    storage: &FjallStorage,
     applied: &Arc<Mutex<u64>>,
     pending: &mut VecDeque<SyncSender<Result<(), String>>>,
 ) {
     for entry in entries {
         // **先按 raft 索引报告已应用位置**（含 no-op / ConfChange —— 它们也占索引，
         // 漏报会让压缩位置与日志错开一格）。刻意放在 `continue` 之前。
-        storage.set_applied(entry.index);
+        storage
+            .set_applied(entry.index)
+            .unwrap_or_else(|e| fatal(id, "记录已应用位置", e));
         // 空条目 = 新 leader 的就位条目（无 op）
         if entry.data.is_empty() {
             continue;
@@ -650,7 +696,9 @@ fn apply_committed(
                 continue;
             }
             if let Ok(cs) = raw.apply_conf_change(&cc) {
-                storage.set_conf_state(cs);
+                storage
+                    .set_conf_state(cs)
+                    .unwrap_or_else(|e| fatal(id, "成员表落盘", e));
             }
             continue;
         }

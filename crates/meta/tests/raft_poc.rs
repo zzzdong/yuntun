@@ -331,3 +331,110 @@ fn wait_all_equal(cluster: &yuntun_meta::Cluster, timeout: Duration) {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+/// **M3 的 G1 判据**：metanode **全量重启**后 Catalog 与重启前**逐字节一致**。
+///
+/// 这是 R3 的目标 1（`metanode-design.md §1.1`），也是"能不能把元数据托付给这套存储"的总检验。
+/// 它一次压到四件事：
+///
+/// | # | 压到什么 | 错了会怎样 |
+/// |---|---|---|
+/// | 1 | 日志与硬状态真落盘（`append`/`set_hard_state` 用 SyncAll） | 重启后数据倒退 |
+/// | 2 | 状态机由盘上**重建**（快照 + 其后日志重放） | 状态凭空少一半（或整份空） |
+/// | 3 | `Config.applied` 取对（= 快照 index） | raft 重放已应用条目 → 计数器多走 → **静默分叉** |
+/// | 4 | 成员表恢复 | 重启后组不成立（选不出 leader） |
+///
+/// 场景里**先在 leader 上压缩一次**：于是 leader 重启走"从快照恢复 + 重放其后条目"，
+/// 其余节点走"空状态机 + 全量日志重放"—— 两条重建路径都被覆盖（这是 42.4b 那个
+/// "怎么稳定走到快照"的遗留在本层的替代验证：**恢复路径**而非**发送路径**）。
+#[test]
+fn full_cluster_restart_keeps_state_byte_identical() {
+    let mut cluster = yuntun_meta::Cluster::start();
+    let leader = cluster.wait_leader(T).expect("三节点应选出 leader");
+
+    cluster
+        .propose(
+            PocOp::CreateSchema {
+                name: "analytics".into(),
+                now_ms: 1_000,
+            },
+            T,
+        )
+        .expect("建 schema");
+    cluster
+        .propose(
+            PocOp::CreateTable {
+                name: "cpu".into(),
+                now_ms: 1_001,
+            },
+            T,
+        )
+        .expect("建表");
+    let mut now = 2_000u64;
+    for b in ["r1", "r2", "r3", "r4"] {
+        now += 1;
+        cluster
+            .propose(
+                PocOp::Commit {
+                    table: "public.cpu".into(),
+                    batch_id: b.into(),
+                    rows: 1,
+                    now_ms: now,
+                },
+                T,
+            )
+            .expect("写入");
+    }
+    wait_all_equal(&cluster, T);
+
+    // 让 leader 压缩一次：制造"从快照恢复"的重建路径
+    let compacted = cluster.compact(leader).expect("leader 在运行");
+    assert!(compacted > 0, "压缩必须真的发生（否则只覆盖了重放路径）");
+
+    // 记下重启前的状态（逐字节）
+    let before: Vec<(u64, Vec<u8>)> = PEERS
+        .iter()
+        .map(|id| (*id, cluster.canonical(*id).expect("节点在运行")))
+        .collect();
+
+    // **全量重启**（模拟"metanode 全量重启"：三个进程都死掉再起来）
+    for id in PEERS {
+        cluster.kill(id);
+    }
+    assert_eq!(cluster.alive(), 0, "全部停掉（此时只剩盘上的文件）");
+    for id in PEERS {
+        cluster.restart(id);
+    }
+
+    // 断言 G1：每个节点的状态与重启前**逐字节一致**
+    let deadline = std::time::Instant::now() + T;
+    loop {
+        let all_same = before
+            .iter()
+            .all(|(id, want)| cluster.canonical(*id).as_ref() == Some(want));
+        if all_same {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "全量重启后状态与重启前不一致（M3 的 G1 不成立）\n{}",
+            cluster.dump()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // 重启后必须**还能服务**：再写一笔，三个节点继续收敛
+    now += 1;
+    cluster
+        .propose(
+            PocOp::Commit {
+                table: "public.cpu".into(),
+                batch_id: "after_restart".into(),
+                rows: 1,
+                now_ms: now,
+            },
+            T,
+        )
+        .expect("重启后应能继续提交");
+    wait_all_equal(&cluster, T);
+}
