@@ -10,7 +10,6 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use arrow::array::Int64Array;
-use yuntun_catalog::CatalogOps;
 use yuntun_server::Lakehouse;
 use yuntun_sql::session::SessionCtx;
 use yuntun_sql::SqlResult;

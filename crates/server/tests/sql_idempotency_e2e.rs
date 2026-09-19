@@ -21,7 +21,6 @@ use arrow_flight::{Action, FlightData, FlightDescriptor, PutResult, Ticket};
 use futures::StreamExt;
 use prost::Message;
 use tokio_util::sync::CancellationToken;
-use yuntun_catalog::CatalogOps;
 use yuntun_model::ops::CreateTableRequest;
 use yuntun_server::flight::command_bytes;
 use yuntun_server::Lakehouse;
@@ -126,7 +125,7 @@ async fn count_rows(lakehouse: &Lakehouse) -> i64 {
     lakehouse
         .query
         .catalog()
-        .refresh(&(lakehouse.catalog.clone() as Arc<dyn CatalogOps>))
+        .refresh(&(lakehouse.catalog.clone()))
         .await
         .unwrap();
     let batches = lakehouse

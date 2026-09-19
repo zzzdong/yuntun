@@ -23,7 +23,12 @@ use yuntun_wal::writer::WalWriter;
 
 /// 运行中的各组件句柄（供运维查询/测试断言）。
 pub struct Lakehouse {
-    pub catalog: Arc<MemoryCatalog>,
+    /// **只暴露 trait**（`Arc<dyn CatalogOps>`）：全仓只有装配点知道用的是哪个实现。
+    ///
+    /// 这就是「**`if distributed` 分支为零**」的实现方式 —— 不靠纪律，靠**类型**：
+    /// 别处拿不到 `MemoryCatalog`（要拿得先在这里 `as` 下去，一眼可见）。
+    /// 分布式形态切换时，改的只有装配点那一行。
+    pub catalog: Arc<dyn CatalogOps>,
     pub ingestor: Arc<Ingestor>,
     pub query: Arc<QueryEngine>,
     /// SQL 处理层（W-4：MySQL wire 端口与 FlightServer 各自持有句柄；
@@ -120,7 +125,7 @@ impl Lakehouse {
 pub async fn collect_metrics(
     ingestor: &Arc<Ingestor>,
     query: &Arc<QueryEngine>,
-    catalog: &Arc<MemoryCatalog>,
+    catalog: &Arc<dyn CatalogOps>,
     wal: &WalWriter,
 ) -> LakehouseMetrics {
     let cs = ingestor.chunk_stats();
@@ -193,8 +198,10 @@ impl Lakehouse {
         cfg: &Config,
         shutdown: CancellationToken,
     ) -> Result<Self, yuntun_model::error::LakeError> {
-        // ① Catalog（C5：阶段 0 内存实现）
-        let catalog = Arc::new(MemoryCatalog::new());
+        // ① Catalog —— **装配点**：全仓只有这一处知道具体实现是谁。
+        //    分布式形态（S3-4 第二件）就是在这里换成 `RemoteCatalog`，别处一行不改。
+        //    C5：阶段 0 是内存实现（重启后靠 WAL 的 DDL 重放重建）。
+        let catalog: Arc<dyn CatalogOps> = Arc::new(MemoryCatalog::new());
 
         // ② ObjectStore
         let store_cfg = match &cfg.store {
@@ -431,7 +438,7 @@ pub fn spawn_metrics_log(
 /// 记录重建；重放幂等（TableAlreadyExists / TableNotFound 忽略），保证 SQL 写入的数据
 /// 崩溃重启后表存在、可恢复（S1.6 验收）。
 async fn replay_wal_ddl(
-    catalog: &Arc<MemoryCatalog>,
+    catalog: &Arc<dyn CatalogOps>,
     wal: &WalWriter,
 ) -> Result<(), yuntun_model::error::LakeError> {
     let reader = yuntun_wal::reader::WalReader::new(wal.shard_dir());

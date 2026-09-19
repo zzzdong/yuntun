@@ -1079,7 +1079,7 @@ async fn compaction_during_query_keeps_counts_monotonic() {
         })
     };
 
-    let c = compactor(setup.catalog.clone() as Arc<dyn CatalogOps>, &store_root, 3);
+    let c = compactor(setup.catalog.clone(), &store_root, 3);
     let mut acked = 0u64;
     for round in 0..3 {
         // 每轮 3 批 → 3 个文件（rows_threshold=1，每批一个 chunk）

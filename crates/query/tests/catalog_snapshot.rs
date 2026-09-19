@@ -50,7 +50,7 @@ async fn commit(c: &MemoryCatalog, table: &str, batch_id: &str) {
 }
 
 fn catalog_ref(c: &Arc<MemoryCatalog>) -> Arc<dyn CatalogOps> {
-    c.clone() as Arc<dyn CatalogOps>
+    c.clone()
 }
 
 #[tokio::test]

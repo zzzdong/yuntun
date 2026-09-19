@@ -20,7 +20,6 @@ use arrow_flight::sql::{
 use arrow_flight::{Action, FlightData, FlightDescriptor, PutResult};
 use futures::StreamExt;
 use prost::Message;
-use yuntun_catalog::CatalogOps;
 use yuntun_model::ops::CreateTableRequest;
 use yuntun_server::flight::command_bytes;
 use yuntun_server::Lakehouse;
@@ -159,7 +158,7 @@ scan_interval_ms = 20
     lakehouse
         .query
         .catalog()
-        .refresh(&(lakehouse.catalog.clone() as Arc<dyn CatalogOps>))
+        .refresh(&(lakehouse.catalog.clone()))
         .await
         .unwrap();
 
@@ -373,7 +372,7 @@ scan_interval_ms = 20
     lakehouse
         .query
         .catalog()
-        .refresh(&(lakehouse.catalog.clone() as Arc<dyn CatalogOps>))
+        .refresh(&(lakehouse.catalog.clone()))
         .await
         .unwrap();
 

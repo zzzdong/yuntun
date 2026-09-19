@@ -381,7 +381,7 @@ mod tests {
     async fn compact_merges_files_atomically() {
         let catalog: Arc<MemoryCatalog> = Arc::new(MemoryCatalog::new());
         setup(&catalog).await;
-        let c = compactor(catalog.clone() as Arc<dyn CatalogOps>);
+        let c = compactor(catalog.clone());
 
         // 写 3 个文件并提交
         let mut batch_ids = Vec::new();
@@ -459,7 +459,7 @@ mod tests {
     async fn compact_skips_when_below_threshold() {
         let catalog: Arc<MemoryCatalog> = Arc::new(MemoryCatalog::new());
         setup(&catalog).await;
-        let c = compactor(catalog.clone() as Arc<dyn CatalogOps>);
+        let c = compactor(catalog.clone());
         let snap = catalog.current_snapshot().await;
         // 无文件 → None
         assert!(compact_shard(&c, "t", "s0", snap).await.unwrap().is_none());

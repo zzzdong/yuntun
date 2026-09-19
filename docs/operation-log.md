@@ -3261,3 +3261,56 @@ CLI 层拦的是"人手打错"，`MetaNode::open` 拦的是"API 调用方漏了"
 | 4 | 其余 op 的 proto 镜像（`DropSchema`/`EvolveSchema`/`DropShard`/`Compaction`） | S3-0 余 |
 
 ---
+
+---
+
+## 52. R3 S3-4（第二件·上半）：拆掉 catalog 接缝上的**具体类型**（2026-09-20）
+
+### 52.0 本轮做了什么
+
+把"装配层之外还能看见 `MemoryCatalog`"这件事，从**纪律**变成**类型**：
+
+| 位置 | 之前 | 现在 |
+|---|---|---|
+| `Lakehouse.catalog` | `Arc<MemoryCatalog>` | **`Arc<dyn CatalogOps>`** |
+| `collect_metrics` / `replay_wal_ddl` 的参数 | `&Arc<MemoryCatalog>` | `&Arc<dyn CatalogOps>` |
+| 测试与夹具里的 `x.clone() as Arc<dyn CatalogOps>` | 转型（因为源是具体类型） | 已随之清理（只有"源类型确实是具体类型"的 4 处保留转型：chaos 夹具 / query 测试助手） |
+
+**这一轮是纯类型级改动，零行为变化** —— 所以它的验收判据就是"**用例必须一模一样地全绿**"。
+
+### 52.1 判据（S3-4 原话的两条）
+
+| 判据 | 结果 |
+|---|---|
+| **既有用例全绿**（standalone 不回归） | ✅ **293 passed / 0 failed**（59 targets；日志无 `Blocking waiting for file lock` = 可采信，见 `§51.5`） |
+| **`if distributed` 分支为零** | ✅ **代码命中 0**（只有两处**注释**提到这句话） |
+| 生产代码里谁还知道具体实现 | ✅ 全仓**只有装配点一处**：`crates/server/src/lib.rs` 的 `let catalog: Arc<dyn CatalogOps> = Arc::new(MemoryCatalog::new());`。其余 `MemoryCatalog` 出现处全在**测试模块**或注释里 |
+
+**为什么靠类型而不是靠纪律**：别处拿不到 `MemoryCatalog` —— 要拿得先在装配点 `as` 下去，一眼可见。
+分布式形态切换时（下一件）改的就是那一行。
+
+### 52.2 探明的"下一件要补什么"（这轮的真正价值）
+
+量了一遍生产代码对 catalog 的**全部**方法依赖（`server`/`query`/`ingest`/`compaction`），结论：
+
+- **全部落在 trait 上** ✅ —— 包括一开始担心的 `current_snapshot` / `known_batch_ids` /
+  `check_idempotency` / `record_idempotency`（它们早就在 trait 上，`compaction` 与 `ingest` 一直在用）
+  → **接缝没有"只有具体类型才有"的隐藏依赖**，这是最好的结果。
+- 所以 `RemoteCatalog` 要覆盖的就是 `CatalogOps` 的 **21 个方法**，其中：
+  | 类别 | 线上路径 | 状态 |
+  |---|---|---|
+  | 写（DDL/提交/分片/Compaction/幂等记录） | `Propose(op)` | 4 个 op 已镜像（CreateSchema/DropTable/CommitFiles/CreateTable）；**余** DropSchema/EvolveSchema/DropShard/Compaction/幂等记录 |
+  | 读（版本/表元数据/schema/命名空间） | `Prefetch` / `Delta` | ✅ `§51` 已定形 |
+  | 读（文件/清单级） | `Prefetch` 载荷（**待扩**） | ⏳ 载荷现在只到"表 + schema" |
+  | 线性化读位置 | `Status.applied_index` | ⏳ 需在 `§5` 约定 4 的口径下定形（ReadIndex） |
+
+### 52.3 遗留（下一件 = S3-4 第二件·下半）
+
+| # | 项 | 说明 |
+|---|---|---|
+| 1 | `RemoteCatalog`（`CatalogOps` 的 gRPC 实现） | 写走 `Propose`、读走 `Prefetch`；按 52.2 的表补齐缺口 |
+| 2 | 其余 op 镜像：`DropSchema`/`EvolveSchema`/`DropShard`/`Compaction`/幂等记录 | 机械工作，但**必须先有**（`RemoteCatalog` 的写路径要用） |
+| 3 | 文件/清单级读载荷（`list_visible_files`） | 现在 `Prefetch` 载荷不含文件级条目 |
+| 4 | 切装配点 | 一行；但只有 1–3 完成后才可能全绿 |
+
+---

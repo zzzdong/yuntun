@@ -13,7 +13,6 @@ use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::Ticket;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
-use yuntun_catalog::CatalogOps;
 use yuntun_server::Lakehouse;
 
 /// 简易轨执行 SQL（返回结果批次；DDL/INSERT 为空）。
@@ -235,7 +234,7 @@ async fn multi_schema_create_isolate_and_recover() {
     lakehouse
         .query
         .catalog()
-        .refresh(&(lakehouse.catalog.clone() as Arc<dyn CatalogOps>))
+        .refresh(&(lakehouse.catalog.clone()))
         .await
         .unwrap();
     let shutdown2 = CancellationToken::new();
