@@ -169,8 +169,8 @@ impl CatalogState { pub fn apply(&mut self, revision: u64, op: &CatalogOp) -> Op
 
 | 项 | 决定 | 理由 |
 |---|---|---|
-| 内容 | `CatalogState` 的 prost 编码（含**两组版本号**、每表最后变更版本、幂等索引） | 少任何一项都会让 follower 的 delta 语义失真 |
-| 格式 | 顶部带 `format_version` + `revision` 头，后跟分块 payload（每块可独立校验 CRC） | 与 WAL 的 tearing 教训一致（`§29.1`）：**部分接收必须能被识别** |
+| 内容 | `CatalogState` 的 prost 编码（含**两组版本号**、每表最后变更版本、幂等索引） | 少任何一项都会让 follower 的 delta 语义失真。✅ **载荷已实现 2026-09-19**：`CatalogStateSnapshot`（11 字段**逐字段无损**；`encode_canonical` **不是**快照格式、别混用）。防线 = `snapshot_covers_every_state_dimension`（逐一改动 11 个维度、断言快照字节必变）—— 专防"加字段忘加进快照"（那种漏法会让换主/重启**静默回退**）。重建**拒绝**而非"尽力恢复"（键重复/缺 `public`/空条目一律报错；`operation-log §41.7`） |
+| 格式 | 顶部带 `format_version` + `revision` 头，后跟分块 payload（每块可独立校验 CRC） | 与 WAL 的 tearing 教训一致（`§29.1`）：**部分接收必须能被识别**。✅ **已实现 2026-09-19**：`model/src/snapshot.rs`（帧头 CRC + 块 CRC + 总长一致**三层**；实测"任一偏移截断/任一字节翻转"都检出）。⚠️ 校验顺序是 **magic → 帧头 CRC → 版本**：先报版本会把"文件损坏"误诊成"版本不支持"（`operation-log §41.6`） |
 | 触发 | 日志条数 > `N`（默认 10 万）或状态 > `M`（默认 256MB） | "现在就定上界"（`refactor.md §6.2`） |
 | 安装 | 落临时目录 → 校验 → 原子替换 → 更新 `applied_index` | 崩溃安全；安装期间**服务不停**（旧状态继续服务） |
 | **保留策略** | manifest 条目**不无限增长**：按表保留 `checkpoint`（每窗口/每天一个基线）+ 近期条目；归档旧条目到对象存储（路径进 SM） | 否则 snapshot 必然膨胀到传不动（这是 `§6.2` 点名的高成本补救项） |
@@ -280,7 +280,7 @@ S3-0 与 S3-2 可并行（proto 与状态机抽取互不依赖）。
 | 3 节点写入不中断 | 持续写入 + 随机 kill leader（每 20s） | 无写入失败；总计提交数 = 成功数 + 幂等命中数 |
 | 元数据不丢 | 全量重启 metanode（先 kill -9 leader） | 重启后 Catalog 序列化**逐字节等于**重启前（G1） |
 | 幂等跨进程 | 两个 datanode 同键并发提交 | 只生效一次；行数不重复 |
-| 快照可安装 | 新 follower 加入（日志已被截断） | 安装成功；状态与 leader 一致；安装期间**旧状态仍可服务** |
+| 快照可安装 | 新 follower 加入（日志已被截断） | 安装成功；状态与 leader 一致；安装期间**旧状态仍可服务**。**前置已完成**（载荷+帧，`operation-log §41`）；**安装本身待做 = S3-1b** |
 | snapshot 上界 | 造 N 天 manifest（或 10 万条） | snapshot 大小线性可控；恢复时间有上界 |
 | standalone 不回归 | `cargo test --workspace` | **全绿**（当前 217）+ `if distributed` 零命中 |
 | 读旧窗口可观测 | 写入后立刻在另一节点查 | 结果符合声明（≤30s 收敛），且 `metrics` 里有 lag 指标 |

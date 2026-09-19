@@ -38,6 +38,11 @@ use yuntun_model::ops::{
 use yuntun_model::schema::apply_change;
 
 use crate::normalize_table;
+use yuntun_model::error::SnapshotError;
+use yuntun_model::snapshot::{
+    CatalogStateSnapshot, SnapshotFileEntry, SnapshotIdempotencyEntry, SnapshotSchemaEntry,
+    SnapshotTableEntry, SnapshotTableVerEntry, SNAPSHOT_FORMAT_VERSION,
+};
 
 /// Catalog 的全部可变状态。
 ///
@@ -490,11 +495,202 @@ impl CatalogState {
 
     // ---------------------------------------------------------------- 确定性编码
 
-    /// 状态机的**规范编码**：用于①快照（S3-3 会换成 prost 版本，语义不变）
-    /// ②**确定性对拍**（同一串 op → 同一段字节）。
+    // ---------------------------------------------------------------- 快照（metanode-design §4.4）
+
+    /// 导出**完整**快照消息（逐字段；不做校验）。
+    ///
+    /// 与 [`Self::encode_canonical`] 的区别是**目的不同**：那个是给"对拍"用的可读文本
+    /// （只含能区分状态的字段），这个是给"换主/重启/新节点追日志"用的**无损**载荷。
+    /// 少一个字段 = 状态静默回退，所以这里必须逐字段搬，并靠
+    /// `snapshot_covers_every_state_dimension` 测试兜住"加字段忘加进快照"。
+    pub fn to_snapshot_msg(&self) -> CatalogStateSnapshot {
+        CatalogStateSnapshot {
+            format_version: SNAPSHOT_FORMAT_VERSION as u64,
+            revision: self.snapshot_version,
+            last_applied: self.last_applied,
+            schema_ver: self.schema_ver,
+            manifest_ver: self.manifest_ver,
+            namespaces: self.namespaces.iter().cloned().collect(),
+            tables: self
+                .tables
+                .iter()
+                .map(|(k, v)| SnapshotTableEntry {
+                    name: k.clone(),
+                    meta: Some(v.clone()),
+                })
+                .collect(),
+            schemas: self
+                .schemas
+                .iter()
+                .map(|((t, ver), sv)| SnapshotSchemaEntry {
+                    table: t.clone(),
+                    version: *ver,
+                    value: Some(sv.clone()),
+                })
+                .collect(),
+            files: self
+                .files
+                .iter()
+                .map(|(k, v)| SnapshotFileEntry {
+                    batch_id: k.clone(),
+                    manifest: Some(v.clone()),
+                })
+                .collect(),
+            idempotency: self
+                .idempotency
+                .iter()
+                .map(|(k, v)| SnapshotIdempotencyEntry {
+                    key: k.clone(),
+                    record: Some(v.clone()),
+                })
+                .collect(),
+            table_manifest_ver: self
+                .table_manifest_ver
+                .iter()
+                .map(|(t, v)| SnapshotTableVerEntry {
+                    table: t.clone(),
+                    manifest_ver: *v,
+                })
+                .collect(),
+        }
+    }
+
+    /// 从快照消息**严格**重建。
+    ///
+    /// 校验规则（**拒绝**而非"尽力恢复" —— 静默取"最后一个"会让副本间状态分歧）：
+    ///
+    /// | 规则 | 理由 |
+    /// |---|---|
+    /// | `format_version` 必须等于本实现版本 | 载荷布局变了就必须显式拒绝，不能猜 |
+    /// | `revision > 0` | 0 表示"快照号未初始化"，不是合法状态 |
+    /// | `namespaces` 必须含 `public` | 状态机不变量（[`Self::new`] 保证） |
+    /// | 各列表**键不得重复** | 重复键 → "谁生效"取决于遍历顺序 = 不确定性 |
+    /// | 条目值不得为 `None` | 空条目是构造错误，不是合法状态 |
+    ///
+    /// **不**校验的（有意）：文件与表的引用完整性。事件到达顺序可能让快照里出现
+    /// "文件引用了已删表"的中间态（`drop_table` 与 `commit_files` 的交错），
+    /// 硬校验会让**合法快照装不进去** —— 那比少校验危险得多。
+    pub fn from_snapshot_msg(msg: CatalogStateSnapshot) -> Result<Self, SnapshotError> {
+        if msg.format_version != SNAPSHOT_FORMAT_VERSION as u64 {
+            return Err(SnapshotError::UnsupportedVersion(msg.format_version as u32));
+        }
+        if msg.revision == 0 {
+            return Err(SnapshotError::InvalidState(
+                "revision 必须 > 0（0 = 快照号未初始化）".into(),
+            ));
+        }
+        if !msg.namespaces.iter().any(|n| n == DEFAULT_SCHEMA) {
+            return Err(SnapshotError::InvalidState(format!(
+                "namespaces 必须含 {DEFAULT_SCHEMA}"
+            )));
+        }
+        let mut namespaces = BTreeSet::new();
+        for n in &msg.namespaces {
+            if !namespaces.insert(n.clone()) {
+                return Err(SnapshotError::InvalidState(format!("schema {n} 重复")));
+            }
+        }
+        let mut tables: BTreeMap<String, TableMeta> = BTreeMap::new();
+        for e in &msg.tables {
+            let v = e
+                .meta
+                .clone()
+                .ok_or_else(|| SnapshotError::InvalidState(format!("表 {} 缺 meta", e.name)))?;
+            if tables.insert(e.name.clone(), v).is_some() {
+                return Err(SnapshotError::InvalidState(format!("表 {} 重复", e.name)));
+            }
+        }
+        let mut schemas: BTreeMap<(String, u64), SchemaVersion> = BTreeMap::new();
+        for e in &msg.schemas {
+            let v = e.value.clone().ok_or_else(|| {
+                SnapshotError::InvalidState(format!("schema {} v{} 缺值", e.table, e.version))
+            })?;
+            if schemas.insert((e.table.clone(), e.version), v).is_some() {
+                return Err(SnapshotError::InvalidState(format!(
+                    "schema {} v{} 重复",
+                    e.table, e.version
+                )));
+            }
+        }
+        let mut files: BTreeMap<String, FileManifest> = BTreeMap::new();
+        for e in &msg.files {
+            let v = e.manifest.clone().ok_or_else(|| {
+                SnapshotError::InvalidState(format!("文件 {} 缺 manifest", e.batch_id))
+            })?;
+            if files.insert(e.batch_id.clone(), v).is_some() {
+                return Err(SnapshotError::InvalidState(format!(
+                    "文件 {} 重复",
+                    e.batch_id
+                )));
+            }
+        }
+        let mut idempotency: BTreeMap<String, IdempotencyRecord> = BTreeMap::new();
+        for e in &msg.idempotency {
+            let v = e
+                .record
+                .clone()
+                .ok_or_else(|| SnapshotError::InvalidState(format!("幂等键 {} 缺记录", e.key)))?;
+            if idempotency.insert(e.key.clone(), v).is_some() {
+                return Err(SnapshotError::InvalidState(format!("幂等键 {} 重复", e.key)));
+            }
+        }
+        let mut table_manifest_ver: BTreeMap<String, u64> = BTreeMap::new();
+        for e in &msg.table_manifest_ver {
+            if table_manifest_ver
+                .insert(e.table.clone(), e.manifest_ver)
+                .is_some()
+            {
+                return Err(SnapshotError::InvalidState(format!(
+                    "table_manifest_ver {} 重复",
+                    e.table
+                )));
+            }
+        }
+        Ok(Self {
+            tables,
+            namespaces,
+            schemas,
+            files,
+            idempotency,
+            snapshot_version: msg.revision,
+            last_applied: msg.last_applied,
+            schema_ver: msg.schema_ver,
+            manifest_ver: msg.manifest_ver,
+            table_manifest_ver,
+        })
+    }
+
+    /// **快照产物** = 无损载荷打上帧（分块 + CRC）。
+    ///
+    /// 这是可直接写进 fjall / 对象存储 / 经 gRPC 传输的字节。
+    pub fn snapshot_artifact(&self) -> Vec<u8> {
+        let payload = yuntun_model::snapshot::encode_payload(&self.to_snapshot_msg());
+        yuntun_model::snapshot::frame(&payload, self.snapshot_version, 0)
+    }
+
+    /// 从快照产物恢复（解帧 → 解载荷 → 严格重建）。
+    ///
+    /// 帧头的 `revision` 必须与载荷里的 `revision` 一致：不一致说明帧与载荷
+    /// **不是同一次快照产生的**（拼接/回滚搞混），装上去必错。
+    pub fn restore_snapshot(bytes: &[u8]) -> Result<Self, SnapshotError> {
+        let un = yuntun_model::snapshot::unframe(bytes)?;
+        let msg = yuntun_model::snapshot::decode_payload(&un.payload)?;
+        if msg.revision != un.revision {
+            return Err(SnapshotError::RevisionMismatch {
+                framed: un.revision,
+                payload: msg.revision,
+            });
+        }
+        Self::from_snapshot_msg(msg)
+    }
+
+    /// 状态机的**规范编码**：**确定性对拍**用（同一串 op → 同一段字节），人可读。
     ///
     /// 编码里必须包含**所有**会影响后续行为的字段 —— 少一个字段，对拍就会漏掉一类分叉：
     /// 两组版本号、每表最后变更版本、快照号、幂等索引、版本链的 `created_at` …
+    ///
+    /// ⚠️ 本函数**不是**快照格式：它只编码能区分状态的字段（够对拍、人可读）。
+    /// 换主/重启/新节点追日志要用**无损**的 [`Self::snapshot_artifact`]，两者别混用。
     pub fn encode_canonical(&self) -> Vec<u8> {
         use std::fmt::Write as _;
         let mut s = String::new();
@@ -774,5 +970,263 @@ mod tests {
         assert_eq!(st.sweep_expired_idempotency(24 * 3600, 100 + 23 * 3600), 0);
         // now = 100 + 25h → 过期
         assert_eq!(st.sweep_expired_idempotency(24 * 3600, 100 + 25 * 3600), 1);
+    }
+}
+
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+    use yuntun_model::error::SnapshotError;
+    use yuntun_model::meta::IngestConfig;
+    use yuntun_model::schema::SchemaChange;
+    use yuntun_model::snapshot::{encode_payload, frame};
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)]))
+    }
+
+    fn create_table_req(name: &str) -> CreateTableRequest {
+        CreateTableRequest {
+            name: name.into(),
+            namespace: DEFAULT_SCHEMA.into(),
+            schema: schema(),
+            partition_cols: vec![],
+            default_format: "parquet".into(),
+            ingest_config: IngestConfig::standard(),
+        }
+    }
+
+    fn commit_req(table: &str, batch_id: &str, keys: &[&str]) -> CommitFilesRequest {
+        CommitFilesRequest {
+            table: table.into(),
+            batch_id: batch_id.into(),
+            client_request_id: keys.first().map(|s| s.to_string()),
+            client_request_ids: keys.iter().map(|s| s.to_string()).collect(),
+            shard: "s0".into(),
+            time_window: "w1".into(),
+            files: vec![FileManifest {
+                file_path: format!("p/{batch_id}.parquet"),
+                batch_id: batch_id.into(),
+                table: table.into(),
+                shard: "s0".into(),
+                time_window: "w1".into(),
+                row_count: 7,
+                ..Default::default()
+            }],
+            schema_version: 1,
+            row_count: 7,
+        }
+    }
+
+    /// 一个"每个维度都非空"的状态：快照测试必须有东西可丢，否则测不出漏字段。
+    fn rich_state() -> CatalogState {
+        let mut st = CatalogState::new();
+        st.create_schema("analytics").unwrap();
+        st.create_table(create_table_req("cpu"), 1_000).unwrap();
+        st.evolve_schema(
+            EvolveSchemaRequest {
+                table: format!("{DEFAULT_SCHEMA}.cpu"),
+                expected_version: 1,
+                change: SchemaChange::AddColumn {
+                    field: Field::new("host", DataType::Utf8, true),
+                },
+            },
+            1_001,
+        )
+        .unwrap();
+        st.commit_files(commit_req("public.cpu", "b1", &["k1"]), 1_002)
+            .unwrap();
+        st.record_idempotency(IdempotencyRecord {
+            client_request_id: "k9".into(),
+            batch_id: "b1".into(),
+            committed_at: 1_002,
+        });
+        st
+    }
+
+    /// **无损往返**：产物 → 恢复 → 规范编码与再编码都必须**逐字节相同**。
+    ///
+    /// 再编码相同这一条很关键：它同时证明"快照编码是确定性的"
+    /// （否则同一个状态会产出不同字节，副本间无法比对、去重、缓存）。
+    #[test]
+    fn snapshot_roundtrip_is_lossless_and_deterministic() {
+        let a = rich_state();
+        let bytes = a.snapshot_artifact();
+        let b = CatalogState::restore_snapshot(&bytes).expect("恢复应成功");
+
+        assert_eq!(
+            a.encode_canonical(),
+            b.encode_canonical(),
+            "恢复出的状态与源状态不等价（规范编码不同）"
+        );
+        assert_eq!(
+            a.snapshot_artifact(),
+            bytes,
+            "恢复后重新产出快照的字节变了 → 快照编码不确定"
+        );
+        assert_eq!(b.current_snapshot(), a.current_snapshot(), "快照号丢失");
+        assert_eq!(b.read_index(), a.read_index(), "applied index 丢失");
+        assert_eq!(b.version(), a.version(), "schema/manifest 版本丢失");
+    }
+
+    /// **往返之后行为一致**：恢复出的状态**继续 apply 同一个 op**，必须与源状态收敛到同一结果。
+    ///
+    /// 比"编码相同"更强：它证明快照没有丢掉任何**影响未来应用结果**的东西
+    /// （例如漏掉 `idempotency` 会让同一幂等键在恢复后**重复生效**，
+    /// 而静态编码比对在某些字段上未必看得出来）。
+    #[test]
+    fn snapshot_roundtrip_preserves_future_behavior() {
+        let mut a = rich_state();
+        let bytes = a.snapshot_artifact();
+        let mut b = CatalogState::restore_snapshot(&bytes).expect("恢复应成功");
+
+        // 幂等键 k1 已用过：恢复后必须仍然"命中"，而不是再次提交
+        let ra = a.commit_files(commit_req("public.cpu", "b2", &["k1"]), 2_000);
+        let rb = b.commit_files(commit_req("public.cpu", "b2", &["k1"]), 2_000);
+        assert_eq!(
+            format!("{ra:?}").contains("duplicate"),
+            format!("{rb:?}").contains("duplicate"),
+            "幂等判定在恢复前后不一致：源={ra:?} 恢复={rb:?}"
+        );
+        // 再提交一个新键，两边必须都接受且状态一致
+        a.commit_files(commit_req("public.cpu", "b3", &["k3"]), 2_001)
+            .unwrap();
+        b.commit_files(commit_req("public.cpu", "b3", &["k3"]), 2_001)
+            .unwrap();
+        assert_eq!(
+            a.encode_canonical(),
+            b.encode_canonical(),
+            "恢复后的状态机与源状态机对同一后续 op 反应不同"
+        );
+    }
+
+    /// **维度覆盖**：状态机的**每个**维度都必须体现在快照里。
+    ///
+    /// 这是专防"加字段忘了加进快照"的回归测试 —— 那种漏法不会让任何测试变红，
+    /// 只会让换主/重启后状态**静默回退**。所以每个维度都断言"改了它，产物必须变"。
+    #[test]
+    fn snapshot_covers_every_state_dimension() {
+        let base = rich_state();
+        let base_bytes = base.snapshot_artifact();
+        let mut cases: Vec<(&str, CatalogState)> = Vec::new();
+
+        let mut s = rich_state();
+        s.create_schema("another").unwrap();
+        cases.push(("namespaces", s));
+
+        let mut s = rich_state();
+        s.create_table(create_table_req("mem"), 3_000).unwrap();
+        cases.push(("tables", s));
+
+        let mut s = rich_state();
+        s.evolve_schema(
+            EvolveSchemaRequest {
+                table: format!("{DEFAULT_SCHEMA}.cpu"),
+                expected_version: 2,
+                change: SchemaChange::AddColumn {
+                    field: Field::new("region", DataType::Utf8, true),
+                },
+            },
+            3_001,
+        )
+        .unwrap();
+        cases.push(("schemas", s));
+
+        let mut s = rich_state();
+        s.commit_files(commit_req("public.cpu", "b4", &["k4"]), 3_002)
+            .unwrap();
+        cases.push(("files", s));
+
+        let mut s = rich_state();
+        s.record_idempotency(IdempotencyRecord {
+            client_request_id: "kz".into(),
+            batch_id: "b1".into(),
+            committed_at: 3_003,
+        });
+        cases.push(("idempotency", s));
+
+        // 计数器是**白盒**改的：它们是状态的一部分，但没有任何公开 op 只改计数器
+        let mut s = rich_state();
+        s.snapshot_version += 1;
+        cases.push(("snapshot_version(revision)", s));
+        let mut s = rich_state();
+        s.last_applied += 1;
+        cases.push(("last_applied", s));
+        let mut s = rich_state();
+        s.schema_ver += 1;
+        cases.push(("schema_ver", s));
+        let mut s = rich_state();
+        s.manifest_ver += 1;
+        cases.push(("manifest_ver", s));
+        let mut s = rich_state();
+        s.table_manifest_ver
+            .insert("public.cpu".into(), 9_999);
+        cases.push(("table_manifest_ver", s));
+
+        for (name, st) in cases {
+            assert_ne!(
+                st.snapshot_artifact(),
+                base_bytes,
+                "维度 `{name}` 变了但快照字节没变 → 快照漏了这个字段（换主/重启后会静默回退）"
+            );
+        }
+    }
+
+    /// 重复键必须**拒绝**：重复键下"谁生效"取决于遍历顺序 = 不确定性。
+    #[test]
+    fn snapshot_rejects_duplicate_keys() {
+        let st = rich_state();
+        let mut msg = st.to_snapshot_msg();
+        let dup = msg.tables[0].clone();
+        msg.tables.push(dup);
+        let err = CatalogState::from_snapshot_msg(msg).unwrap_err();
+        assert!(
+            matches!(err, SnapshotError::InvalidState(ref m) if m.contains("重复")),
+            "重复表键未被拒绝：{err:?}"
+        );
+    }
+
+    /// 缺 `public` 的状态非法（状态机不变量）。
+    #[test]
+    fn snapshot_rejects_missing_public_namespace() {
+        let st = rich_state();
+        let mut msg = st.to_snapshot_msg();
+        msg.namespaces.retain(|n| n != DEFAULT_SCHEMA);
+        let err = CatalogState::from_snapshot_msg(msg).unwrap_err();
+        assert!(
+            matches!(err, SnapshotError::InvalidState(ref m) if m.contains("namespaces")),
+            "缺 public 未被拒绝：{err:?}"
+        );
+    }
+
+    /// 帧头 revision 与载荷 revision 不一致 = 帧与载荷不是同一次快照 → 必须拒绝。
+    #[test]
+    fn snapshot_rejects_frame_payload_revision_mismatch() {
+        let st = rich_state();
+        let msg = st.to_snapshot_msg();
+        let payload = encode_payload(&msg);
+        let bad = frame(&payload, msg.revision + 7, 0);
+        let err = CatalogState::restore_snapshot(&bad).unwrap_err();
+        assert!(
+            matches!(err, SnapshotError::RevisionMismatch { .. }),
+            "帧/载荷 revision 不一致未被拒绝：{err:?}"
+        );
+    }
+
+    /// 截断的产物必须**装不进去**（快照被截半 = 半状态，绝不能"尽力恢复"）。
+    #[test]
+    fn snapshot_rejects_truncated_artifact() {
+        let st = rich_state();
+        let bytes = st.snapshot_artifact();
+        for cut in [0, 1, 20, 35, 36, 40, bytes.len() - 1] {
+            assert!(
+                CatalogState::restore_snapshot(&bytes[..cut]).is_err(),
+                "截断到 {cut} 字节竟被接受（产物共 {} 字节）",
+                bytes.len()
+            );
+        }
     }
 }

@@ -60,6 +60,50 @@ impl From<std::io::Error> for LakeError {
     }
 }
 
+/// 状态机快照的帧/载荷错误（`metanode-design.md` §4.4）。
+///
+/// 单列一个类型而不是塞进 [`LakeError`]：快照编解码只发生在 metanode 的存储/传输层，
+/// 且这些错误**都是致命一致性错误**（不能像 `S3`/`SchemaChanged` 那样重试），
+/// 混进 `LakeError` 会诱导调用方按"可重试"处理。
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotError {
+    #[error("snapshot frame too short: {len} bytes (header needs 36)")]
+    TooShort { len: usize },
+    #[error("bad snapshot magic (not a yuntun snapshot)")]
+    BadMagic,
+    #[error("unsupported snapshot format version {0} (this build writes 1)")]
+    UnsupportedVersion(u32),
+    #[error("snapshot header CRC mismatch: stored {expected:#010x} computed {actual:#010x}")]
+    HeaderCrcMismatch { expected: u32, actual: u32 },
+    #[error("invalid snapshot chunk size {chunk_size} (must be 1..=64MiB)")]
+    InvalidChunkSize { chunk_size: u32 },
+    #[error("snapshot truncated at offset {offset}: need {needed} bytes, {remaining} left")]
+    Truncated {
+        offset: usize,
+        needed: usize,
+        remaining: usize,
+    },
+    #[error("snapshot chunk at offset {offset} CRC mismatch: stored {expected:#010x} computed {actual:#010x}")]
+    ChunkCrcMismatch {
+        offset: usize,
+        expected: u32,
+        actual: u32,
+    },
+    #[error("snapshot payload length mismatch: header says {declared}, chunks carried {actual}")]
+    LengthMismatch { declared: u64, actual: usize },
+    #[error("snapshot has {count} trailing bytes after the last chunk")]
+    TrailingBytes { count: usize },
+    #[error("snapshot payload does not decode: {0}")]
+    Decode(String),
+    /// 载荷结构合法（protobuf 解得开）但**语义非法** —— 如键重复、缺 `public`、条目为空值。
+    /// 这类错误**不能容忍**：静默取"最后一个"会让副本间状态分歧。
+    #[error("snapshot payload is semantically invalid: {0}")]
+    InvalidState(String),
+    /// 帧头 `revision` 与载荷里的快照号不一致 —— 说明帧与载荷不是同一次快照产生的。
+    #[error("snapshot revision mismatch: frame says {framed}, payload says {payload}")]
+    RevisionMismatch { framed: u64, payload: u64 },
+}
+
 /// WAL 专用错误（详细设计 §4.9）。
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum WalError {

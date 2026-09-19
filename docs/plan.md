@@ -544,7 +544,9 @@ SQL `INSERT` 返回成功时数据仅落 WAL（与 Flight DoPut 语义一致）�
 > **S3-5 键集合去重已接线**（`operation-log §39`）：键集合从 WAL 派生（不引入第二个真相来源），
 > 并修掉"认领 ≠ 重复"语义坑（把认领当重复会让 manifest 永不落盘、恢复 100% 失败）。
 > **S3-1 选型闸门已过**（`operation-log §40`）：三节点收敛 + kill leader 不丢已提交数据 + 样板 124 行
-> → **保留 raft-rs**（openraft 降级为备选）；余 S3-1b 快照安装 + 日志压缩。
+> → **保留 raft-rs**（openraft 降级为备选）。
+> **快照编解码已落地**（`operation-log §41`）：帧格式（帧头+块 CRC 三层保护）+ `CatalogState` 无损载荷
+> + 11 维度覆盖测试（专防"加字段忘加进快照"）→ S3-1b / S3-3 的共同前置已就绪。
 > **S3-1 选型闸门已过**（`operation-log §40`）：三节点收敛 + kill leader 不丢已提交数据 + 样板 124 行
 > → **保留 raft-rs**（openraft 降级为备选）；余 S3-1b 快照安装 + 日志压缩。
 

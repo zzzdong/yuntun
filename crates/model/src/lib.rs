@@ -17,11 +17,13 @@ pub mod error;
 pub mod meta;
 pub mod ops;
 pub mod schema;
+pub mod snapshot;
 pub mod wal_record;
 
 pub use batch::{BatchState, BatchStatus};
 pub use error::LakeError;
 pub use meta::*;
+pub use snapshot::{decode_payload, encode_payload, frame, unframe, CatalogStateSnapshot, Unframed};
 pub use ops::*;
 pub use schema::{apply_change, classify, SchemaChange, SchemaChangeKind, SchemaCompatibility};
 use std::time::SystemTime;
