@@ -363,6 +363,28 @@ impl CatalogState {
             .collect()
     }
 
+    /// 自快照 `since` 以来**变过**的文件（新增**或删除**），按 `(表, batch_id)` 排序。
+    ///
+    /// # 为什么不复用 [`Self::list_visible_files`]
+    ///
+    /// 客户端的本地清单是**按版本增量刷新**的，它要的是「我错过的那部分变化」——
+    /// **包括墓碑**（`deleted_at > since` 的文件）。只回「当前可见」会让客户端
+    /// **永远删不掉已删文件**：它那边的旧副本还在，查询就会去读已删数据
+    /// （**静默读到脏数据**，不报错）。
+    ///
+    /// - `since == 0` → 全量（含墓碑；客户端据此重建清单）
+    /// - `table == None` → 所有表
+    pub fn files_since(&self, table: Option<&str>, since: u64) -> Vec<FileManifest> {
+        let key = table.map(normalize_table);
+        self.files
+            .values()
+            .filter(|f| key.as_ref().is_none_or(|k| normalize_table(&f.table) == *k))
+            // `valid_from` 之后新增的，或 `deleted_at` 之后被删的 —— 两者都要发
+            .filter(|f| f.valid_from > since || (f.deleted_at != 0 && f.deleted_at > since))
+            .cloned()
+            .collect()
+    }
+
     /// L1 分片移除（§6.3）：整 shard 文件 `deleted_at = current_snapshot + 1`。
     pub fn drop_shard(&mut self, table: &str, shard: &str) -> u64 {
         let next = self.next_snapshot();

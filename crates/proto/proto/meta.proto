@@ -183,6 +183,8 @@ message PrefetchRequest {
   bool   full               = 3;  // true = 无视 since，要全量
   // 要刷新的表（**全限定** `schema.table`）；空 = 只要版本号
   repeated string tables    = 4;
+  // 客户端本地清单的快照水位：文件级增量按它算（0 = 要全量）
+  uint64 since_snapshot     = 5;
 }
 
 message PrefetchResponse {
@@ -198,6 +200,14 @@ message PrefetchResponse {
 // 后续要加 manifest / 文件级增量时只加字段，不动 `PrefetchResponse` 的形状。
 message PrefetchPayload {
   repeated TableMeta tables = 1;
+  // 文件级增量（**含墓碑**：`deleted_at > since_snapshot` 的也要发）。
+  // 只发"当前可见"会让客户端永远删不掉已删文件 → 查询读到已删数据（静默）。
+  repeated FileEntry files  = 2;
+}
+
+message FileEntry {
+  string          batch_id = 1;  // 键（与状态机的 files 表一致）
+  FileManifestMsg manifest = 2;
 }
 
 // `TableMeta` 的线上镜像（逐字段对齐 `yuntun_model::meta::TableMeta`）。

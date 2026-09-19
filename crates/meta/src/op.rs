@@ -277,6 +277,12 @@ pub fn commit_request_to_proto(r: &CommitFilesRequest) -> pb::CommitFilesRequest
     }
 }
 
+/// 公开包装：`Prefetch` 载荷要用（把逐字段镜像的**唯一实现**留在本模块，
+/// 避免"载荷那边再写一份"导致两份定义漂移）。
+pub fn manifest_to_proto_pub(f: &FileManifest) -> pb::FileManifestMsg {
+    manifest_to_proto(f)
+}
+
 fn manifest_to_proto(f: &FileManifest) -> pb::FileManifestMsg {
     pb::FileManifestMsg {
         file_path: f.file_path.clone(),

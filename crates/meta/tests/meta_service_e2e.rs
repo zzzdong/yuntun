@@ -223,6 +223,7 @@ async fn prefetch_payload_semantics() {
                 since_manifest_ver: since_manifest,
                 full,
                 tables,
+                since_snapshot: 0,
             })
             .await
             .expect("prefetch 应当成功")
@@ -311,6 +312,114 @@ async fn prefetch_payload_semantics() {
     assert!(
         !ahead.payload.as_ref().unwrap().tables.is_empty(),
         "要求全量重建时应当顺手把全量载荷带上（否则客户端还得再发一次请求）"
+    );
+
+    server.abort();
+}
+
+/// 文件级增量载荷：**必须带墓碑**（`deleted_at`）。
+///
+/// 为什么单独立一条：只发「当前可见」的文件，客户端就**永远删不掉已删文件** ——
+/// 它那边的旧副本还在，查询会去读已删数据（**静默读到脏数据**，不报错）。
+/// 这条用例就是拿「删分片」来逼出墓碑的。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prefetch_carries_file_deltas_including_tombstones() {
+    let cluster = Cluster::start();
+    let leader = cluster.wait_leader(T).expect("三节点应选出 leader");
+    let node = cluster.handle(leader).expect("取 leader 句柄");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { yuntun_meta::serve(node, listener).await });
+    let mut client = connect(addr).await;
+
+    let propose = |c: &mut MetaClient<tonic::transport::Channel>, op: pb::Op| {
+        let mut c = c.clone();
+        async move {
+            c.propose(pb::ProposeRequest {
+                op: Some(op),
+                request_id: b"rid".to_vec(),
+                schema_ver: 0,
+            })
+            .await
+            .expect("提议成功")
+            .into_inner()
+        }
+    };
+    let prefetch_at = |c: &mut MetaClient<tonic::transport::Channel>, since_snapshot: u64| {
+        let mut c = c.clone();
+        async move {
+            c.prefetch(pb::PrefetchRequest {
+                since_schema_ver: u64::MAX, // 只关心文件级
+                since_manifest_ver: u64::MAX,
+                full: false,
+                tables: vec!["public.cpu".into()],
+                since_snapshot,
+            })
+            .await
+            .expect("prefetch 成功")
+            .into_inner()
+        }
+    };
+
+    for op in [
+        create_schema_op("analytics", 1_000),
+        create_table_op("cpu", 1_001),
+        commit_op("b-file", "key-file", 7, 1_002),
+    ] {
+        assert!(propose(&mut client, op).await.accepted);
+    }
+
+    // ---- ① 全量（since_snapshot=0）→ 应当拿到那个文件，且它是"活的" ----
+    let all = prefetch_at(&mut client, 0).await;
+    let files = all.payload.as_ref().unwrap().files.clone();
+    assert_eq!(files.len(), 1, "应当有一个文件：{files:?}");
+    assert_eq!(files[0].batch_id, "b-file");
+    let m = files[0].manifest.as_ref().expect("manifest 必填");
+    assert!(m.valid_from > 0, "提交时分配的 valid_from 必须带出来");
+    assert_eq!(m.deleted_at, 0, "刚提交的文件不是墓碑");
+
+    // ---- ② 水位 = 当前 → **零文件**（客户端已是最新，零开销路径）----
+    let now = prefetch_at(&mut client, all.snapshot).await;
+    assert!(
+        now.payload.as_ref().unwrap().files.is_empty(),
+        "水位已是最新时不该回任何文件（否则每次刷新都要搬全量清单）"
+    );
+
+    // ---- ③ 删整个 shard → 文件变墓碑；**增量必须把它发回来** ----
+    let before_delete = all.snapshot;
+    let r = propose(
+        &mut client,
+        pb::Op {
+            now_ms: 2_000,
+            kind: Some(pb::op::Kind::DropShard(pb::DropShardOp {
+                table: "public.cpu".into(),
+                shard: "s0".into(),
+            })),
+        },
+    )
+    .await;
+    assert!(r.accepted, "删分片应当生效（确有文件被标记）");
+
+    let delta = prefetch_at(&mut client, before_delete).await;
+    let files = delta.payload.as_ref().unwrap().files.clone();
+    assert_eq!(
+        files.len(),
+        1,
+        "删分片后必须把**墓碑**发回来（否则客户端永远删不掉它，会读到已删数据）：{files:?}"
+    );
+    let m = files[0].manifest.as_ref().unwrap();
+    assert!(m.deleted_at != 0, "墓碑的判据就是 deleted_at != 0：{m:?}");
+    assert!(
+        m.valid_from <= before_delete,
+        "这个文件的 valid_from 早于水位 —— 说明它**只**能被墓碑那条规则捞出来（这正是要测的）"
+    );
+
+    // ---- ④ 再往后推一代：墓碑也不该再出现（客户端已经处理过它）----
+    let later = prefetch_at(&mut client, delta.snapshot).await;
+    assert!(
+        later.payload.as_ref().unwrap().files.is_empty(),
+        "已发过的墓碑不该重复发（否则每次刷新都在搬历史）：{:?}",
+        later.payload.as_ref().unwrap().files
     );
 
     server.abort();

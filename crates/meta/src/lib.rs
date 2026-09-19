@@ -66,7 +66,7 @@ use raft::StateRole;
 use protobuf::Message as PbMessage;
 
 use yuntun_catalog::CatalogState;
-use yuntun_model::meta::TableMeta;
+use yuntun_model::meta::{FileManifest, TableMeta};
 use prost::Message as _;
 
 /// 三节点的固定成员表（PoC 用常量；生产由 `--init` / `Join` 决定）。
@@ -232,12 +232,37 @@ impl NodeHandle {
             req.tables.iter().filter_map(|t| st.get_table(t)).collect()
         };
 
+        // 文件级增量（含墓碑）。
+        //
+        // 口径与表载荷一致：`tables` 空且不是全量 → **零载荷**（纯版本探测）。
+        // 否则按请求的表逐个取「自 `since_snapshot` 起变过的文件」。
+        let mut files: Vec<FileManifest> = if req.tables.is_empty() && !full {
+            Vec::new()
+        } else if full {
+            st.files_since(None, req.since_snapshot)
+        } else {
+            req.tables
+                .iter()
+                .flat_map(|t| st.files_since(Some(t), req.since_snapshot))
+                .collect()
+        };
+        // 规范化顺序（同一请求 → 同一字节）：便于对拍与断言，
+        // 也让"客户端缓存打补丁"的路径可复现。
+        files.sort_by(|a, b| (&a.table, &a.batch_id).cmp(&(&b.table, &b.batch_id)));
+
         yuntun_proto::meta::PrefetchResponse {
             schema_ver: v.schema_ver,
             manifest_ver: v.manifest_ver,
             snapshot: st.current_snapshot(),
             payload: Some(yuntun_proto::meta::PrefetchPayload {
                 tables: tables.iter().map(crate::op::table_meta_to_proto).collect(),
+                files: files
+                    .iter()
+                    .map(|f| yuntun_proto::meta::FileEntry {
+                        batch_id: f.batch_id.clone(),
+                        manifest: Some(crate::op::manifest_to_proto_pub(f)),
+                    })
+                    .collect(),
             }),
             full_reload: full,
         }
