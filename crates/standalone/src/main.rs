@@ -46,9 +46,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Some(p) => yuntun_server::Config::from_path(p)?,
         None => {
             tracing::warn!(
-                "no --config given, using defaults (local store ./data, memory catalog)"
+                "no --config given, using defaults (local store ./data, meta = embedded metanode)"
             );
-            yuntun_server::Config::default()
+            let mut c = yuntun_server::Config::default();
+            // **没有配置文件也要让元数据活过重启**：`Config::default()` 的
+            // `[meta] dir` 是 None（= 进程内临时目录，那是给测试用的），
+            // 生产默认必须落在一个稳定目录上，否则"重启即换了一个新集群"
+            // —— 而 `[meta] dir` 省略时 `warnings()` 已经会吼，这里把它补上。
+            if c.meta.dir.is_none() {
+                c.meta.dir = Some(std::path::PathBuf::from("./data/meta"));
+            }
+            c
         }
     };
     tracing::info!(listen = %cfg.server.listen, "config loaded");

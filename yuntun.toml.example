@@ -116,3 +116,13 @@ listen = "0.0.0.0:3306"
 # trust | native_password（users 非空时自动切换；当前仅实现 trust 无鉴权）
 auth = "trust"
 # users = [{ user = "yuntun", password = "..." }]
+
+[meta]
+# 元数据的装配形态（S3-4）：
+#   embedded（默认）= 进程内 1 节点 metanode（raft + fjall 落盘）+ loopback 传输
+#   memory          = 进程内内存实现（回滚点：元数据重启即空，靠 WAL 的 DDL 重放重建）
+mode = "embedded"
+# 落盘目录（**生产必须配**：省略 = 进程内临时目录，重启等于换了一个新集群）
+dir = "./data/meta"
+# gRPC 监听；同机没必要固定端口，:0 让内核分配
+listen = "127.0.0.1:0"

@@ -31,6 +31,11 @@ pub struct Lakehouse {
     pub catalog: Arc<dyn CatalogOps>,
     pub ingestor: Arc<Ingestor>,
     pub query: Arc<QueryEngine>,
+    /// 嵌入式 metanode（`[meta] mode = "embedded"` 时才有）。
+    ///
+    /// **必须持有**：它的 `Drop` 会停 raft 线程。丢掉它 = 后台线程失控
+    /// （测试里表现为"进程退不干净"）。
+    _meta: Option<yuntun_meta::MetaNode>,
     /// SQL 处理层（W-4：MySQL wire 端口与 FlightServer 各自持有句柄；
     /// 引擎无状态，仅 write_policy 为实例级配置）
     pub sql: Arc<SqlEngine>,
@@ -193,15 +198,95 @@ impl Lakehouse {
         Self::build_with_shutdown(cfg, CancellationToken::new()).await
     }
 
-    /// 同 build，但注入外部 shutdown（standalone 主循环使用）。
+    /// 起**进程内 1 节点 metanode**，返回连它的 `RemoteCatalog`（设计 §3.3 的 standalone 形态）。
+///
+/// # 为什么走 **loopback gRPC** 而不是直接调 `NodeHandle`
+///
+/// 为了让 standalone 与分布式走**同一条代码路径**。直接调句柄会得到"本地一条路、远端另一条路"，
+/// 两者的差异只会在上线时暴露 —— 那正是设计禁止的分叉（`§3.3`：禁止分叉）。
+/// 代价是每个写多一次 loopback 往返（同机、量级可忽略），换来的是**同一份代码被两种形态验证**。
+///
+/// # 目录
+///
+/// `[meta] dir` 省略 → **进程内临时目录**（每个 `Lakehouse` 一个，互不干扰；测试友好），
+/// 并打 warn（重启即新集群）。生产请在配置里显式给（`standalone` 的默认路径是 `./data/meta`）。
+async fn build_embedded_catalog(
+    cfg: &Config,
+) -> Result<(Arc<dyn CatalogOps>, yuntun_meta::MetaNode), yuntun_model::error::LakeError> {
+    use std::collections::HashMap;
+
+    let dir = match &cfg.meta.dir {
+        Some(d) => d.clone(),
+        None => {
+            // 每个实例一个目录：同一个进程里可能起多个 Lakehouse（测试就是），
+            // 共用一个目录会让它们互相看到对方的表（现象是莫名其妙的 TableAlreadyExists）。
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::env::temp_dir().join(format!(
+                "yuntun-meta-{}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0),
+                n
+            ))
+        }
+    };
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        yuntun_model::error::LakeError::Io(format!("建 meta 目录 {} 失败：{e}", dir.display()))
+    })?;
+
+    // 单 voter：raft 不需要任何对端（`MetaNode::open` 对多节点会要求 peer 地址）
+    let node = yuntun_meta::MetaNode::open(&dir, 1, vec![1], HashMap::new())
+        .map_err(|e| yuntun_model::error::LakeError::Other(format!("起嵌入式 metanode 失败：{e}")))?;
+    if !node.wait_leader(Duration::from_secs(10)) {
+        return Err(yuntun_model::error::LakeError::Other(
+            "嵌入式 metanode 10s 内未当选 leader（单节点组正常在几十毫秒内选出来）".into(),
+        ));
+    }
+
+    let listener = tokio::net::TcpListener::bind(&cfg.meta.listen).await.map_err(|e| {
+        yuntun_model::error::LakeError::Io(format!("绑定 {} 失败：{e}", cfg.meta.listen))
+    })?;
+    let addr = listener.local_addr().map_err(|e| {
+        yuntun_model::error::LakeError::Io(format!("取监听地址失败：{e}"))
+    })?;
+    let served = node.handle();
+    tokio::spawn(async move {
+        // 服务错误在这里只能打日志：`serve` 只在监听器层面失败（进程退出前一直运行）
+        if let Err(e) = yuntun_meta::serve(served, listener).await {
+            eprintln!("[meta] 嵌入式 gRPC 服务退出：{e}");
+        }
+    });
+
+    let remote = yuntun_meta::RemoteCatalog::connect(vec![addr.to_string()]).map_err(|e| {
+        yuntun_model::error::LakeError::Other(format!("连嵌入式 metanode 失败：{e}"))
+    })?;
+    tracing::info!(dir = %dir.display(), addr = %addr, "catalog 装配为 embedded metanode（1 节点 raft + loopback gRPC）");
+    Ok((Arc::new(remote), node))
+}
+
+/// 同 build，但注入外部 shutdown（standalone 主循环使用）。
     pub async fn build_with_shutdown(
         cfg: &Config,
         shutdown: CancellationToken,
     ) -> Result<Self, yuntun_model::error::LakeError> {
-        // ① Catalog —— **装配点**：全仓只有这一处知道具体实现是谁。
-        //    分布式形态（S3-4 第二件）就是在这里换成 `RemoteCatalog`，别处一行不改。
-        //    C5：阶段 0 是内存实现（重启后靠 WAL 的 DDL 重放重建）。
-        let catalog: Arc<dyn CatalogOps> = Arc::new(MemoryCatalog::new());
+        // ① Catalog —— **装配点**：全仓只有这一处知道具体实现是谁（`§52` 把接缝上的
+        //    具体类型全清掉了，所以这里换实现不需要动任何业务代码）。
+        //
+        //    | `[meta] mode` | 形态 | 元数据 |
+        //    |---|---|---|
+        //    | `memory`（回滚点） | 进程内内存实现 | 重启即空，靠 WAL 的 DDL 重放重建 |
+        //    | `embedded`（默认） | 进程内 **1 节点 metanode**（raft + fjall）+ loopback gRPC | **落盘**，重启仍在 |
+        let (catalog, meta_node): (Arc<dyn CatalogOps>, Option<yuntun_meta::MetaNode>) =
+            match cfg.meta.mode {
+                config::MetaMode::Memory => (Arc::new(MemoryCatalog::new()), None),
+                config::MetaMode::Embedded => {
+                    let (c, node) = Self::build_embedded_catalog(cfg).await?;
+                    (c, Some(node))
+                }
+            };
 
         // ② ObjectStore
         let store_cfg = match &cfg.store {
@@ -296,6 +381,7 @@ impl Lakehouse {
 
         Ok(Self {
             catalog,
+            _meta: meta_node,
             ingestor,
             query,
             sql,

@@ -12,6 +12,8 @@ yuntun-store = { path = "../store" }
 yuntun-chunk = { path = "../chunk" }
 yuntun-format = { path = "../format" }
 yuntun-catalog = { path = "../catalog" }
+# 嵌入式 metanode（S3-4 装配点：`[meta] mode = "embedded"`）
+yuntun-meta = { path = "../meta" }
 yuntun-ingest = { path = "../ingest" }
 yuntun-query = { path = "../query" }
 yuntun-compaction = { path = "../compaction" }

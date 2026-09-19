@@ -233,6 +233,49 @@ impl Default for CompactionSection {
     }
 }
 
+/// 元数据（catalog）的装配形态。
+///
+/// **这是设计指定的回滚点**（`metanode-design §3.3` + S3-4 验收）：
+/// 换成 `Memory` 就退回"进程内内存实现"，不需要改任何业务代码 —— 因为业务侧只认
+/// `Arc<dyn CatalogOps>`（`§52` 拆掉的接缝）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetaMode {
+    /// 进程内内存实现（阶段 0 形态；重启即空，靠 WAL 的 DDL 重放重建）
+    Memory,
+    /// 进程内 **1 节点 metanode**（raft + fjall 落盘）+ **loopback gRPC**（设计 §3.3 的 standalone 形态）
+    Embedded,
+}
+
+/// `[meta]` 段。
+///
+/// 段级 `#[serde(default)]`：字段可省略（各自取 `Default`）。这样**回滚开关只要一行**：
+/// `[meta] mode = "memory"` —— 回滚操作越简单，真出事时才越敢按。
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct MetaSection {
+    pub mode: MetaMode,
+    /// embedded 的 gRPC 监听地址；`127.0.0.1:0` = 内核分配（推荐：同机没必要固定端口）
+    pub listen: String,
+    /// embedded 的落盘目录。
+    ///
+    /// **省略 = 进程内临时目录**（测试友好；但**重启会丢掉元数据** → 会打 warn）。
+    /// 生产（`yuntun` 二进制）默认给 `./data/meta`（见 `standalone`），请显式配置。
+    pub dir: Option<std::path::PathBuf>,
+}
+
+impl Default for MetaSection {
+    fn default() -> Self {
+        Self {
+            // 默认即"设想的形态"（设计 §3.3：standalone = 1 节点 raft + 本地传输）。
+            // 回滚 = 配置里写 `mode = "memory"`。
+            mode: MetaMode::Embedded,
+            listen: "127.0.0.1:0".into(),
+            dir: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(default)]
 pub struct QuerySection {
@@ -287,6 +330,11 @@ pub struct SqlSection {
 #[serde(default)]
 pub struct Config {
     pub server: ServerConfig,
+    /// 元数据（catalog）的装配形态 —— **S3-4 的装配层开关**（设计指定的回滚点）。
+    /// `#[serde(default)]`：老配置文件（没有 `[meta]` 段）必须照样能读 ——
+    /// 加一个必填段等于把所有既有部署一次性打挂。
+    #[serde(default)]
+    pub meta: MetaSection,
     pub store: StoreSection,
     pub wal: WalSection,
     pub chunk: ChunkSection,
@@ -300,6 +348,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             server: ServerConfig::default(),
+            meta: MetaSection::default(),
             store: StoreSection::Local {
                 root: PathBuf::from("./data/store"),
             },
@@ -330,6 +379,13 @@ impl Config {
     /// 所有实例重新在同一秒 flush，ADR-10 的惊群问题复活，但功能测试全绿。
     pub fn warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
+        if self.meta.mode == MetaMode::Embedded && self.meta.dir.is_none() {
+            out.push(
+                "[meta] mode = embedded 但未配置 dir：元数据只写**进程内临时目录**，\
+                 重启即等于换了一个新集群（生产请显式配置 [meta] dir）"
+                    .into(),
+            );
+        }
         let max_resident = self.ingest.chunk_max_resident_secs;
         let normal_deadline = self.ingest.max_flush_delay_secs + self.ingest.flush_phase_spread_secs;
         if max_resident <= normal_deadline {
@@ -583,14 +639,21 @@ scan_interval_ms = 50
     #[test]
     fn warnings_flag_resident_ceiling_that_bypasses_phase_spread() {
         // 默认配置满足不变量
-        assert!(Config::default().warnings().is_empty());
+        // 默认配置只有一条告警：`[meta] mode = embedded` 但没配 `dir`
+        //（= 元数据写在进程内临时目录，重启即新集群）。这是**刻意**的默认：
+        // 测试/试跑不该往工作目录里写东西；生产请在配置里显式给 `[meta] dir`。
+        let w = Config::default().warnings();
+        assert_eq!(w.len(), 1, "默认配置应当只有 meta.dir 这一条告警：{w:?}");
+        assert!(w[0].contains("[meta]"), "{w:?}");
         // 硬兜底 ≤ 正常到期 → 会绕过相位分散（功能全绿但惊群复活）
+        // `[meta] dir` 显式给上：本用例只关心 ingest 那条告警，
+        // 不该被"embedded 没配目录"那条干扰（否则加一条无关告警就会打红它）。
         let cfg = Config::from_toml(
-            "[ingest]\nmax_flush_delay_secs = 30\nflush_phase_spread_secs = 60\nchunk_max_resident_secs = 60",
+            "[meta]\nmode = \"memory\"\n[ingest]\nmax_flush_delay_secs = 30\nflush_phase_spread_secs = 60\nchunk_max_resident_secs = 60",
         )
         .unwrap();
         let w = cfg.warnings();
-        assert_eq!(w.len(), 1);
+        assert_eq!(w.len(), 1, "{w:?}");
         assert!(w[0].contains("绕过相位分散"), "{w:?}");
         // 零预算：写入必被拒
         let cfg = Config::from_toml("[chunk]\nmem_budget_mb = 0").unwrap();
