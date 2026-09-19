@@ -16,4 +16,6 @@ raft = "0.7"
 protobuf = "2"
 # raft 的 `Snapshot::set_data` / `get_data` 用 `Bytes`
 bytes = { workspace = true }
+# S3-3：metanode 的落盘存储（键值 + 原子批 + fsync）
+fjall = "3"
 slog = "2"

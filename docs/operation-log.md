@@ -2569,3 +2569,83 @@ to_commit 5 is out of range [last_index 0]   （etcd 那句 "Was the raft log co
 | 6 | 成员变更（learner → voter）—— **也是稳定复现"新节点追快照"的正路** | S3-6 |
 
 ---
+
+---
+
+## 43. R3 S3-3（第一件）：fjall 落盘版 `Storage` —— 把不变量交给存储保证（2026-09-19）
+
+### 43.0 交付
+
+| 位置 | 内容 |
+|---|---|
+| `crates/meta/src/fjall_storage.rs`（**新**） | `FjallStorage`：raft `Storage` 的落盘实现 + 5 条测试 |
+| `crates/meta/Cargo.toml` | `fjall = "3"` |
+
+**与内存版的关系**：内存版（`MetaStorage`）是**语义的定义处**（单测把它钉死），本实现逐条对齐它 ——
+两个文件的方法名与不变量注释刻意保持一致，便于对读。差别只有"真相在哪"：
+
+| | 内存版 | fjall 版 |
+|---|---|---|
+| 真相 | 进程内存 | **fjall**（每节点一个目录） |
+| 崩溃后 | 全丢（PoC 用它换测试速度与确定性） | 从盘恢复，含 `applied_index` → 喂 `Config.applied` |
+| PoC 是否用 | ✅（快、无 IO 抖动） | ⏳ 节点装配待进程化（S3-3 后续） |
+
+### 43.1 三个设计决定
+
+**① 先盘、后缓存。** 每一步都**先写 fjall 成功、再更新缓存**。反过来会让缓存领先于盘，
+崩溃后就出现"内存说有一份快照、盘上没有"—— 最难查的一类不一致。
+
+**② 压缩用 `batch(...).durability(SyncAll)` —— 让"不变量"变成"存储保证"。**
+
+压缩要同时做四件事：写新产物、更新压缩位置与任期、删被覆盖的日志、删旧产物。
+逐条写的话，**任意中间一刻掉电**都会留下"索引指向不存在/对不上的产物"。同一原子批里做完，
+就变成要么全成、要么全不成 —— 上一轮靠**应用层纪律**维持的不变量
+（"产物必须与 `compacted_index` 严格对应"，`§42.2`），在这里由**存储层**兜住。
+这比"每处都记得小心"可靠得多。
+
+**③ fsync 分级**（不是所有写都值得付 fsync）：
+
+| 写 | 模式 | 理由 |
+|---|---|---|
+| `set_hard_state`（term/vote） | **SyncAll** | 投过票却没落盘 → 重启可能重复投票 → 破坏"一任期一票" |
+| `append` | **SyncAll** | 日志是恢复的权威来源 |
+| `apply_snapshot` / `compact_applied` | **SyncAll** | 同 + 不变量 |
+| `set_commit` | `Buffer` | commit 是**派生**值：重启后由 term/vote + 日志重新推出 |
+| `set_applied` | `Buffer` | 只影响"从哪继续 apply"；保守重放是安全的（幂等） |
+
+### 43.2 键布局
+
+```text
+"cs"  ConfState        "hs"  HardState        "ap"  applied_index
+"ci" / "ct"  compacted_index / compacted_term  "li"  last_index
+"L" + idx(u64 BE)  日志条目      "S" + idx(u64 BE)  快照产物（只保留最新一份）
+```
+
+首日志索引由 `ci + 1` 推出（压缩时把 ≤ ci 的条目真删掉），所以只存最后一个索引，
+避免启动时全表扫描。索引用**大端**：范围扫描即日志序。
+
+### 43.3 测试（5 条，含三条"跨 reopen"）
+
+| 用例 | 钉住什么 |
+|---|---|
+| `log_hardstate_and_applied_survive_reopen` | 日志两端/任期、`vote`（重复投票防线）、成员表、**`applied`**（要喂 `Config.applied`）跨重启存活 |
+| `artifact_and_compacted_index_stay_consistent_across_reopen` | 压缩 → **重开** → `snapshot()` 返回压缩那一刻的产物（含 b1、**不含** b2）、压缩掉的日志真的没了、`entries` 边界正确 |
+| `snapshot_is_not_faked_when_artifact_missing` | 白盒删掉产物（模拟盘上不一致）→ 必须报**可重试**，**绝不**返回对不上的快照 |
+| `stale_snapshot_is_ignored_and_old_artifact_dropped` | 旧快照忽略且不计入安装数；旧产物被删（无界增长防线） |
+| `overwrite_truncates_old_tail` | raft 允许的"截断重写尾部"不留旧条目残留、不产生空洞 |
+
+**反证**：把 `snapshot()` 改成"现场从当前状态机取产物"（正是 `§42.2` 记录的错误写法）
+→ 两条用例失败，报 `产物必须是压缩那一刻的（含 b1、不含 b2）`。已恢复。
+
+### 43.4 边界与遗留
+
+| # | 项 | 归属 |
+|---|---|---|
+| 1 | **节点装配**：让 metanode 进程用 `FjallStorage`（现 PoC 仍用内存版） | S3-3 后续 |
+| 2 | **真崩溃测试**：本轮的"重启"是 drop 后 reopen（干净关闭）。真掉电/`kill -9` 需要**子进程**级注入（参照 `§31` 的 chaos 手法） | S3-3 后续 |
+| 3 | **合并 fsync**：现在每个 Ready 一次 fsync。metanode 提交速率是"文件数/秒"量级，够用；合并留给压测后再定 | S3-6 |
+| 4 | fjall 调优（LSM 参数 / 是否分离大 value）：快照产物是大 value，值得按 `KvSeparationOptions` 调 | S3-6 |
+| 5 | `memtable`/compaction 对 **P99 持久化延迟**的影响（metanode 的 ack 依赖 fsync） | S3-6 |
+| 6 | leader 为何能发出已被压缩的条目（`§42.7` 遗留 1） | S3-3 后续 |
+
+---

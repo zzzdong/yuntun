@@ -35,8 +35,10 @@
 //! raft 消息直接经 `std::sync::mpsc` 传递（**不序列化**）—— 生产实现要走 gRPC，
 //! 但那是 S3-0/S3-3 的事，与选型无关。
 
+pub mod fjall_storage;
 pub mod storage;
 
+pub use fjall_storage::FjallStorage;
 pub use storage::MetaStorage;
 
 use std::collections::{HashMap, VecDeque};

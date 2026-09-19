@@ -247,7 +247,7 @@ message ProposeResponse {
 | **S3-0** | proto 定义 + `tonic-build`（`T10.8`）：把现有手写 prost struct 迁到 `.proto` 生成 | 编解码 round-trip；与现有 `CommitFilesRequest` 字段**逐个对齐**的兼容测试 | 保留手写 struct（双份并存一个 commit） |
 | **S3-1** | **raft PoC（选型闸门）**：3 节点进程内集群，写/读/kill leader/快照/安装 | **4 项通过 + 第 5 项机制通过**（`operation-log §40` + **§42**）：三节点收敛、kill leader 不丢已提交、接缝干净、样板 124 行、**快照机制已证明**（自写 `Storage` + 帧/载荷双重校验 + 安装路径 + 反证）；**gate 第 5 项的"集成层稳定触发"未拿到**（`§42.4b`/`§42.7` 遗留 1）→ 仍**保留 raft-rs** | 逃生门已降级：真正贵的是**自写 `Storage` + 快照正确性**（两个候选都躲不掉），而非某个库的样板量 |
 | **S3-2** | `CatalogState` 抽取（§4.1）+ **确定性对拍** | ✅ **第一切片已落地**（`operation-log §38`）：`CatalogState` 抽出、抓到并修掉**四处真实非确定性**（3 处状态机读钟 + 1 处 `HashSet` 决定版本分配序）、`encode_canonical` + 5 个对拍用例（含反证）。**余**：键集合接线（S3-5）、快照 prost 版（S3-3） | 已保留 `MemoryCatalog` 作为宿主（语义零改动） |
-| **S3-3** | `yuntun-meta` 进程 + `MetaService`（Propose/Prefetch/Delta/Status/Join）+ fjall | 单节点 metanode 可独立启动；重启后状态一致 | — |
+| **S3-3** | `yuntun-meta` 进程 + `MetaService`（Propose/Prefetch/Delta/Status/Join）+ fjall | 单节点 metanode 可独立启动；重启后状态一致。**进行中（2026-09-19）**：**落盘 `Storage`（fjall）已完成** —— 先盘后缓存 + **原子批（把"产物↔压缩位置"不变量交给存储保证）** + fsync 分级；5 条测试含 3 条跨 reopen（`operation-log §43`）。**余**：节点装配（把 PoC 从内存版切成 fjall 版）、两类时钟统一、快照触发/保留策略、真崩溃（子进程）注入 | — |
 | **S3-4** | `RemoteCatalog`（`CatalogOps` 的 gRPC 实现）+ standalone 装配（本地传输、1 节点 raft） | **既有 217 用例全绿**（standalone 不回归）；`if distributed` 分支为零 | 切回 `MemoryCatalog`（装配层开关） |
 | **S3-5** | 幂等权威迁 SM + **键集合**去重（§4.5，含 `§27.5` 遗留 #1） | ✅ **已接线**（`operation-log §39`）：键集合从 WAL 派生、两条提交路径都带上；过程中抓到并修掉"**认领 ≠ 重复**"语义坑（把认领当重复会让 manifest 永不落盘 + 恢复 100% 失败）。**余**：SM 内持久化（S3-3，现仍是 MemoryCatalog 宿主） | — |
 | **S3-6** | 3 节点集群运维：bootstrap / Join / 快照调参 / 观测（leader/term/applied/lag） | `Status` 可读；follower lag 可观测；快照安装不停服 | — |
@@ -299,7 +299,7 @@ C-4 快照安装期间崩溃（安装原子性）。
 | S3-0 | proto + tonic-build | 2–3 天 | 无 |
 | S3-1 | raft PoC（选型闸门） | 3–4 天 | S3-0（可后置） |
 | S3-2 | `CatalogState` 抽取 + 对拍 | 3–5 天 | 无（可与 S3-0 并行） |
-| S3-3 | metanode 进程 | 3–4 天 | S3-1/S3-2 |
+| S3-3 | metanode 进程 | 3–4 天 | S3-1/S3-2。**进行中**：落盘 `Storage`（fjall）已完成（`operation-log §43`） |
 | S3-4 | `RemoteCatalog` + standalone 装配 | 2–3 天 | S3-3 |
 | S3-5 | 幂等权威 + 键集合 | 2 天 | S3-3 |
 | S3-6 | 集群运维 + 观测 | 2–3 天 | S3-4 |
