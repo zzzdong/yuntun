@@ -3082,3 +3082,101 @@ raft 的"等应用到状态机"是**阻塞**的（`recv_timeout`）。直接在�
 `git status` 干净（该目录本就未跟踪）。
 
 ---
+
+---
+
+## 50. R3 S3-3 收尾：节点间 **gRPC 传输** —— 3 节点复制 + 换主不丢已提交（2026-09-19）
+
+### 50.0 本轮结论
+
+M3 的 G1 判据（**kill leader 自动选主、提交不丢失**）第一次跑在**真网络路径**上并通过：
+`crates/meta/tests/multi_node_grpc_e2e.rs` 一条用例串起
+**3 节点选主 → 经 gRPC 复制 → 三节点收敛 → 杀 leader → 重选 → 继续写 → 换主前的幂等键仍命中**（0.46s）。
+
+至此 S3-3 的**运行形态**齐了：单节点可作进程独立启动（`§48`）、多节点经网络复制（本轮）、
+崩溃后从盘恢复（`§44`/`§48`）。剩下的是"其余 op 的镜像 / 快照触发策略 / 成员变更 / 鉴权"（50.6）。
+
+### 50.1 为什么传输得自己写；以及为什么用 gRPC 承载
+
+raft-rs 只吐 `eraftpb::Message`，**传输是使用者的责任**（库文档明说）。选型对比：
+
+| 方案 | 代价 |
+|---|---|
+| **gRPC（本轮）** | 每消息一次 HTTP/2 往返。心跳 3 tick ≈ 30ms，量级完全够；换来**一个端口**、复用 TLS/鉴权/可观测，不必再写一套分帧 + 握手 |
+| 裸 TCP + 长度前缀 | 少一层开销，但**多一个端口**、多一套协议/分帧/超时，TLS 还得再写一遍 |
+
+**判定**：先用 gRPC。唯一可能让它成为瓶颈的场景是"**大日志批量追赶**"（每秒上百 MB 的追加），
+那时换成裸 TCP **只需替换 `transport.rs`** —— `spawn_node` 只依赖 `PeerTransport` trait，
+raft 循环一行不用改（这正是本轮先抽 trait 的原因）。
+
+### 50.2 传输语义与"必须留下信号"
+
+| 性质 | raft 是否要求 | 本实现 |
+|---|---|---|
+| 不丢 | **不要求**（心跳/选举/追加按 tick 重发） | 队列满 → **丢** + 计数；**绝不阻塞** raft 线程 |
+| 保序 | **不要求**（靠 term/index 自愈） | 不保证（多连接并发） |
+| 不重 | 要求（重复会让 raft 反复 `step`） | gRPC 不重复；**我们不做重发** |
+
+`send()` 非阻塞是硬要求：调用点在 **raft 线程**上，阻塞它 = 拖住 tick = 别人选你当 leader 时你没反应。
+
+因此每 peer 一个后台发送任务 + 计数：
+
+| 计数 | 含义 | 为什么要它 |
+|---|---|---|
+| `queued` | 成功进队列 | —— |
+| `dropped` | 队列满/对端未知 | 区分"我们没发"与"网络丢了" |
+| `failed` | RPC 失败/超时 | 对端不可达（重启中属正常） |
+| `delivered` | 对端确认已入它的 raft 线程 | **唯一能证明"复制真走了网络"的信号** |
+| `rejected` | 对端拒收（线程已退出） | 对端其实死了但连接还在 |
+
+**"永远选不出 leader"是最难查的故障** —— 没有这几个数，就只能靠猜。
+
+### 50.3 载荷为什么是**不透明 bytes**
+
+`Meta.Raft` 的 `message` 字段直接装 `eraftpb::Message` 的 protobuf 编码，**不在 proto 里重写一遍**：
+重写会得到"两份必然漂移的定义 + 每升一次 raft 就要同步改 proto"。
+代价是它**不可自描述** → 跨版本混跑不能被 proto 挡住，要靠发布约束（登记为 50.6-③）。
+
+### 50.4 三道启动检查 + 一个"提前到 CLI"的闸门
+
+| # | 检查 | 不做会怎样 |
+|---|---|---|
+| 1 | 盘上成员表 == 启动参数里的成员表 | 各节点各自成组，数据永远合不回来 |
+| 2 | 每个**别的 voter** 都有地址（缺哪个列哪个） | 发不出消息 → 永远选不出 leader，且**不报错** |
+| 3 | 多节点时处于 tokio 运行时上下文（要起发送任务） | 启动即失败，但错误信息会含糊（现在明说"要在运行时内调用"） |
+
+检查 ② 同时在 **CLI 层**拦一遍（退出码 2，提示可直接照做）。这不是重复：
+CLI 层拦的是"人手打错"，`MetaNode::open` 拦的是"API 调用方漏了"。
+
+**实测这条闸门立刻见效**：改完语义后，`cli::tests::explicit_voters_are_sorted_and_deduped`
+（3 voter 却没给 `--peer`）当场变红 —— 老用例就是被新语义抓出来的。
+
+### 50.5 反证（证明用例不是自说自话）
+
+| 做法 | 结果 |
+|---|---|
+| 把各节点的 `--peer` 指到**错端口**（网络不通） | ✅ 用例在 30s 内以"没选出 leader"失败 |
+| 用例内断言"各节点 `delivered` 之和 > 0" | ✅ 不成立就失败 —— 防"复制其实没走 gRPC 却过了"（比如误退回进程内邮箱） |
+
+### 50.6 遗留
+
+| # | 项 | 归属 |
+|---|---|---|
+| 1 | **成员变更**（`Meta.Join`：learner → voter）、加节点不重启 | S3-6 |
+| 2 | **鉴权**：`Meta.Raft` 现在是**裸的** —— 任何能连上端口的人都能往里塞 raft 消息 | S3-6 / 部署（真实环境必须 mTLS 或内网隔离） |
+| 3 | **版本混跑保护**：载荷不可自描述，跨版本节点混跑需要版本门（当前靠发布约束） | S3-6 |
+| 4 | 大日志追赶的性能（HTTP/2 vs 裸 TCP）与抓包级观测 | 性能阶段 |
+| 5 | 其余 op 的 proto 镜像 / 两个时钟统一 / 快照触发与保留策略 | S3-0 余 / S3-4 / S3-3 余 |
+
+### 50.7 交付物
+
+| 位置 | 内容 |
+|---|---|
+| `crates/proto/proto/meta.proto` | `rpc Raft(RaftRequest) returns (RaftResponse)`（`from`/`message` → `delivered`/`reason`） |
+| `crates/meta/src/transport.rs`（新） | `PeerTransport` trait + `Mpsc`/`No`/`Grpc` 三个实现 + `TransportStats`（5 个计数） |
+| `crates/meta/src/lib.rs` | `spawn_node` 改收 `Arc<dyn PeerTransport>`；**三处出站**（`take_messages`/`take_persisted_messages`/`light.take_messages`）全走它；`NodeHandle::deliver`（收件箱）；`MetaNode::open(.., peers)`、`transport_stats()`、`MetaNodeError::{MissingPeer,Transport}` |
+| `crates/meta/src/service.rs` | `Meta.Raft` 处理：只做"解码 + 入箱"；解不开**报错**（不是 `delivered=false` 的软失败 —— 那是"协议不一致"被伪装成"对端拒收"） |
+| `crates/meta/src/cli.rs` | `--peer <id>@<host:port>`（端点串校验、重复 id 拒绝、缺地址点名） |
+| `crates/meta/tests/multi_node_grpc_e2e.rs`（新） | 3 节点真 gRPC：选主/复制/收敛/杀 leader/重选/继续写/幂等命中（**0.46s**） |
+
+---

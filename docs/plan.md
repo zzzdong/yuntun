@@ -561,7 +561,7 @@ SQL `INSERT` 返回成功时数据仅落 WAL（与 Flight DoPut 语义一致）�
 > 错误码映射按约定 3 落地、三个集群用例改跑生产路径。
 > **gRPC 服务层与真端到端已落地**（`operation-log §47`）：`MetaService` + `NodeHandle`，客户端能真调
 > （写入/幂等重试/Status/Delta/UNIMPLEMENTED 全覆盖；阻塞提案走阻塞线程池）。
-> 遗留（S3-3）：~~CLI/`--init` bootstrap~~ ✅ **已落地**（`§48`：metanode 可作进程独立启动、`kill -9` 真崩溃恢复已验证）、**多节点部署形态（节点间网络传输）**、其余 op 的镜像、两个时钟统一、
+> 遗留（S3-3）：~~CLI/`--init` bootstrap~~ ✅ **已落地**（`§48`：metanode 可作进程独立启动、`kill -9` 真崩溃恢复已验证）、~~多节点部署形态~~ ✅ **已落地**（`§50`：节点间 gRPC 传输 + 3 节点复制 + 换主不丢已提交）、其余 op 的镜像、两个时钟统一、
 > 快照触发/保留策略、真崩溃注入（子进程）。
 > **S3-1 选型闸门已过**（`operation-log §40`）：三节点收敛 + kill leader 不丢已提交数据 + 样板 124 行
 > → **保留 raft-rs**（openraft 降级为备选）；余 S3-1b 快照安装 + 日志压缩。

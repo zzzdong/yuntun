@@ -41,6 +41,7 @@ pub mod fjall_storage;
 pub mod op;
 pub mod service;
 pub mod storage;
+pub mod transport;
 
 pub use cli::Args;
 pub use error::{MetaError, MetaNodeError};
@@ -48,6 +49,9 @@ pub use fjall_storage::FjallStorage;
 pub use op::{apply, decode_op, StateOp};
 pub use service::{serve, MetaService};
 pub use storage::MetaStorage;
+pub use transport::{
+    GrpcTransport, MpscTransport, NoTransport, PeerTransport, TransportStats, TransportStatsView,
+};
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
@@ -94,6 +98,8 @@ enum Command {
 
 /// 节点运行时的可观测句柄（测试用）。
 struct NodeState {
+    /// 本节点的 raft 收件箱（`Cluster::handle` 构造 `NodeHandle` 时要用）
+    inbox_tx: Sender<Message>,
     /// 该节点的状态机（**唯一**被 raft 提交序驱动的实例）
     sm: Arc<Mutex<CatalogState>>,
     /// 该节点的 raft 存储（日志 + 硬状态 + 快照产物，**落盘**）
@@ -135,6 +141,8 @@ pub struct NodeHandle {
     sm: Arc<Mutex<CatalogState>>,
     storage: FjallStorage,
     cmd_tx: Sender<Command>,
+    /// raft 收件箱：`Meta.Raft`（节点间）收到的消息从这里进 raft 线程。
+    raft_inbox: Sender<Message>,
 }
 
 impl NodeHandle {
@@ -189,6 +197,14 @@ impl NodeHandle {
             changed_tables: d.changed_tables,
             full_reload: d.full_reload_required,
         }
+    }
+
+    /// 把一条**节点间** raft 消息交给本节点的 raft 线程。
+    ///
+    /// 返回 `false` = 线程已退出（正常关停或崩溃）—— 调用方（`Meta.Raft`）据此回
+    /// `delivered=false`，让对端能统计出"发了但没人收"（见 `transport` 模块的计数说明）。
+    pub fn deliver(&self, msg: Message) -> bool {
+        self.raft_inbox.send(msg).is_ok()
     }
 
     /// 本节点的存储（诊断；S3-6 观测会用）
@@ -300,7 +316,9 @@ impl Cluster {
             spawn_node(
                 id,
                 rx,
-                self.mailboxes.clone(),
+                // 进程内簇 = "本地传输"（设计 §3.3 说的那种）：仍然走 `PeerTransport`
+                // 抽象，所以"换成网络"不需要改 raft 循环一行。
+                Arc::new(MpscTransport::new(self.mailboxes.clone())),
                 sm.clone(),
                 storage.handle(),
                 role.clone(),
@@ -310,6 +328,13 @@ impl Cluster {
                 cmd_rx,
             ),
         );
+        // 本节点的收件箱 = `Cluster::start` 为它建的邮箱发送端
+        //（必须在 `insert` 前取出来：`self.nodes` 的可变借用与 `self.mailboxes` 冲突）
+        let inbox_tx = self
+            .mailboxes
+            .get(&id)
+            .cloned()
+            .expect("邮箱必须已建（Cluster::start 为每个 peer 建过）");
         self.nodes.insert(
             id,
             NodeState {
@@ -320,6 +345,7 @@ impl Cluster {
                 debug,
                 status,
                 cmd_tx,
+                inbox_tx,
             },
         );
     }
@@ -434,6 +460,7 @@ impl Cluster {
             sm: n.sm.clone(),
             storage: n.storage.handle(),
             cmd_tx: n.cmd_tx.clone(),
+            raft_inbox: n.inbox_tx.clone(),
         })
     }
 
@@ -511,20 +538,31 @@ pub struct MetaNode {
     handle: NodeHandle,
     cmd_tx: Sender<Command>,
     thread: Option<thread::JoinHandle<Receiver<Message>>>,
+    /// 出站传输计数（多节点时才有意义；单节点恒为 0）。
+    /// 暴露它是为了让"传输到底有没有work"**可断言**，而不是只能看日志。
+    stats: Arc<TransportStats>,
 }
 
 impl MetaNode {
-    /// 打开（或按盘上状态恢复）一个单节点 metanode。
+    /// 打开（或按盘上状态恢复）一个 metanode。
     ///
-    /// 三道检查都在**动手之前**做完，任何一道不过就拒绝启动：
+    /// 四道检查都在**动手之前**做完，任何一道不过就拒绝启动：
     ///
     /// 1. 存储能打开（目录权限/被占用/快照损坏）；
     /// 2. 盘上成员表与本次配置一致（否则本节点会在一个凑不齐的组里静默空转）；
-    /// 3. 成员表只有一个节点（多节点需要网络传输；见 [`MetaNodeError::MultiNodeUnsupported`]）。
+    /// 3. 成员表里的**其他** voter 都有地址（缺了 → [`MetaNodeError::MissingPeer`]）；
+    /// 4. 多节点时处于 tokio 运行时上下文（要起发送任务）。
+    ///
+    /// # 参数
+    ///
+    /// - `voters`：成员表（**持久化状态**，只在首次写入；之后必须与盘上一致）。
+    /// - `peers`：`节点 id → "host:port"`。**只需列别的节点**（列了自己会被忽略）。
+    ///   单节点传空表：这时不碰网络、也不需要 tokio 上下文。
     pub fn open(
         dir: impl AsRef<std::path::Path>,
         id: u64,
         voters: Vec<u64>,
+        peers: HashMap<u64, String>,
     ) -> Result<Self, MetaNodeError> {
         let dir = dir.as_ref();
         let (storage, sm) = FjallStorage::open_with_state(dir, id, voters.clone())
@@ -539,15 +577,38 @@ impl MetaNode {
             return Err(MetaNodeError::MembershipMismatch { stored, requested });
         }
 
-        // ③ 多节点支持前，先明确拒绝（否则会静默空转到天荒地老）
-        if stored.len() > 1 {
-            return Err(MetaNodeError::MultiNodeUnsupported { voters: stored });
+        // ③ 每个"别的 voter"都必须有地址。
+        //    缺地址的后果**不报错**：消息发不出去 → 永远选不出 leader（最难查的那种故障），
+        //    所以宁可拒绝启动，并把**缺哪个**列出来。
+        let mut peers = peers;
+        peers.remove(&id); // 列了自己也无妨（常见的复制粘贴写法），忽略即可
+        let missing: Vec<u64> = stored
+            .iter()
+            .copied()
+            .filter(|v| *v != id && !peers.contains_key(v))
+            .collect();
+        if !missing.is_empty() {
+            return Err(MetaNodeError::MissingPeer { missing });
         }
 
-        // 单 voter：raft 不需要与任何 peer 通信，本节点自选为 leader。
-        // 邮箱仍按同一套建（下一步换成网络传输时，这里就是"发件箱"）。
-        let (tx, rx) = mpsc::channel::<Message>();
-        let mailboxes: HashMap<u64, Sender<Message>> = HashMap::from([(id, tx)]);
+        // ④ 传输层：单节点不需要网络（且**不要求** tokio 上下文）；多节点必须有运行时。
+        let (inbox_tx, rx) = mpsc::channel::<Message>();
+        let stats = Arc::new(TransportStats::default());
+        let transport: Arc<dyn PeerTransport> = if peers.is_empty() {
+            Arc::new(NoTransport)
+        } else {
+            let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+                MetaNodeError::Transport(
+                    "多节点传输需要 tokio 运行时上下文：请在 runtime 内调用 MetaNode::open\
+                     （单节点不需要，见 main.rs 的启动顺序）"
+                        .into(),
+                )
+            })?;
+            Arc::new(
+                GrpcTransport::new(&handle, peers, stats.clone())
+                    .map_err(MetaNodeError::Transport)?,
+            )
+        };
 
         let role = Arc::new(Mutex::new(StateRole::Follower));
         let applied = Arc::new(Mutex::new(0u64));
@@ -563,29 +624,30 @@ impl MetaNode {
             sm: sm.clone(),
             storage: storage.handle(),
             cmd_tx: cmd_tx.clone(),
+            raft_inbox: inbox_tx,
         };
         let thread = spawn_node(
-            id,
-            rx,
-            mailboxes,
-            sm,
-            storage,
-            role,
-            applied,
-            debug,
-            status,
-            cmd_rx,
+            id, rx, transport, sm, storage, role, applied, debug, status, cmd_rx,
         );
         Ok(Self {
             id,
             handle,
             cmd_tx,
             thread: Some(thread),
+            stats,
         })
     }
 
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// 出站传输计数快照（多节点才有意义）。
+    ///
+    /// 用例/运维靠它区分"根本没发"与"发了但对方没收到" —— 这两种在现象上都是
+    /// "集群不动"，原因却完全不同。
+    pub fn transport_stats(&self) -> TransportStatsView {
+        self.stats.view()
     }
 
     /// 节点句柄（给 gRPC 服务层用）。
@@ -636,7 +698,7 @@ impl Drop for MetaNode {
 fn spawn_node(
     id: u64,
     mailbox: Receiver<Message>,
-    mailboxes: HashMap<u64, Sender<Message>>,
+    transport: Arc<dyn PeerTransport>,
     sm: Arc<Mutex<CatalogState>>,
     storage: FjallStorage,
     role: Arc<Mutex<StateRole>>,
@@ -766,11 +828,13 @@ fn spawn_node(
             // ④ Ready 循环
             if raw.has_ready() {
                 let mut rd = raw.ready();
-                // 出站消息
+                // 出站消息 → 传输层。
+                //
+                // ⚠️ 这里仍在 **raft 线程** 上：传输层的 `send` 必须非阻塞
+                // （`GrpcTransport` 只做出站队列 `try_send`，满了就丢 —— raft 会重发）。
+                // 若在这里 await 网络，tick 会被拖住 = 别人选你当 leader 时你没反应。
                 for msg in rd.take_messages() {
-                    if let Some(tx) = mailboxes.get(&msg.to) {
-                        let _ = tx.send(msg);
-                    }
+                    transport.send(msg.to, msg);
                 }
                 // 快照安装：**必须**在 advance 前完成（else raft 会认为已稳定）。
                 //
@@ -807,11 +871,10 @@ fn spawn_node(
                     &applied,
                     &mut pending,
                 );
-                // 持久化后的消息（follower 的 append 响应等）
+                // 持久化后的消息（follower 的 append 响应等）—— 同样走后端传输、
+                // 同样**不阻塞**（这几条必须在落盘后才发，晚一点没关系，卡住才致命）
                 for msg in rd.take_persisted_messages() {
-                    if let Some(tx) = mailboxes.get(&msg.to) {
-                        let _ = tx.send(msg);
-                    }
+                    transport.send(msg.to, msg);
                 }
                 // ② advance：拿到 commit index 与下一批可应用条目
                 let mut light = raw.advance(rd);
@@ -820,10 +883,11 @@ fn spawn_node(
                         .set_commit(commit)
                         .unwrap_or_else(|e| fatal(id, "提交点落盘", e));
                 }
+                // LightReady 的消息**必须**发出去：`advance` 的轻量批次里带的是
+                // "落盘后生成"的响应（如 follower 的 append 回复）——漏发会表现为
+                // "leader 一直等不到多数派确认"（写不进去，且没有任何错误）
                 for msg in light.take_messages() {
-                    if let Some(tx) = mailboxes.get(&msg.to) {
-                        let _ = tx.send(msg);
-                    }
+                    transport.send(msg.to, msg);
                 }
                 let committed = light.take_committed_entries();
                 apply_committed(

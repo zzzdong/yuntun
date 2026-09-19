@@ -43,6 +43,9 @@ service Meta {
   rpc Status   (StatusRequest)   returns (StatusResponse);
   // 成员变更（learner → voter）
   rpc Join     (JoinRequest)     returns (JoinResponse);
+  // 节点间：一条 raft 消息（S3-3 传输）。**不是客户端接口** ——
+  // 客户端用它没有意义（它只对 raft 有语义），单独列出来是为了让"哪些 RPC 是给谁的"一目了然。
+  rpc Raft     (RaftRequest)     returns (RaftResponse);
 }
 
 // ---------------------------------------------------------------- 写路径
@@ -209,4 +212,29 @@ message JoinRequest {
 message JoinResponse {
   uint64 voters   = 1;
   uint64 learners = 2;
+}
+
+// ---------------------------------------------------------------- 节点间（raft 传输）
+
+// 一条 raft 消息。
+//
+// **载荷是不透明 bytes**：投票/心跳/追加日志这些消息的格式由 raft-rs（`eraftpb`）定义，
+// 我们在 proto 里重写一遍只会得到"两份必然漂移的定义 + 每升一次 raft 就要同步改 proto"。
+// 代价是本字段不可自描述 —— 所以**版本必须随消息走**（本 crate 的 `PROTO_VERSION` 已在
+// Status 里暴露，跨版本节点混跑要靠发布约束拦住，见 operation-log §50.5）。
+message RaftRequest {
+  // 发送方节点 id（对端据此做成员校验与观测；**不是**鉴权凭据）
+  uint64 from = 1;
+  // `raft::eraftpb::Message` 的 protobuf 编码
+  bytes message = 2;
+}
+
+message RaftResponse {
+  // 是否已交给对端的 raft 线程。
+  //
+  // `false` **不是**致命错误（raft 会按 tick 重发），但必须能被统计出来：
+  // "永远选不出 leader"是最难查的故障，没有这个信号就只能靠猜。
+  bool   delivered = 1;
+  // 未交付的原因（对端未运行 / 不是成员）—— 日志与指标用
+  string reason    = 2;
 }

@@ -142,11 +142,13 @@ impl From<MetaError> for tonic::Status {
 pub enum MetaNodeError {
     /// 存储打不开：目录权限、被别的进程占着（fjall 有目录锁）、快照损坏…
     Storage(String),
-    /// 成员表里不止一个节点。
+    /// 多节点，但缺**对端地址**。
     ///
-    /// 多节点复制要走**网络传输**（下一步）；现在起起来各节点互相发不出消息，
-    /// 只会静默空转（永远选不出 leader），所以明确拒绝而不是"先跑着看看"。
-    MultiNodeUnsupported { voters: Vec<u64> },
+    /// 缺了就无法给这些节点发 raft 消息 → 本节点会静默空转（永远选不出 leader）。
+    /// 这个错误是"给出能直接照做的提示"的关键：**缺哪个列哪个**。
+    MissingPeer { missing: Vec<u64> },
+    /// 传输层起不来（地址非法 / 不在 tokio 运行时上下文里）。
+    Transport(String),
     /// 盘上的成员表与本次配置不一致。
     MembershipMismatch { stored: Vec<u64>, requested: Vec<u64> },
 }
@@ -155,11 +157,13 @@ impl std::fmt::Display for MetaNodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MetaNodeError::Storage(m) => write!(f, "存储不可用：{m}"),
-            MetaNodeError::MultiNodeUnsupported { voters } => write!(
+            MetaNodeError::MissingPeer { missing } => write!(
                 f,
-                "成员表 {voters:?} 不止一个节点：多节点 raft 复制需要网络传输（下一步），\
-                 现在启动会各说各话（永远选不出 leader）。单节点请用 --voters <自己的 id>。"
+                "缺少对端地址：节点 {missing:?} 在成员表里，但没给它们的地址（--peer）。\n\
+                 没有地址就发不出 raft 消息 → 本节点会一直选不出 leader（且**不报错**）。\n\
+                 补上：--peer <id>@<host:port>,... （只需列**别的**节点，可以带上自己）"
             ),
+            MetaNodeError::Transport(m) => write!(f, "传输层不可用：{m}"),
             MetaNodeError::MembershipMismatch { stored, requested } => write!(
                 f,
                 "盘上成员表是 {stored:?}，本次配置是 {requested:?}。\n\

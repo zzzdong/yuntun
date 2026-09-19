@@ -15,6 +15,8 @@ use std::time::Duration;
 
 use tonic::{Request, Response, Status};
 
+use raft::eraftpb::Message;
+
 use crate::{MetaError, NodeHandle};
 use yuntun_proto::meta as pb;
 
@@ -87,6 +89,36 @@ impl pb::meta_server::Meta for MetaService {
         Err(Status::unimplemented(
             "成员变更（learner → voter）属 S3-6；现在加节点必须改初始成员表并全量重启",
         ))
+    }
+
+    /// 节点间：一条 raft 消息（`Meta.Raft`）。**不是客户端接口**。
+    ///
+    /// 这一层刻意只做"解码 + 入箱"，**不做**：去重、排序、鉴权、地址校验 ——
+    /// 前两者由 raft 自己保证/容忍（见 `transport` 模块文档），后两者是部署层的事
+    /// （真实环境要 mTLS，登记在 operation-log §50.6）。
+    async fn raft(
+        &self,
+        req: Request<pb::RaftRequest>,
+    ) -> Result<Response<pb::RaftResponse>, Status> {
+        let r = req.into_inner();
+        // 解不开 = 版本不匹配或线上被截断。**必须报错**（不回 delivered=false 的"软失败"）：
+        // 软失败会让对端以为"对端收到了但拒收"，真相却是**协议不一致**，两者的处置完全不同。
+        let msg = <Message as protobuf::Message>::parse_from_bytes(&r.message).map_err(|e| {
+            Status::invalid_argument(format!(
+                "raft 消息解不开（节点 {} 发来 {} 字节）：{e}",
+                r.from,
+                r.message.len()
+            ))
+        })?;
+        let delivered = self.node.deliver(msg);
+        Ok(Response::new(pb::RaftResponse {
+            delivered,
+            reason: if delivered {
+                String::new()
+            } else {
+                "本节点的 raft 线程已退出（未运行）".into()
+            },
+        }))
     }
 }
 

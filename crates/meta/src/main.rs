@@ -33,8 +33,14 @@ fn main() {
 }
 
 fn run(args: &cli::Args) -> Result<(), Box<dyn std::error::Error>> {
-    // ① 起节点：打开存储 → 按盘上状态重建状态机 → 拉起 raft 线程
-    let node = MetaNode::open(&args.dir, args.id, args.voters.clone())?;
+    // ⓪ **先建运行时**：多节点传输要 `Handle::current()` 给每个 peer 起发送任务
+    //    （单节点不需要网络，但把顺序统一成"先运行时"更少一个分支 —— 少一个分支就少一种
+    //    "单机能跑、多机报错"的差异）。`enter()` 的 guard 要活到 `open` 之后。
+    let rt = tokio::runtime::Runtime::new()?;
+    let _guard = rt.enter();
+
+    // ① 起节点：打开存储 → 按盘上状态重建状态机 → 拉起 raft 线程（+ 多节点传输）
+    let node = MetaNode::open(&args.dir, args.id, args.voters.clone(), args.peer_map())?;
 
     // ② 等选主。**必须先等**：在选出 leader 之前接请求只会全部收到 `NotLeader`，
     //    调用方会以为"服务起来了但一直失败"（比等几百毫秒难查得多）。
@@ -48,7 +54,6 @@ fn run(args: &cli::Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ③ 起服务
-    let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let listener = tokio::net::TcpListener::bind(args.listen).await?;
         let addr = listener.local_addr()?;

@@ -333,9 +333,14 @@ fn process_refuses_the_two_misuses_of_init() {
     assert!(stderr.contains("已有数据"), "{stderr}");
 }
 
-/// 成员表不一致必须**拒绝启动**，而不是在一个凑不齐成员的组里静默空转。
+/// **多节点的两道闸门**：
+///
+/// ① 盘上成员表与启动参数不一致 → 拒绝（否则本节点会在一个凑不齐的组里静默空转）；
+/// ② 成员表里有别的节点、却没给它们地址 → 拒绝（发不出消息 = 永远选不出 leader）。
+///
+/// ② 现在由 **CLI 语义校验**在启动前拦住（退出码 2），而不是等运行期 —— 早失败、提示更直接。
 #[test]
-fn process_refuses_membership_mismatch_and_multinode() {
+fn process_refuses_membership_mismatch_and_missing_peer() {
     let dir = TempDir::new("metanode-membership");
     // 先按单节点**真正起一次**：`--init` 的语义是"首次启动"，它会一直服务，
     // 所以必须像真部署那样 —— 起 → 等就绪 → 停（用 `.output()` 等它会一直挂着）。
@@ -343,28 +348,31 @@ fn process_refuses_membership_mismatch_and_multinode() {
     let _ = p.wait_listening();
     p.kill9(); // 此后盘上成员表 = [1]
 
-    // ① 按 3 节点重启 → 成员表不一致，拒绝
+    // ① 盘上说 [1]，启动参数说 [1,2,3]（地址给全了，所以能走到运行期检查）→ 拒绝
     let out = Command::new(BIN)
         .args(["--id", "1", "--dir"])
         .arg(dir.path())
         .args(["--voters", "1,2,3"])
+        .args(["--peer", "2@127.0.0.1:9002,3@127.0.0.1:9003"])
         .output()
         .expect("跑二进制");
     assert_eq!(out.status.code(), Some(1), "启动失败应退出 1");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("盘上成员表"), "{stderr}");
 
-    // ② 新目录 + 多节点成员表 → 明确拒绝（多节点复制要网络传输，下一步）
-    let fresh = dir.path().join("multi");
+    // ② 多节点却没给 --peer → **用法错**（退 2），且提示缺哪个节点
     let out = Command::new(BIN)
         .args(["--id", "1", "--dir"])
-        .arg(&fresh)
+        .arg(dir.path().join("multi"))
         .args(["--voters", "1,2,3", "--init"])
         .output()
         .expect("跑二进制");
-    assert_eq!(out.status.code(), Some(1), "启动失败应退出 1");
+    assert_eq!(out.status.code(), Some(2), "用法错应退出 2");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("不止一个节点"), "{stderr}");
+    assert!(
+        stderr.contains("[2, 3]") || stderr.contains("没给它们地址"),
+        "应说明缺哪些对端地址：{stderr}"
+    );
 }
 
 /// clap 接管语法层后的**统一行为**：`--help`/`--version` 退 0，未知 flag 退 2 并**指出参数名**。

@@ -53,9 +53,46 @@ pub struct Args {
     #[arg(long, value_delimiter = ',')]
     pub voters: Vec<u64>,
 
+    /// 其他节点的地址（`id@host:port`，逗号分隔）。**多节点必填**。
+    ///
+    /// 只需列**别的**节点（列了自己会被忽略）。缺了会**静默**选不出 leader，所以宁可早失败。
+    #[arg(long, value_delimiter = ',', value_parser = parse_peer)]
+    pub peer: Vec<Peer>,
+
     /// 首次启动：显式声明「这个目录是新集群」
     #[arg(long)]
     pub init: bool,
+}
+
+/// `--peer` 的取值：`<id>@<host:port>`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Peer {
+    pub id: u64,
+    pub addr: String,
+}
+
+/// `--peer` 的解析器。
+///
+/// 地址在这里**做成 gRPC 端点再校验一次**：写错一个 `--peer` 若只表现为"集群永远选不出
+/// leader"（消息发不出去且不报错），排查成本极高 —— 启动期报出来最省事。
+fn parse_peer(s: &str) -> Result<Peer, String> {
+    let (id, addr) = s.split_once('@').ok_or_else(|| {
+        format!("取值应为 <id>@<host:port>（如 2@127.0.0.1:9001），收到 {s:?}")
+    })?;
+    let id = id
+        .trim()
+        .parse::<u64>()
+        .map_err(|e| format!("节点 id {id:?} 不是整数：{e}"))?;
+    let addr = addr.trim();
+    if addr.is_empty() {
+        return Err(format!("{s:?} 缺少地址"));
+    }
+    tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .map_err(|e| format!("地址 {addr:?} 不能用作 gRPC 端点：{e}"))?;
+    Ok(Peer {
+        id,
+        addr: addr.to_string(),
+    })
 }
 
 impl Args {
@@ -88,7 +125,37 @@ impl Args {
                 self.voters, self.id
             ));
         }
+        // 同一个 id 两个地址 = "消息到底发哪"没有正确答案：静默取一个是错的，直接拒绝
+        let mut seen = std::collections::HashSet::new();
+        for p in &self.peer {
+            if !seen.insert(p.id) {
+                return Err(format!(
+                    "--peer 里节点 {} 出现了多次（同一节点只能有一个地址）",
+                    p.id
+                ));
+            }
+        }
+        // 多节点：每个**别的** voter 都必须有地址。缺地址的后果**不报错**（发不出去 →
+        // 永远选不出 leader），所以在这里拦住，并列出缺哪个。
+        let missing: Vec<u64> = self
+            .voters
+            .iter()
+            .copied()
+            .filter(|v| *v != self.id && !seen.contains(v))
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "成员表里有节点 {missing:?}，但没给它们地址。\n\
+                 用 --peer <id>@<host:port>,... 补上（只需列别的节点）；\n\
+                 单节点请确认 --voters 只有自己。"
+            ));
+        }
         Ok(self)
+    }
+
+    /// `id → 地址`（交给 `MetaNode::open`）。
+    pub fn peer_map(&self) -> std::collections::HashMap<u64, String> {
+        self.peer.iter().map(|p| (p.id, p.addr.clone())).collect()
     }
 
     /// **启动安全闸门**：把"参数合法"提升到"意图合法"。
@@ -156,6 +223,8 @@ mod tests {
     fn explicit_voters_are_sorted_and_deduped() {
         let a = run(&[
             "--id", "2", "--dir", "/tmp/x", "--voters", "3,1,2,2", "--listen", "0.0.0.0:7000",
+            // 多节点：别的 voter 必须有地址（否则 normalize 拒绝，见另一条用例）
+            "--peer", "1@127.0.0.1:9001,3@127.0.0.1:9003",
         ]);
         assert_eq!(a.voters, vec![1, 2, 3], "成员表要归一化（顺序/重复都不该影响语义）");
         assert_eq!(a.listen.to_string(), "0.0.0.0:7000");
@@ -205,6 +274,54 @@ mod tests {
         assert_eq!(parse(&["--help"]).unwrap_err().kind(), ErrorKind::DisplayHelp);
         // `--version` 同理
         assert_eq!(parse(&["--version"]).unwrap_err().kind(), ErrorKind::DisplayVersion);
+    }
+
+    /// 多节点：给全 `--peer` 才能过；缺一个就**早失败**并列出缺哪个。
+    #[test]
+    fn multi_voter_requires_peer_address_for_each_other_node() {
+        // 给全 → 过
+        let a = run(&[
+            "--id", "1", "--dir", "/tmp/x", "--voters", "1,2,3",
+            "--peer", "2@127.0.0.1:9002,3@127.0.0.1:9003",
+        ]);
+        assert_eq!(a.peer_map().get(&2).map(String::as_str), Some("127.0.0.1:9002"));
+
+        // 缺一个 → 报错里点名
+        let a = parse(&[
+            "--id", "1", "--dir", "/tmp/x", "--voters", "1,2,3", "--peer", "2@127.0.0.1:9002",
+        ]).unwrap();
+        let e = a.normalize().unwrap_err();
+        assert!(e.contains("[3]"), "应点名缺节点 3：{e}");
+
+        // 列了自己也无妨（忽略即可，不该报错）
+        let a = run(&[
+            "--id", "1", "--dir", "/tmp/x", "--voters", "1,2",
+            "--peer", "1@127.0.0.1:9001,2@127.0.0.1:9002",
+        ]);
+        assert_eq!(a.peer_map().len(), 2);
+    }
+
+    /// `--peer` 写错必须**在启动前**报出来（否则表现为"永远选不出 leader"，极难查）。
+    #[test]
+    fn malformed_peer_is_rejected_by_clap() {
+        for bad in ["nope", "2", "x@127.0.0.1:9", "2@"] {
+            let e = parse(&["--id", "1", "--dir", "/tmp/x", "--peer", bad]).unwrap_err();
+            assert!(
+                e.to_string().contains("--peer"),
+                "坏值 {bad:?} 的报错应提到 --peer：{e}"
+            );
+        }
+    }
+
+    /// 同一节点给两个地址 → 拒绝（"消息发哪"没有正确答案，静默取一个是错的）。
+    #[test]
+    fn duplicate_peer_id_is_rejected() {
+        let a = parse(&[
+            "--id", "1", "--dir", "/tmp/x", "--voters", "1,2",
+            "--peer", "2@127.0.0.1:9002,2@127.0.0.1:9003",
+        ]).unwrap();
+        let e = a.normalize().unwrap_err();
+        assert!(e.contains("出现了多次"), "{e}");
     }
 
     /// 两条安全闸门：空目录必须 `--init`；有数据的目录不许 `--init`。
