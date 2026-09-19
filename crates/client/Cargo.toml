@@ -9,6 +9,8 @@ name = "yuntun-cli"
 path = "src/main.rs"
 
 [dependencies]
+# CLI 参数解析（全仓统一）
+clap = { workspace = true }
 # prettyprint = CLI 表格输出；csv/json = 导入解析
 arrow = { workspace = true, features = ["prettyprint", "csv", "json"] }
 arrow-flight = { workspace = true }

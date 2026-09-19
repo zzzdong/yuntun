@@ -163,6 +163,16 @@ impl FjallStorage {
         self.sm.clone()
     }
 
+    /// 盘上记录的成员表。
+    ///
+    /// 启动时必须与实际配置**比对**：不一致（典型：曾按 3 节点跑过，现在按单节点起）
+    /// 会让本节点在一个"永远凑不齐成员"的组里静默空转 —— 宁可拒绝启动。
+    pub fn voters(&self) -> Vec<u64> {
+        let mut v = self.cache.lock().unwrap().conf_state.voters.clone();
+        v.sort_unstable();
+        v
+    }
+
     /// 盘上那份快照覆盖到的 index（= 压缩位置）。**进程启动时 `Config.applied` 应取它**：
     /// 状态机正是从这个快照恢复的，raft 只需重放它之后的条目。
     pub fn snapshot_index(&self) -> u64 {

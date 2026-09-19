@@ -14,28 +14,23 @@ use std::path::PathBuf;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// 启动参数（clap）。
+///
+/// `#[command(version)]` 直接接管 `--version`（打印 `yuntun <版本>`，与原手写行为一致，
+/// 并额外支持 `-V`）；`--help` 由 clap 从本结构的 doc 注释生成 —— 手写的那套
+/// "unknown arg + usage" 只在拼错时给一行含糊提示，clap 会指出**是哪个参数**。
+#[derive(clap::Parser, Debug)]
+#[command(name = "yuntun", version, about = "yuntun 单机进程（阶段 1；原 bins/all-in-one）")]
+struct Args {
+    /// 配置文件（TOML）；省略则用默认配置（本地 ./data + 内存 catalog）
+    #[arg(long)]
+    config: Option<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // ---- 参数（cmd 入口规范：flag 包）----
-    let mut config_path: Option<PathBuf> = None;
-    let mut show_version = false;
-    let mut args = std::env::args().skip(1);
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--config" => {
-                config_path = Some(PathBuf::from(args.next().unwrap_or_default()));
-            }
-            "--version" => show_version = true,
-            other => {
-                eprintln!("unknown arg: {other}\nusage: yuntun [--config <file>] [--version]");
-                std::process::exit(2);
-            }
-        }
-    }
-    if show_version {
-        println!("yuntun {VERSION}");
-        return Ok(());
-    }
+    // ---- 参数（clap：help/version/用法错的文案与退出码全仓统一）----
+    let config_path = <Args as clap::Parser>::parse().config;
 
     // ---- 日志 ----
     tracing_subscriber::fmt()

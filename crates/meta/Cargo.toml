@@ -4,12 +4,19 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+# 显式命名：进程名 `metanode` 是**对外接口**（编排脚本/测试用 CARGO_BIN_EXE_metanode 引用它），
+# 别让它跟着包名（yuntun-meta）变。
+name = "metanode"
+path = "src/main.rs"
+
 [dependencies]
 yuntun-model = { path = "../model" }
 yuntun-catalog = { path = "../catalog" }
 arrow = { workspace = true }
 # gRPC 面（S3-0）：op 类型与错误码映射
 yuntun-proto = { path = "../proto" }
+clap = { workspace = true }
 prost = { workspace = true }
 tonic = { workspace = true }
 # gRPC 服务层：tokio 运行时 + futures（把 accept 循环包成 Stream）

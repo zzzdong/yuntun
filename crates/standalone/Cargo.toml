@@ -9,6 +9,8 @@ name = "yuntun"
 path = "src/main.rs"
 
 [dependencies]
+# CLI 参数解析（全仓统一）
+clap = { workspace = true }
 yuntun-server = { path = "../server" }
 yuntun-store = { path = "../store" }
 tokio = { workspace = true }

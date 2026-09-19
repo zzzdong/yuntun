@@ -35,13 +35,15 @@
 //! raft 消息直接经 `std::sync::mpsc` 传递（**不序列化**）—— 生产实现要走 gRPC，
 //! 但那是 S3-0/S3-3 的事，与选型无关。
 
+pub mod cli;
 pub mod error;
 pub mod fjall_storage;
 pub mod op;
 pub mod service;
 pub mod storage;
 
-pub use error::MetaError;
+pub use cli::Args;
+pub use error::{MetaError, MetaNodeError};
 pub use fjall_storage::FjallStorage;
 pub use op::{apply, decode_op, StateOp};
 pub use service::{serve, MetaService};
@@ -489,6 +491,147 @@ impl Drop for Cluster {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+/// **单节点 metanode 运行时**（进程用；S3-3 的启动路径）。
+///
+/// 与 [`Cluster`]（测试用的进程内三节点）的区别：
+///
+/// | | `Cluster` | `MetaNode` |
+/// |---|---|---|
+/// | 成员表 | 硬编码 `PEERS` | 调用方给（CLI/配置） |
+/// | 目录 | 临时目录，`Drop` 清理 | 调用方给，**永不自动删** |
+/// | 规模 | 3 节点（进程内邮箱） | **只支持单 voter**（多节点要网络传输，下一步） |
+/// | 用途 | 验证机制 | 真正跑起来 |
+///
+/// 关键点：落盘与恢复**完全共用**同一条链路（`FjallStorage::open_with_state` + `spawn_node`），
+/// 所以集群用例里验过的"重启后逐字节一致"对进程同样成立 —— 这也是进程级用例
+/// （`tests/metanode_process_e2e.rs`）能直接断言状态恢复、而不必重新证明一遍机制的原因。
+pub struct MetaNode {
+    id: u64,
+    handle: NodeHandle,
+    cmd_tx: Sender<Command>,
+    thread: Option<thread::JoinHandle<Receiver<Message>>>,
+}
+
+impl MetaNode {
+    /// 打开（或按盘上状态恢复）一个单节点 metanode。
+    ///
+    /// 三道检查都在**动手之前**做完，任何一道不过就拒绝启动：
+    ///
+    /// 1. 存储能打开（目录权限/被占用/快照损坏）；
+    /// 2. 盘上成员表与本次配置一致（否则本节点会在一个凑不齐的组里静默空转）；
+    /// 3. 成员表只有一个节点（多节点需要网络传输；见 [`MetaNodeError::MultiNodeUnsupported`]）。
+    pub fn open(
+        dir: impl AsRef<std::path::Path>,
+        id: u64,
+        voters: Vec<u64>,
+    ) -> Result<Self, MetaNodeError> {
+        let dir = dir.as_ref();
+        let (storage, sm) = FjallStorage::open_with_state(dir, id, voters.clone())
+            .map_err(|e| MetaNodeError::Storage(e.to_string()))?;
+
+        // ② 成员表必须一致（成员表是**持久化状态**，不随启动参数改变）
+        let mut requested = voters;
+        requested.sort_unstable();
+        requested.dedup();
+        let stored = storage.voters();
+        if stored != requested {
+            return Err(MetaNodeError::MembershipMismatch { stored, requested });
+        }
+
+        // ③ 多节点支持前，先明确拒绝（否则会静默空转到天荒地老）
+        if stored.len() > 1 {
+            return Err(MetaNodeError::MultiNodeUnsupported { voters: stored });
+        }
+
+        // 单 voter：raft 不需要与任何 peer 通信，本节点自选为 leader。
+        // 邮箱仍按同一套建（下一步换成网络传输时，这里就是"发件箱"）。
+        let (tx, rx) = mpsc::channel::<Message>();
+        let mailboxes: HashMap<u64, Sender<Message>> = HashMap::from([(id, tx)]);
+
+        let role = Arc::new(Mutex::new(StateRole::Follower));
+        let applied = Arc::new(Mutex::new(0u64));
+        let debug = Arc::new(Mutex::new(String::new()));
+        let status = Arc::new(Mutex::new(NodeStatus {
+            node_id: id,
+            ..Default::default()
+        }));
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
+        let handle = NodeHandle {
+            id,
+            status: status.clone(),
+            sm: sm.clone(),
+            storage: storage.handle(),
+            cmd_tx: cmd_tx.clone(),
+        };
+        let thread = spawn_node(
+            id,
+            rx,
+            mailboxes,
+            sm,
+            storage,
+            role,
+            applied,
+            debug,
+            status,
+            cmd_rx,
+        );
+        Ok(Self {
+            id,
+            handle,
+            cmd_tx,
+            thread: Some(thread),
+        })
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// 节点句柄（给 gRPC 服务层用）。
+    pub fn handle(&self) -> NodeHandle {
+        self.handle.clone()
+    }
+
+    /// 等本节点成为 leader（单节点组启动后几十毫秒内必然发生）。
+    ///
+    /// 启动路径需要它：**在选出 leader 之前接受请求只会全部收到 `NotLeader`**，
+    /// 客户端会以为"服务起来了但一直失败"。
+    pub fn wait_leader(&self, timeout: std::time::Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self.handle.status().role == "Leader" {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// 停机：让 raft 线程退出并 join（模拟"干净关闭"；`kill -9` 走的是另一条路）。
+    pub fn shutdown(mut self) {
+        let _ = self.cmd_tx.send(Command::Stop);
+        if let Some(h) = self.thread.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for MetaNode {
+    fn drop(&mut self) {
+        // 不 join 就等于进程退出时线程被强杀 —— 测试里会造成"偶发"的 fjall 目录锁残留。
+        // 所以 Drop 也走一遍停止流程（幂等：thread 取走后为 None）。
+        let _ = self.cmd_tx.send(Command::Stop);
+        if let Some(h) = self.thread.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// 起一个 raft 驱动线程。
+///
+/// 参数多是**有意**的（与 `Cluster::spawn_with` 同款处理）：这里就是把一个节点的全部
+/// 运行期句柄显式交出去 —— 收进结构体反而会掩盖"谁共享了什么"。
 #[allow(clippy::too_many_arguments)]
 fn spawn_node(
     id: u64,

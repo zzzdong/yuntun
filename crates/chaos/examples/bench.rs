@@ -97,11 +97,27 @@ fn make_batch(seed: usize, rows: usize, base_ms: i64) -> arrow::record_batch::Re
     .unwrap()
 }
 
+/// 压测参数（clap）。
+#[derive(clap::Parser, Debug)]
+#[command(
+    name = "bench",
+    about = "吞吐压测（阶段 0.5 验收 E1）：进程内直调 Ingestor，隔离 Flight 网络层",
+    after_help = "示例:\n  cargo run --release -p yuntun-chaos --example bench -- 30 16"
+)]
+struct Args {
+    /// 压测时长（秒）
+    #[arg(default_value_t = 10)]
+    duration_secs: u64,
+    /// 并发 worker 数
+    #[arg(default_value_t = 8)]
+    workers: usize,
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let duration = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10u64);
-    let workers: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8);
+    let args = <Args as clap::Parser>::parse();
+    let duration = args.duration_secs;
+    let workers = args.workers;
     let batch_rows = 500; // 每批 500 行 ≈ 500KB
 
     // 压测需要真实磁盘 I/O（tmpfs 会把 fsync 变成 no-op，吞吐/延迟失真）

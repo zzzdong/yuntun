@@ -134,6 +134,44 @@ impl From<MetaError> for tonic::Status {
     }
 }
 
+/// metanode **启动**路径的错误。
+///
+/// 与 [`MetaError`] 分开：那些是"处理请求失败"（有的可重试），这些是"**起不来**"
+/// （配置/盘的问题，重试多少次都一样）。混在一起会诱导调用方去重试配置错误。
+#[derive(Debug, Clone)]
+pub enum MetaNodeError {
+    /// 存储打不开：目录权限、被别的进程占着（fjall 有目录锁）、快照损坏…
+    Storage(String),
+    /// 成员表里不止一个节点。
+    ///
+    /// 多节点复制要走**网络传输**（下一步）；现在起起来各节点互相发不出消息，
+    /// 只会静默空转（永远选不出 leader），所以明确拒绝而不是"先跑着看看"。
+    MultiNodeUnsupported { voters: Vec<u64> },
+    /// 盘上的成员表与本次配置不一致。
+    MembershipMismatch { stored: Vec<u64>, requested: Vec<u64> },
+}
+
+impl std::fmt::Display for MetaNodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MetaNodeError::Storage(m) => write!(f, "存储不可用：{m}"),
+            MetaNodeError::MultiNodeUnsupported { voters } => write!(
+                f,
+                "成员表 {voters:?} 不止一个节点：多节点 raft 复制需要网络传输（下一步），\
+                 现在启动会各说各话（永远选不出 leader）。单节点请用 --voters <自己的 id>。"
+            ),
+            MetaNodeError::MembershipMismatch { stored, requested } => write!(
+                f,
+                "盘上成员表是 {stored:?}，本次配置是 {requested:?}。\n\
+                 成员表是持久化状态，不随启动参数改变：要改成员请走成员变更（S3-6）；\
+                 确认这个目录属于**另一个集群**的话，请换 --dir 或手动清空该目录。"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MetaNodeError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

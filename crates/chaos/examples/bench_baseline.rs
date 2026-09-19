@@ -172,21 +172,61 @@ fn peak(times: &[i64], bucket_ms: i64) -> (usize, i64) {
     (best, best_at)
 }
 
+/// 基线压测参数（clap）。
+///
+/// 位置参数顺序与原手写版**逐一对应**（secs shards batch_rows batches_per_sec
+/// max_flush_delay phase_spread rows_threshold pad bytes_threshold_mb），
+/// 所以文档与历史命令不用改。
+#[derive(clap::Parser, Debug)]
+#[command(
+    name = "bench_baseline",
+    about = "T8 基线压测：flush 时刻分布 / 峰值提交 / seal→committed 延迟分布",
+    after_help = "示例:\n  # 低吞吐表 100 shard，500 行/秒，跑 130s\n                    cargo run --release -p yuntun-chaos --example bench_baseline -- 130 100 50 10 30 5 500000\n\n                  注：本地磁盘/单进程下 S3 PUT 与 CommitFiles 被替换成「本地写 + 内存提交」，\n                    所以绝对延迟乐观；**分布形状**与配置无关地成立（P0 要定的正是配置）。"
+)]
+struct Args {
+    /// 压测时长（秒）；至少 130（2 个整分钟窗口）才有分布样本
+    #[arg(default_value_t = 130)]
+    secs: u64,
+    /// shard 数
+    #[arg(default_value_t = 100)]
+    shards: usize,
+    /// 每批行数
+    #[arg(default_value_t = 50)]
+    batch_rows: usize,
+    /// 每秒批次数
+    #[arg(default_value_t = 10)]
+    batches_per_sec: u64,
+    /// `max_flush_delay_secs`
+    #[arg(default_value_t = 30)]
+    max_flush_delay: u64,
+    /// `flush_phase_spread_secs`
+    #[arg(default_value_t = 5)]
+    phase_spread: u64,
+    /// `rows_threshold`
+    #[arg(default_value_t = 500_000)]
+    rows_threshold: u64,
+    /// 每行填充字节数（撑大行宽）
+    #[arg(default_value_t = 0)]
+    pad: usize,
+    /// `bytes_threshold`（MB）
+    #[arg(default_value_t = 128)]
+    bytes_threshold_mb: usize,
+    /// 关掉「读者」：没有读者时 chunk 内存永不归还，测到的是背压而非阈值
+    /// （等价于旧环境变量 `YUNTUN_BENCH_NO_READER`，两种写法都仍然生效）
+    #[arg(long)]
+    no_reader: bool,
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    let a: Vec<String> = std::env::args().collect();
-    let g = |i: usize, d: i64| a.get(i).and_then(|s| s.parse().ok()).unwrap_or(d);
-    let secs = g(1, 130) as u64;
-    let shards = g(2, 100) as usize;
-    let batch_rows = g(3, 50) as usize;
-    let batches_per_sec = g(4, 10) as u64;
-    let max_flush_delay = g(5, 30) as u64;
-    let phase_spread = g(6, 5) as u64;
-    let rows_threshold = g(7, 500_000) as u64;
-    let pad = g(8, 0) as usize;
-    let bytes_threshold_mb = g(9, 128) as usize;
+    let args = <Args as clap::Parser>::parse();
+    let (secs, shards, batch_rows, batches_per_sec) =
+        (args.secs, args.shards, args.batch_rows, args.batches_per_sec);
+    let (max_flush_delay, phase_spread, rows_threshold) =
+        (args.max_flush_delay, args.phase_spread, args.rows_threshold);
+    let (pad, bytes_threshold_mb) = (args.pad, args.bytes_threshold_mb);
     // 是否有"读者"：见 §下方注释 —— 没有读者时 chunk 内存永不归还，测量的是背压而非阈值。
-    let reader = std::env::var("YUNTUN_BENCH_NO_READER").is_err();
+    let reader = !args.no_reader && std::env::var("YUNTUN_BENCH_NO_READER").is_err();
 
     let dir = yuntun_testkit::TestDir::disk("bench-baseline");
     let wal_dir = dir.join("wal").to_string_lossy().to_string();

@@ -43,6 +43,8 @@ object_store = { version = "0.13", features = ["aws"] }
 url = "2"
 
 # ---- 运行时 ----
+# CLI 参数解析（全仓统一，不手写：手写的 help/错误信息/补全迟早漂移）
+clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 tonic = "0.14"

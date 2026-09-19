@@ -24,6 +24,8 @@ bytes = { workspace = true }
 parquet = { workspace = true }
 
 [dev-dependencies]
+# 示例（bench/bench_baseline）的参数解析
+clap = { workspace = true }
 yuntun-testkit = { path = "../testkit" }
 # 探针需要直接观察 chunk 层的可见性判定（提交→标记窗口）
 yuntun-chunk = { path = "../chunk" }
