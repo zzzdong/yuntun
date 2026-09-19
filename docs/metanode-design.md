@@ -153,6 +153,11 @@ impl CatalogState { pub fn apply(&mut self, revision: u64, op: &CatalogOp) -> Op
 **逃生门（明确的时间点）**：S3-1 PoC 结束时评审一次；若 raft-rs 的样板（Storage/snapshot/传输）预计超过总工作量的 50%，
 则切换到 openraft，并把"需要自建生产验证"作为**新增风险**入册。**S3-2 开始后不再切换**。
 
+> ✅ **闸门已过（2026-09-19，`operation-log §40`）**：三节点选主 + 收敛 + kill leader 不丢已提交数据
+> 三项实测通过；**raft 集成核心仅 124 行**（Ready 循环 49 行）→ 样板可控，**保留 raft-rs**。
+> openraft 降级为备选：仅在 S3-3（fjall Storage + 快照 + 成员变更）样板失控时再评估；
+> 届时不需动 `CatalogState` 与上层接口 —— 这正是先做 S3-2 的价值。
+
 ### 4.3 D3：日志与状态机存储 —— **fjall**
 
 - `design.md` 已规划 `fjall = "3.1.8"`（LSM，纯 Rust，无 C 依赖）；
@@ -240,7 +245,7 @@ message ProposeResponse {
 | 步 | 内容 | 验收（必须能跑） | 回滚点 |
 |---|---|---|---|
 | **S3-0** | proto 定义 + `tonic-build`（`T10.8`）：把现有手写 prost struct 迁到 `.proto` 生成 | 编解码 round-trip；与现有 `CommitFilesRequest` 字段**逐个对齐**的兼容测试 | 保留手写 struct（双份并存一个 commit） |
-| **S3-1** | **raft PoC（选型闸门）**：3 节点进程内集群，写/读/kill leader/快照/安装 | 3 节点写入不中断；kill leader 后 30s 内恢复；快照可安装 | 换 openraft（§4.2 逃生门） |
+| **S3-1** | **raft PoC（选型闸门）**：3 节点进程内集群，写/读/kill leader/快照/安装 | ✅ **闸门已过**（`operation-log §40`）：三节点收敛（规范编码逐字节相同）、kill leader 后存活节点当选且 b1/b2/b3 不丢、反证成立（切断消息路由则两条用例都失败）、样板 124 行 → **保留 raft-rs**。**余**：S3-1b 快照安装 + 日志压缩 | openraft 降级为备选（仅在 S3-3 样板失控时） |
 | **S3-2** | `CatalogState` 抽取（§4.1）+ **确定性对拍** | ✅ **第一切片已落地**（`operation-log §38`）：`CatalogState` 抽出、抓到并修掉**四处真实非确定性**（3 处状态机读钟 + 1 处 `HashSet` 决定版本分配序）、`encode_canonical` + 5 个对拍用例（含反证）。**余**：键集合接线（S3-5）、快照 prost 版（S3-3） | 已保留 `MemoryCatalog` 作为宿主（语义零改动） |
 | **S3-3** | `yuntun-meta` 进程 + `MetaService`（Propose/Prefetch/Delta/Status/Join）+ fjall | 单节点 metanode 可独立启动；重启后状态一致 | — |
 | **S3-4** | `RemoteCatalog`（`CatalogOps` 的 gRPC 实现）+ standalone 装配（本地传输、1 节点 raft） | **既有 217 用例全绿**（standalone 不回归）；`if distributed` 分支为零 | 切回 `MemoryCatalog`（装配层开关） |
@@ -314,7 +319,7 @@ C-4 快照安装期间崩溃（安装原子性）。
 
 | # | 待决 | 何时定 | 判据 |
 |---|---|---|---|
-| 1 | raft 库最终选型（raft-rs vs openraft） | S3-1 结束 | §4.2 逃生门准则 |
+| 1 | ~~raft 库最终选型（raft-rs vs openraft）~~ ✅ **已定：raft-rs**（2026-09-19） | S3-1 结束 | §4.2 逃生门准则 + `operation-log §40` 实测（样板 124 行、三项判据通过） |
 | 2 | snapshot 保留策略的具体参数（保留 N 天 / 多少条） | S3-3 期间 | 压出增长曲线后再拍 |
 | 3 | metanode 全不可用时的写入行为（**拒写 vs 降级**） | S3-4 前 | 建议拒写（恢复语义简单）；若业务要求可用性优先，则必须同时声明"元数据不可用期间的数据可见性不保证" |
 | 4 | 是否在 R3 就引入 TLS/鉴权 | 阶段 4 前 | 现在只登记为已知限制 |

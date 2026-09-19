@@ -90,6 +90,8 @@ MySQL 端口 **trust 无鉴权**（按网络隔离部署）；MySQL 轨结果集
 | 阈值与背压基线 | 账本口径 B/行 / 内存水位峰值 / 背压档 / RowGroup 数 / 单文件字节 | `operation-log §33`（同程序，`pad`/`bytes_threshold`/读者开关） |
 | 多节点基线 | 全局提交时间线（峰值 9 次/秒 @4 节点）、争用下的 seal 构成、相位让位触发 | `operation-log §37`（`scripts/bench_multi.sh`） |
 | R3 确定性防线 | `CatalogState` 规范编码 + 对拍（同一串 op → 逐字节相同）+ 4 处非确定性已修 | `operation-log §38`（`catalog/src/state.rs`） |
+| R3 选型闸门 | raft-rs 三节点：收敛（编码逐字节相同）/ kill leader 不丢已提交 / 样板 124 行 / 反证成立 | `operation-log §40` + `crates/meta/tests/raft_poc.rs` |
+| R3 选型闸门 | raft-rs 三节点：收敛（编码逐字节相同）/ kill leader 不丢已提交 / 样板 124 行 / 反证成立 | `operation-log §40` + `crates/meta/tests/raft_poc.rs` |
 | 吞吐 | `bench.rs`（E1 目标 8w 行/秒） | `crates/chaos/examples/bench.rs` |
 
 **五个真缺陷（都"不报错、只产出错数据"，功能测试全绿时抓到的）**：
@@ -160,7 +162,7 @@ window_closed    files= 3
 | 2 | 让文件数可预期：`bytes_threshold` 是否随速率自适应，或暴露"目标文件行数"配置 | 用户设的是字节、观测到的是行数，口径不直观 | 属易用性/可运维性 |
 | 3 | `max_row_group_size` 专项 | 显式设定（实测现状 = 整文件 1 组）→ 需测 RowGroup 大小对扫描剪枝/压缩率/写入内存的影响 | 与文件大小互为约束 |
 | 4 | ~~真多节点基线压测~~ ✅ **本机多进程已完成**（`operation-log §37`） | 4 节点 × 20k rows/s：全局峰值 **9 次/秒**、`pressure` 主导 60%、相位让位 2~3 次/节点生效 | **剩余**：R3 后打同一 Meta 的真并发（唯一的硬门槛）+ 真实 S3/MinIO + 跨机 + 内存曲线时序 |
-| 3 | **R3：metanode 独立 + raft**（**设计已定稿** → [`metanode-design.md`](metanode-design.md)） | M3：3 节点写入不中断 + metanode 全量重启后 Catalog **逐字节一致** + standalone 不回归（217 用例全绿、`if distributed` 零命中） | 语义零改动（R2 已把访问形态按远程定义），只换状态机宿主；**进行中**：**S3-2 第一切片已落地**（`CatalogState` + 4 处非确定性已修 + 对拍防线，`§38`）；**S3-5 键集合去重已接线**（键集合从 WAL 派生；过程中修掉"认领≠重复"语义坑，`§39`）；**余 S3-0（proto/tonic）、raft 接入（S3-1/S3-3）** |
+| 3 | **R3：metanode 独立 + raft**（**设计已定稿** → [`metanode-design.md`](metanode-design.md)） | M3：3 节点写入不中断 + metanode 全量重启后 Catalog **逐字节一致** + standalone 不回归（217 用例全绿、`if distributed` 零命中） | 语义零改动（R2 已把访问形态按远程定义），只换状态机宿主；**进行中**：**S3-2 第一切片已落地**（`CatalogState` + 4 处非确定性已修 + 对拍防线，`§38`）；**S3-5 键集合去重已接线**（键集合从 WAL 派生；修掉"认领≠重复"语义坑，`§39`）；**S3-1 闸门已过**（raft-rs 保留，`§40`）；**余 S3-1b 快照安装、S3-0 proto/tonic、S3-3 metanode 进程（fjall Storage）** |
 | 4 | **R4：datanode 化 + 冷热边界** | M4：多 datanode 并发写 + 查询结果**与单节点串行精确相等**（对拍，硬要求） | 这一步才消费 `source_instance` → 消灭缺口 §5.1-1（重复计数） |
 | 5 | **R5：分布式并发查询** | M5：fanout 下对拍继续成立；查询中杀节点行为符合声明 | 依赖 R4 的分片归属 |
 | 6 | **R6：compaction / GC 全局化** | M6：文件数收敛 + **开 GC 的多节点压测零误删** + 租约可接管 | 最后做：它需要前四步提供的一致性基础 |

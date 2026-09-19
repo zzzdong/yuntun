@@ -2278,3 +2278,60 @@ RowGroup 实测 : rows=150000 row_groups=3 | rows=150000 row_groups=3 | rows=605
 | 3 | `BatchPendingPayload.client_request_id` 仍是单键 | 它只用于恢复期的批次追踪；权威键集合在 Catalog。若将来需要按批次反查键集合，应改为从 WAL 派生（同一原则） |
 
 ---
+
+---
+
+## 40. R3 S3-1 选型闸门：raft-rs PoC 通过 —— **保留 raft-rs**（2026-09-19）
+
+### 40.0 闸门结论
+
+| # | 判据 | 结果 |
+|---|---|---|
+| 1 | 三节点选主 + **收敛到同一状态** | ✅ `three_node_cluster_converges_on_proposed_ops`（三个节点的规范编码**逐字节相同**） |
+| 2 | kill leader → 重新选主 + **已提交数据不丢** | ✅ `leader_kill_reelects_and_keeps_committed_ops`（新 leader 由存活节点当选、b1/b2/b3 全在） |
+| 3 | **状态机接缝干净**：`CatalogState` 原样被驱动 | ✅ `apply_op()` 是纯函数（无锁/无时钟/无 IO），两个候选都不需要为它改一行 |
+| 4 | 样板规模可接受（设计 §4.2 的逃生门：>50% 总工作 → 换 openraft） | ✅ **raft 集成核心 124 行**（Ready 循环 49 行）；整个 PoC crate 482 行含注释、测试 163 行 |
+
+**结论：保留 raft-rs**（正确性证据优先：它有 Jepsen 验证，openraft 生产验证较少）。
+逃生门仍未关闭但**降级为备选**：若 S3-3 实现 fjall `Storage` + 快照安装 + 成员变更时样板失控，
+再评估 openraft —— 届时换的只是 `yuntun-meta` 内部实现，`CatalogState` 与上层接口不动
+（这正是先做 S3-2 的价值）。
+
+### 40.1 交付物
+
+| 位置 | 内容 |
+|---|---|
+| **新 crate** `yuntun-meta` | S3-3 的落点；本轮内含 PoC |
+| `crates/meta/src/lib.rs` | 三节点集群（进程内 `mpsc` 传 `Message`，**不序列化**）+ `RawNode` 驱动循环 + `apply_op` 接缝 + `Cluster`（wait_leader/propose/kill/canonical） |
+| `crates/meta/tests/raft_poc.rs` | 两个闸门用例（163 行） |
+
+**边界（诚实说明，避免被当成"R3 已完成"）**：
+- 用 raft-rs 自带 `MemStorage` —— 落盘/崩溃恢复**没测**（真 Storage 是 S3-3 的 fjall 后端；
+  它在两个候选下工作量相同，故与选型无关）；
+- 进程内消息**不序列化** —— gRPC 编解码/超时/重试是 S3-0 + S3-3；
+- **快照安装与日志压缩没测**（PoC 无 compaction、无新成员加入）→ 登记为 S3-1b；
+- 成员变更、pre-vote 隔离行为、读写一致性（ReadIndex/线性化读）未测。
+
+### 40.2 两个值得记的坑（都是实测撞出来的）
+
+| # | 坑 | 现象 | 教训 |
+|---|---|---|---|
+| 1 | **raft entry index ≠ 已应用 op 数** | 第一版用例按 `applied >= 4` 等收敛 → **假失败**："节点 3 与节点 1 不一致"。真因：**leader 就位会先写一条空 no-op 条目**占掉 index 1，4 个 op 对应 index 2..5；follower 应用到 index 4 时其实只应用了 3 个 op | 等待条件必须**语义化**（"状态里出现 X"），不要把 raft index 当业务进度 |
+| 2 | **待回复队列必须在 `propose()` 成功之后入队** | 若先入队再提议、提议失败时再弹出，队列与日志条目会**错位** → 应用 A 的 op 却回复了 B 的等待者（静默错配，客户端以为自己的写成功了） | 顺序：`propose()` 成功 → 入队；失败 → 立刻回错不入队 |
+
+### 40.3 反证（证明用例不是自说自话）
+
+把节点间的消息路由切断（`take_messages` 不外发）→ **两条用例都失败**（10s 内选不出 leader）。
+已恢复。即：这两个用例依赖**真实的消息复制**，不是"本地自转"。
+
+### 40.4 遗留
+
+| # | 项 | 归属 |
+|---|---|---|
+| 1 | 快照安装 + 日志压缩（`compact()` + 新成员追快照） | **S3-1b** |
+| 2 | fjall `Storage`（term/vote/commit + 日志 + 快照落盘）→ 崩溃恢复 | S3-3 |
+| 3 | gRPC 传输（`Meta.Propose/Prefetch/Delta`）+ 非 leader 带 leader hint | S3-0 + S3-3 |
+| 4 | 线性化读（ReadIndex）与"读旧窗口 ≤ `cache_ttl`"的边界 | S3-4 |
+| 5 | 成员变更（learner → voter）与 `--init` bootstrap | S3-6 |
+
+---

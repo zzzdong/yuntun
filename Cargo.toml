@@ -8,6 +8,7 @@ members = [
     "crates/chunk",
     "crates/format",
     "crates/catalog",
+    "crates/meta",
     "crates/ingest",
     "crates/query",
     "crates/compaction",
