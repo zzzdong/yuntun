@@ -1,0 +1,198 @@
+// yuntun metanode 的 gRPC 面（S3-0）。
+//
+// 设计依据：docs/metanode-design.md §5（接口契约）、§6（S3-0 验收）。
+//
+// 三条**不能破坏**的约定（改之前先读设计）：
+//
+// 1. `Op` 必须**自包含**：所有时间戳/ID 都在 op 里（见下方 `Op.now_ms`），状态机 apply 时
+//    **不读钟、不读环境**（否则各副本在同一串 op 上会分叉 —— S3-2 抓到过四类真实非确定性）。
+// 2. **两组版本号语义不变**：DDL 推进 schema_ver、文件清单/compaction 推进 manifest_ver；
+//    响应与快照必须**同时**带两者（破坏它会让查询缓存在别的节点上静默失效）。
+// 3. **非 leader 的错误必须可重试**（`UNAVAILABLE` + leader hint），而不是让写入失败
+//    —— G2「写入不中断」依赖这条。
+//
+// # 迁移进度（诚实登记）
+//
+// `yuntun-model` 里的请求结构是**手写普通 Rust 结构**（`ops.rs`，**不是** prost 消息），
+// 所以接口面不能"直接搬字节"，必须**逐字段镜像**。本轮迁移：
+//
+// | op | 状态 |
+// |---|---|
+// | `CreateSchema` | ✅ |
+// | `DropTable` | ✅ |
+// | `CommitFiles`（含 `FileManifest` / `StatisticsLite` / `ColumnStatLite`） | ✅（设计 §6 点名的那一项） |
+// | `CreateTable` / `EvolveSchema` / `DropShard` / `Compaction` / 租约 | ⏳ 后续增量 |
+//
+// 未迁移的 op 目前**不进**这个 proto（而不是留个没有编解码的 `bytes` 字段 —— 那种占位会
+// 让下一位实现者以为"已经有格式了"）。`wire_compat.rs` 里有一条断言分支数的用例：
+// 加分支必须同时更新它，防止漏覆盖。
+
+syntax = "proto3";
+
+package yuntun.meta.v1;
+
+service Meta {
+  // 写：op 已提交（多数派持久化）才返回
+  rpc Propose  (ProposeRequest)  returns (ProposeResponse);
+  // 读：版本号 + 全量/增量载荷
+  rpc Prefetch (PrefetchRequest) returns (PrefetchResponse);
+  // 读：manifest_delta(since)
+  rpc Delta    (DeltaRequest)    returns (DeltaResponse);
+  // 运维：leader / term / 各索引 / 快照位置
+  rpc Status   (StatusRequest)   returns (StatusResponse);
+  // 成员变更（learner → voter）
+  rpc Join     (JoinRequest)     returns (JoinResponse);
+}
+
+// ---------------------------------------------------------------- 写路径
+
+// 自描述的 op（约定 1）。
+message Op {
+  // 提交时刻（Unix 毫秒）。**由发起方打点**并随 op 传播 —— 状态机不读钟。
+  uint64 now_ms = 1;
+
+  oneof kind {
+    CreateSchemaOp create_schema = 2;
+    DropTableOp    drop_table    = 3;
+    CommitFilesOp  commit_files  = 4;
+  }
+}
+
+message CreateSchemaOp {
+  string name = 1;
+}
+
+message DropTableOp {
+  string name = 1;
+}
+
+// 与 `ops::CommitFilesRequest` **逐字段对齐**（设计 §6 的 S3-0 验收项）。
+message CommitFilesRequestMsg {
+  string table             = 1;
+  string batch_id          = 2;
+  // 单键（历史字段；新写入应使用键集合）
+  optional string client_request_id = 3;
+  // **幂等键集合**（S3-5：一个 chunk 聚多个键，提交层按键集合去重）
+  repeated string client_request_ids = 4;
+  string shard             = 5;
+  string time_window       = 6;
+  repeated FileManifestMsg files = 7;
+  uint64 schema_version    = 8;
+  uint64 row_count         = 9;
+}
+
+message CommitFilesOp {
+  CommitFilesRequestMsg request = 1;
+}
+
+// 与 `meta::FileManifest` 逐字段对齐（tag 与手写结构**保持一致**，便于对照阅读）。
+message FileManifestMsg {
+  string file_path          = 1;
+  string batch_id           = 2;
+  string client_request_id  = 3;
+  uint64 schema_version     = 4;
+  uint32 status             = 5;   // FileStatus
+  uint64 valid_from         = 6;
+  uint64 deleted_at         = 7;
+  StatisticsLiteMsg stats   = 8;
+  uint64 row_count          = 9;
+  uint64 file_size          = 10;
+  string table              = 11;
+  string shard              = 12;
+  string time_window        = 13;
+  string partition_key      = 14;
+  string source_instance    = 15;
+  uint64 sealed_at_ms       = 16;  // 写侧封口时刻（T8 基线加的运维字段）
+  uint64 committed_at_ms    = 17;  // 提交成功时刻
+  string seal_reason        = 18;  // 封口原因（可观测性：为什么这个 chunk 被封）
+  string seal_pressure      = 19;  // 触发的压力档位（内存/磁盘水位）
+}
+
+message StatisticsLiteMsg {
+  repeated ColumnStatLiteMsg columns = 1;
+}
+
+message ColumnStatLiteMsg {
+  string name      = 1;
+  bytes  min       = 2;
+  bytes  max       = 3;
+  uint64 null_count = 4;
+}
+
+message ProposeRequest {
+  Op     op         = 1;
+  // 幂等：同 request_id 重复 propose 必须返回同一结果（跨进程去重靠 SM 内的幂等键）
+  bytes  request_id = 2;
+  // OCC：客户端读到的版本（DDL 用；不符 → FAILED_PRECONDITION，可重试）
+  uint64 schema_ver = 3;
+}
+
+message ProposeResponse {
+  bool   accepted     = 1;  // false = 幂等命中（不重复应用）
+  uint64 revision     = 2;  // raft log index（SM 的权威位置）
+  uint64 schema_ver   = 3;  // 变更后的两组版本（约定 2：必须同时给）
+  uint64 manifest_ver = 4;
+  // 各 op 的结果（形状与手写 Response 一致；S3-3 逐 op 定形）
+  bytes  result       = 5;
+  // 本次提交分配的 Catalog 快照号（读己之写用）
+  uint64 snapshot     = 6;
+}
+
+// ---------------------------------------------------------------- 读路径
+
+message PrefetchRequest {
+  uint64 since_schema_ver   = 1;
+  uint64 since_manifest_ver = 2;
+  bool   full               = 3;  // true = 无视 since，要全量
+}
+
+message PrefetchResponse {
+  uint64 schema_ver   = 1;
+  uint64 manifest_ver = 2;
+  uint64 snapshot     = 3;
+  // 表/清单载荷（S3-4 定形）
+  bytes  payload      = 4;
+  bool   full_reload  = 5;  // true = 客户端必须丢弃本地缓存（结构变更）
+}
+
+message DeltaRequest {
+  uint64 since_manifest_ver = 1;
+}
+
+message DeltaResponse {
+  uint64 schema_ver              = 1;
+  uint64 manifest_ver            = 2;
+  repeated string changed_tables = 3;
+  bool   full_reload             = 4;
+}
+
+// ---------------------------------------------------------------- 运维
+
+message StatusRequest {}
+
+message StatusResponse {
+  uint64 node_id       = 1;
+  string role          = 2;  // leader / follower / candidate / learner
+  uint64 term          = 3;
+  uint64 leader_id     = 4;  // 0 = 未知（用于 leader hint）
+  uint64 commit_index  = 5;
+  uint64 applied_index = 6;
+  // 以下三个用于回答「快照与日志的健康度」（排查「follower 追不上」的第一手信息）
+  uint64 snapshot_index = 7;
+  uint64 first_index    = 8;
+  uint64 last_index     = 9;
+  string version        = 10;
+}
+
+// ---------------------------------------------------------------- 成员
+
+message JoinRequest {
+  uint64 node_id      = 1;
+  string address      = 2;
+  bool   learner_only = 3;  // true = 只加为 learner（追平后再提升）
+}
+
+message JoinResponse {
+  uint64 voters   = 1;
+  uint64 learners = 2;
+}

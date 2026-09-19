@@ -2733,3 +2733,78 @@ to_commit 5 is out of range [last_index 0]   （etcd 那句 "Was the raft log co
 | 4 | 合并 fsync / fjall 调优（大 value 分离）/ P99 持久化延迟 | S3-6 |
 
 ---
+
+---
+
+## 45. R3 S3-0：gRPC 面落地（proto + tonic-build）+ 逐字段兼容测试（2026-09-19）
+
+### 45.0 交付
+
+| 位置 | 内容 |
+|---|---|
+| `crates/proto/proto/meta.proto`（**新**） | `Meta` 服务（Propose/Prefetch/Delta/Status/Join）+ op 面（本轮迁移 3 个 op） |
+| `crates/proto/build.rs`（**新**） | `tonic-prost-build` 生成 server + client |
+| `crates/proto/tests/wire_compat.rs`（**新**，6 条） | 设计 §6 的 S3-0 验收：round-trip + **与 `CommitFilesRequest` 逐字段对齐** |
+
+**验收对照（设计 §6）**：
+
+| 设计要求 | 本轮结果 |
+|---|---|
+| 编解码 round-trip | ✅ 每个 op 分支 + 请求/响应/状态消息 |
+| 与现有 `CommitFilesRequest` **字段逐个对齐** | ✅ `commit_files_is_field_for_field_lossless`（9 + 17 + 4 个字段逐一断言，含 `stats` 的有/无两种形态） |
+| 回滚点：保留手写 struct（双份并存一个 commit） | ✅ 手写结构**一个没动**，接口面独立 |
+
+### 45.1 一个依赖拆包坑（升级 tonic 时会撞同一类）
+
+crate 里原写着 `tonic-build = "0.12"`、`tonic = "0.14"`。tonic **0.14 把 prost 支持拆出去了**：
+运行期是 `tonic-prost`、build 期是 `tonic-prost-build`。于是生成代码引用了
+`tonic::codec::ProstCodec`（0.14 已无此路径）→ 编译失败：
+
+```text
+error[E0433]: cannot find `ProstCodec` in `codec`
+```
+
+修法：build-dep 换 `tonic-prost-build = "0.14"`、运行期加 `tonic-prost = "0.14"`。
+**教训**：`tonic` 与 `tonic-build` 的版本必须成对升级，且 0.14 起要认识这两个拆出来的包。
+
+### 45.2 设计层面的两个发现（决定了 proto 怎么写）
+
+**① `ops.rs` 的请求结构是普通 Rust 结构，不是 prost 消息。**
+所以接口面**不能**"把手写结构编码成 bytes 塞进去"（那种做法看起来很省事，却没有来源）。
+必须**逐字段镜像**成 proto —— 这正是设计 §6 说"逐字段对齐"的原因。
+
+**② WAL 的 `Record` 不能当 op 编码复用。**
+它是既有的、已被测试覆盖的 op 编码，看起来很诱人；但 `DdlPayload` 只覆盖
+`CreateTable/DropTable/CreateSchema/DropSchema`，**没有 `EvolveSchema`**，也没有文件提交
+（`Batch*` 是数据面批次生命周期，不是 catalog 提交）。所以 metanode 的 op 面只能自己定。
+
+**③ 未迁移的 op 不放 `bytes` 占位。**
+留一个没有编解码的 `bytes` 字段会让下一位实现者以为"格式已经有了"。所以未迁移的 op
+**先不进 proto**，并在文件头与 `wire_compat.rs` 里显式登记进度（分支数变化必须更新断言）。
+
+### 45.3 测试写法：**逐字段断言**而不是整体相等
+
+`CommitFilesRequest` 没实现 `PartialEq`（手写结构），所以测试逐字段比 —— 这反而更贴题：
+断言名里写着"哪个字段丢了"。它的价值**当场兑现**：第一版镜像漏了 `seal_reason` 与
+`seal_pressure`（T8/封口原因两轮加的可观测性字段），测试直接报 `files[0].seal_reason 丢了`。
+
+**反证**：把 `to_manifest` 里的 `seal_reason` 改成空串 → 失败（`files[0].seal_reason 丢了`）。已恢复。
+
+### 45.4 迁移进度（**诚实登记**）
+
+| op | 状态 |
+|---|---|
+| `CreateSchema` / `DropTable` / `CommitFiles`（含 `FileManifest`/统计两结构） | ✅ |
+| `CreateTable`（`partition_cols` / `ingest_config` 的形状待定）/ `EvolveSchema`（`SchemaChange` 三个变体）/ `DropShard` / `Compaction` / 租约 | ⏳ 后续增量 |
+| `ProposeResponse.result` 的逐 op 形状 | S3-3（与 `MetaService` 实现一起定形） |
+| `PrefetchResponse.payload` 的形状 | S3-4 |
+
+### 45.5 遗留
+
+| # | 项 | 归属 |
+|---|---|---|
+| 1 | 其余 op 的镜像 + 生产侧映射（`yuntun-meta` 内的边界转换器，现暂在测试里做原型） | S3-3 |
+| 2 | `protoc` 依赖：本轮环境有 `libprotoc 36.1`；CI/新机器需装 `protobuf-compiler` 或改用 `protoc-bin-vendored` | S3-3 前 |
+| 3 | 错误码映射（约定 3：`FAILED_PRECONDITION` / `UNAVAILABLE` + leader hint）需要 `MetaService` 实现时逐条落 | S3-3 |
+
+---

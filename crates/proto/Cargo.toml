@@ -7,6 +7,14 @@ license.workspace = true
 [dependencies]
 prost = { workspace = true }
 tonic = { workspace = true }
+# tonic 0.14 起 prost 编解码拆到独立 crate（生成的代码会引用它）
+tonic-prost = "0.14"
 
 [build-dependencies]
-tonic-build = "0.12"
+# tonic 0.14 起 build 侧也拆分了：prost 支持在 tonic-prost-build
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+# 兼容测试要用手写结构做"逐字段对齐"（设计 §6 的 S3-0 验收）
+yuntun-model = { path = "../model" }
+arrow = { workspace = true }
