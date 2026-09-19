@@ -545,8 +545,11 @@ pub fn apply(state: &mut CatalogState, op: &StateOp) -> Result<ApplyOutcome, Met
             if state.get_table(&qualified).is_some() {
                 return Ok(ApplyOutcome::hit());
             }
+            // ⚠️ 单位：状态机的 `created_at` 是**秒**（`MemoryCatalog` 传 `now_secs()`）。
+            // 第一版传的是 `now`（毫秒）→ 两种部署形态的 `created_at` 差 1000× 且**不报错**，
+            // 是整机对拍（`§58`）抓出来的。凡是要"把一个时间塞进状态机"，都先确认单位。
             state
-                .create_table(request.clone(), now)
+                .create_table(request.clone(), now / 1000)
                 .map_err(MetaError::from_lake)?;
             Ok(ApplyOutcome::one())
         }
