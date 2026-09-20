@@ -119,14 +119,9 @@ async fn ingest_accumulate_flush_reaches_manifest_and_wal_terminal() {
 
     // 读己之写：未落盘数据经 ShardReader 可读（此例已提交，缓存未追上仍可读）
     let reader: Arc<dyn yuntun_store::ShardReader> = ingestor.chunks();
-    let rows: usize = reader
-        .read_table("public.t", 0)
-        .await
-        .unwrap()
-        .iter()
-        .map(|b| b.num_rows())
-        .sum();
-    assert_eq!(rows, 3);
+    let read = reader.read_table("public.t", 0).await.unwrap();
+    assert_eq!(read.rows(), 3);
+    assert!(!read.stale, "没放弃过副本，不该报 STALE");
 }
 
 /// 指标口径回归（`plan.md` T6.12）：`wal_backlog` 是**半开区间**差值。

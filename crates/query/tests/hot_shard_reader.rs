@@ -12,7 +12,7 @@ use yuntun_catalog::{CatalogOps, MemoryCatalog};
 use yuntun_model::error::LakeError;
 use yuntun_model::ops::CreateTableRequest;
 use yuntun_query::{LocalCatalog, QueryEngine};
-use yuntun_store::{RemoteShard, ShardFetch, ShardId, ShardTier};
+use yuntun_store::{RemoteShard, ShardFetch, ShardId, ShardRead, ShardTier};
 
 /// 假传输：一份静态的"远端分片服务"数据（不依赖 MemoryShard，真正独立）。
 struct CannedFetch {
@@ -37,9 +37,17 @@ impl ShardFetch for CannedFetch {
     fn fetch_shard<'a>(
         &'a self,
         id: &'a ShardId,
-        _cached_snapshot: u64,
-    ) -> futures::future::BoxFuture<'a, Result<Vec<arrow::record_batch::RecordBatch>, LakeError>> {
-        Box::pin(async move { Ok(self.entries.get(id).cloned().unwrap_or_default()) })
+        _known_manifest_ver: u64,
+    ) -> futures::future::BoxFuture<'a, Result<ShardRead, LakeError>> {
+        Box::pin(async move {
+            // 本用例只验"查询能经远端接缝读到热数据"：水位取 0（不高于 known）⇒ 不报 STALE。
+            // STALE 契约本身由 `store/src/shard.rs` 与 `chunk/src/store.rs` 两处单测钉住。
+            Ok(ShardRead {
+                batches: self.entries.get(id).cloned().unwrap_or_default(),
+                flushed_watermark: 0,
+                stale: false,
+            })
+        })
     }
 }
 

@@ -4023,3 +4023,71 @@ pub fn visible(&self, cached_snapshot: u64) -> bool {
 - 闸门用例 **2 条**：第二个 `Lakehouse` 被拒（含"拒绝发生在动盘之前"：假遗留 spill 必须还在）/
   **两份**私有状态任一处冲突都拒
 - 全量 `cargo test --workspace --no-fail-fast` → **312 passed / 0 failed**（含 62.4 修掉的那两类不忠实用例）
+
+---
+
+## 63. R4 **T12.2 第一刀**：把"水位 + STALE"变成契约（顺带抓出一个**真实存在**的竞态）（2026-09-20）
+
+### 63.1 改了什么（`§61.4` 契约的代码化）
+
+| 位置 | 改动 |
+|---|---|
+| `store::shard` | 新增 `ShardRead { batches, flushed_watermark, stale }`；`read_shard` / `read_table` 参数 `cached_snapshot` → **`known_manifest_ver`**（与 §61.4 用词一致），返回 `ShardRead` |
+| `store::ShardFetch` | `fetch_shard` 的**响应**改为 `ShardRead` —— 水位**随 pull 响应回来**（`architecture §4.4` 原话），而不是靠推送 |
+| `chunk::ChunkStore` | 新增单调水位 `released_watermark`（`AtomicU64`，只增不减）+ `flushed_watermark()`；`reclaim` 放弃副本时把它计入 |
+| `query::table` | 适配新返回；`stale` **只记录不消费**（见 63.4 遗留） |
+| 测试 | `store` 的远端接缝用例 + 查询侧 `hot_shard_reader` 用例适配；`chunk` 新增一条**定向复现竞态**的用例 |
+
+合并口径写进了 trait 文档：**数据拼接、水位取 max、`stale` 取 or** —— 只要有一部分不可信，整个答案就不可信。
+
+### 63.2 契约精化（本轮实测得出）：水位按"**已放弃本地副本**"记，不是"已 commit"
+
+`§61.4` 第 1 条只说"水位单位 = manifest 版本号"。落到实现时发现还要定一件事：**记到哪一步**。
+
+- 若按"**已 commit**"记：本仓的回收是**惰性**的（由查询缓存 swap 驱动），于是"已 commit、
+  但本地副本还在"的窗口里，`stale` 会**每次查询都报** —— 而那个窗口里数据**读得到**，
+  报的是**误报**；
+- 按"**已放弃本地副本**"记则**精确**：没放弃副本 ⇒ 数据一定在本地 ⇒ **不可能丢** ⇒ 不该报警。
+
+所以 `flushed_watermark` 的语义定为：**该实例已 flush 且已放弃本地副本的最高 manifest 版本**。
+这是对 `§61.4` 的**细化**（安全方向不变：只在真有丢数据风险时报警）。
+
+### 63.3 本刀真正的价值：`§4.5` 的"两头都没有"**今天就发生**（并已钉住）
+
+`architecture-with-chunk §4.5` 说"任何已 seal 的数据，要么在 chunk 里可 pull，要么在 manifest
+里可 read，**不会两边都不在**"。写这条契约时才发现：**它今天就会被违反**，而且不是分布式的特例：
+
+```text
+① 某批数据 commit 在 manifest 版本 5        （ChunkStore::mark_committed(id, 5)）
+② 本地副本被回收                            （reclaim(6)：缓存已推进到 6，副本没用了）
+③ 读者仍拿快照 4 来读                       （查询在 ① 之前取的可变快照，规划期还没结束）
+   → 热数据拉不到（副本已放弃）
+   → 它的 manifest（4）里也没有 valid_from=5 的文件（快照隔离按 4 判定）
+   → **这批数据两头都没有** —— 而调用方只看到"空"，无从分辨"没有热数据"与"数据丢了"
+```
+
+**旧行为**：`read_table(t, 4)` 返回空 `Vec` ⇒ 查询**静默少这批数据**（正是本仓最怕的"静默错数据"）。
+**新行为**：`ShardRead { batches: [], flushed_watermark: 5, stale: true }` ⇒ 调用方拿到了信号，
+可以刷新 manifest 后用版本 5 重读（那时 `valid_from=5` 的文件可见 ⇒ 数据回来）。
+
+用例 `chunk::store::tests::stale_is_reported_after_a_committed_chunk_was_released` 把三步全钉住，
+并**同时钉住误报方向**：
+
+| 断言 | 防的是什么 |
+|---|---|
+| 未回收时 `stale == false` 且能读到 3 行 | **误报**（若按"已 commit"记，这里就会报 stale） |
+| 回收后 `stale == true` 且 `batches` 为空 | **静默丢数据**（旧行为在这里回一个空，谁都不知道） |
+| `known` 到水位后 `stale == false` | 重试之后必须能恢复正常，否则 STALE 会变成永久状态 |
+
+> 结论：**这条契约不是为分布式准备的"将来时"，而是把一个今天就能触发的静默错误变成可观测信号。**
+
+### 63.4 遗留（下一刀 T12.2 第二刀）
+
+1. **查询侧只记录不消费**：`table.rs` 收到 `stale` 只打 `warn!`。**不当场报错**是刻意的 ——
+   STALE 在"快照落后于提交"的**正常**窗口里也会出现（缓存 TTL 内提交过就会），报错会把常态变成故障。
+   消费它需要"**刷新 manifest → 用新版本重试**"，落在 `Cache` / `QueryEngine` 层（与"按实例持有
+   热读器"是同一层改动，见下一刀）。
+2. **远端形态必须给真实水位**：`RemoteShard` 拿到什么就传什么。已写进 `ShardFetch::fetch_shard`
+   文档：远端实现**不能**用 0 装作"没有已放弃的数据"——那等于把 STALE 静默关掉（S5-6 的活）。
+3. **重启后水位归 0**：进程重启后本实例没有 chunk，水位从 0 重新计；它对"重启前提交的数据"不再
+   给 STALE 信号（那部分数据的可见性由读者自己的 manifest 版本决定）。

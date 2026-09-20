@@ -36,7 +36,7 @@ use async_trait::async_trait;
 
 use yuntun_model::error::LakeError;
 use yuntun_model::wal_record::ddl_op;
-use yuntun_store::{ShardId, ShardReader, ShardTier};
+use yuntun_store::{ShardId, ShardRead, ShardReader, ShardTier};
 
 use crate::budget::{MemoryLedger, Pressure};
 use crate::chunk::{
@@ -255,6 +255,11 @@ pub struct ChunkStore {
     wal_segment: AtomicU64,
     /// 因内存水位跳过相位分散而提前 flush 的累计次数（见 [`ChunkStoreStats::phase_yielded_flushes`]）
     phase_yielded: AtomicU64,
+    /// **本实例已 flush 且已放弃本地副本的最高 manifest 版本**（单调不回退）。
+    ///
+    /// 见 [`ShardRead::flushed_watermark`] 为什么按"已放弃副本"而不是"已 commit"记：
+    /// 回收是惰性的，"已 commit 未回收"的数据仍读得到，用 commit 记会**误报 STALE**。
+    released_watermark: AtomicU64,
     inner: Mutex<Inner>,
 }
 
@@ -268,6 +273,7 @@ impl ChunkStore {
             phase_yielded: AtomicU64::new(0),
             next_id: AtomicU64::new(0),
             wal_segment: AtomicU64::new(0),
+            released_watermark: AtomicU64::new(0),
             inner: Mutex::new(Inner::default()),
         });
         let purged = store.purge_leftover_spills();
@@ -323,6 +329,13 @@ impl ChunkStore {
     /// 变更计数（写入 / 提交 / DDL / 回收）。
     pub fn version(&self) -> u64 {
         self.version.load(Ordering::SeqCst)
+    }
+
+    /// **已放弃本地副本的最高 manifest 版本**（对外即 [`ShardReader`] 的 `flushed_watermark`）。
+    ///
+    /// 只增不减：一旦某批数据被放弃本地副本，它就永远"已经不在本地热数据里"了。
+    pub fn flushed_watermark(&self) -> u64 {
+        self.released_watermark.load(Ordering::SeqCst)
     }
 
     /// 更新当前 WAL segment 号（spill 头记录 WAL 引用用）。
@@ -839,6 +852,10 @@ impl ChunkStore {
                     .committed_snapshot
                     .is_some_and(|s| cached_snapshot >= s);
                 if caught_up && c.state == ChunkState::Flushed {
+                    // 放弃副本 ⇒ 这条数据从此只能从 manifest 冷读。把它计入水位：
+                    // 还在拿旧 manifest 的读者需要知道"你可能会少这批数据"（§4.5 的窗口）。
+                    self.released_watermark
+                        .fetch_max(c.committed_snapshot.unwrap_or(0), Ordering::SeqCst);
                     if c.is_in_memory() {
                         freed += c.bytes;
                     }
@@ -990,10 +1007,10 @@ impl ShardReader for ChunkStore {
     async fn read_shard(
         &self,
         id: &ShardId,
-        cached_snapshot: u64,
-    ) -> Result<Vec<RecordBatch>, LakeError> {
+        known_manifest_ver: u64,
+    ) -> Result<ShardRead, LakeError> {
         let mut out = Vec::new();
-        for c in self.visible_chunks(Some(&id.table), cached_snapshot) {
+        for c in self.visible_chunks(Some(&id.table), known_manifest_ver) {
             if &c.key.shard != id {
                 continue;
             }
@@ -1002,15 +1019,25 @@ impl ShardReader for ChunkStore {
                 Err(e) => tracing::warn!(chunk = %c.id, error = %e, "chunk read failed"),
             }
         }
-        Ok(out)
+        let watermark = self.flushed_watermark();
+        Ok(ShardRead {
+            batches: out,
+            flushed_watermark: watermark,
+            stale: watermark > known_manifest_ver,
+        })
     }
 
     async fn read_table(
         &self,
         table: &str,
-        cached_snapshot: u64,
-    ) -> Result<Vec<RecordBatch>, LakeError> {
-        Ok(self.read_table_sync(table, cached_snapshot))
+        known_manifest_ver: u64,
+    ) -> Result<ShardRead, LakeError> {
+        let watermark = self.flushed_watermark();
+        Ok(ShardRead {
+            batches: self.read_table_sync(table, known_manifest_ver),
+            flushed_watermark: watermark,
+            stale: watermark > known_manifest_ver,
+        })
     }
 
     fn reclaim(&self, cached_snapshot: u64) {
@@ -1546,8 +1573,51 @@ mod tests {
         assert_ne!(reader.version(), 0, "变更计数用于提交驱动刷新");
         let ids = futures::executor::block_on(reader.shards_of("public.t")).unwrap();
         assert_eq!(ids.len(), 1);
-        let total = futures::executor::block_on(reader.read_table("public.t", 0)).unwrap();
-        assert_eq!(total.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+        let read = futures::executor::block_on(reader.read_table("public.t", 0)).unwrap();
+        assert_eq!(read.rows(), 3);
+        assert!(!read.stale, "没放弃过副本，不该报 STALE");
+        assert_eq!(read.flushed_watermark, 0, "新 store 的水位是 0");
+    }
+
+    /// **`architecture-with-chunk §4.5` 的"两头都没有"窗口**（本刀的真正目的）。
+    ///
+    /// 一批数据已 commit 且**已放弃本地副本**，而读者还拿旧 manifest 版本 —— 此时热数据拉不到、
+    /// 它 manifest 里也还没有那个文件。**旧行为下这里只是"读到空"，读者会静默少这批数据**；
+    /// 契约要求把 `stale` 报出来（`operation-log §61.4`：不得用空结果顶替）。
+    #[test]
+    fn stale_is_reported_after_a_committed_chunk_was_released() {
+        let f = fixture("chunk-stale-window", tight_policy(3), 1 << 20);
+        let chunk_id = f
+            .store
+            .append(key(), 1, schema(), 0, vec![batch(vec![1, 2, 3])], 0)
+            .unwrap()
+            .chunk_id;
+        // 该批数据 commit 在 manifest 版本 5
+        f.store.mark_committed(chunk_id, 5).unwrap();
+
+        let reader: Arc<dyn ShardReader> = f.store.clone();
+        // 读者在快照 4：数据还在本地副本里 ⇒ 热路径必须仍读得到，且**不该**报 STALE
+        let fresh = futures::executor::block_on(reader.read_table("public.t", 4)).unwrap();
+        assert_eq!(fresh.rows(), 3, "还没放弃副本，热路径必须仍读得到");
+        assert!(!fresh.stale, "没放弃副本 ⇒ 不可能丢数据 ⇒ 不该报 STALE");
+
+        // 本地副本被回收（缓存推进到 6）⇒ 这条数据从此只能从 manifest 冷读
+        assert!(f.store.reclaim(6) >= 1, "应回收那个已 commit 的 chunk");
+        assert_eq!(f.store.flushed_watermark(), 5, "水位 = 已放弃副本的最高版本");
+
+        // 同一读者（仍在快照 4）再来读：热数据已不在本地，它的 manifest（4）里也没有
+        // valid_from=5 的文件 ⇒ **两头都没有**。契约要求报 STALE，而不是回一个"空"。
+        let behind = futures::executor::block_on(reader.read_table("public.t", 4)).unwrap();
+        assert_eq!(behind.rows(), 0, "本地副本已放弃");
+        assert!(
+            behind.stale,
+            "必须报 STALE —— 否则读者会把这批数据静默丢掉"
+        );
+        assert_eq!(behind.flushed_watermark, 5);
+
+        // 刷新到水位之后恢复正常（不再 STALE，也不再依赖本地副本）
+        let caught_up = futures::executor::block_on(reader.read_table("public.t", 5)).unwrap();
+        assert!(!caught_up.stale, "known 已到水位 ⇒ 不再 STALE");
     }
 
     #[test]

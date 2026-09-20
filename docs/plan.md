@@ -582,7 +582,7 @@ standalone 仍可单机运行（同一份装配的裁剪）。
 | ID | 内容 | 说明 |
 |---|---|---|
 | T12.1 | 拆 `yuntun-ingestor` / `yuntun-queryd` / `yuntun-compactor` | 从 `standalone` 逐组件摘出 |
-| T12.2 | **消费 `source_instance`：冷热边界按实例二维切分** | **v2.1 新增**：这是"重复计数"的解药（§5.3-1） |
+| T12.2 | **消费 `source_instance`：冷热边界按实例二维切分** | **进行中**：第一刀已落地 —— 契约（水位 + STALE）代码化，并**抓出一个今天就触发的静默错误**（`§4.5` 的"两头都没有"：回收后拿旧快照读 ⇒ 静默少数据），`operation-log §63`；**下一刀**：查询侧按实例持有热读器 + 消费 STALE（刷新 manifest → 重试） |
 | T12.3 | 成员发现 + 分片归属（谁持有哪个 `(table, shard)` 的热数据） | 与 `ShardReader`/`ShardFetch` 对接（缝已在） |
 | T12.4 | 每节点私有状态初始化与校验（WAL 目录 + spill 目录） | ✅ **已落地**（`private_dir` 租约，节点装配层；`operation-log §62`）；下移到 store 层（更严格）为后续项 |
 | T12.5 | `instance_id` 唯一性校验（启动即拒绝重复） | ✅ **本机形态已落地**（同一目录第二个消费者启动即拒，报错点名 `instance_id`/`pid`/`role`）；跨机器重名属 T12.3 成员注册 |

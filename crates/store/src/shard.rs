@@ -59,6 +59,39 @@ impl ShardId {
     }
 }
 
+/// 一次热数据拉取的结果**与边界信息**（`operation-log §61.4` 定死的契约）。
+#[derive(Debug, Clone)]
+pub struct ShardRead {
+    /// 对 `known_manifest_ver` 而言尚不可冷读的那部分数据
+    pub batches: Vec<RecordBatch>,
+    /// **本实例已 flush 且已放弃本地副本的最高 manifest 版本**（单调不回退）。
+    ///
+    /// 为什么是"**已放弃副本**"而不是"已 commit"：本仓的回收是**惰性**的（由查询缓存 swap
+    /// 驱动），"已 commit 但还没回收"窗口里数据仍在热副本中**读得到**，用 commit 记会让
+    /// `stale` 每次查询都误报；用 release 记则**精确** —— 没回收 ⇒ 不可能丢数据。
+    pub flushed_watermark: u64,
+    /// `known_manifest_ver < flushed_watermark` ⇒ 本次结果**可能不完整**，
+    /// 调用方**必须**刷新 manifest 后用新版本重试，**不得**把 `batches` 当完整答案
+    /// （也别把空 `batches` 当"没有热数据" —— 那正是这个窗口会骗人的地方）。
+    pub stale: bool,
+}
+
+impl ShardRead {
+    /// 空数据 + 给定水位的构造（`stale` 按契约由水位与 `known` 比较得出）。
+    pub fn empty(flushed_watermark: u64, known_manifest_ver: u64) -> Self {
+        Self {
+            batches: Vec::new(),
+            flushed_watermark,
+            stale: flushed_watermark > known_manifest_ver,
+        }
+    }
+
+    /// 行数（调用方最常用的聚合；避免到处写 `iter().map(num_rows).sum()`）。
+    pub fn rows(&self) -> usize {
+        self.batches.iter().map(|b| b.num_rows()).sum()
+    }
+}
+
 // ---------------------------------------------------------------- 读侧接缝
 
 /// **热数据读接口**：查询侧唯一依赖的热数据入口。
@@ -66,8 +99,13 @@ impl ShardId {
 /// - `yuntun_chunk::ChunkStore`：进程内 chunk（单机 / 与写入同进程）；
 /// - [`RemoteShard`]：远端分片服务（分离部署，传输由 [`ShardFetch`] 注入）。
 ///
-/// 语义：返回该分片**对 `cached_snapshot` 尚不可见**的数据
-/// （即尚未进入查询缓存所依据的 Manifest 快照的那部分），用于与磁盘分片求并集。
+/// 语义：返回该分片**对 `known_manifest_ver` 尚不可冷读**的数据（+ 边界信息 [`ShardRead`]），
+/// 用于与磁盘分片求并集。
+///
+/// **边界信息是契约的一部分**（`operation-log §61.4`）：调用方拿旧 manifest 版本去拉热数据时，
+/// 对方可能**已经放弃**了那批数据的本地副本（已 commit 并 reclaim）——此时热数据拉不到、
+/// 调用方的 manifest 里也还没有那些文件，就是 `architecture-with-chunk §4.5` 的
+/// "两头都没有"。`ShardRead::stale` 就是给这个窗口的信号：**刷新 manifest 后用新版本重试**。
 #[async_trait]
 pub trait ShardReader: Send + Sync + std::fmt::Debug {
     fn tier(&self) -> ShardTier;
@@ -78,24 +116,38 @@ pub trait ShardReader: Send + Sync + std::fmt::Debug {
     /// 枚举某表当前存在的分片。
     async fn shards_of(&self, table: &str) -> Result<Vec<ShardId>, LakeError>;
 
-    /// 读**单个分片**对 `cached_snapshot` 尚不可见的数据。
+    /// 读**单个分片**对 `known_manifest_ver` 尚不可冷读的数据 + 边界信息。
+    ///
+    /// `known_manifest_ver` = 调用方所依据的 manifest 版本（通常就是它的 Catalog 快照号）。
     async fn read_shard(
         &self,
         id: &ShardId,
-        cached_snapshot: u64,
-    ) -> Result<Vec<RecordBatch>, LakeError>;
+        known_manifest_ver: u64,
+    ) -> Result<ShardRead, LakeError>;
 
     /// 便捷：读整表（默认 = 枚举 + 逐分片；远端实现可覆写为单次 RPC）。
+    ///
+    /// 合并口径：数据拼接、**水位取 max**、**`stale` 取或** —— 只要有一部分不可信，
+    /// 整个答案就不可信。
     async fn read_table(
         &self,
         table: &str,
-        cached_snapshot: u64,
-    ) -> Result<Vec<RecordBatch>, LakeError> {
+        known_manifest_ver: u64,
+    ) -> Result<ShardRead, LakeError> {
         let mut out = Vec::new();
+        let mut watermark = 0u64;
+        let mut stale = false;
         for id in self.shards_of(table).await? {
-            out.extend(self.read_shard(&id, cached_snapshot).await?);
+            let r = self.read_shard(&id, known_manifest_ver).await?;
+            out.extend(r.batches);
+            watermark = watermark.max(r.flushed_watermark);
+            stale |= r.stale;
         }
-        Ok(out)
+        Ok(ShardRead {
+            batches: out,
+            flushed_watermark: watermark,
+            stale,
+        })
     }
 
     /// 回收**本地副本**中已被 `cached_snapshot` 覆盖（或已陈旧世代）的条目。
@@ -115,12 +167,16 @@ pub trait ShardFetch: Send + Sync {
         table: &'a str,
     ) -> futures::future::BoxFuture<'a, Result<Vec<ShardId>, LakeError>>;
 
-    /// 读单个分片对 `cached_snapshot` 尚不可见的数据。
+    /// 读单个分片对 `known_manifest_ver` 尚不可冷读的数据。
+    ///
+    /// **响应必须带边界信息**（`architecture-with-chunk §4.4`：水位随 pull 响应回来，
+    /// 而不是靠推送）—— 远端实现若拿不到真实水位，**不能**用 0 装作"没有已放弃的数据"，
+    /// 那会把 STALE 静默关掉；正确做法是让服务端把它的 watermark 一起返回（S5-6）。
     fn fetch_shard<'a>(
         &'a self,
         id: &'a ShardId,
-        cached_snapshot: u64,
-    ) -> futures::future::BoxFuture<'a, Result<Vec<RecordBatch>, LakeError>>;
+        known_manifest_ver: u64,
+    ) -> futures::future::BoxFuture<'a, Result<ShardRead, LakeError>>;
 
     /// 服务端变更水位（拿不到返回 0：查询侧退化为 TTL 刷新）。
     fn fetch_version(&self) -> u64 {
@@ -164,9 +220,9 @@ impl ShardReader for RemoteShard {
     async fn read_shard(
         &self,
         id: &ShardId,
-        cached_snapshot: u64,
-    ) -> Result<Vec<RecordBatch>, LakeError> {
-        self.fetch.fetch_shard(id, cached_snapshot).await
+        known_manifest_ver: u64,
+    ) -> Result<ShardRead, LakeError> {
+        self.fetch.fetch_shard(id, known_manifest_ver).await
     }
     // reclaim 用默认空实现：远端服务的 GC 由服务端负责
 }
@@ -219,10 +275,6 @@ mod tests {
         RecordBatch::try_new(schema, vec![SArc::new(Int64Array::from(vec![v]))]).unwrap()
     }
 
-    fn rows(b: &[RecordBatch]) -> usize {
-        b.iter().map(|x| x.num_rows()).sum()
-    }
-
     fn id() -> ShardId {
         ShardId::new("public.t", "default", "2026-09-12T10:00")
     }
@@ -269,9 +321,17 @@ mod tests {
         fn fetch_shard<'a>(
             &'a self,
             id: &'a ShardId,
-            _cached_snapshot: u64,
-        ) -> futures::future::BoxFuture<'a, Result<Vec<RecordBatch>, LakeError>> {
-            Box::pin(async move { Ok(self.entries.get(id).cloned().unwrap_or_default()) })
+            known_manifest_ver: u64,
+        ) -> futures::future::BoxFuture<'a, Result<ShardRead, LakeError>> {
+            Box::pin(async move {
+                let batches = self.entries.get(id).cloned().unwrap_or_default();
+                // 假服务端：水位固定 42（与 `fetch_version` 同源），于是 `known < 42` 必须报 STALE
+                Ok(ShardRead {
+                    batches,
+                    flushed_watermark: 42,
+                    stale: 42 > known_manifest_ver,
+                })
+            })
         }
 
         fn fetch_version(&self) -> u64 {
@@ -291,9 +351,18 @@ mod tests {
             Arc::new(RemoteShard::new(Arc::new(CannedFetch { entries })));
         assert_eq!(reader.tier(), ShardTier::Memory);
         assert_eq!(reader.version(), 42, "远端水位供查询侧刷新触发");
-        assert_eq!(rows(&reader.read_table("public.t", 0).await.unwrap()), 2);
+        // 契约：响应带回水位；`known=42` 到位 ⇒ 不 STALE
+        let all = reader.read_table("public.t", 42).await.unwrap();
+        assert_eq!(all.rows(), 2);
+        assert_eq!(all.flushed_watermark, 42);
+        assert!(!all.stale, "known 已到水位，不该报 STALE");
         assert_eq!(reader.shards_of("public.t").await.unwrap().len(), 2);
-        assert_eq!(rows(&reader.read_shard(&id(), 0).await.unwrap()), 1);
+        assert_eq!(reader.read_shard(&id(), 42).await.unwrap().rows(), 1);
+
+        // 拿旧 manifest 版本读 ⇒ **必须**报警：对方可能已放弃那批数据的本地副本
+        let behind = reader.read_table("public.t", 41).await.unwrap();
+        assert!(behind.stale, "known 落后于水位必须报 STALE");
+        assert_eq!(behind.flushed_watermark, 42);
         // 远端 reader 不驱动本地回收（GC 归服务端）
         reader.reclaim(9);
     }

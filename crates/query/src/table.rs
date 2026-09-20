@@ -93,12 +93,27 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
 
         // ① 热数据（读己之写）：写后即可查，不等 flush / 缓存 TTL
         if let Some(hot) = &self.hot {
-            let raw = hot
+            let read = hot
                 .read_table(&self.ident, self.snapshot.snapshot)
                 .await
                 .map_err(|e| {
                     datafusion::error::DataFusionError::Execution(format!("hot shard read: {e}"))
                 })?;
+            // `stale` ⇒ 本实例已放弃 (本次快照, 水位] 之间数据的本地副本，而本次快照的 manifest
+            // 里还没有那些文件（`architecture-with-chunk §4.5` 的"两头都没有"窗口）。
+            //
+            // **本刀只把信号接出来并记录**：消费它（刷新 manifest → 用新版本重试）是下一刀
+            // （`operation-log §63`）。之所以不在这里直接报错：STALE 在"快照落后于提交"的
+            // 正常窗口里也会出现，报错会把它变成常态。
+            if read.stale {
+                tracing::warn!(
+                    table = %self.ident,
+                    known_manifest_ver = self.snapshot.snapshot,
+                    flushed_watermark = read.flushed_watermark,
+                    "hot read may be incomplete: instance released data above our manifest version"
+                );
+            }
+            let raw = read.batches;
             if !raw.is_empty() {
                 let mut batches = Vec::with_capacity(raw.len());
                 for b in raw {
