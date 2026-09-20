@@ -42,6 +42,15 @@ pub struct Lakehouse {
     pub wal: WalWriter,
     pub store: Arc<dyn object_store::ObjectStore>,
     pub shutdown: CancellationToken,
+    /// 节点私有状态目录的**排他所有权**：WAL 根目录（R4 T12.4–T12.5，
+    /// `operation-log §28.2` 的显式化）。
+    ///
+    /// **必须活到进程退出**：租约的 `Drop` 释放锁 —— 提前丢掉 = 目录立刻可被第二个消费者
+    /// 接管，而"两个消费者消费同一份私有状态"正是它要拦住的（同一条数据被各 flush 一次，
+    /// 产出**重复文件**且不报错）。
+    _wal_dir_lease: yuntun_model::private_dir::PrivateDirLease,
+    /// spill 目录的排他所有权（同上）。
+    _spill_dir_lease: yuntun_model::private_dir::PrivateDirLease,
 }
 
 // ---------------------------------------------------------------- 观测（T6.12）
@@ -272,6 +281,38 @@ async fn build_embedded_catalog(
         cfg: &Config,
         shutdown: CancellationToken,
     ) -> Result<Self, yuntun_model::error::LakeError> {
+        // ⓪ **节点私有状态的排他所有权**（先于一切动盘动作）：WAL 根目录 + spill 目录。
+        //
+        //   为什么必须在最前面：这两个目录是**节点私有状态**，同一时刻只能有一个消费者。
+        //   两个消费者会让同一条数据被各吸收一次、各自 flush → **重复文件、不报错**
+        //   （`operation-log §28.2` 实测：9 批次 27 行 → 11 个文件 33 行）。放最前面还保证
+        //   "被拒的那个进程"**不会先动盘** —— 后面的 WAL 重放与 `purge_leftover_spills`
+        //   都会改文件，对别人正在用的目录做这些就是破坏别人的数据。
+        let wal_dir_lease = yuntun_model::private_dir::acquire(
+            &cfg.wal.dir,
+            yuntun_model::private_dir::DirOwner {
+                instance_id: cfg.chunk.instance_id.clone(),
+                role: "wal-root".into(),
+            },
+        )?;
+        let spill_dir_lease = yuntun_model::private_dir::acquire(
+            &cfg.chunk.spill_dir,
+            yuntun_model::private_dir::DirOwner {
+                instance_id: cfg.chunk.instance_id.clone(),
+                role: "chunk-spill".into(),
+            },
+        )?;
+        // 记录写失败只影响"下一个消费者看不到谁占着"，不影响保护本身 —— 但要可见。
+        for lease in [&wal_dir_lease, &spill_dir_lease] {
+            if let Some(e) = lease.record_error() {
+                tracing::warn!(
+                    dir = %lease.dir().display(),
+                    error = %e,
+                    "owner record not written"
+                );
+            }
+        }
+
         // ① Catalog —— **装配点**：全仓只有这一处知道具体实现是谁（`§52` 把接缝上的
         //    具体类型全清掉了，所以这里换实现不需要动任何业务代码）。
         //
@@ -388,6 +429,8 @@ async fn build_embedded_catalog(
             wal,
             store,
             shutdown,
+            _wal_dir_lease: wal_dir_lease,
+            _spill_dir_lease: spill_dir_lease,
         })
     }
 

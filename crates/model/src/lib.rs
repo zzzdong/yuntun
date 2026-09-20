@@ -8,6 +8,8 @@
 //! - [`ops`]: Catalog 操作的请求/响应类型（详细设计 §3.3）
 //! - [`batch`]: 攒批批次状态（BatchState，由 WAL 事件重建，详细设计 §4.6）
 //! - [`arrow_util`]: 批次 schema 对齐（写入 / 查询热数据路径共用）
+//! - [`private_dir`]: 节点私有状态目录的**排他所有权**（`operation-log §28.2` 的显式化：
+//!   同一份 WAL / spill 目录同一时刻只能有一个消费者）
 //!
 //! 注：分片存储形态（内存分片 / 磁盘分片）属于存储层，见 `yuntun-store::shard`。
 
@@ -16,6 +18,7 @@ pub mod batch;
 pub mod error;
 pub mod meta;
 pub mod ops;
+pub mod private_dir;
 pub mod schema;
 pub mod snapshot;
 pub mod wal_record;

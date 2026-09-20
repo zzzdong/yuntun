@@ -118,6 +118,10 @@ type = "memory"
 [wal]
 dir = "{wal_dir}"
 
+[chunk]
+# 每个测试 = 一个节点：私有目录（spill）必须各用各的，否则闸门会（正确地）拒绝第二个消费者
+spill_dir = "{wal_dir}/spill"
+
 [ingest]
 rows_threshold = 1
 time_threshold_secs = 1
@@ -226,8 +230,17 @@ async fn multi_schema_create_isolate_and_recover() {
 
     // ============ 崩溃重启（schema 事件 + 表定义均由 WAL 重放）============
     shutdown.cancel();
-    drop(_bg);
+    // **等旧节点真的停下来**再起新的。
+    //
+    // `drop(JoinHandle)` 只是 **detach**：任务还在跑，于是出现"旧消费者没退出、新消费者已起来"
+    // —— 这正是 `operation-log §28.2` 的形态（同一份私有状态被两个消费者消费 → 重复文件）。
+    // 真实重启 = 进程退出 **之后**才起新进程，所以这里要 `await` 句柄真正退出。
+    for h in _bg {
+        let _ = h.await;
+    }
     drop(client);
+    // 旧节点持有私有目录的所有权（`private_dir` 闸门）：不 drop 它，新节点会被**正确地**拒绝启动
+    drop(lakehouse);
     let lakehouse = Arc::new(Lakehouse::build(&cfg).await.unwrap());
     let _bg2 = lakehouse.spawn_background(&cfg);
     tokio::time::sleep(Duration::from_millis(700)).await;

@@ -236,6 +236,17 @@ datanode-X 侧:
 
 做法：manifest 中每个文件记 `source_instance`；pull 响应带该实例的 `flushed_watermark`；协调者按实例二维切分（冷读该实例 ≤watermark 的文件，热 pull (watermark, now]）。**此契约必须在实现前定死**，否则多实例后会冒出重复计数这类极难排查的 bug。
 
+> **契约已定死（`operation-log §61`，2026-09-20）**：① 水位单位 = **manifest 版本号**，与
+> `Chunk::visible` / `mark_committed` 同号，**不引入第二套序号**；② pull 带 `known_manifest_ver`，
+> owner 落后于自己的水位时返回 **STALE**（协调者刷新重试），**不得**回空结果；
+> ③ `release-after-commit`：manifest 版本推进后才释放 chunk；④ **拉取为权威**，
+> 推送（水位表）只能当提示 —— 陈旧水位会静默地造成重复读或漏读，方向随机。
+>
+> 另有一个反直觉的实测结论：现有实现（per-chunk `committed_snapshot` + 读者 `cached_snapshot`）
+> 因为与文件 `valid_from` **用同一个号**，在单机形态下结构上不会重复计数；
+> 它会坏在三种情况下（提交者≠持有者 / release 早于协调者刷新 / 用全局 min(watermark) 当边界），
+> 这三种正是 T12.2 的全部工作量。
+
 ### 4.5 不变量：数据不会"两头都没有"
 
 竞态场景：查询方拿 manifest V（不含 F1），owner flush C1 → commit 到 V2 → 释放 C1，此时 pull 已拿不到、manifest V 也读不到 F1。

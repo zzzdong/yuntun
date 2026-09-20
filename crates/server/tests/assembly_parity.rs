@@ -62,6 +62,8 @@ fn config(embedded: bool, base: &Path) -> Config {
         root: base.join("store"),
     };
     cfg.wal.dir = base.join("wal");
+    // 私有状态目录同理：每个测试 = 一个节点，目录各用各的（`private_dir` 闸门）
+    cfg.chunk.spill_dir = base.join("spill");
     // 尽快 seal（与既有 e2e 同款）：对拍要的是"能落盘"，不是吞吐
     cfg.ingest.rows_threshold = 1;
     cfg.ingest.max_flush_delay_secs = 1;

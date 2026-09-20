@@ -158,6 +158,10 @@ type = "memory"
 [wal]
 dir = "{wal_dir}"
 
+[chunk]
+# 每个测试 = 一个节点：私有目录（spill）必须各用各的，否则闸门会（正确地）拒绝第二个消费者
+spill_dir = "{wal_dir}/spill"
+
 [ingest]
 rows_threshold = 1
 time_threshold_secs = 1

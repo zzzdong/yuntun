@@ -25,6 +25,8 @@ type = "memory"
 dir = "{base}/wal"
 
 [chunk]
+# 每个测试 = 一个节点：私有目录（spill）必须各用各的，否则闸门会（正确地）拒绝第二个消费者
+spill_dir = "{base}/spill"
 mem_budget_mb = 16
 query_mem_budget_mb = 8
 

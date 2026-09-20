@@ -200,7 +200,7 @@ standalone → server → ingest → chunk  → store → model
 | **P2** | spill 复用（校验 WAL 引用一致则沿用副本）替代"丢弃重来" | 当前丢弃重来（正确但重启后重新编码） | 重启恢复耗时占比（大 WAL 场景） | 阶段 2 |
 | **P2** | `chunk_max_resident_secs`（60s）与 WAL 物理回收的关系 | 强制 seal+flush 已实现；segment 清理闸门仍是 R21 遗留 | WAL 磁盘占用峰值 vs 写入速率 | 阶段 2 |
 | **P2** | 内存压力下是否跳过墓碑期（架构 §4.6 允许） | 当前不跳（换来零可见性空洞） | 极端内存压力下的可用性测试 | 阶段 3 前 |
-| **P2** | **冷热边界按实例的协议形态**：各实例的 flush watermark 如何传播 / 消费（推送 vs 查询时拉取） | `FileManifest.source_instance` 已写但**无消费者**（§5.1-C） | R4 设计评审（两种形态的查询放大对比） | **R4 开工前** |
+| **P2** | **冷热边界按实例的协议形态**：各实例的 flush watermark 如何传播 / 消费（推送 vs 查询时拉取） | `FileManifest.source_instance` 已写但**无消费者**（§5.1-C） | ✅ **已定：拉取**（水位随 pull 响应回，推送仅可作提示）+ 契约 4 条 —— `operation-log §61` | **R4 开工前** |
 | **P2** | **compaction 租约方案**：meta 租约 vs 独立 coordinator | 无租约（单进程后台任务） | R6 设计评审 + 双执行者注入测试 | **R6 开工前** |
 | **P2** | 孤儿 GC 的"在途窗口"判定方式（上传时间 + 提交时间 vs GC 侧标记） | 1h 静置 + 进程内 `first_seen`（非多写者安全） | R6 误删专项设计 | **R6 开工前** |
 
@@ -584,8 +584,8 @@ standalone 仍可单机运行（同一份装配的裁剪）。
 | T12.1 | 拆 `yuntun-ingestor` / `yuntun-queryd` / `yuntun-compactor` | 从 `standalone` 逐组件摘出 |
 | T12.2 | **消费 `source_instance`：冷热边界按实例二维切分** | **v2.1 新增**：这是"重复计数"的解药（§5.3-1） |
 | T12.3 | 成员发现 + 分片归属（谁持有哪个 `(table, shard)` 的热数据） | 与 `ShardReader`/`ShardFetch` 对接（缝已在） |
-| T12.4 | 每节点私有状态初始化与校验（WAL 目录 + spill 目录） | §2.3-3 的代码化 |
-| T12.5 | `instance_id` 唯一性校验（启动即拒绝重复） | 重复 `instance_id` 会直接破坏 T12.2 的前提 |
+| T12.4 | 每节点私有状态初始化与校验（WAL 目录 + spill 目录） | ✅ **已落地**（`private_dir` 租约，节点装配层；`operation-log §62`）；下移到 store 层（更严格）为后续项 |
+| T12.5 | `instance_id` 唯一性校验（启动即拒绝重复） | ✅ **本机形态已落地**（同一目录第二个消费者启动即拒，报错点名 `instance_id`/`pid`/`role`）；跨机器重名属 T12.3 成员注册 |
 
 **准出**：多 datanode 并发写入 + 查询，**与单节点串行结果精确相等**（对拍，见 §8）；
 杀掉任一 datanode 后重启，其未 flush 数据由 WAL 恢复且不重复。

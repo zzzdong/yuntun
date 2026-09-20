@@ -50,8 +50,27 @@ pub enum LakeError {
     Wal(#[from] WalError),
     #[error("io error: {0}")]
     Io(String),
+    /// 节点私有状态目录（WAL / spill）**已被另一个消费者占用**。
+    ///
+    /// **单列变体而不是塞进 `Io`**：调用方必须能区分"目录被占"（运维问题：停机 / 换目录）
+    /// 与"磁盘坏了"（硬件问题）—— 混在 `Io` 里就只能靠字符串匹配，那等于没有类型。
+    /// 消息体由 [`crate::private_dir::DirLeaseError`] 生成，含占用者的 `pid` / `instance_id` / `role`。
+    #[error("{0}")]
+    DirBusy(String),
     #[error("{0}")]
     Other(String),
+}
+
+impl From<crate::private_dir::DirLeaseError> for LakeError {
+    fn from(e: crate::private_dir::DirLeaseError) -> Self {
+        match &e {
+            // "被占"是**配置/运维**问题，不能混进 Io —— 调用方要按类型分流
+            crate::private_dir::DirLeaseError::Busy { .. } => LakeError::DirBusy(e.to_string()),
+            crate::private_dir::DirLeaseError::Io { source, .. } => {
+                LakeError::Io(source.to_string())
+            }
+        }
+    }
 }
 
 impl From<std::io::Error> for LakeError {
