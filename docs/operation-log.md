@@ -3783,8 +3783,64 @@ self.trace("recv_snapshot", format!("忽略（旧于本地 first={}）", inner.f
 
 - **更正**：上一个提交（`6675043`）的信息里把本章误写为 `§51` —— 当时 `§49` 之后直接是
   `§50…§58`（S3-4 那批），实际章节号是 **§59**。
-- **决定不做：暂不声明 `rust-version`（MSRV）**。edition 2024 的编译器下限是 `1.85`，但声明 MSRV
-  是**对外承诺**（要进 CI 卡住），不该顺手加。代价是 `resolver = "3"` 目前**等价于 v2**
-  （v3 的全部行为差异是 MSRV-aware 解析，没有 MSRV 就无从生效）—— 这也正是锁文件零变化的原因。
-  将来要启用：`[workspace.package] rust-version = "1.85"` + 18 个 crate 加
-  `rust-version.workspace = true`，并检查锁文件是否因此降级依赖。
+- ~~**决定不做：暂不声明 `rust-version`（MSRV）**~~ —— **本条已被 `§60` 取代**（写 `§59` 时判为
+  "不该顺手加"，随即按要求补上）。保留原文以示转折，结论以 `§60` 为准：**MSRV = 1.94**，
+  **不是** policy 想取的 1.92 —— 下界被 `datafusion 55.0.0`（声明 `1.94.0`）顶住。
+
+---
+
+## 60. MSRV 声明：**1.94**（policy 想取 1.92，被 datafusion 顶住）（2026-09-20）
+
+### 60.1 意图 vs 事实：MSRV **不是自由可选项**
+
+意图是官方"latest stable − 6"策略：当时工具链 1.98 → **1.92**。但 MSRV 的真实取值是
+**全依赖链的 max** —— 量法：解析一次，取所有包声明的 `rust-version` 最大值。
+
+```
+已解析包 524；其中声明了 rust-version 的 398
+依赖侧有效下界（最高要求）= 1.94.0
+要求 > 1.92 的：31 个 —— **全部**是 datafusion-*（`datafusion 55.0.0` → 需要 rustc 1.94.0）
+把这 31 个去掉后，要求最高的那档里**没有任何包** → 下界完全由 datafusion 决定
+```
+
+→ 声明 1.92 是**假承诺**：在 1.92 上 cargo 会直接拒绝：
+
+```
+package `datafusion v55.0.0` cannot be built because it requires rustc 1.94.0 or newer,
+while the currently active rustc version is 1.92.0
+```
+
+**有效 MSRV = max(policy, 依赖侧最高要求) = 1.94**。datafusion 是本仓不可替代的查询引擎，
+所以"**以 datafusion 为基准**"是唯一不牺牲功能的取法；另一条路是降到 `datafusion ≤ 54.x`
+换来 1.92 —— 代价是查询引擎与 arrow 版本联动、要重跑全部对拍，属独立决策，本轮未做。
+
+### 60.2 两处都要写，否则等于没声明
+
+虚拟清单的 `[workspace.package]` **只对显式继承的成员生效**（同 `edition`/`license`）：
+
+- `[workspace.package] rust-version = "1.94"`
+- 18 个成员各加一行 `rust-version.workspace = true`
+
+实测（`cargo metadata`）：18 个 `yuntun-*` 的 `rust_version` **全为 `1.94`** ✓。
+
+### 60.3 声明它是**有实际作用**的
+
+1. **`resolver = "3"` 的 MSRV-aware 解析以它为输入。** `§59.6` 那句"resolver=3 目前等价 v2"
+   **到此才真正失效** —— 现在 v3 有输入了（这也是 `§59` 与本节要连起来读的原因）。
+2. 依赖要求更高 rustc 时会在**下游报出来**：这条只有在真·1.94 机器上才看得见。
+
+### 60.4 验证
+
+- 加 MSRV 后重新解析：`Cargo.lock` **零变化**（无依赖需要降级）
+- `cargo clippy --workspace --all-targets`：本仓 **0 告警**，且 MSRV 提到 1.94 **没有解锁任何
+  MSRV-gated lint**（clippy 把 `rust-version` 当 `msrv` 输入，数字一提就可能开始建议"换用更新的
+  std API" —— 这次没有）
+- `cargo test --workspace --no-fail-fast` → **303 passed / 0 failed**
+
+### 60.5 遗留：这个数是**推导值**，不是"实测能编过"
+
+**没有做真·1.94 构建验证** —— 本机镜像（tuna）`1.92.0` / `1.94.0` 都返回 **404**，
+且已定"不折腾工具链"。所以 `1.94` 是**从依赖侧下界推出来的**，逻辑上成立、但**未经编译器确认**。
+
+> **CI 应补一步 `cargo +1.94 build`** —— 这才是 MSRV 承诺的兑付方式；在补上之前，
+> 把 `rust-version` 当"已保证"是过度解读。

@@ -3,6 +3,7 @@ name = "yuntun-format"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 # ADR-1: Vortex 主格式 + Parquet 回退（FormatSwitch）。
 # Vortex API 仍在演进，依赖通过 `vortex` feature 显式开启（并锁定 Git Commit），

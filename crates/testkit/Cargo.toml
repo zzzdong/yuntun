@@ -3,6 +3,7 @@ name = "yuntun-testkit"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 # 仅测试基础设施，不发布、不进生产依赖
 publish = false
 

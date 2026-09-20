@@ -3,6 +3,7 @@ name = "yuntun-meta"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [[bin]]
 # 显式命名：进程名 `metanode` 是**对外接口**（编排脚本/测试用 CARGO_BIN_EXE_metanode 引用它），

@@ -24,6 +24,17 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+# 最低支持工具链（MSRV）。**它是被依赖链顶出来的，不是自由选的**：
+#
+# policy 上想按官方"latest stable − 6"取 1.92（写此值时工具链 1.98），但 `datafusion 55.0.0`
+# 声明 `rust-version = 1.94.0`（31 个 `datafusion-*` crate 全族如此），而它是本仓不可替代的
+# 查询引擎 —— 所以 1.92 会是**假承诺**：在 1.92 上 cargo 直接以 "datafusion requires rustc
+# 1.94.0" 拒绝构建。**有效下界 = max(policy, 依赖侧最高要求) = 1.94**（推导见 operation-log §60）。
+#
+# 声明它是有实际作用的，不是文档摆设：
+#   ① `resolver = "3"` 的 MSRV-aware 解析以它为输入；不声明 MSRV 时 v3 等价于 v2。
+#   ② 它同时是**对外承诺**：CI 应当用 1.94 真构建一次（本机镜像装不到 1.94，故尚未真验证）。
+rust-version = "1.94"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
