@@ -19,10 +19,22 @@ pub use cache::{
     RefreshOutcome,
 };
 pub use provider::{YuntunCatalogProvider, YuntunSchemaProvider};
-pub use table::YuntunTableProvider;
+pub use table::{HotReadStale, YuntunTableProvider};
 
 /// 流式结果集类型（S1.10：`do_get` 边算边发；协议层无需直接依赖 datafusion）。
 pub use datafusion::execution::SendableRecordBatchStream;
+
+/// 从（可能被包了几层的）DataFusion 错误里认出 [`HotReadStale`]。
+///
+/// DataFusion 会用 `Context` 把计划期错误包一层（"failed to create physical plan" 之类），
+/// 所以必须**沿链下钻**：只认最外层会漏掉它，STALE 就会被当成普通失败上报。
+fn hot_read_stale(e: &DataFusionError) -> Option<&HotReadStale> {
+    match e {
+        DataFusionError::External(b) => b.downcast_ref::<HotReadStale>(),
+        DataFusionError::Context(_, inner) => hot_read_stale(inner),
+        _ => None,
+    }
+}
 
 use datafusion::error::DataFusionError;
 use datafusion::execution::memory_pool::GreedyMemoryPool;
@@ -147,6 +159,52 @@ impl QueryEngine {
         Ok(ctx)
     }
 
+    /// 热读 STALE 的**重试上限**（`operation-log §61.4` 第 2 条）。
+    ///
+    /// 为什么有界：STALE 意味着"我们的 manifest 落后"，刷新一次就该追上；连着追不上说明
+    /// 水位在持续推进（写入比刷新快）或刷新没生效 —— 两种情况都该**显式失败**，
+    /// 而不是无限重试或返回不完整结果。
+    const HOT_STALE_MAX_ATTEMPTS: usize = 3;
+
+    /// STALE 重试：热读报 [`HotReadStale`] ⇒ 刷新 manifest ⇒ 用新版本**重试**。
+    ///
+    /// 三条约束（都来自 `§61.4` 第 2 条）：
+    /// - **必须重试**（不得把不完整结果当答案）；
+    /// - **有界**（耗尽即报错，绝不静默降级）；
+    /// - 刷新失败**直接冒泡**（刷不动就别硬撑 —— 宁可失败也别给错数据）。
+    async fn with_stale_retry<T, F, Fut>(&self, what: &str, attempt: F) -> Result<T, DataFusionError>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<T, DataFusionError>>,
+    {
+        let mut n = 0usize;
+        loop {
+            n += 1;
+            match attempt().await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    let Some(stale) = hot_read_stale(&e) else {
+                        return Err(e);
+                    };
+                    if n >= Self::HOT_STALE_MAX_ATTEMPTS {
+                        return Err(DataFusionError::Execution(format!(
+                            "{what}: 热读连续 {n} 次报 STALE（实例水位 {}）—— 刷新 manifest 也没追上；                             不返回不完整结果",
+                            stale.flushed_watermark
+                        )));
+                    }
+                    tracing::warn!(
+                        attempt = n,
+                        table = %stale.table,
+                        known_manifest_ver = stale.known_manifest_ver,
+                        flushed_watermark = stale.flushed_watermark,
+                        "hot read reported STALE; refreshing manifest, then retrying"
+                    );
+                    self.catalog.refresh_now().await?;
+                }
+            }
+        }
+    }
+
     /// 执行 SQL，返回全部批次（默认 schema = `public`）。
     pub async fn sql(
         &self,
@@ -161,9 +219,13 @@ impl QueryEngine {
         query: &str,
         schema: &str,
     ) -> Result<Vec<arrow::record_batch::RecordBatch>, DataFusionError> {
-        let ctx = self.session_with_schema(schema).await?;
-        let df = ctx.sql(query).await?;
-        df.collect().await
+        // 每次尝试都**重建会话**：provider 持有的是当次快照，刷新 manifest 之后必须换新的
+        self.with_stale_retry("sql", || async {
+            let ctx = self.session_with_schema(schema).await?;
+            let df = ctx.sql(query).await?;
+            df.collect().await
+        })
+        .await
     }
 
     /// 流式执行 SQL（S1.10）：返回 `RecordBatch` 流，**不 collect 全量**——
@@ -181,9 +243,14 @@ impl QueryEngine {
         query: &str,
         schema: &str,
     ) -> Result<SendableRecordBatchStream, DataFusionError> {
-        let ctx = self.session_with_schema(schema).await?;
-        let df = ctx.sql(query).await?;
-        df.execute_stream().await
+        // 同上：`scan` 在物理计划期被调用（热读就在那里），所以 STALE 会在 `execute_stream`
+        // 这一步冒出来 —— 此时流还没被消费，重试是干净的。
+        self.with_stale_retry("sql_stream", || async {
+            let ctx = self.session_with_schema(schema).await?;
+            let df = ctx.sql(query).await?;
+            df.execute_stream().await
+        })
+        .await
     }
 
     /// 已收集批次 → 流：非 DataFusion 产出（方言 shim 的 canned 结果、SHOW TABLES

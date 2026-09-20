@@ -114,6 +114,19 @@ pub struct LocalCatalogStats {
     pub tables: usize,
 }
 
+/// `Arc<dyn CatalogOps>` 的薄包装。
+///
+/// 只为保住 [`LocalCatalog`] 的 `Debug` 派生：trait 对象没有 `Debug`，而"一个刷新能力的句柄"
+/// 出现在 Debug 输出里也没有意义 —— 显示成 `CatalogOps` 即可。
+#[derive(Clone)]
+struct OpsHandle(Arc<dyn CatalogOps>);
+
+impl std::fmt::Debug for OpsHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CatalogOps")
+    }
+}
+
 /// 本地 Catalog（S2-2）：**由任意 `CatalogOps` 物化而来**，查询侧只读它。
 ///
 /// 阶段 0/1 的 `CatalogOps` 是 `MemoryCatalog`（同进程），R3 之后换成 gRPC 客户端 ——
@@ -132,6 +145,12 @@ pub struct LocalCatalog {
     /// 数据节点列表（standalone = 单节点）。**提前放进快照**：查询规划中的
     /// "分片归属"必须与 schema/manifest 同一版本，否则会跨版本拼计划。
     nodes: RwLock<Vec<String>>,
+    /// **刷新所需的 `CatalogOps`**（装配层注入），供查询路径上的 STALE 处置使用。
+    ///
+    /// 为什么由 `LocalCatalog` 自己持有：STALE 的处置是"刷新 manifest → 重试"，而这件事发生在
+    /// **查询路径上**，那里只有 `Arc<LocalCatalog>`（`QueryEngine` 拿不到 ops）。
+    /// `None` = 还没接线：那时 STALE 只能**报错**（明确失败），不能默默降级。
+    ops: RwLock<Option<OpsHandle>>,
 }
 
 impl Default for LocalCatalog {
@@ -150,7 +169,31 @@ impl LocalCatalog {
             delta_tables: AtomicU64::new(0),
             last_error: RwLock::new(None),
             nodes: RwLock::new(vec!["standalone".to_string()]),
+            ops: RwLock::new(None),
         }
+    }
+
+    /// 接线 `CatalogOps`（装配层调用）：让查询路径能在 STALE 时**自己刷新 manifest**。
+    ///
+    /// 不接线也不会坏 —— 但那时 STALE 只能报错（见 [`Self::refresh_now`]）：**宁可显式失败，
+    /// 也不返回不完整的结果**。
+    pub fn set_catalog_ops(&self, ops: Arc<dyn CatalogOps>) {
+        *self.ops.write().unwrap() = Some(OpsHandle(ops));
+    }
+
+    /// **同步**刷新一次（STALE 处置用；与后台刷新任务共用同一条 `refresh` 路径）。
+    ///
+    /// 错误分两种，都会冒泡：① 没接线 ops（配置问题，装配层漏了 `set_catalog_ops`）；
+    /// ② 刷新本身失败（网络 / 元数据故障）—— 此时**不能**继续用旧快照硬撑，
+    /// 因为"数据两头都没有"正是要用新快照才能补上的。
+    pub async fn refresh_now(&self) -> Result<RefreshOutcome, DataFusionError> {
+        let ops = self.ops.read().unwrap().clone().map(|h| h.0).ok_or_else(|| {
+            DataFusionError::Configuration(
+                "LocalCatalog 未接线 CatalogOps：STALE 时无法刷新 manifest（装配层应调用 set_catalog_ops）"
+                    .into(),
+            )
+        })?;
+        self.refresh(&ops).await
     }
 
     /// 接线热数据读侧（装配时调用；与写入侧共享同一 chunk store 或注入远端实现）。

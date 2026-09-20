@@ -16,6 +16,35 @@
 //! - 多 schema_version 共存：批次与文件都对齐到表当前 schema
 //!   （同名列宽化 + 缺失列 null 填充，§6.8 / `arrow_util::align_batch`）。
 
+/// **热读报 STALE**：本实例已放弃 (调用方的 manifest 版本, 它的水位] 之间数据的本地副本，
+/// 而调用方的 manifest 里还没有那些文件（`architecture-with-chunk §4.5` 的"两头都没有"）。
+///
+/// **这是"可重试"信号，不是失败**：`QueryEngine` 认出它 → 刷新 manifest → 用新版本重试
+/// （`operation-log §61.4` 第 2 条）。单独定义类型而不是靠字符串：字符串匹配认不出来，
+/// 而这种错误一旦被当作普通失败上报，用户看到的就是莫名失败。
+#[derive(Debug)]
+pub struct HotReadStale {
+    /// 触发 STALE 的表（全限定名）
+    pub table: String,
+    /// 调用方（查询）所依据的 manifest 版本
+    pub known_manifest_ver: u64,
+    /// 热数据所属实例**已放弃本地副本**的最高版本
+    pub flushed_watermark: u64,
+}
+
+impl std::fmt::Display for HotReadStale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "hot shard read is stale for {}: 查询依据的 manifest 版本 {} 落后于实例水位 {} \
+             （该实例已放弃这部分数据的本地副本；需刷新 manifest 后用新版本重试）",
+            self.table, self.known_manifest_ver, self.flushed_watermark
+        )
+    }
+}
+
+impl std::error::Error for HotReadStale {}
+
 use crate::cache::CatalogSnapshot;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
@@ -102,16 +131,18 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
             // `stale` ⇒ 本实例已放弃 (本次快照, 水位] 之间数据的本地副本，而本次快照的 manifest
             // 里还没有那些文件（`architecture-with-chunk §4.5` 的"两头都没有"窗口）。
             //
-            // **本刀只把信号接出来并记录**：消费它（刷新 manifest → 用新版本重试）是下一刀
-            // （`operation-log §63`）。之所以不在这里直接报错：STALE 在"快照落后于提交"的
-            // 正常窗口里也会出现，报错会把它变成常态。
+            // **必须重试，绝不能当答案**（`operation-log §61.4` 第 2 条）：这里报一个**可识别**
+            // 的错误，由 `QueryEngine` 刷新 manifest 后用新版本重试（`§64`）。
+            // 用**类型**而不是字符串传达"该重试"：字符串匹配认不出来，而这种错误一旦被当成
+            // 普通失败上报，用户就会看到莫名失败。
             if read.stale {
-                tracing::warn!(
-                    table = %self.ident,
-                    known_manifest_ver = self.snapshot.snapshot,
-                    flushed_watermark = read.flushed_watermark,
-                    "hot read may be incomplete: instance released data above our manifest version"
-                );
+                return Err(datafusion::error::DataFusionError::External(Box::new(
+                    HotReadStale {
+                        table: self.ident.to_string(),
+                        known_manifest_ver: self.snapshot.snapshot,
+                        flushed_watermark: read.flushed_watermark,
+                    },
+                )));
             }
             let raw = read.batches;
             if !raw.is_empty() {

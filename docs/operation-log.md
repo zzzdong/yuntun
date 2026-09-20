@@ -4035,7 +4035,7 @@ pub fn visible(&self, cached_snapshot: u64) -> bool {
 | `store::shard` | 新增 `ShardRead { batches, flushed_watermark, stale }`；`read_shard` / `read_table` 参数 `cached_snapshot` → **`known_manifest_ver`**（与 §61.4 用词一致），返回 `ShardRead` |
 | `store::ShardFetch` | `fetch_shard` 的**响应**改为 `ShardRead` —— 水位**随 pull 响应回来**（`architecture §4.4` 原话），而不是靠推送 |
 | `chunk::ChunkStore` | 新增单调水位 `released_watermark`（`AtomicU64`，只增不减）+ `flushed_watermark()`；`reclaim` 放弃副本时把它计入 |
-| `query::table` | 适配新返回；`stale` **只记录不消费**（见 63.4 遗留） |
+| `query::table` | 适配新返回；`stale` 报 `warn!`（**`§64` 起改为消费**：报可识别的 `HotReadStale` → 刷新 → 重试） |
 | 测试 | `store` 的远端接缝用例 + 查询侧 `hot_shard_reader` 用例适配；`chunk` 新增一条**定向复现竞态**的用例 |
 
 合并口径写进了 trait 文档：**数据拼接、水位取 max、`stale` 取 or** —— 只要有一部分不可信，整个答案就不可信。
@@ -4083,7 +4083,7 @@ pub fn visible(&self, cached_snapshot: u64) -> bool {
 
 ### 63.4 遗留（下一刀 T12.2 第二刀）
 
-1. **查询侧只记录不消费**：`table.rs` 收到 `stale` 只打 `warn!`。**不当场报错**是刻意的 ——
+1. **查询侧只记录不消费**（**已在 `§64` 落地**：刷新 manifest → 有界重试。以下为写 `§63` 时的原文）：`table.rs` 收到 `stale` 只打 `warn!`。**不当场报错**是刻意的 ——
    STALE 在"快照落后于提交"的**正常**窗口里也会出现（缓存 TTL 内提交过就会），报错会把常态变成故障。
    消费它需要"**刷新 manifest → 用新版本重试**"，落在 `Cache` / `QueryEngine` 层（与"按实例持有
    热读器"是同一层改动，见下一刀）。
@@ -4091,3 +4091,59 @@ pub fn visible(&self, cached_snapshot: u64) -> bool {
    文档：远端实现**不能**用 0 装作"没有已放弃的数据"——那等于把 STALE 静默关掉（S5-6 的活）。
 3. **重启后水位归 0**：进程重启后本实例没有 chunk，水位从 0 重新计；它对"重启前提交的数据"不再
    给 STALE 信号（那部分数据的可见性由读者自己的 manifest 版本决定）。
+
+---
+
+## 64. R4 **T12.2 第二刀（上半）**：消费 STALE —— 刷新 manifest 后重试（`§63.3` 的窗口被真正补上）（2026-09-20）
+
+`§63.4` 遗留①写着"查询侧只记录不消费"。本节把它消费掉：拿到 STALE **必须**刷新 manifest 后
+用新版本重试（`§61.4` 第 2 条），修补 `§63.3` 钉住的那个"静默少一批数据"。
+
+### 64.1 改了什么
+
+| 位置 | 改动 |
+|---|---|
+| `query::table` | `HotReadStale { table, known_manifest_ver, flushed_watermark }`：把 STALE 报成**可识别的可重试错误**（`DataFusionError::External`） |
+| `query::lib` | `with_stale_retry`：**有界**重试（上限 3），认出 `HotReadStale` ⇒ 刷新 ⇒ 重试；`sql` 与 `sql_stream` **两条路径都过**它 |
+| `query::cache` | `LocalCatalog` 新增 `CatalogOps` 注入点（`set_catalog_ops`）与**同步刷新**入口（`refresh_now`），复用后台刷新那条 `refresh` 路径 |
+| `server` | 装配层接线：`cache.set_catalog_ops(catalog.clone())` |
+| 用例（新） | `query/tests/stale_retry.rs` **4 条**：能追上的重试成功 / 追不上的明确失败 / 没接线报配置错 / **已到位时不重试** |
+
+### 64.2 三个设计点（都不是随便选的）
+
+**① 用类型传"该重试"，不用字符串。** `HotReadStale` 是一个独立错误类型，`with_stale_retry`
+从 `DataFusionError` 链里 `downcast` 出来。字符串匹配认不出来；而这类错误一旦被当成普通失败
+上报，用户看到的就是**莫名失败** —— 比"少数据"好，但仍然是错的方向。
+
+**必须沿链下钻**：DataFusion 会用 `Context` 把计划期错误包一层（"failed to create physical plan"之类），
+只认最外层会漏掉它 —— 于是 STALE 又变回静默路径。
+
+**② 重试包住"建会话 + 计划 + 执行"，而不是只包执行。** `TableProvider::scan` 在**物理计划期**被调用
+（热读就在那里，见 `query/src/table.rs`），所以 STALE 从 `collect()` / `execute_stream()` 冒出来；
+而 provider 持有的是**当次快照**，刷新 manifest 之后**必须重建会话**换新快照，否则重试还是拿旧的读。
+
+**③ 刷新能力挂在 `LocalCatalog` 上。** 查询路径上只有 `Arc<LocalCatalog>`（`QueryEngine` 拿不到
+`CatalogOps`），所以刷新所需的 ops 由装配层注入给它。`Arc<dyn CatalogOps>` 用薄包装 `OpsHandle`
+存（trait 对象没有 `Debug`，而它出现在 Debug 输出里也没意义）。
+
+三条约束（`§61.4` 第 2 条）：**必须重试** / **有界**（耗尽即报错，绝不静默降级）/ **刷新失败直接冒泡**
+（刷不动就别硬撑——宁可失败也别给错数据）。
+
+### 64.3 验证：四条用例，方向两两相对
+
+| 用例 | 钉住的性质 |
+|---|---|
+| `stale_hot_read_is_retried_after_refreshing_manifest` | ①数据拿到（不是静默少行）②热读**至少两次**③**刷新计数真的涨了**④**第二次热读发生在刷新之后**（用"每次热读时的刷新计数"证，不只是"重试了"） |
+| `permanent_stale_fails_loudly_instead_of_returning_partial_result` | 永远 STALE ⇒ **恰好撞 3 次上限**后明确报错（防"用不完整结果顶替"——那比失败更坏） |
+| `stale_without_wired_ops_fails_with_a_config_error` | 装配漏了 `set_catalog_ops` ⇒ STALE 只能**明确失败**，不静默降级 |
+| `caught_up_reader_does_not_trigger_retry` | **防误报**：`known` 已到位 ⇒ 不重试、不多刷一次 manifest（否则"每次查询都重试"会变成新的坑） |
+
+后两条与前两条**方向相反**：只测"该重试时重试"会留下"不该重试时也重试"的隐患，那同样是坑。
+
+### 64.4 遗留
+
+1. **按实例持有热读器**（本刀的"下半"）：现在 `LocalCatalog::hot` 仍是**单实例**
+   `Option<Arc<dyn ShardReader>>`，而水位/STALE 已按实例语义定义 —— 下一步把它变成
+   `HashMap<InstanceId, Arc<dyn ShardReader>>`，`source_instance` 才真正有消费者；
+2. **双实例进程内对拍**（第三刀）：两个 `ChunkStore` 当两个实例，断言"每行只出一次"且与单节点串行**精确相等**；
+3. **远端形态必须给真实水位**（S5-6）与 **重启后水位归 0**（`§63.4` 的 2、3 条）未变。
