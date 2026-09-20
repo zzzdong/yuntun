@@ -91,10 +91,10 @@ impl From<MetaError> for tonic::Status {
                 .insert("err-kind", kind.parse().expect("ascii kind"));
             // 只在**确有 subject**时才插这个键（不搞 "_" 哨兵）：
             // 客户端一句 `md.get("err-subject")` 就能区分"有"与"没有"。
-            if !subject.is_empty() {
-                if let Ok(v) = subject.parse() {
-                    s.metadata_mut().insert("err-subject", v);
-                }
+            if !subject.is_empty()
+                && let Ok(v) = subject.parse()
+            {
+                s.metadata_mut().insert("err-subject", v);
             }
             s
         };

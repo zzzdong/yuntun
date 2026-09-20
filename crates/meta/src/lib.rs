@@ -509,10 +509,10 @@ impl Cluster {
             let _ = n.cmd_tx.send(Command::Stop);
             drop(n); // 释放存储句柄（含 fjall 目录锁），否则重启打不开同一目录
         }
-        if let Some(h) = self.handles.remove(&id) {
-            if let Ok(rx) = h.join() {
-                self.receivers.insert(id, rx);
-            }
+        if let Some(h) = self.handles.remove(&id)
+            && let Ok(rx) = h.join()
+        {
+            self.receivers.insert(id, rx);
         }
     }
 

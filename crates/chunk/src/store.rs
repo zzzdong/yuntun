@@ -227,7 +227,7 @@ pub struct ChunkStoreStats {
     /// 因内存水位而**跳过相位分散**提前 flush 的次数（累计）。
     ///
     /// > 0 表示"削峰正在让位"：文件数与窗口的对应关系仍然成立，但提交时刻不再均匀分散。
-    /// 运维看这个值就知道 Meta/S3 的尖峰是配置问题还是负载超设计。
+    /// > 运维看这个值就知道 Meta/S3 的尖峰是配置问题还是负载超设计。
     pub phase_yielded_flushes: u64,
 }
 
@@ -804,10 +804,10 @@ impl ChunkStore {
         };
         if let Some(p) = spill_path {
             // 本地副本是节点私有加速品，删失败只留垃圾文件（I1：权威在 WAL）
-            if let Err(e) = std::fs::remove_file(&p) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(path = %p.display(), error = %e, "remove discarded spill failed");
-                }
+            if let Err(e) = std::fs::remove_file(&p)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(path = %p.display(), error = %e, "remove discarded spill failed");
             }
         }
         self.ledger.release(freed);

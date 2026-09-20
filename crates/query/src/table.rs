@@ -120,30 +120,30 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
         }
 
         // ② 已提交文件（Manifest 驱动，C7）：文件清单来自**本 provider 的快照**
-        if let Some(t) = table {
-            if !t.files.is_empty() {
-                let files: Vec<PartitionedFile> = t
-                    .files
-                    .iter()
-                    .map(|f| PartitionedFile::new(f.file_path.clone(), f.file_size))
-                    .collect();
+        if let Some(t) = table
+            && !t.files.is_empty()
+        {
+            let files: Vec<PartitionedFile> = t
+                .files
+                .iter()
+                .map(|f| PartitionedFile::new(f.file_path.clone(), f.file_size))
+                .collect();
 
-                let source: Arc<dyn FileSource> = Arc::new(ParquetSource::new(
-                    datafusion_datasource::table_schema::TableSchemaBuilder::new(schema.clone())
-                        .build(),
-                ));
+            let source: Arc<dyn FileSource> = Arc::new(ParquetSource::new(
+                datafusion_datasource::table_schema::TableSchemaBuilder::new(schema.clone())
+                    .build(),
+            ));
 
-                let mut builder = FileScanConfigBuilder::new(self.store_url.clone(), source)
-                    .with_file_group(FileGroup::new(files));
-                if let Some(p) = projection {
-                    builder = builder
-                        .with_projection_indices(Some(p.clone()))
-                        .map_err(|e| {
-                            datafusion::error::DataFusionError::Execution(format!("projection: {e}"))
-                        })?;
-                }
-                inputs.push(DataSourceExec::from_data_source(builder.build()));
+            let mut builder = FileScanConfigBuilder::new(self.store_url.clone(), source)
+                .with_file_group(FileGroup::new(files));
+            if let Some(p) = projection {
+                builder = builder
+                    .with_projection_indices(Some(p.clone()))
+                    .map_err(|e| {
+                        datafusion::error::DataFusionError::Execution(format!("projection: {e}"))
+                    })?;
             }
+            inputs.push(DataSourceExec::from_data_source(builder.build()));
         }
 
         // ③ 空表：给一个空的内存执行（保持 schema / 投影语义）

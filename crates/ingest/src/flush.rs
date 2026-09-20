@@ -414,10 +414,10 @@ fn collect_idempotency_keys(
     // BTreeSet：去重 + 有序 → 提交内容确定（不依赖哈希序，见 catalog/state.rs 纪律 2）
     let mut keys: BTreeSet<String> = BTreeSet::new();
     for (_, rec) in reader.scan_range(from, to)? {
-        if let Record::Data(p) = rec {
-            if !p.client_request_id.is_empty() {
-                keys.insert(p.client_request_id);
-            }
+        if let Record::Data(p) = rec
+            && !p.client_request_id.is_empty()
+        {
+            keys.insert(p.client_request_id);
         }
     }
     Ok(keys.into_iter().collect())

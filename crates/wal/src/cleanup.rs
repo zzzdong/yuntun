@@ -122,27 +122,27 @@ pub fn spawn_timeout_monitor(
             }
 
             // ② 磁盘保护（更激进）：> 水位 → 强制 abort 最老的未完成 batch
-            if let Some(disk) = &disk {
-                if disk.usage() > cfg.disk_high_watermark {
-                    let mut cands = view.non_terminal();
-                    cands.sort_by_key(|s| s.created_at_ms);
-                    if let Some(oldest) = cands.first() {
-                        tracing::warn!(
-                            batch_id = %oldest.batch_id,
-                            usage = %disk.usage(),
-                            "disk watermark exceeded, force aborting oldest batch"
-                        );
-                        let r = wal
-                            .append(Record::BatchAbort(
-                                yuntun_model::wal_record::BatchAbortPayload {
-                                    batch_id: oldest.batch_id.clone(),
-                                },
-                            ))
-                            .await;
-                        if r.is_ok() {
-                            // 同 ①：视图不同步 → 被放弃的批次会一直挡住 segment 释放
-                            view.note_abort(&oldest.batch_id);
-                        }
+            if let Some(disk) = &disk
+                && disk.usage() > cfg.disk_high_watermark
+            {
+                let mut cands = view.non_terminal();
+                cands.sort_by_key(|s| s.created_at_ms);
+                if let Some(oldest) = cands.first() {
+                    tracing::warn!(
+                        batch_id = %oldest.batch_id,
+                        usage = %disk.usage(),
+                        "disk watermark exceeded, force aborting oldest batch"
+                    );
+                    let r = wal
+                        .append(Record::BatchAbort(
+                            yuntun_model::wal_record::BatchAbortPayload {
+                                batch_id: oldest.batch_id.clone(),
+                            },
+                        ))
+                        .await;
+                    if r.is_ok() {
+                        // 同 ①：视图不同步 → 被放弃的批次会一直挡住 segment 释放
+                        view.note_abort(&oldest.batch_id);
                     }
                 }
             }

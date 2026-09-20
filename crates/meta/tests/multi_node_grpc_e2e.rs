@@ -186,19 +186,19 @@ async fn propose_following_leader(
 ) -> pb::ProposeResponse {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if let Some(l) = leader_of(clients).await {
-            if live.contains(&l) {
-                let r = clients[&l]
-                    .clone()
-                    .propose(pb::ProposeRequest {
-                        op: Some(op.clone()),
-                        request_id: b"rid".to_vec(),
-                        schema_ver: 0,
-                    })
-                    .await;
-                if let Ok(resp) = r {
-                    return resp.into_inner();
-                }
+        if let Some(l) = leader_of(clients).await
+            && live.contains(&l)
+        {
+            let r = clients[&l]
+                .clone()
+                .propose(pb::ProposeRequest {
+                    op: Some(op.clone()),
+                    request_id: b"rid".to_vec(),
+                    schema_ver: 0,
+                })
+                .await;
+            if let Ok(resp) = r {
+                return resp.into_inner();
             }
         }
         assert!(

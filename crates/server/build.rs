@@ -32,10 +32,8 @@ fn main() {
             matched = false;
         } else if let Some(v) = line.strip_prefix("name = ") {
             matched = v == "\"arrow\"";
-        } else if matched {
-            if let Some(v) = line.strip_prefix("version = ") {
-                version = v.trim_matches('"').to_string().into();
-            }
+        } else if matched && let Some(v) = line.strip_prefix("version = ") {
+            version = v.trim_matches('"').to_string().into();
         }
     }
     if let Some(v) = version {

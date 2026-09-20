@@ -18,7 +18,6 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
-use yuntun_catalog::CatalogOps;
 use yuntun_server::{Config, Lakehouse};
 use yuntun_sql::session::SessionCtx;
 

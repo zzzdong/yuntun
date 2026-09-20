@@ -4,6 +4,7 @@
 //! - **chunk 内存水位**：内存为什么涨；
 //! - **WAL 积压**：攒批是不是落后了（内存越限的缓冲池）；
 //! - **背压水位**：离"拒写"还有多远；
+//!
 //! 再叠加 **Catalog 版本 + 全量/增量刷新计数**（R2 的成效可量化）。
 
 use std::sync::Arc;
@@ -111,5 +112,5 @@ async fn metrics_expose_memory_backlog_pressure_and_catalog_versions() {
     for h in bg {
         let _ = h.await;
     }
-    let _ = std::fs::remove_dir_all(&dir.string());
+    let _ = std::fs::remove_dir_all(dir.string());
 }

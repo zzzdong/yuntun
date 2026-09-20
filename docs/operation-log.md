@@ -3695,3 +3695,96 @@ e2e 断言：`delta(当前, 当前)` → `full_reload == false`；`delta(当前,
 查询结果**与单节点串行精确相等**（对拍，硬要求）」—— `§58` 这条用例就是它的模板。
 
 ---
+
+---
+
+## 59. 工具链：全仓升 **Rust 2024 edition**（+ 纠正 clippy 基线读数）（2026-09-20）
+
+### 59.1 改动是"根清单一行"
+
+`[workspace.package] edition = "2021" → "2024"`。18 个 crate 全写 `edition.workspace = true`，
+所以**只有一个声明点** —— 这是当初把 `edition` 放进 `workspace.package` 的收益。
+同时 `resolver = "2" → "3"`（2024 的默认解析器）。
+
+**为什么 `resolver` 必须显式写**：根是**虚拟清单**（无 `[package]`），解析器不会被 edition
+推断出来。`resolver = "3"` 实测 `Cargo.lock` **逐字节无变化**（见 59.6）。
+
+### 59.2 为什么一行就能过：先按"2024 会破坏什么"扫一遍
+
+升级前的**可复用步骤** —— 先 grep 五类破坏点，命中为 0 才动手：
+
+| 2024 变更 | grep 目标 | 命中 |
+|---|---|---|
+| `gen` 成保留字 | `\bgen\b` | 0 |
+| `static mut` 引用（现在报错） | `static mut` | 0 |
+| `unsafe extern` / 属性须 `unsafe(...)` | `no_mangle\|export_name\|link_section` | 0 |
+| `std::env::set_var` 变 unsafe | `set_var\|remove_var` | 0 |
+| RPIT 捕获全部生命周期 | `-> impl ` | 0 |
+
+行为类变更（`tail_expr_drop_order` / `if_let_rescope` / never-type fallback）编译期
+**一个都没触发**；全仓**零 `unsafe` 块**，`unsafe_op_in_unsafe_fn` 这类新 lint 也无从下手。
+
+> 结论：**edition 升级的难度取决于代码风格，不是 crate 数量**。本仓把"显式类型 / 无 unsafe /
+> 无 `impl Trait` 返回 / 无全局可变状态"当纪律，于是升级成本≈一行。
+
+### 59.3 顺带抓出：`status.md` 那句"clippy 0 警告"是**热缓存读数**
+
+edition 一改，**所有 crate 全部重建**，clippy 这才把全仓告警吐全：**15 + 7 = 22 条**。
+此前历次 `cargo clippy --workspace --all-targets` 读到的"0 警告"，是**增量编译只报被重建 crate**
+的产物；`status.md` 原文那句"全仓余 1 处历史告警"也是同一个读数来源。
+
+- **15 条 `collapsible_if`**：edition 2024 让 **let-chains** 可用，clippy 于是开始建议
+  `if a { if let Some(x) = b { … } }` → `if a && let Some(x) = b { … }`。2021 下这条建议
+  **无法表达**（语法不成立），所以以前不提 —— **不是以前更干净，是以前没得选**。
+- **7 条其他**（与 edition 无关，属纯热缓存遮蔽）：3 处 doc（2 处 blockquote 续行漏 `>`、
+  1 处列表项后缺空行）、2 处 `now_ms().max(0) as u64`（`now_ms() -> u64` → `.max(0)` 与
+  `as u64` 都是恒等，实测签名与字段类型确认为 `u64` ✓）、1 处 `&String` 冗余借用、
+  1 处未用 import（`lh.catalog` 是 `dyn CatalogOps` trait 对象，方法直接可调，不必引入 trait）。
+
+**修完**：`cargo clippy --workspace --all-targets` 全仓只剩 **1 条外部依赖告警**
+（`proc-macro-error2 v2.0.1`，来自 `opensrv-mysql`，非本仓代码；见 `§49` 那条线）。
+
+### 59.4 两个坑：都会让人"改一个文件、动全仓"
+
+**坑 1 —— `rustfmt <crate 根>` 会递归格式化它的全部子模块。**
+把 `crates/meta/src/lib.rs`、`crates/server/src/lib.rs` 传给 rustfmt 后，**meta 与 server 两个
+crate 被整仓重排**：diff 从预期的 ~60 行炸到 **469/365 行、25 个文件**（`op.rs` 120 行、
+`server/lib.rs` 148 行）。已**全部回退**。要只动一个文件，就**不要**传 crate 根。
+
+**坑 2 —— rustfmt 的宽度按 *CJK 占 2 列* 算。**
+
+```rust
+// rustfmt 眼里"超宽" → 被拆成 5 行（作者显然是有意保留单行）
+self.trace("recv_snapshot", format!("忽略（旧于本地 first={}）", inner.first_index()));
+```
+
+这类"单行调用"全仓 `cargo fmt --check` 报 **338 处、78 个文件**。所以本仓**不是** rustfmt-clean，
+而且**不能**整仓 `cargo fmt`：那会把中文注释附近的行大量拆开，淹没真实改动、且**可读性变差**。
+本轮 15 处 let-chain 全部**手工**按 rustfmt 2024 style 落，再用"每个文件的 `rustfmt --check`
+差异条数是否与基线一致"验证没跑偏（18 个文件里 16 个与基线**完全一致**；`table.rs` 少 1 处 ——
+塌一层后原本超宽的那行正好放得下，属改善；`build.rs` 初版猜错，已按 rustfmt 意见改正）。
+
+**顺带实测的 rustfmt 2024 规则**（探针文件，省得后来者再猜）：let-chain **一律**拆多行
+（首项留 `if` 行、后续 `&&` 缩进 +4、`{` 独占一行）—— 连 `if let Some(v) = x && y {` 也拆；
+但 **`else if` 上的链保留单行**。
+
+### 59.5 验证
+
+- `cargo test --workspace --no-fail-fast` → **303 passed / 0 failed**（44 个二进制 + 17 个 doctest），
+  与 `status.md` 记的 303 测试函数 / 303 用例**逐一对上**
+- `cargo check --workspace --all-targets` → **0 error**
+- `cargo clippy --workspace --all-targets` → 本仓 **0**，仅余外部 `proc-macro-error2`
+- `resolver = "3"` 后 `Cargo.lock` **无变化**
+
+> 顺带修了 `status.md` 三处陈旧数字：§1 与 §4 表里的"214 用例 / 184 个测试函数"（实为 303），
+> 以及"全仓余 1 处历史告警"（实为 0 + 1 条外部）。
+
+### 59.6 更正与遗留
+
+- **更正**：上一个提交（`6675043`）的信息里把本章误写为 `§51` —— 当时 `§49` 之后直接是
+  `§50…§58`（S3-4 那批），实际章节号是 **§59**。
+- **决定不做：暂不声明 `rust-version`（MSRV）**。edition 2024 的编译器下限是 `1.85`，但声明 MSRV
+  是**对外承诺**（要进 CI 卡住），不该顺手加。代价是 `resolver = "3"` 目前**等价于 v2**
+  （v3 的全部行为差异是 MSRV-aware 解析，没有 MSRV 就无从生效）—— 这也正是锁文件零变化的原因。
+  将来要启用：`[workspace.package] rust-version = "1.85"` + 18 个 crate 加
+  `rust-version.workspace = true`，并检查锁文件是否因此降级依赖。

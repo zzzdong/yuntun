@@ -595,18 +595,18 @@ impl CatalogOps for RemoteCatalog {
                         last = Some(st);
                         continue;
                     }
-                    if st.code() == tonic::Code::FailedPrecondition {
-                        if let Some(v) = actual_version_of(&st) {
-                            // 冲突：读一次当前 schema，还原成与 `MemoryCatalog` **同形**的错误
-                            let new_schema = match self.table_schema(&table).await? {
-                                Some((s, _)) => s,
-                                None => return Err(LakeError::TableNotFound(table.clone())),
-                            };
-                            return Err(LakeError::SchemaChanged {
-                                actual_version: v,
-                                new_schema,
-                            });
-                        }
+                    if st.code() == tonic::Code::FailedPrecondition
+                        && let Some(v) = actual_version_of(&st)
+                    {
+                        // 冲突：读一次当前 schema，还原成与 `MemoryCatalog` **同形**的错误
+                        let new_schema = match self.table_schema(&table).await? {
+                            Some((s, _)) => s,
+                            None => return Err(LakeError::TableNotFound(table.clone())),
+                        };
+                        return Err(LakeError::SchemaChanged {
+                            actual_version: v,
+                            new_schema,
+                        });
                     }
                     return Err(map_status(st));
                 }

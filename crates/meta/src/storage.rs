@@ -202,11 +202,11 @@ impl MetaStorage {
                 // 已被快照覆盖（重复投递）；丢弃而不是报错：raft 认为它已持久化
                 continue;
             }
-            if let Some(last) = inner.entries.last() {
-                if e.index <= last.index {
-                    // 覆盖已有条目（raft 允许截断重写）
-                    inner.entries.retain(|x| x.index < e.index);
-                }
+            if let Some(last) = inner.entries.last()
+                && e.index <= last.index
+            {
+                // 覆盖已有条目（raft 允许截断重写）
+                inner.entries.retain(|x| x.index < e.index);
             }
             inner.entries.push(e.clone());
         }

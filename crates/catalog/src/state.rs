@@ -289,10 +289,11 @@ impl CatalogState {
             .chain(req.client_request_id.clone())
             .collect();
         for key in &keys {
-            if let Some(rec) = self.idempotency.get(key) {
-                if !rec.batch_id.is_empty() && rec.batch_id != req.batch_id {
-                    return Ok(self.dup_commit_response());
-                }
+            if let Some(rec) = self.idempotency.get(key)
+                && !rec.batch_id.is_empty()
+                && rec.batch_id != req.batch_id
+            {
+                return Ok(self.dup_commit_response());
             }
         }
         for key in &keys {

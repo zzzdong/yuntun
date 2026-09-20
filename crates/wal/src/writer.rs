@@ -307,11 +307,10 @@ fn commit_loop(rx: mpsc::Receiver<CommitRequest>, st: Arc<ShardState>, mut guard
         if guard
             .writer
             .should_rotate(incoming, st.cfg.segment_max_size, st.cfg.segment_max_age)
+            && let Err(e) = rotate(&mut guard, &st)
         {
-            if let Err(e) = rotate(&mut guard, &st) {
-                fail_batch(&mut batch, e);
-                continue 'outer;
-            }
+            fail_batch(&mut batch, e);
+            continue 'outer;
         }
 
         // 追加写入 + 一次性 fsync

@@ -112,13 +112,13 @@ fn try_widen(column: &str, from: &DataType, to: &DataType) -> Option<SchemaChang
         crate::meta::promotion_rank(from),
         crate::meta::promotion_rank(to),
     );
-    if let (Some(a), Some(b)) = (rf, rt) {
-        if b > a {
-            return Some(SchemaChange::WidenType {
-                column: column.to_string(),
-                to: to.clone(),
-            });
-        }
+    if let (Some(a), Some(b)) = (rf, rt)
+        && b > a
+    {
+        return Some(SchemaChange::WidenType {
+            column: column.to_string(),
+            to: to.clone(),
+        });
     }
     None
 }

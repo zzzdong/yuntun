@@ -348,10 +348,11 @@ fn wait_all_equal(cluster: &yuntun_meta::Cluster, timeout: Duration) {
         let first = cluster.canonical(alive[0]);
         if alive.iter().all(|id| cluster.canonical(*id) == first) {
             // 不能只看"都等于第一个"：还要确认第一个不是空状态（否则会瞬间通过）
-            if let Some(c) = &first {
-                if !c.is_empty() && cluster.applied(alive[0]).unwrap_or(0) > 0 {
-                    return;
-                }
+            if let Some(c) = &first
+                && !c.is_empty()
+                && cluster.applied(alive[0]).unwrap_or(0) > 0
+            {
+                return;
             }
         }
         assert!(

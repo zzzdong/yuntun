@@ -286,20 +286,20 @@ impl Ingestor {
         //（"提交键集合"粒度属 R3 状态机，`refactor.md` S3-5）。所以 Meta 层去重
         // 兜不住"一个文件含多个键"的批次粒度 —— 入口是唯一正确的拦点。
         // 漏掉它的后果是静默重复计数（客户端超时重试即命中）。
-        if let Some(k) = &client_key {
-            if self.catalog.check_idempotency(k).await?.is_some() {
-                tracing::debug!(key = %k, table = %table, "idempotency key already claimed, skipping write");
-                return Ok(Receipt {
-                    table: b.table,
-                    shard: b.shard_key,
-                    wal_seq: 0,
-                    row_count: 0,
-                    schema_version: 0,
-                    expected_visible_at: now_ms(),
-                    expected_visible_in_secs: 0,
-                    duplicate: true,
-                });
-            }
+        if let Some(k) = &client_key
+            && self.catalog.check_idempotency(k).await?.is_some()
+        {
+            tracing::debug!(key = %k, table = %table, "idempotency key already claimed, skipping write");
+            return Ok(Receipt {
+                table: b.table,
+                shard: b.shard_key,
+                wal_seq: 0,
+                row_count: 0,
+                schema_version: 0,
+                expected_visible_at: now_ms(),
+                expected_visible_in_secs: 0,
+                duplicate: true,
+            });
         }
 
         // ①-④ Schema 解析 / OCC 演进（必须在写对象存储之前，C8）
@@ -361,7 +361,7 @@ impl Ingestor {
                 .record_idempotency(yuntun_model::meta::IdempotencyRecord {
                     client_request_id: k.clone(),
                     batch_id: String::new(),
-                    committed_at: now_ms().max(0) as u64 / 1000,
+                    committed_at: now_ms() / 1000,
                 })
                 .await?;
         }
@@ -630,7 +630,7 @@ impl Ingestor {
                 .record_idempotency(yuntun_model::meta::IdempotencyRecord {
                     client_request_id: p.client_request_id.clone(),
                     batch_id: String::new(),
-                    committed_at: now_ms().max(0) as u64 / 1000,
+                    committed_at: now_ms() / 1000,
                 })
                 .await?;
             reindexed += 1;
