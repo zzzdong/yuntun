@@ -29,6 +29,8 @@ uuid = { workspace = true }
 [dev-dependencies]
 yuntun-testkit = { path = "../testkit" }
 yuntun-ingest = { path = "../ingest" }
+# 仅测试：双实例对拍需要**真的** chunk store 当两个 datanode（库本身只依赖 `ShardReader` 缝）
+yuntun-chunk = { path = "../chunk" }
 yuntun-wal = { path = "../wal" }
 yuntun-store = { path = "../store" }
 tokio-util = { workspace = true }

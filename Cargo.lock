@@ -5536,6 +5536,7 @@ dependencies = [
  "url",
  "uuid",
  "yuntun-catalog",
+ "yuntun-chunk",
  "yuntun-format",
  "yuntun-ingest",
  "yuntun-model",
