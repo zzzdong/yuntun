@@ -581,7 +581,7 @@ standalone 仍可单机运行（同一份装配的裁剪）。
 
 | ID | 内容 | 说明 |
 |---|---|---|
-| T12.1 | 拆 `yuntun-ingestor` / `yuntun-queryd` / `yuntun-compactor` | 从 `standalone` 逐组件摘出 |
+| T12.1 | 拆 `yuntun-ingestor` / `yuntun-queryd` / `yuntun-compactor` | 从 `standalone` 逐组件摘出。**前置已落地**（`§67`）：数据面 gRPC 面（`yuntun-shardrpc` + `shard.proto`）—— `RemoteShard` 第一次真能跨网络拉热数据，且**水位/STALE 随响应回来**；`§66` 的对拍已在 gRPC 形态下复用通过 |
 | T12.2 | **消费 `source_instance`：冷热边界按实例二维切分** | ✅ **进程内形态完成（三刀齐）**：第一刀已落地 —— 契约（水位 + STALE）代码化，并**抓出一个今天就触发的静默错误**（`§4.5` 的"两头都没有"：回收后拿旧快照读 ⇒ 静默少数据），`operation-log §63`；**第二刀（上半）已落地**：查询侧**消费 STALE**（`HotReadStale` 可识别可重试错误 + 有界重试，`sql`/`sql_stream` 两条路径；`LocalCatalog` 拿到 `CatalogOps` 注入点与同步刷新入口，`§64`）。**第二刀（下半）已落地**：热读器**按实例**持有（`HotShards = BTreeMap<instance, ShardReader>`，`source_instance` 第一次成为读路径的键；逐实例拉 + `HotReadStale.instance`；`BTreeMap` 保确定性、`shard_version` 求和，`§65`）。**第三刀已落地**（`§66`）：双实例（两个 `ChunkStore`，刻意用**相同** shard）vs 单节点串行的**逐行对拍**（6 行不多不少）+ **反证**（只注册一个实例只看到自己那 3 行 ⇒ 主断言非空转）。语义闭环（进程内）到此完成；**跨进程形态随 T12.1**（拆进程后可复用同一条对拍逻辑） |
 | T12.3 | 成员发现 + 分片归属（谁持有哪个 `(table, shard)` 的热数据） | 与 `ShardReader`/`ShardFetch` 对接（缝已在） |
 | T12.4 | 每节点私有状态初始化与校验（WAL 目录 + spill 目录） | ✅ **已落地**（`private_dir` 租约，节点装配层；`operation-log §62`）；下移到 store 层（更严格）为后续项 |

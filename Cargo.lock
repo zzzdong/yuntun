@@ -5583,6 +5583,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "yuntun-shardrpc"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "futures",
+ "tokio",
+ "tonic",
+ "tracing",
+ "yuntun-catalog",
+ "yuntun-chunk",
+ "yuntun-model",
+ "yuntun-proto",
+ "yuntun-query",
+ "yuntun-store",
+ "yuntun-testkit",
+]
+
+[[package]]
 name = "yuntun-sql"
 version = "0.1.0"
 dependencies = [

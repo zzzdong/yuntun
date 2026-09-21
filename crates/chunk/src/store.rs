@@ -1027,6 +1027,17 @@ impl ShardReader for ChunkStore {
         })
     }
 
+    /// 实例级水位：本法器**就是**一个实例，水位直接取自它自己的单调计数。
+    ///
+    /// 注意这里与 `read_table` 的差别：`read_table` 会顺带读数据，而本方法**只答边界** ——
+    /// 分片枚举为空时它依然必须能答（那正是"刚放弃完副本"的时刻，`§67` 的坑）。
+    async fn watermark(&self, known_manifest_ver: u64) -> Result<ShardRead, LakeError> {
+        Ok(ShardRead::empty(
+            self.flushed_watermark(),
+            known_manifest_ver,
+        ))
+    }
+
     async fn read_table(
         &self,
         table: &str,

@@ -6,9 +6,10 @@
 //! 本轮环境已有 `libprotoc 36.1`，故直接用系统 protoc。
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=proto/meta.proto");
+    println!("cargo:rerun-if-changed=proto/shard.proto");
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
-        .compile_protos(&["proto/meta.proto"], &["proto"])?;
+        .compile_protos(&["proto/meta.proto", "proto/shard.proto"], &["proto"])?;
     Ok(())
 }

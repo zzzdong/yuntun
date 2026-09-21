@@ -25,21 +25,31 @@ use yuntun_store::{create_store, ShardId, ShardRead, ShardReader, ShardTier, Sto
 struct FlakyHot {
     cache: Arc<LocalCatalog>,
     seen: Mutex<Vec<(u64, u64)>>,
-    /// 前 N 次热读报 STALE（0 = 从不报）。`usize::MAX` = 永远报。
-    stale_first: usize,
+    /// 缓存刷新计数达到这个值之前一直报 STALE（`u64::MAX` = 永远报）。
+    ///
+    /// **为什么按"刷新计数"而不是按"调用次数"**：契约把水位独立成了 `watermark()`
+    /// （实例级属性，`§67`），于是**一轮查询会调用多次**（逐分片 + 一次水位）——
+    /// 按次数决定会让同一轮内的几次调用给出互相矛盾的答案。按刷新计数则天然对齐
+    /// "**一轮查询**"：引擎刷新 manifest 之后判定随之改变，这也正是真实实现的语义。
+    stale_until_refreshes: u64,
 }
 
 impl FlakyHot {
-    fn new(cache: Arc<LocalCatalog>, stale_first: usize) -> Self {
+    fn new(cache: Arc<LocalCatalog>, stale_until_refreshes: u64) -> Self {
         Self {
             cache,
             seen: Mutex::new(Vec::new()),
-            stale_first,
+            stale_until_refreshes,
         }
     }
 
     fn calls(&self) -> Vec<(u64, u64)> {
         self.seen.lock().unwrap().clone()
+    }
+
+    /// 与真实实现同构：**水位与 stale 由同一处判定**（`read_shard` 与 `watermark` 都问它）
+    fn is_stale(&self) -> bool {
+        self.cache.stats().refreshes < self.stale_until_refreshes
     }
 }
 
@@ -63,16 +73,26 @@ impl ShardReader for FlakyHot {
         known_manifest_ver: u64,
     ) -> Result<ShardRead, LakeError> {
         let refreshes = self.cache.stats().refreshes;
-        let mut seen = self.seen.lock().unwrap();
-        seen.push((known_manifest_ver, refreshes));
-        let n = seen.len();
-        drop(seen);
+        self.seen
+            .lock()
+            .unwrap()
+            .push((known_manifest_ver, refreshes));
 
-        let stale = n <= self.stale_first;
+        let stale = self.is_stale();
         Ok(ShardRead {
             // 一行数据：查出来的 count 必须是 1，否则就是"静默少了数据"
             batches: vec![batch(1)],
             // 报 STALE 时水位取一个"高于任何 manifest 版本"的值，语义与真实实现一致
+            flushed_watermark: if stale { u64::MAX } else { 0 },
+            stale,
+        })
+    }
+
+    /// 实例级水位：**与 `read_shard` 用同一判据**（真实数据节点也是同一处判定）
+    async fn watermark(&self, _known_manifest_ver: u64) -> Result<ShardRead, LakeError> {
+        let stale = self.is_stale();
+        Ok(ShardRead {
+            batches: Vec::new(),
             flushed_watermark: if stale { u64::MAX } else { 0 },
             stale,
         })
@@ -118,7 +138,7 @@ async fn stale_hot_read_is_retried_after_refreshing_manifest() {
     let cache = Arc::new(LocalCatalog::new());
     // 本刀的接线：查询路径要能在 STALE 时**自己刷新 manifest**
     cache.set_catalog_ops(catalog.clone());
-    let hot = Arc::new(FlakyHot::new(cache.clone(), 1)); // 仅第一次报 STALE
+    let hot = Arc::new(FlakyHot::new(cache.clone(), 2)); // setup 已刷过 1 次 ⇒ 首次仍 STALE，引擎刷新后追上
     cache.set_hot_shards("inst-a", hot.clone());
     cache.refresh(&catalog).await.unwrap();
     let refreshes_before = cache.stats().refreshes;
@@ -154,7 +174,7 @@ async fn permanent_stale_fails_loudly_instead_of_returning_partial_result() {
 
     let cache = Arc::new(LocalCatalog::new());
     cache.set_catalog_ops(catalog.clone());
-    let hot = Arc::new(FlakyHot::new(cache.clone(), usize::MAX)); // 永远 STALE
+    let hot = Arc::new(FlakyHot::new(cache.clone(), u64::MAX)); // 永远 STALE
     cache.set_hot_shards("inst-a", hot.clone());
     cache.refresh(&catalog).await.unwrap();
 
@@ -182,7 +202,7 @@ async fn stale_without_wired_ops_fails_with_a_config_error() {
 
     let cache = Arc::new(LocalCatalog::new());
     // **故意不调** `set_catalog_ops`
-    let hot = Arc::new(FlakyHot::new(cache.clone(), 1));
+    let hot = Arc::new(FlakyHot::new(cache.clone(), 2));
     cache.set_hot_shards("inst-a", hot.clone());
     cache.refresh(&catalog).await.unwrap();
 
@@ -202,7 +222,7 @@ async fn caught_up_reader_does_not_trigger_retry() {
 
     let cache = Arc::new(LocalCatalog::new());
     cache.set_catalog_ops(catalog.clone());
-    let hot = Arc::new(FlakyHot::new(cache.clone(), 0)); // 从不报 STALE
+    let hot = Arc::new(FlakyHot::new(cache.clone(), 1)); // setup 已刷过 1 次 ⇒ 从不报 STALE
     cache.set_hot_shards("inst-a", hot.clone());
     cache.refresh(&catalog).await.unwrap();
     let refreshes_before = cache.stats().refreshes;

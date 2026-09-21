@@ -5,6 +5,7 @@ members = [
     "crates/proto",
     "crates/wal",
     "crates/store",
+    "crates/shardrpc",
     "crates/chunk",
     "crates/format",
     "crates/catalog",

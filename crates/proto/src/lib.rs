@@ -20,5 +20,13 @@ pub mod meta {
     tonic::include_proto!("yuntun.meta.v1");
 }
 
+/// 数据面 gRPC 面（`proto/shard.proto`，package `yuntun.shard.v1`）。
+///
+/// 与 `meta` 分开成两个 proto 包是刻意的：**元数据面与数据面的演进节奏不同** ——
+/// 数据面要能单独换传输/压缩而不动 raft 的线上契约。
+pub mod shard {
+    tonic::include_proto!("yuntun.shard.v1");
+}
+
 /// 本 crate 与 proto 包的版本声明（放进 `StatusResponse.version`，便于排查版本错配）。
 pub const PROTO_VERSION: &str = "yuntun.meta.v1";

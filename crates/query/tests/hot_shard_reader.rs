@@ -34,6 +34,14 @@ impl ShardFetch for CannedFetch {
         })
     }
 
+    fn fetch_watermark<'a>(
+        &'a self,
+        known_manifest_ver: u64,
+    ) -> futures::future::BoxFuture<'a, Result<ShardRead, LakeError>> {
+        // 假服务端没有"已放弃的副本" ⇒ 水位 0（与它的 `fetch_shard` 一致）
+        Box::pin(async move { Ok(ShardRead::empty(0, known_manifest_ver)) })
+    }
+
     fn fetch_shard<'a>(
         &'a self,
         id: &'a ShardId,

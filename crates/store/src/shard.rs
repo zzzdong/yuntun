@@ -125,28 +125,34 @@ pub trait ShardReader: Send + Sync + std::fmt::Debug {
         known_manifest_ver: u64,
     ) -> Result<ShardRead, LakeError>;
 
-    /// 便捷：读整表（默认 = 枚举 + 逐分片；远端实现可覆写为单次 RPC）。
+    /// **本实例的水位**（`operation-log §63.2` 的语义：已 flush 且**已放弃本地副本**的最高版本）。
     ///
-    /// 合并口径：数据拼接、**水位取 max**、**`stale` 取或** —— 只要有一部分不可信，
-    /// 整个答案就不可信。
+    /// **必须单独实现，不能从分片推**：水位是**实例级**属性，与"当前有没有分片"无关 ——
+    /// 实例刚放弃某批副本时（`reclaim` 之后），分片枚举恰好是**空**的，若把水位当成分片的
+    /// 派生量，就会把"没有分片"误报成"没有已放弃的数据"（`stale = false`），
+    /// 调用方于是**静默丢掉那批数据**。这不是假设：`shardrpc` 的远端往返用例当场抓到过
+    /// （原始记录见 `operation-log §67`）。
+    async fn watermark(&self, known_manifest_ver: u64) -> Result<ShardRead, LakeError>;
+
+    /// 便捷：读整表（默认 = 枚举 + 逐分片 + **实例水位**；远端实现可覆写为更少的往返）。
+    ///
+    /// 合并口径：数据拼接；**水位与 `stale` 一律取 [`Self::watermark`] 的**（实例级属性，
+    /// 分片级的值只是它的投影，不能拿来替代）。顺序也是刻意的：**先读分片、后取水位** ——
+    /// 若在两者之间有数据被放弃，后取的水位能覆盖它（反过来会漏）。
     async fn read_table(
         &self,
         table: &str,
         known_manifest_ver: u64,
     ) -> Result<ShardRead, LakeError> {
         let mut out = Vec::new();
-        let mut watermark = 0u64;
-        let mut stale = false;
         for id in self.shards_of(table).await? {
-            let r = self.read_shard(&id, known_manifest_ver).await?;
-            out.extend(r.batches);
-            watermark = watermark.max(r.flushed_watermark);
-            stale |= r.stale;
+            out.extend(self.read_shard(&id, known_manifest_ver).await?.batches);
         }
+        let wm = self.watermark(known_manifest_ver).await?;
         Ok(ShardRead {
             batches: out,
-            flushed_watermark: watermark,
-            stale,
+            flushed_watermark: wm.flushed_watermark,
+            stale: wm.stale,
         })
     }
 
@@ -175,6 +181,16 @@ pub trait ShardFetch: Send + Sync {
     fn fetch_shard<'a>(
         &'a self,
         id: &'a ShardId,
+        known_manifest_ver: u64,
+    ) -> futures::future::BoxFuture<'a, Result<ShardRead, LakeError>>;
+
+    /// **实例级水位**（`FetchShard` 的边界信息走这里，而不是从分片推）。
+    ///
+    /// **没有默认实现是刻意的**：任何"默认值"（包括 0）都等于**静默关掉 STALE**，
+    /// 而那正是 `§67` 记录的那个静默丢数据。远端实现拿不到真实水位时应当报错，
+    /// 不该假装"没有已放弃的数据"。
+    fn fetch_watermark<'a>(
+        &'a self,
         known_manifest_ver: u64,
     ) -> futures::future::BoxFuture<'a, Result<ShardRead, LakeError>>;
 
@@ -224,7 +240,11 @@ impl ShardReader for RemoteShard {
     ) -> Result<ShardRead, LakeError> {
         self.fetch.fetch_shard(id, known_manifest_ver).await
     }
-    // reclaim 用默认空实现：远端服务的 GC 由服务端负责
+
+    async fn watermark(&self, known_manifest_ver: u64) -> Result<ShardRead, LakeError> {
+        self.fetch.fetch_watermark(known_manifest_ver).await
+    }
+    // `read_table` 用默认实现（枚举 + 逐片 + 水位）；reclaim 用默认空实现（GC 归服务端）
 }
 
 // ---------------------------------------------------------------- 磁盘分片
@@ -316,6 +336,14 @@ mod tests {
                 ids.sort();
                 Ok(ids)
             })
+        }
+
+        fn fetch_watermark<'a>(
+            &'a self,
+            known_manifest_ver: u64,
+        ) -> futures::future::BoxFuture<'a, Result<ShardRead, LakeError>> {
+            // 与 `fetch_shard` 同源：水位固定 42（假服务端）
+            Box::pin(async move { Ok(ShardRead::empty(42, known_manifest_ver)) })
         }
 
         fn fetch_shard<'a>(

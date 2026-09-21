@@ -4281,3 +4281,76 @@ partition，各自出各自的文件"（`architecture §5.1` 无归属写入）�
 
 > 留作观察：该断言更稳的写法是"**等到采够样本（带超时）**"而不是"固定窗口里计数" ——
 > 那样机器快慢只影响耗时，不影响判定。本轮不改（属 chaos 夹具的事，与 T12.2 无关）。
+
+---
+
+## 67. 数据面 gRPC 面：热数据分片拉取走网络（S5-6；R4 T12.1 的前置）（2026-09-21）
+
+### 67.1 做了什么
+
+`ShardReader` / `ShardFetch` 这两条缝早就留好了，但在此之前**只有进程内实现是真的** ——
+`RemoteShard` 的传输在测试里是个假实现（`CannedFetch`）。本次把它变成能跑在网络上的东西：
+
+| 件 | 内容 |
+|---|---|
+| `crates/proto/proto/shard.proto`（新） | `ShardFetch` 服务：`FetchShards` / `FetchShard` / **`FetchWatermark`**；`FetchShardResponse` 带 `batches_ipc` + `flushed_watermark` + `stale` |
+| **`crates/shardrpc`（新 crate，第 19 个）** | 服务端 `ShardService`（包**任意** `Arc<dyn ShardReader>`）+ 客户端 `GrpcShardFetch`（→ `RemoteShard`）+ 批次编解码 + `serve()` |
+| 用例 | `batches_watermark_and_stale_survive_the_wire`、`parity_holds_with_instances_behind_grpc` |
+
+**为什么单独一个 crate**：`yuntun-proto` 的定位写着"只放接口，**不把 tonic 拖进查询/写入路径**"，
+而 `store` 正被查询路径依赖、`chunk` 正被写入路径依赖 —— 谁都不能加 tonic。单开一个 crate 后，
+只有**装配层**（将来的数据节点 / 查询节点进程）才引入它。
+
+**批次编码复用 arrow IPC stream**（与 WAL 记录、spill 同一形态）：批次在系统里只该有一种线上编码。
+
+### 67.2 用例当场抓到一个**契约级** bug：水位被当成了"分片的派生量"
+
+第一版跑起来后，往返用例的 ①-b 断言失败：
+
+```text
+远端必须把 STALE 报回来 —— 否则协调者会把这批数据静默丢掉
+```
+
+**根因**：`RemoteShard` 用的是 trait 的**默认** `read_table` —— "枚举分片 + 逐片合并"，水位取
+各片水位的 `max`。而 `reclaim` 之后那个 chunk 已经没了 ⇒ **分片枚举为空** ⇒ 合并出来的水位是
+**0**、`stale = false`。也就是说：
+
+> 实例明明已经放弃了一批数据的本地副本，却告诉协调者"我这儿没有已放弃的数据" ——
+> 协调者于是**静默丢掉那批数据**。
+
+这与 `§63.3` 是**同一个错误形状**（"数据两头都没有，而调用方只看到空"），只是从进程内挪到了
+网络另一侧 —— 契约写对了，**默认实现把它悄悄推翻**。
+
+**修法是结构性的，不是补一句文档**：
+
+1. `ShardReader` 新增**必实现**的 `async fn watermark(&self, known) -> Result<ShardRead, _>` ——
+   专门回答"本实例已放弃副本到哪了"，**与有没有分片无关**；
+2. `ShardFetch` 新增**必实现**的 `fetch_watermark(...)`（proto 里对应 `FetchWatermark`）——
+   **没有默认实现是刻意的**：任何默认值（包括 0）都等于**静默关掉 STALE**，而那正是本节的 bug；
+3. 默认 `read_table` 改为**先读分片、后取实例水位**，水位与 `stale` **一律取实例级的**
+   （分片级的值只是它的投影）。顺序也是刻意的：若在两者之间有数据被放弃，**后取**的水位能覆盖它
+   （反过来会漏）。
+
+> 一句话总结这条契约：**水位是实例级属性，不是分片级属性。** 分片枚举恰好为空，正是"刚放弃完
+> 副本"的时刻 —— 那时它最不能报 0。
+
+### 67.3 用例验什么
+
+`batches_watermark_and_stale_survive_the_wire`（真 TCP + gRPC + IPC 编解码）：
+
+| 阶段 | 断言 |
+|---|---|
+| 未放弃副本 | 3 行完整过网络；水位 0；**不**报 STALE（防误报方向） |
+| `reclaim(6)` 之后 | 热路径 0 行（副本确实没了）；**报 STALE**；水位 **5** 带得回来 |
+
+`parity_holds_with_instances_behind_grpc`：`§66` 那条**对拍**在远端形态下同样成立 ——
+单节点串行 vs 两个 gRPC 数据节点各写一半，**逐行相等**。这正是 `§66.5` 承诺的
+"跨进程形态复用同一条对拍逻辑"的兑现（差别只在**传输**，判定逻辑一行没改）。
+
+### 67.4 遗留
+
+1. **尚未接线**：standalone 仍是进程内热读（`set_hot_shards(instance_id, chunks)`）—— 本节的
+   客户端是**为 T12.1 拆进程准备的**；届时装配点把 `GrpcShardFetch` 包成 `RemoteShard` 注册即可；
+2. **`version()` 还没上 wire**：`RemoteShard::version()` 仍走 `ShardFetch::fetch_version` 的默认 0，
+   于是"提交驱动刷新"在远端形态下退化成 TTL（`shard.rs` 的 trait 文档已写明这一退化）；
+3. 本节的"跨网络"仍是同进程内的 gRPC 往返；**真跨进程**随 T12.1。

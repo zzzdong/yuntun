@@ -1,0 +1,69 @@
+// 数据面 gRPC 面（S5-6；R4 T12.1「拆进程」的前置）。
+//
+// ## 为什么响应里必须有水位与 stale
+//
+// 契约出处 `architecture-with-chunk §4.4`：**水位随 pull 响应回来**（推送的水位必然陈旧，
+// 而定界必须精确）。少了 `flushed_watermark` / `stale`，协调者就会在
+// 「实例已放弃那批数据的本地副本、而自己的 manifest 还没追上」的窗口里**静默少数据** ——
+// 这正是 `operation-log §63.3` 用四段断言钉住的那个错误，只是换到了网络另一侧。
+//
+// 远端实现**不能**用 0 冒充水位：那等于把 STALE 静默关掉（见 `ShardFetch::fetch_shard` 文档）。
+syntax = "proto3";
+
+package yuntun.shard.v1;
+
+service ShardFetch {
+  // 枚举某表当前存在于该实例上的分片。
+  rpc FetchShards (FetchShardsRequest) returns (FetchShardsResponse);
+  // 拉单个分片对 `known_manifest_ver` 尚不可冷读的数据（+ 边界信息）。
+  rpc FetchShard (FetchShardRequest) returns (FetchShardResponse);
+  // **实例级**水位：与"有没有分片"无关 —— 分片枚举为空时它依然必须能答。
+  //
+  // 为什么单独一个 RPC：实测发现把水位当成分片的派生量会**静默丢数据** ——
+  // 实例已放弃某批副本后，分片枚举恰好为空（副本没了），于是"没有分片"被误当成
+  // "没有已放弃的数据"（`operation-log §67`，由 `shardrpc` 的往返用例当场抓到）。
+  rpc FetchWatermark (FetchWatermarkRequest) returns (FetchWatermarkResponse);
+}
+
+message ShardIdMsg {
+  // 全限定表名 `schema.table`
+  string table = 1;
+  string shard = 2;
+  // 时间窗口（整分钟对齐）
+  string window = 3;
+}
+
+message FetchShardsRequest {
+  string table = 1;
+}
+
+message FetchShardsResponse {
+  repeated ShardIdMsg shards = 1;
+}
+
+message FetchWatermarkRequest {
+  // 调用方所依据的 manifest 版本（只用于判定 stale）
+  uint64 known_manifest_ver = 1;
+}
+
+message FetchWatermarkResponse {
+  uint64 flushed_watermark = 1;
+  bool stale = 2;
+}
+
+message FetchShardRequest {
+  ShardIdMsg shard = 1;
+  // 调用方所依据的 manifest 版本（= 它那次查询的 Catalog 快照号）
+  uint64 known_manifest_ver = 2;
+}
+
+message FetchShardResponse {
+  // 每批一个 arrow IPC stream —— **与 WAL 记录 / spill 同一种编码**：
+  // 批次在系统里只该有一种线上形态，否则就多一处会漂移的编解码。
+  repeated bytes batches_ipc = 1;
+  // 本实例已 flush **且已放弃本地副本**的最高 manifest 版本（单调不回退，`§63.2`）
+  uint64 flushed_watermark = 2;
+  // `known_manifest_ver < flushed_watermark` ⇒ 本次结果可能不完整：
+  // 调用方必须刷新 manifest 后用新版本重试，**不得**当作完整答案
+  bool stale = 3;
+}
