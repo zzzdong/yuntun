@@ -397,7 +397,7 @@ async fn build_embedded_catalog(
         // ⑥ QueryEngine（缓存刷新在 spawn_background 中启动）
         let cache = Arc::new(yuntun_query::LocalCatalog::new());
         // 读己之写：查询侧接线热数据读侧（进程内 chunk；分离部署换成 `RemoteShard`，零改动）
-        cache.set_hot_shards(chunks.clone());
+        cache.set_hot_shards(cfg.chunk.instance_id.clone(), chunks.clone());
         // STALE 的处置是"刷新 manifest → 重试"，发生在**查询路径**上（那里只有 `LocalCatalog`），
         // 所以刷新所需的 `CatalogOps` 由装配层注入给它（`operation-log §61.4` 第 2 条）。
         cache.set_catalog_ops(catalog.clone());

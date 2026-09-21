@@ -15,7 +15,7 @@ pub mod provider;
 pub mod table;
 
 pub use cache::{
-    spawn_cache_refresh, CachedTable, CatalogSnapshot, LocalCatalog, LocalCatalogStats,
+    spawn_cache_refresh, CachedTable, CatalogSnapshot, HotShards, LocalCatalog, LocalCatalogStats,
     RefreshOutcome,
 };
 pub use provider::{YuntunCatalogProvider, YuntunSchemaProvider};
@@ -188,8 +188,8 @@ impl QueryEngine {
                     };
                     if n >= Self::HOT_STALE_MAX_ATTEMPTS {
                         return Err(DataFusionError::Execution(format!(
-                            "{what}: 热读连续 {n} 次报 STALE（实例水位 {}）—— 刷新 manifest 也没追上；                             不返回不完整结果",
-                            stale.flushed_watermark
+                            "{what}: 热读连续 {n} 次报 STALE（实例 {} 水位 {}）—— 刷新 manifest 也没追上；不返回不完整结果",
+                            stale.instance, stale.flushed_watermark
                         )));
                     }
                     tracing::warn!(

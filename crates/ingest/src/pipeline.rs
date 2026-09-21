@@ -237,7 +237,7 @@ impl Ingestor {
         self.chunks.pressure()
     }
 
-    /// chunk 层句柄（热数据读侧接缝：查询侧 `set_hot_shards(chunks)`）。
+    /// chunk 层句柄（热数据读侧接缝：查询侧 `set_hot_shards(instance_id, chunks)`）。
     pub fn chunks(&self) -> Arc<ChunkStore> {
         self.chunks.clone()
     }

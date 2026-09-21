@@ -4147,3 +4147,62 @@ pub fn visible(&self, cached_snapshot: u64) -> bool {
    `HashMap<InstanceId, Arc<dyn ShardReader>>`，`source_instance` 才真正有消费者；
 2. **双实例进程内对拍**（第三刀）：两个 `ChunkStore` 当两个实例，断言"每行只出一次"且与单节点串行**精确相等**；
 3. **远端形态必须给真实水位**（S5-6）与 **重启后水位归 0**（`§63.4` 的 2、3 条）未变。
+
+---
+
+## 65. R4 **T12.2 第二刀（下半）**：热读器按**实例**持有 —— `source_instance` 的第一个消费者（2026-09-20）
+
+### 65.1 改了什么
+
+`LocalCatalog::hot` 从**单实例**（`Option<Arc<dyn ShardReader>>`）变成**按实例**：
+
+```rust
+pub type HotShards = BTreeMap<String, Arc<dyn ShardReader>>;   // instance_id → 热读器
+```
+
+| 位置 | 改动 |
+|---|---|
+| `query::cache` | 字段类型 + `set_hot_shards(instance_id, reader)`（**签名变更**：不再有"唯一那个热读器"）+ `hot_shards() -> HotShards` |
+| `query::provider` / `query::table` | 三个 provider 结构体与 `YuntunTableProvider` 都改持 `HotShards`（空 map = 未接线，替代原来的 `None`） |
+| `query::table::scan` | **逐实例**拉：每个实例用自己的水位回答是否 STALE；`HotReadStale` 增加 `instance` 字段（"谁没追上"是多实例下最关键的诊断信息） |
+| 装配 | `server` 用 `cfg.chunk.instance_id` 注册、`chaos` 用 `"chaos"` 注册（**就这一处**知道自己是哪个实例） |
+
+**为什么必须是这一步**：`§61.4` 的水位语义**本来就是按实例定义的**（"每个实例自己的已 flush 水位"），
+而在此之前查询侧只有一个"热读器"槽位 —— 那时 `source_instance` 在元数据里躺着，**读路径上无人消费**。
+本刀之后，`FileManifest.source_instance` 与配置里的 `instance_id` 第一次成为**读路径的键**。
+
+### 65.2 两个不是随便选的决定
+
+**① 用 `BTreeMap` 而不是 `HashMap`：遍历顺序必须确定。**
+
+多实例读出来的批次要拼在一起，拼接顺序会影响结果的**批次顺序**（乃至上层算子的行为）。
+本仓的确定性纪律（`§38`：同一串输入 → 同结果）要求迭代有序 —— `HashMap` 的随机序会让
+"同一份数据、同样的查询"偶尔产出不同顺序的批次，那是最难查的一类不确定性。
+
+**② `shard_version()` 取各实例**之和**，不取 max。**
+
+它的用途是"提交驱动刷新"的变更探测（"有没有东西变了"）。取 max 在**实例集合被替换**时
+可能出现"看起来没变"（旧实例的高水位换成了新实例的低水位）；求和则对"是否有变化"是单调可靠的。
+实例集合是**装配期固定**的，所以求和没有稳定性问题。
+
+### 65.3 新用例：钉住"按实例"这个**结构**本身
+
+`query/tests/hot_shard_reader.rs::hot_data_from_every_registered_instance_is_read`：
+两个 `instance_id` 各注册一个热读器（各持一个分片、各一行），断言 `count(*) == 2`。
+
+> 防的是：只读"某一个"实例 ⇒ 另一台的**未落盘数据静默消失**。这类错比报错难查得多 ——
+> 它不违反任何 manifest 约束，只是"少了一层数据来源"。旧结构（单槽位）下写不出这条断言。
+
+### 65.4 验证
+
+- `cargo test -p yuntun-query`：含新用例与既有接缝用例全绿
+- 全量：见 `status.md`（本轮跑完整 workspace）
+- 装配点只有两处（`server` 与 `chaos`），各自的 `instance_id` 与写入侧**同源**（`cfg.chunk.instance_id` / `"chaos"`）
+
+### 65.5 遗留
+
+1. **第三刀**：两个 `ChunkStore` 当两个实例的**进程内对拍** —— 断言"每行只出一次"且与单节点串行
+   **精确相等**（M4 判据的第一形态）；
+2. 快照里的 `nodes`（"分片归属"）与 `hot` 的键集**目前同源但未强制一致** —— R5 做 fanout 时
+   由成员发现统一（T12.3）；
+3. 远端必须给真实水位（S5-6）/ 重启后水位归 0（`§63.4`）未变。

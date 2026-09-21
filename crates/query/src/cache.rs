@@ -21,7 +21,7 @@
 //! **每次 flush 都会让全表 schema 缓存失效** → 缓存退化为全量重建。
 //! 分组后：DDL 才全量，写入走增量（S2-7）。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -114,6 +114,16 @@ pub struct LocalCatalogStats {
     pub tables: usize,
 }
 
+/// 按**实例**持有的热数据读侧：`instance_id → ShardReader`。
+///
+/// 键就是 `FileManifest.source_instance` / 配置里的 `instance_id`（`architecture §4.4`：
+/// 冷热边界**按实例**二维切分 —— 每个实例有**自己的**"已放弃本地副本"水位，
+/// 所以查询必须逐个问，而不是把某一份热数据当全世界）。
+///
+/// 用 `BTreeMap` 而不是 `HashMap`：**遍历顺序必须确定**。多实例读出来的批次拼接顺序会
+/// 影响结果顺序，而"同一串输入 → 同一份结果"是本仓的确定性纪律（`§38`）。
+pub type HotShards = BTreeMap<String, Arc<dyn ShardReader>>;
+
 /// `Arc<dyn CatalogOps>` 的薄包装。
 ///
 /// 只为保住 [`LocalCatalog`] 的 `Debug` 派生：trait 对象没有 `Debug`，而"一个刷新能力的句柄"
@@ -134,9 +144,9 @@ impl std::fmt::Debug for OpsHandle {
 #[derive(Debug)]
 pub struct LocalCatalog {
     current: RwLock<Arc<CatalogSnapshot>>,
-    /// 热数据读侧（store 层 [`ShardReader`]）：查询据此读**chunk**（尚未落盘的热数据）。
-    /// 阶段 0 = 进程内 chunk store；分离部署 = `RemoteShard`。
-    hot: RwLock<Option<Arc<dyn ShardReader>>>,
+    /// 热数据读侧（store 层 [`ShardReader`]），**按实例**持有：查询据此读**chunk**
+    /// （尚未落盘的热数据）。单机 = 一个实例（本节点）；R4 起每个 datanode 一个。
+    hot: RwLock<HotShards>,
     refreshes: AtomicU64,
     full_reloads: AtomicU64,
     delta_tables: AtomicU64,
@@ -163,7 +173,7 @@ impl LocalCatalog {
     pub fn new() -> Self {
         Self {
             current: RwLock::new(Arc::new(CatalogSnapshot::default())),
-            hot: RwLock::new(None),
+            hot: RwLock::new(BTreeMap::new()),
             refreshes: AtomicU64::new(0),
             full_reloads: AtomicU64::new(0),
             delta_tables: AtomicU64::new(0),
@@ -196,24 +206,31 @@ impl LocalCatalog {
         self.refresh(&ops).await
     }
 
-    /// 接线热数据读侧（装配时调用；与写入侧共享同一 chunk store 或注入远端实现）。
-    pub fn set_hot_shards(&self, hot: Arc<dyn ShardReader>) {
-        *self.hot.write().unwrap() = Some(hot);
+    /// 接线**某实例**的热数据读侧（装配时调用；与写入侧共享同一 chunk store 或注入远端实现）。
+    ///
+    /// `instance_id` 必须与写侧的 `instance_id` 一致 —— 它同时是
+    /// `FileManifest.source_instance`，是"这条热数据属于谁"的唯一标识。
+    /// **逐实例注册**（而不是共用一个 key）：否则 STALE / 水位判断失去意义（`§61.4`）。
+    pub fn set_hot_shards(&self, instance_id: impl Into<String>, hot: Arc<dyn ShardReader>) {
+        self.hot.write().unwrap().insert(instance_id.into(), hot);
     }
 
-    /// 热数据读侧句柄（TableProvider 在 scan 时读热数据）。
-    pub fn hot_shards(&self) -> Option<Arc<dyn ShardReader>> {
+    /// 按实例取热数据读侧的**不可变视图**（一次查询取一次；键有序 ⇒ 结果确定）。
+    pub fn hot_shards(&self) -> HotShards {
         self.hot.read().unwrap().clone()
     }
 
     /// 热分片变更计数（写入/提交/DDL）：供刷新任务做**提交驱动刷新**。
+    ///
+    /// 多实例时取**各实例之和**：任何一个实例有变化都必须触发刷新（取 max 在实例被替换时
+    /// 可能"看起来没变"）。实例集合是装配期固定的，所以求和对"是否有变化"是单调可靠的。
     pub fn shard_version(&self) -> u64 {
         self.hot
             .read()
             .unwrap()
-            .as_ref()
+            .values()
             .map(|s| s.version())
-            .unwrap_or(0)
+            .sum()
     }
 
     /// **当前不可变快照**：一次查询取一次，之后整条链路共用（S2-4）。
@@ -439,7 +456,8 @@ impl LocalCatalog {
     fn swap(&self, next: CatalogSnapshot) {
         let snapshot_no = next.snapshot;
         *self.current.write().unwrap() = Arc::new(next);
-        if let Some(s) = self.hot_shards() {
+        // 逐个实例回收：回收是"本地副本"的事，而副本是各实例自己的
+        for s in self.hot_shards().into_values() {
             s.reclaim(snapshot_no);
         }
     }

@@ -1,7 +1,7 @@
 //! Manifest 驱动的 TableProvider（C7 / 详细设计 §8）+ **热数据**（读己之写）。
 //!
 //! scan 把同一 shard 的两种形态合并成一个执行计划（见 `yuntun_store::shard`）：
-//! ① **热数据**：已 fsync、尚未落盘的 chunk，经 store 层的 [`ShardReader`] 读取
+//! ① **热数据**：已 fsync、尚未落盘的 chunk，经 store 层的 [`yuntun_store::ShardReader`] 读取
 //!    （阶段 0 = 进程内 chunk store；分离部署 = `RemoteShard`）—— 写后立即可查；
 //! ② **磁盘分片**：已落对象存储的 Parquet 文件组（Manifest 驱动，快照隔离）。
 //!
@@ -24,6 +24,8 @@
 /// 而这种错误一旦被当作普通失败上报，用户看到的就是莫名失败。
 #[derive(Debug)]
 pub struct HotReadStale {
+    /// **哪个实例**的水位超前了（诊断的关键：多实例时"谁没追上"决定先查谁）
+    pub instance: String,
     /// 触发 STALE 的表（全限定名）
     pub table: String,
     /// 调用方（查询）所依据的 manifest 版本
@@ -36,9 +38,9 @@ impl std::fmt::Display for HotReadStale {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "hot shard read is stale for {}: 查询依据的 manifest 版本 {} 落后于实例水位 {} \
+            "hot shard read is stale for {} at instance {}: 查询依据的 manifest 版本 {} 落后于该实例水位 {} \
              （该实例已放弃这部分数据的本地副本；需刷新 manifest 后用新版本重试）",
-            self.table, self.known_manifest_ver, self.flushed_watermark
+            self.table, self.instance, self.known_manifest_ver, self.flushed_watermark
         )
     }
 }
@@ -62,7 +64,7 @@ use datafusion_datasource::source::DataSourceExec;
 use datafusion_datasource::PartitionedFile;
 use datafusion_datasource_parquet::source::ParquetSource;
 use std::sync::Arc;
-use yuntun_store::ShardReader;
+use crate::cache::HotShards;
 
 /// 一张 yuntun 表的 DataFusion 视图（**绑定在某个不可变 Catalog 快照上**）。
 #[derive(Debug)]
@@ -73,9 +75,9 @@ pub struct YuntunTableProvider {
     ident: String,
     schema: arrow::datatypes::SchemaRef,
     store_url: ObjectStoreUrl,
-    /// 热数据读侧（store 层 [`ShardReader`]）：scan 时读 chunk。
-    /// `None` = 未接线（单测），退化为纯磁盘分片（Manifest）可见性。
-    hot: Option<Arc<dyn ShardReader>>,
+    /// 热数据读侧（store 层 [`yuntun_store::ShardReader`]），**按实例**：scan 时逐实例读 chunk。
+    /// 空 map = 未接线（单测），退化为纯磁盘分片（Manifest）可见性。
+    hot: HotShards,
 }
 
 impl YuntunTableProvider {
@@ -83,7 +85,7 @@ impl YuntunTableProvider {
         snapshot: Arc<CatalogSnapshot>,
         ident: impl Into<String>,
         schema: arrow::datatypes::SchemaRef,
-        hot: Option<Arc<dyn ShardReader>>,
+        hot: HotShards,
     ) -> Self {
         Self {
             snapshot,
@@ -120,13 +122,19 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
         // 快照里的表条目 —— 不可变，规划期读多次结果一致
         let table = self.snapshot.get(&self.ident);
 
-        // ① 热数据（读己之写）：写后即可查，不等 flush / 缓存 TTL
-        if let Some(hot) = &self.hot {
-            let read = hot
+        // ① 热数据（读己之写）：写后即可查，不等 flush / 缓存 TTL。
+        //
+        // **按实例逐个拉**（`architecture §4.4`：冷热边界按实例二维切分）：每个实例有**自己的**
+        // "已放弃本地副本的水位"，都用查询的快照版本去问，各自回答自己是否 STALE。
+        // 键有序（`BTreeMap`）⇒ 批次拼接顺序确定 ⇒ 结果可复现。
+        for (instance, reader) in &self.hot {
+            let read = reader
                 .read_table(&self.ident, self.snapshot.snapshot)
                 .await
                 .map_err(|e| {
-                    datafusion::error::DataFusionError::Execution(format!("hot shard read: {e}"))
+                    datafusion::error::DataFusionError::Execution(format!(
+                        "hot shard read ({instance}): {e}"
+                    ))
                 })?;
             // `stale` ⇒ 本实例已放弃 (本次快照, 水位] 之间数据的本地副本，而本次快照的 manifest
             // 里还没有那些文件（`architecture-with-chunk §4.5` 的"两头都没有"窗口）。
@@ -138,6 +146,7 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
             if read.stale {
                 return Err(datafusion::error::DataFusionError::External(Box::new(
                     HotReadStale {
+                        instance: instance.clone(),
                         table: self.ident.to_string(),
                         known_manifest_ver: self.snapshot.snapshot,
                         flushed_watermark: read.flushed_watermark,
@@ -145,24 +154,23 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
                 )));
             }
             let raw = read.batches;
-            if !raw.is_empty() {
-                let mut batches = Vec::with_capacity(raw.len());
-                for b in raw {
-                    batches.push(
-                        yuntun_model::arrow_util::align_batch(&b, &schema).map_err(|e| {
-                            datafusion::error::DataFusionError::Execution(format!(
-                                "pending align: {e}"
-                            ))
-                        })?,
-                    );
-                }
-                let exec =
-                    MemorySourceConfig::try_new_exec(&[batches], schema.clone(), projection.cloned())
-                        .map_err(|e| {
-                            datafusion::error::DataFusionError::Execution(format!("pending plan: {e}"))
-                        })?;
-                inputs.push(exec);
+            if raw.is_empty() {
+                continue;
             }
+            let mut batches = Vec::with_capacity(raw.len());
+            for b in raw {
+                batches.push(
+                    yuntun_model::arrow_util::align_batch(&b, &schema).map_err(|e| {
+                        datafusion::error::DataFusionError::Execution(format!("pending align: {e}"))
+                    })?,
+                );
+            }
+            let exec =
+                MemorySourceConfig::try_new_exec(&[batches], schema.clone(), projection.cloned())
+                    .map_err(|e| {
+                        datafusion::error::DataFusionError::Execution(format!("pending plan: {e}"))
+                    })?;
+            inputs.push(exec);
         }
 
         // ② 已提交文件（Manifest 驱动，C7）：文件清单来自**本 provider 的快照**

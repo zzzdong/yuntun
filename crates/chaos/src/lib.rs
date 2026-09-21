@@ -258,7 +258,7 @@ async fn build_full_with_wal(
     ingestor.resume_recovered().await.unwrap();
     let cache = Arc::new(yuntun_query::LocalCatalog::new());
     // 读己之写：查询侧接热数据读侧（同 Lakehouse）
-    cache.set_hot_shards(chunks);
+    cache.set_hot_shards("chaos".to_string(), chunks);
     cache.set_nodes(vec!["chaos".to_string()]);
     let engine = Arc::new(QueryEngine::new(
         yuntun_store::create_store(&yuntun_store::StoreConfig::Local {

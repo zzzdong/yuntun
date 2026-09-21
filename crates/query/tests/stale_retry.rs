@@ -119,7 +119,7 @@ async fn stale_hot_read_is_retried_after_refreshing_manifest() {
     // 本刀的接线：查询路径要能在 STALE 时**自己刷新 manifest**
     cache.set_catalog_ops(catalog.clone());
     let hot = Arc::new(FlakyHot::new(cache.clone(), 1)); // 仅第一次报 STALE
-    cache.set_hot_shards(hot.clone());
+    cache.set_hot_shards("inst-a", hot.clone());
     cache.refresh(&catalog).await.unwrap();
     let refreshes_before = cache.stats().refreshes;
 
@@ -155,7 +155,7 @@ async fn permanent_stale_fails_loudly_instead_of_returning_partial_result() {
     let cache = Arc::new(LocalCatalog::new());
     cache.set_catalog_ops(catalog.clone());
     let hot = Arc::new(FlakyHot::new(cache.clone(), usize::MAX)); // 永远 STALE
-    cache.set_hot_shards(hot.clone());
+    cache.set_hot_shards("inst-a", hot.clone());
     cache.refresh(&catalog).await.unwrap();
 
     let engine = QueryEngine::new(create_store(&StoreConfig::Memory).unwrap(), cache.clone());
@@ -183,7 +183,7 @@ async fn stale_without_wired_ops_fails_with_a_config_error() {
     let cache = Arc::new(LocalCatalog::new());
     // **故意不调** `set_catalog_ops`
     let hot = Arc::new(FlakyHot::new(cache.clone(), 1));
-    cache.set_hot_shards(hot.clone());
+    cache.set_hot_shards("inst-a", hot.clone());
     cache.refresh(&catalog).await.unwrap();
 
     let engine = QueryEngine::new(create_store(&StoreConfig::Memory).unwrap(), cache.clone());
@@ -203,7 +203,7 @@ async fn caught_up_reader_does_not_trigger_retry() {
     let cache = Arc::new(LocalCatalog::new());
     cache.set_catalog_ops(catalog.clone());
     let hot = Arc::new(FlakyHot::new(cache.clone(), 0)); // 从不报 STALE
-    cache.set_hot_shards(hot.clone());
+    cache.set_hot_shards("inst-a", hot.clone());
     cache.refresh(&catalog).await.unwrap();
     let refreshes_before = cache.stats().refreshes;
 

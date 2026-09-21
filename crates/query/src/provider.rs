@@ -6,14 +6,13 @@
 //! `SessionContext`）在规划期无论调用多少次 `schema()`/`table()`，看到的都是**同一个
 //! Catalog 版本**；`Arc` 共享也省掉了每次 `table()` 深拷贝文件清单的开销。
 
-use crate::cache::CatalogSnapshot;
+use crate::cache::{CatalogSnapshot, HotShards};
 use crate::table::YuntunTableProvider;
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::TableType;
 use std::sync::Arc;
-use yuntun_store::ShardReader;
 
 /// 表类型常量（SchemaProvider::table_type 用）。
 const BASE_TABLE: TableType = TableType::Base;
@@ -24,15 +23,15 @@ pub struct YuntunSchemaProvider {
     snapshot: Arc<CatalogSnapshot>,
     /// 本 provider 对应的 schema（MySQL 的 database 概念）
     namespace: String,
-    /// 热数据读侧（与快照同源注入；`None` = 未接线，退化为纯磁盘分片）
-    hot: Option<Arc<dyn ShardReader>>,
+    /// 热数据读侧（与快照同源注入；**空 map** = 未接线，退化为纯磁盘分片），按实例持有
+    hot: HotShards,
 }
 
 impl YuntunSchemaProvider {
     pub fn new(
         snapshot: Arc<CatalogSnapshot>,
         namespace: impl Into<String>,
-        hot: Option<Arc<dyn ShardReader>>,
+        hot: HotShards,
     ) -> Self {
         Self {
             snapshot,
@@ -97,11 +96,11 @@ impl SchemaProvider for YuntunSchemaProvider {
 #[derive(Debug)]
 pub struct YuntunCatalogProvider {
     snapshot: Arc<CatalogSnapshot>,
-    hot: Option<Arc<dyn ShardReader>>,
+    hot: HotShards,
 }
 
 impl YuntunCatalogProvider {
-    pub fn new(snapshot: Arc<CatalogSnapshot>, hot: Option<Arc<dyn ShardReader>>) -> Self {
+    pub fn new(snapshot: Arc<CatalogSnapshot>, hot: HotShards) -> Self {
         Self { snapshot, hot }
     }
 }

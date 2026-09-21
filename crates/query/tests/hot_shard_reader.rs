@@ -88,7 +88,7 @@ async fn query_reads_hot_data_through_remote_shard_reader() {
     assert_eq!(reader.tier(), ShardTier::Memory);
 
     let cache = Arc::new(LocalCatalog::new());
-    cache.set_hot_shards(reader);
+    cache.set_hot_shards("standalone", reader);
     cache.refresh(&catalog).await.unwrap();
 
     let store = yuntun_store::create_store(&yuntun_store::StoreConfig::Memory).unwrap();
@@ -104,4 +104,65 @@ async fn query_reads_hot_data_through_remote_shard_reader() {
         .unwrap()
         .value(0);
     assert_eq!(got, 2, "查询经 ShardReader 读到远端内存分片的热数据");
+}
+
+/// **按实例**持有热读器：多个实例的热数据都要被读到（`source_instance` 的第一个消费者）。
+///
+/// 这条钉住的是"按实例切分"这个**结构**本身：注册在两个 `instance_id` 下的热数据必须**都**
+/// 参与查询 —— 只读"某一个"实例会让另一台的未落盘数据**静默消失**（比报错更难查）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hot_data_from_every_registered_instance_is_read() {
+    // 表存在，但**没有任何已提交文件** → 只能靠热数据
+    let catalog: Arc<dyn CatalogOps> = Arc::new(MemoryCatalog::new());
+    catalog
+        .create_table(CreateTableRequest {
+            name: "hot2".into(),
+            namespace: yuntun_model::ops::DEFAULT_SCHEMA.into(),
+            schema: Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)])),
+            partition_cols: vec![],
+            default_format: "parquet".into(),
+            ingest_config: Default::default(),
+        })
+        .await
+        .unwrap();
+
+    // 两个"实例"：各持有一个分片、各一行（模拟两个 datanode 各自的 chunk）
+    let mut a = HashMap::new();
+    a.insert(
+        ShardId::new("public.hot2", "default", "2026-09-12T10:00"),
+        vec![batch(1)],
+    );
+    let mut b = HashMap::new();
+    b.insert(
+        ShardId::new("public.hot2", "default", "2026-09-12T10:01"),
+        vec![batch(2)],
+    );
+
+    let cache = Arc::new(LocalCatalog::new());
+    cache.set_hot_shards(
+        "inst-a",
+        Arc::new(RemoteShard::new(Arc::new(CannedFetch { entries: a }))),
+    );
+    cache.set_hot_shards(
+        "inst-b",
+        Arc::new(RemoteShard::new(Arc::new(CannedFetch { entries: b }))),
+    );
+    cache.refresh(&catalog).await.unwrap();
+
+    let store = yuntun_store::create_store(&yuntun_store::StoreConfig::Memory).unwrap();
+    let engine = QueryEngine::new(store, cache);
+    let batches = engine
+        .sql("SELECT count(*) FROM yuntun.public.hot2")
+        .await
+        .unwrap();
+    let got = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(
+        got, 2,
+        "两个实例的热数据都必须被读到（只读一个 = 另一台的数据静默消失）"
+    );
 }
