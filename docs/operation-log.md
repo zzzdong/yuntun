@@ -4354,3 +4354,71 @@ partition，各自出各自的文件"（`architecture §5.1` 无归属写入）�
 2. **`version()` 还没上 wire**：`RemoteShard::version()` 仍走 `ShardFetch::fetch_version` 的默认 0，
    于是"提交驱动刷新"在远端形态下退化成 TTL（`shard.rs` 的 trait 文档已写明这一退化）；
 3. 本节的"跨网络"仍是同进程内的 gRPC 往返；**真跨进程**随 T12.1。
+
+---
+
+## 68. T12.1 第一刀：**数据节点进程** `yuntun-ingestor`（2026-09-21）
+
+### 68.1 拆的是什么
+
+单进程形态下，"吸收 WAL / 持有热数据 / 对外提供热读"三件事都挤在 `standalone` 里，
+于是热读只能是**进程内函数调用**（装配层把 `Arc<ChunkStore>` 直接交给查询侧）。本刀把
+**数据节点**摘出来成独立进程（t12.1 要拆三个：`ingestor` / `queryd` / `compactor`，这是第一个）：
+
+```text
+yuntun-ingestor 进程 ── 私有 WAL → 吸收 → chunk store（热数据）
+       │  gRPC（shard.proto）+ arrow IPC
+查询侧：GrpcShardFetch → RemoteShard → QueryEngine
+```
+
+它启动时做的事，顺序是刻意的：
+
+| 序 | 动作 | 为什么是这个位置 |
+|---|---|---|
+| ① | `private_dir` 租约（`wal-root` / `chunk-spill`） | **排在所有会改文件的操作之前**：被拒的进程连 WAL 都不该打开（`§62` / R-13） |
+| ② | `WalWriter::open`（自带 recovery） | 数据节点热数据的**真相来源**：`synced_seq` 从盘上恢复，回放即恢复热数据 |
+| ③ | `MemoryCatalog` + 本地冷存根 | 元数据面接 metanode 属 T12.3；冷文件先落本机目录 |
+| ④ | `Ingestor::new(...)` + `spawn_accumulator` | **`Ingestor` 自带 chunk store** ⇒ 写侧与热读侧同一实例 = "读己之写" |
+| ⑤ | `shardrpc::serve(chunks, listener)` | 先 bind 再打印 `LISTEN <addr>`：上层拿到的是**真实**地址（`:0` 由内核分配） |
+
+**与单进程形态不是两套实现**：组件、契约全同（`Ingestor` / 私有目录租约 / `ShardReader`），
+差别只在**传输** —— 查询侧从"拿到 `Arc<ChunkStore>`"换成"拿到 `GrpcShardFetch` 包出来的
+`RemoteShard`"。所以 `§66`/`§67` 的对拍逻辑**一行都不用改**（见 68.3）。
+
+### 68.2 数据怎么进进程：**回放它自己的 WAL**
+
+跨进程的"写入面"（客户端如何把数据交给数据节点）**尚未定**，本轮不去发明它。用例的喂法是
+**预置它的 WAL，让进程启动后自己回放** —— 这不是为测试特设的通道，而是数据节点**重启后的
+真实恢复路径**（`§28.2` 的 R-13 教训正在此处继续成立：同一私有目录同一时刻只有一个消费者）。
+
+副产品：这条用例顺带把"崩溃恢复后热数据必须自己长回来"也验了。
+
+### 68.3 三条既有承诺的兑现（全部由用例钉住）
+
+| 承诺出处 | 用例 | 结果 |
+|---|---|---|
+| `§66.5`"跨进程形态可复用同一条对拍逻辑" | `parity_holds_across_processes` | 复用，判定逻辑一行没改 |
+| `§67.4`"真跨进程随 T12.1" | `hot_rows_cross_a_real_process_boundary` | 热数据在**另一个进程**里长大，经 gRPC 被查到 |
+| `§28.2`/`§62`"同一私有目录只有一个消费者" | `second_process_on_the_same_private_dir_is_rejected` | 第二个进程**启动即拒**，且不打印 `LISTEN`（连 WAL 都没开） |
+
+对拍仍然是 `§66` 那一条：**单节点串行 vs 两个数据节点各写一半，逐行相等**，
+外加**反证**（只注册 `inst-a` 时只看到它自己那 3 行）—— 防"主断言空转"。
+
+### 68.4 用例怎么起进程（可复用手法）
+
+沿用 `metanode_process_e2e` 的范式（`crates/ingestor/tests/cross_process_hot_read.rs`）：
+
+- `env!("CARGO_BIN_EXE_yuntun-ingestor")` 拿被测二进制路径；`--listen 127.0.0.1:0` 由内核分配端口，
+  **进程把真实地址打到 stdout**（`LISTEN <addr>`），用例读这一行 —— 既避免端口互抢，也不需要
+  "先探测端口再起服务"的 TOCTOU 窗口；
+- stderr 后台收进 `String`：断言失败时能打出来（否则只剩"提前退出"四个字）；
+- `Drop` 里 `kill + wait`：用例失败也不留孤儿进程；
+- 热数据"长出来"是**有延迟**的（攒批扫描间隔 100ms 量级）⇒ 用例 `wait_rows` 轮询而不是 `sleep` 固定值。
+
+### 68.5 遗留
+
+1. **写入面未定**：客户端如何把数据交给数据节点（新 RPC？还是数据节点自己消费源？）——
+   本刀只走"自己的 WAL"，属恢复路径；
+2. **`queryd` / `compactor` 未拆**：`standalone` 仍是可用的全功能形态，三者尚未对等；
+3. **元数据面仍是本地 `MemoryCatalog`**：跨进程共享（成员发现 / 分片归属 / DDL 可见性）属 T12.3；
+4. 数据节点缺 WAL 超时监控 / compaction / 孤儿清理（按设计归别的进程）。

@@ -11,6 +11,7 @@ members = [
     "crates/catalog",
     "crates/meta",
     "crates/ingest",
+    "crates/ingestor",
     "crates/query",
     "crates/compaction",
     "crates/sql",

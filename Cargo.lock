@@ -5470,6 +5470,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "yuntun-ingestor"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "clap",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "yuntun-catalog",
+ "yuntun-ingest",
+ "yuntun-model",
+ "yuntun-query",
+ "yuntun-shardrpc",
+ "yuntun-store",
+ "yuntun-testkit",
+ "yuntun-wal",
+]
+
+[[package]]
 name = "yuntun-meta"
 version = "0.1.0"
 dependencies = [

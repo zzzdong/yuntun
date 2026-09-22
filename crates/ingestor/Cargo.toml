@@ -1,0 +1,28 @@
+[package]
+name = "yuntun-ingestor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# 数据节点进程（R4 T12.1）：`Ingestor` + 私有目录租约 + 数据面 gRPC 服务。
+# 单独成 crate 的理由与 `shardrpc` 同源：**只有装配层才引入 tonic** ——
+# `yuntun-ingest`（写入路径）不该为了"对外服务"而多背一项传输依赖。
+[dependencies]
+yuntun-model = { path = "../model" }
+yuntun-catalog = { path = "../catalog" }
+yuntun-wal = { path = "../wal" }
+yuntun-ingest = { path = "../ingest" }
+yuntun-store = { path = "../store" }
+yuntun-shardrpc = { path = "../shardrpc" }
+clap = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# 用例要在"查询侧"真的跑一遍引擎（数据面客户端 + 对拍）
+yuntun-query = { path = "../query" }
+yuntun-testkit = { path = "../testkit" }
+arrow = { workspace = true }
