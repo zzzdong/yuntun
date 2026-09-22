@@ -82,6 +82,21 @@ rand = "0.8"
 # raft-rs = "0.7"
 # fjall   = "3.1.8"
 
+# 开发构建的产物大小/链接耗时主要来自调试信息。
+#
+# 默认 `debug = true` 会把**完整 DWARF** 塞进每一个测试二进制（本仓 40k 行 + datafusion/
+# arrow 的依赖图），而链接耗时与链接器的输入体量正相关 —— 这是本机 `rust-lld` 的主要负担，
+# 同时白占磁盘（同一仓库的 release 全量调试信息曾达 2.3GB）。
+#
+# 只留行号：backtrace 仍能给出文件/行，足以定位失败用例；需要完整变量与类型时用
+# `CARGO_PROFILE_DEV_DEBUG=2 cargo test ...` 单次覆盖。
+[profile.dev]
+debug = "line-tables-only"
+
+# 依赖不带调试信息 —— 体积大头在它们身上（本仓自己的 crate 仍保留行号）。
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 # 0.1 发布产物瘦身：完整调试信息会让二进制达到 2.3GB。
 # line-tables-only 保留崩溃回溯的文件/行号，体积小一个量级；
