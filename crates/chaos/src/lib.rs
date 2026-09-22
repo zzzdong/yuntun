@@ -259,7 +259,7 @@ async fn build_full_with_wal(
     let cache = Arc::new(yuntun_query::LocalCatalog::new());
     // 读己之写：查询侧接热数据读侧（同 Lakehouse）
     cache.set_hot_shards("chaos".to_string(), chunks);
-    cache.set_nodes(vec!["chaos".to_string()]);
+    cache.set_members(vec![yuntun_query::Member::local("chaos")]);
     let engine = Arc::new(QueryEngine::new(
         yuntun_store::create_store(&yuntun_store::StoreConfig::Local {
             root: store_root.to_string_lossy().to_string(),
@@ -1081,7 +1081,17 @@ async fn compaction_during_query_keeps_counts_monotonic() {
 
     let c = compactor(setup.catalog.clone(), &store_root, 3);
     let mut acked = 0u64;
-    for round in 0..3 {
+    // **等到采够样本**（把 `§66.5` 的观察落地）：
+    //
+    // 门槛不能是"固定跑 3 轮" —— 满负载机器上 3 轮可能整个落在两次 10ms 采样**之间**，
+    // 于是样本数成了机器快慢的函数（本轮实测：负载 115 时只采到 1 个样本）。
+    // 改成"轮数下限 3 **且** 样本数下限 3"（带 30s 超时）后，机器慢只影响**耗时**，
+    // 不影响**判定** —— 而这两者的混淆正是 flaky 的来源。
+    let sample_deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut round = 0usize;
+    while round < 3
+        || (seen.lock().unwrap().len() < 3 && std::time::Instant::now() < sample_deadline)
+    {
         // 每轮 3 批 → 3 个文件（rows_threshold=1，每批一个 chunk）
         for i in 0..3 {
             acked += ingest_into(&setup, "cq", "s0", 1_000 + (round * 10 + i) as i64).await;
@@ -1136,6 +1146,7 @@ async fn compaction_during_query_keeps_counts_monotonic() {
             1,
             "round {round}: 新快照应只见合并产物"
         );
+        round += 1;
     }
 
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1145,7 +1156,7 @@ async fn compaction_during_query_keeps_counts_monotonic() {
     // 满负载机器上 10ms 间隔的采样次数会明显变少，卡死数量会把机器快慢当成失败。
     assert!(
         observed.len() >= 3,
-        "查询样本太少（{})，无法支撑并发断言",
+        "查询样本太少（{}），无法支撑并发断言（已跑 {round} 轮、30s 采样超时兜底）",
         observed.len()
     );
 

@@ -43,10 +43,41 @@ pub struct CachedTable {
     pub files: Vec<FileManifest>,
 }
 
+/// 成员表里的一条：**数据节点名录**（T12.3 第一刀）。
+///
+/// **为什么必须带地址**：只有 `instance_id` 时，"有哪些实例"变不成"怎么连" —— 而 R4 的
+/// 查询侧恰恰要按**发现到的成员**去装配热读器（`architecture-with-chunk §3.2` 的成员名录）。
+/// 地址由装配层 / 成员发现填入；同进程实例（standalone）没有地址，故是 `Option`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Member {
+    pub instance_id: String,
+    /// 数据面地址（`host:port`）。`None` = 同进程 / 尚未上报
+    pub address: Option<String>,
+}
+
+impl Member {
+    /// 只知 ID 的成员（同进程实例，或地址尚未上报）。
+    pub fn local(instance_id: impl Into<String>) -> Self {
+        Self {
+            instance_id: instance_id.into(),
+            address: None,
+        }
+    }
+
+    /// 带数据面地址的成员（成员发现 / 配置的远端数据节点）。
+    pub fn at(instance_id: impl Into<String>, address: impl Into<String>) -> Self {
+        Self {
+            instance_id: instance_id.into(),
+            address: Some(address.into()),
+        }
+    }
+}
+
 /// **不可变 Catalog 快照**（S2-4）：一次查询共用一份。
 ///
 /// - `Arc` 共享 → `table()` 不再深拷贝文件清单；
 /// - 构建后不再修改 → 同一查询的 plan 与 scan 看到**同一个** Catalog 版本。
+
 #[derive(Debug, Default, Clone)]
 pub struct CatalogSnapshot {
     /// 全限定表标识 `schema.table` → 物化条目（`Arc`：快照写时复制的代价与文件数无关）
@@ -152,9 +183,12 @@ pub struct LocalCatalog {
     delta_tables: AtomicU64,
     /// 最近一次刷新失败的原因（观测用；刷新失败不清空旧快照 —— 宁可读旧数据也别读不到）
     last_error: RwLock<Option<String>>,
-    /// 数据节点列表（standalone = 单节点）。**提前放进快照**：查询规划中的
-    /// "分片归属"必须与 schema/manifest 同一版本，否则会跨版本拼计划。
-    nodes: RwLock<Vec<String>>,
+    /// **成员表（唯一真相）**：快照的 `nodes`（有哪些实例）与热读器的键集**都由它派生**。
+    ///
+    /// 此前这两份各自更新（`nodes` 一个 `Vec`、`hot` 一个 `BTreeMap`），**同源但不强制一致**
+    /// —— 正是 `§65.5` 记下的坑。漂移的后果是**查询静默少数据**（名录里有、读不到）
+    /// 或按错误的实例集合算归属。
+    members: RwLock<BTreeMap<String, Member>>,
     /// **刷新所需的 `CatalogOps`**（装配层注入），供查询路径上的 STALE 处置使用。
     ///
     /// 为什么由 `LocalCatalog` 自己持有：STALE 的处置是"刷新 manifest → 重试"，而这件事发生在
@@ -178,7 +212,10 @@ impl LocalCatalog {
             full_reloads: AtomicU64::new(0),
             delta_tables: AtomicU64::new(0),
             last_error: RwLock::new(None),
-            nodes: RwLock::new(vec!["standalone".to_string()]),
+            members: RwLock::new(BTreeMap::from([(
+                "standalone".to_string(),
+                Member::local("standalone"),
+            )])),
             ops: RwLock::new(None),
         }
     }
@@ -211,8 +248,18 @@ impl LocalCatalog {
     /// `instance_id` 必须与写侧的 `instance_id` 一致 —— 它同时是
     /// `FileManifest.source_instance`，是"这条热数据属于谁"的唯一标识。
     /// **逐实例注册**（而不是共用一个 key）：否则 STALE / 水位判断失去意义（`§61.4`）。
+    /// 注入某实例的热读器（装配层 / 成员发现调用）。
+    ///
+    /// **会顺带把它登记为成员**：热读器是"能读谁"的句柄，而"谁存在"以成员表为准 ——
+    /// 只放句柄不登记，正是 `§65.5` 那个会漂移的旧形态。反方向（成员被摘除）见
+    /// [`Self::set_members`]。
+    ///
+    /// 加锁顺序固定为 **成员表 → 热读器表**（见 `set_members` 的注释）：两处都按这个顺序，
+    /// 才不会互相死锁。
     pub fn set_hot_shards(&self, instance_id: impl Into<String>, hot: Arc<dyn ShardReader>) {
-        self.hot.write().unwrap().insert(instance_id.into(), hot);
+        let id = instance_id.into();
+        self.ensure_member(&id);
+        self.hot.write().unwrap().insert(id, hot);
     }
 
     /// 按实例取热数据读侧的**不可变视图**（一次查询取一次；键有序 ⇒ 结果确定）。
@@ -360,7 +407,7 @@ impl LocalCatalog {
             schemas,
             version,
             snapshot: snapshot_no,
-            nodes: self.nodes(),
+            nodes: self.member_ids(),
         });
         self.full_reloads.fetch_add(1, Ordering::SeqCst);
         tracing::debug!(tables = n, snapshot = snapshot_no, "local catalog: full reload");
@@ -433,7 +480,7 @@ impl LocalCatalog {
         }
         next.version = version;
         next.snapshot = snapshot_no;
-        next.nodes = self.nodes();
+        next.nodes = self.member_ids();
         let refreshed = delta.changed_tables.len();
         self.swap(next);
         self.delta_tables
@@ -462,14 +509,58 @@ impl LocalCatalog {
         }
     }
 
-    /// 数据节点列表。standalone = 本节点；R4 起由成员发现提供。
-    fn nodes(&self) -> Vec<String> {
-        self.nodes.read().unwrap().clone()
+    // ------------------------------------------------------------ 成员表（T12.3）
+
+    /// 登记成员（已存在则保留原地址 —— 别把已知地址抹成 `None`）。
+    fn ensure_member(&self, instance_id: &str) {
+        self.members
+            .write()
+            .unwrap()
+            .entry(instance_id.to_string())
+            .or_insert_with(|| Member::local(instance_id));
     }
 
-    /// 注入节点列表（装配层；standalone 传 `[ingest.instance_id]`）。
-    pub fn set_nodes(&self, nodes: Vec<String>) {
-        *self.nodes.write().unwrap() = nodes;
+    /// 成员表（按 `instance_id` 有序 ⇒ 取值确定）。
+    pub fn members(&self) -> Vec<Member> {
+        self.members.read().unwrap().values().cloned().collect()
+    }
+
+    /// 成员 ID 清单 —— 快照的 `nodes` 用它，不再单独维护一份。
+    fn member_ids(&self) -> Vec<String> {
+        self.members.read().unwrap().keys().cloned().collect()
+    }
+
+    /// **权威地**设置成员表（成员发现 / 装配层调用）。
+    ///
+    /// 被摘除的成员，其热读器**一并移除**：成员表是"谁存在"的唯一真相，而"存在却读不到"
+    /// 只会让查询得出无法解释的空结果。这条安全性来自**设计**而非本函数：成员摘除走 raft，
+    /// 且只在它的文件已提交之后发生（`architecture-with-chunk §3.1 / §3.2`）—— 所以摘除那一刻，
+    /// 它那份数据必然已能从冷侧读到。
+    ///
+    /// 加锁顺序 **成员表 → 热读器表**，与 [`Self::set_hot_shards`] 一致。
+    pub fn set_members(&self, members: Vec<Member>) {
+        let next: BTreeMap<String, Member> = members
+            .into_iter()
+            .map(|m| (m.instance_id.clone(), m))
+            .collect();
+        // 锁序固定为 **成员表 → 热读器表**（与 `set_hot_shards` 同向，否则两侧并发会互相死锁）
+        let mut members_w = self.members.write().unwrap();
+        let mut hot = self.hot.write().unwrap();
+
+        let dropped: Vec<String> = hot
+            .keys()
+            .filter(|id| !next.contains_key(*id))
+            .cloned()
+            .collect();
+        for id in &dropped {
+            hot.remove(id);
+            // 摘除是有语义的（该实例的热数据不再参与查询）—— 必须留痕
+            tracing::warn!(
+                instance_id = %id,
+                "member removed: its hot shards no longer participate in queries"
+            );
+        }
+        *members_w = next;
     }
 
     fn record_error(&self, msg: String) -> DataFusionError {

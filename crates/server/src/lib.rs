@@ -403,7 +403,7 @@ async fn build_embedded_catalog(
         cache.set_catalog_ops(catalog.clone());
         // 节点列表进入快照（S2-4）：standalone = 本节点；R4 起由成员发现提供。
         // 放在快照里是为了让"分片归属"与 schema/manifest 同一版本，避免跨版本拼计划。
-        cache.set_nodes(vec![cfg.chunk.instance_id.clone()]);
+        cache.set_members(vec![yuntun_query::Member::local(cfg.chunk.instance_id.clone())]);
         // query 执行区内存池 = 另一块独立预算，超限直接报错而不抢 chunk 内存（架构 §2.8）
         let query = Arc::new(
             QueryEngine::with_query_memory_limit(

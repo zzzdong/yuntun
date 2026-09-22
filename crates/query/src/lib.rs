@@ -17,6 +17,7 @@ pub mod table;
 pub use cache::{
     spawn_cache_refresh, CachedTable, CatalogSnapshot, HotShards, LocalCatalog, LocalCatalogStats,
     RefreshOutcome,
+    Member,
 };
 pub use provider::{YuntunCatalogProvider, YuntunSchemaProvider};
 pub use table::{HotReadStale, YuntunTableProvider};
