@@ -400,3 +400,27 @@ fn idempotency_key_set_survives_the_envelope() {
     assert_eq!(back.client_request_id.as_deref(), Some("req-legacy"));
     assert_eq!(from_msg(&back).client_request_ids, r.client_request_ids);
 }
+
+/// T12.3：数据节点注册 op 的载荷往返。
+///
+/// 这个 op 的载荷**只有身份与地址**（没有时间戳）：注册时刻由 `apply` 用 op 的 `now_ms`
+/// 落章 —— 时间戳若随载荷自述，同一串 op 在不同副本上会得到不同的名录时刻。
+#[test]
+fn register_datanode_op_roundtrips_field_by_field() {
+    let op = Op {
+        now_ms: 1_700_000_000_000,
+        kind: Some(op::Kind::RegisterDatanode(RegisterDatanodeOp {
+            instance_id: "inst-a".into(),
+            address: "10.0.0.7:50051".into(),
+        })),
+    };
+    let back = roundtrip(&op);
+    assert_eq!(back.now_ms, op.now_ms);
+    match back.kind {
+        Some(op::Kind::RegisterDatanode(r)) => {
+            assert_eq!(r.instance_id, "inst-a");
+            assert_eq!(r.address, "10.0.0.7:50051");
+        }
+        other => panic!("kind 往返后变了：{other:?}"),
+    }
+}

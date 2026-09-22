@@ -67,7 +67,19 @@ message Op {
     // 幂等"认领"（写入前登记键）。**必须是 op**：认领一旦只存在本地，
     // 并发同键请求会双双通过预筛各写一份（见 pipeline.rs 的认领注释）。
     IdempotencyOp  idempotency   = 10;
+    // 数据节点注册（T12.3）。**必须走 raft**：成员名录要与 schema/manifest **同版本**
+    // 读出去（`architecture-with-chunk §3.1`），否则查询侧会拿"新文件清单 + 旧节点集合"
+    // 拼计划。注意**存活状态（心跳）不走这里** —— 秒级心跳会把 raft 写爆（`§3.2`）。
+    RegisterDatanodeOp register_datanode = 11;
   }
+}
+
+// 数据节点名录里的一条。
+message RegisterDatanodeOp {
+  // 实例标识（= `FileManifest.source_instance`；热数据按它归属）
+  string instance_id = 1;
+  // 数据面地址（host:port）—— 查询侧要按它装配热读器
+  string address = 2;
 }
 
 message CreateSchemaOp {

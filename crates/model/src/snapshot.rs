@@ -48,7 +48,12 @@ use crate::error::SnapshotError;
 /// 帧头 magic（含版本字母，便于十六进制 dump 时肉眼识别）。
 pub const SNAPSHOT_MAGIC: [u8; 8] = *b"YTSNAP01";
 /// 本实现写出的帧格式版本。
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+/// 快照载荷布局版本。**改布局必须 +1**（例如 2：新增 `datanodes`）。
+///
+/// 为什么必须 bump：`decode_payload` 拿它做**严格相等**校验 —— 旧构建读到新载荷会
+/// **明确拒绝**，而不是默默忽略未知字段。名录这类字段一旦被静默丢掉，查询侧就会按
+/// 空成员表算归属（`§69` 那类"静默少数据"）。
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
 /// 帧头长度。
 pub const SNAPSHOT_HEADER_LEN: usize = 36;
 /// 块头长度（`data_len` + `crc`）。
@@ -286,6 +291,10 @@ pub struct CatalogStateSnapshot {
     pub idempotency: Vec<SnapshotIdempotencyEntry>,
     #[prost(message, repeated, tag = "11")]
     pub table_manifest_ver: Vec<SnapshotTableVerEntry>,
+    /// **数据节点名录**（T12.3）：装快照后必须原样恢复 —— 它是"分片归属"的输入，
+    /// 丢一份就等于全体查询按空成员表算归属。
+    #[prost(message, repeated, tag = "12")]
+    pub datanodes: Vec<crate::meta::DatanodeMember>,
 }
 
 // ---------------------------------------------------------------- 载荷编解码
@@ -400,8 +409,12 @@ mod tests {
         framed[0] = b'X';
         assert!(matches!(unframe(&framed), Err(SnapshotError::BadMagic)));
 
+        // **相对当前版本**取"未来版本"，不要写死数字：
+        // 写死会让每次 bump `SNAPSHOT_FORMAT_VERSION` 都把一个正确的实现判成失败
+        // （本仓真踩过：`2` 从"未来版本"变成了"当前版本"）。
+        let future_ver = SNAPSHOT_FORMAT_VERSION + 1;
         let mut framed = frame(b"x", 1, 0);
-        framed[8..12].copy_from_slice(&2u32.to_le_bytes());
+        framed[8..12].copy_from_slice(&future_ver.to_le_bytes());
         // 版本变了 → 先撞帧头 CRC（因为我们同时改了被 CRC 覆盖的字节）
         let err = unframe(&framed).unwrap_err();
         assert!(
@@ -410,12 +423,12 @@ mod tests {
         );
         // 构造一个"版本不符但帧头 CRC 正确"的帧：模拟来自未来版本的合法帧
         let mut future = frame(b"x", 1, 0);
-        future[8..12].copy_from_slice(&2u32.to_le_bytes());
+        future[8..12].copy_from_slice(&future_ver.to_le_bytes());
         let hcrc = crc32fast::hash(&future[..SNAPSHOT_HEADER_LEN - 4]);
         future[32..36].copy_from_slice(&hcrc.to_le_bytes());
         assert!(matches!(
             unframe(&future),
-            Err(SnapshotError::UnsupportedVersion(2))
+            Err(SnapshotError::UnsupportedVersion(v)) if v == future_ver
         ));
     }
 

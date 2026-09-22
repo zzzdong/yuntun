@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use arrow::datatypes::SchemaRef;
 use yuntun_model::error::LakeError;
 use yuntun_model::meta::{
-    FileManifest, FileStatus, IdempotencyRecord, SchemaVersion, TableMeta,
+    DatanodeMember, FileManifest, FileStatus, IdempotencyRecord, SchemaVersion, TableMeta,
 };
 use yuntun_model::ops::{
     qualified_name, split_qualified, validate_schema_name, validate_table_name, CatalogVersion,
@@ -64,6 +64,10 @@ pub struct CatalogState {
     snapshot_version: u64,
     /// 已 apply 的变更数（Raft 线性化抽象）
     last_applied: u64,
+    /// **数据节点名录**（T12.3）：`instance_id` → 成员（含数据面地址）。
+    ///
+    /// 放状态机里而非配置：它必须与 schema/manifest **同版本**读出去（`§3.1`）。
+    datanodes: BTreeMap<String, DatanodeMember>,
     /// 结构变更计数（表 / schema / schema 演进）—— 缓存**全量重建**的触发器（S2-5）
     schema_ver: u64,
     /// 文件清单变更计数 —— 缓存**增量刷新**的触发器（S2-5）
@@ -85,6 +89,30 @@ impl CatalogState {
     }
 
     // ---------------------------------------------------------------- 内部：版本推进
+
+    /// 注册/更新一个数据节点。返回 `true` = 状态有变化。
+    ///
+    /// **推进 `schema_ver`**（⇒ 客户端**全量重建**快照）：成员名录是"分片归属"的输入，
+    /// 新节点加入会改变"该去哪儿拉热数据"；让缓存带着旧名录继续跑就是**按错误归属查**。
+    ///
+    /// **同 ID 同地址 ⇒ 不推进**：节点重启会重复注册（同地址），若每次都推进版本，
+    /// 反复重启会把所有客户端的缓存刷爆。这正是本函数返回 `bool` 的原因 ——
+    /// 幂等判定要能被上层（`apply`）用来报 `accepted=false`。
+    pub fn register_datanode(&mut self, m: DatanodeMember) -> bool {
+        if let Some(cur) = self.datanodes.get(&m.instance_id)
+            && cur.address == m.address
+        {
+            return false;
+        }
+        self.datanodes.insert(m.instance_id.clone(), m);
+        self.bump_schema_ver();
+        true
+    }
+
+    /// 数据节点名录（元数据读响应用它下发给查询侧）。
+    pub fn datanodes(&self) -> &BTreeMap<String, DatanodeMember> {
+        &self.datanodes
+    }
 
     /// 结构变更：推进 `schema_ver`（缓存全量重建）。
     fn bump_schema_ver(&mut self) -> u64 {
@@ -575,6 +603,7 @@ impl CatalogState {
                     record: Some(v.clone()),
                 })
                 .collect(),
+            datanodes: self.datanodes.values().cloned().collect(),
             table_manifest_ver: self
                 .table_manifest_ver
                 .iter()
@@ -665,6 +694,15 @@ impl CatalogState {
                 return Err(SnapshotError::InvalidState(format!("幂等键 {} 重复", e.key)));
             }
         }
+        let mut datanodes: BTreeMap<String, DatanodeMember> = BTreeMap::new();
+        for m in &msg.datanodes {
+            if datanodes.insert(m.instance_id.clone(), m.clone()).is_some() {
+                return Err(SnapshotError::InvalidState(format!(
+                    "数据节点 {} 重复",
+                    m.instance_id
+                )));
+            }
+        }
         let mut table_manifest_ver: BTreeMap<String, u64> = BTreeMap::new();
         for e in &msg.table_manifest_ver {
             if table_manifest_ver
@@ -683,6 +721,7 @@ impl CatalogState {
             schemas,
             files,
             idempotency,
+            datanodes,
             snapshot_version: msg.revision,
             last_applied: msg.last_applied,
             schema_ver: msg.schema_ver,

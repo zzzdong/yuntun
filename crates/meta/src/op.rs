@@ -17,7 +17,8 @@ use std::sync::Arc;
 use yuntun_catalog::CatalogState;
 use arrow::datatypes::{DataType, Field, Schema};
 use yuntun_model::meta::{
-    ColumnStatLite, FileManifest, IdempotencyRecord, IngestConfig, StatisticsLite, TableMeta,
+    ColumnStatLite, DatanodeMember, FileManifest, IdempotencyRecord, IngestConfig, StatisticsLite,
+    TableMeta,
 };
 use yuntun_model::ops::EvolveSchemaRequest;
 use yuntun_model::schema::SchemaChange;
@@ -73,6 +74,12 @@ pub enum StateOp {
         record: IdempotencyRecord,
         now_ms: u64,
     },
+    /// **数据节点注册**（T12.3）：名录必须与 schema/manifest 同版本读出去，
+    /// 所以它是 op（走 raft），不是旁路注册接口。
+    RegisterDatanode {
+        member: DatanodeMember,
+        now_ms: u64,
+    },
 }
 
 // `CreateTableRequest` 里有 `SchemaRef`（`Arc<Schema>`）—— `Arc` 未使用会告警
@@ -93,7 +100,8 @@ impl StateOp {
             | StateOp::EvolveSchema { now_ms, .. }
             | StateOp::DropShard { now_ms, .. }
             | StateOp::Compaction { now_ms, .. }
-            | StateOp::RecordIdempotency { now_ms, .. } => *now_ms,
+            | StateOp::RecordIdempotency { now_ms, .. }
+            | StateOp::RegisterDatanode { now_ms, .. } => *now_ms,
         }
     }
 }
@@ -176,6 +184,15 @@ pub fn decode_op(op: &pb::Op) -> Result<StateOp, MetaError> {
         },
         pb::op::Kind::EvolveSchema(e) => StateOp::EvolveSchema {
             request: evolve_schema_from_proto(e)?,
+            now_ms,
+        },
+        pb::op::Kind::RegisterDatanode(r) => StateOp::RegisterDatanode {
+            member: DatanodeMember {
+                instance_id: r.instance_id.clone(),
+                address: r.address.clone(),
+                // 时间戳留 0：**由 `apply` 用 op 的 `now_ms` 落章**（见 apply 里的注释）
+                registered_at_ms: 0,
+            },
             now_ms,
         },
         pb::op::Kind::DropShard(d) => StateOp::DropShard {
@@ -558,6 +575,20 @@ pub fn apply(state: &mut CatalogState, op: &StateOp) -> Result<ApplyOutcome, Met
                 return Ok(ApplyOutcome::hit());
             }
             state.drop_table(name).map_err(MetaError::from_lake)?;
+            Ok(ApplyOutcome::one())
+        }
+        StateOp::RegisterDatanode { member, .. } => {
+            // 注册时刻**由 op 的 `now_ms` 落章**，不信载荷里的自述时间：
+            // 状态机不读钟（纪律 1），但也不能把时钟交给调用方随 op 一起带进来 ——
+            // 那样同一串 op 在不同副本上会得到不同的名录时刻（时间戳是状态的一部分）。
+            let mut stamped = member.clone();
+            stamped.registered_at_ms = now;
+            // 幂等：同 ID 同地址 = 无变化（`accepted=false`）。
+            // **这里的幂等不只是礼貌**：节点重启会重复注册，若每次都推进 `schema_ver`，
+            // 所有客户端都会被拉去全量重建快照。
+            if !state.register_datanode(stamped) {
+                return Ok(ApplyOutcome::hit());
+            }
             Ok(ApplyOutcome::one())
         }
         StateOp::DropSchema { name, .. } => {
@@ -1069,4 +1100,63 @@ mod tests {
         .accepted);
     }
 
+    /// T12.3：数据节点注册 —— 名录进状态机，且**重复注册不得推进版本**。
+    ///
+    /// 为什么这条幂等是关键：节点每次重启都会重注册（同地址）。若每次推进 `schema_ver`，
+    /// 全体客户端的缓存会被反复拉去全量重建 —— 一个健康检查式的动作变成集群级抖动。
+    #[test]
+    fn register_datanode_is_idempotent_for_the_same_address() {
+        let mut sm = CatalogState::new();
+        let member = |addr: &str| DatanodeMember {
+            instance_id: "inst-a".into(),
+            address: addr.into(),
+            registered_at_ms: 0,
+        };
+
+        // ① 首次注册：进名录 + 推进版本（⇒ 客户端全量重建，认到新节点）
+        let v0 = sm.version();
+        let a = apply(
+            &mut sm,
+            &StateOp::RegisterDatanode {
+                member: member("10.0.0.7:50051"),
+                now_ms: 1_000,
+            },
+        )
+        .unwrap();
+        assert!(a.accepted, "首次注册必须算作有变化");
+        assert_eq!(sm.datanodes().len(), 1);
+        assert_eq!(sm.datanodes()["inst-a"].address, "10.0.0.7:50051");
+        assert_eq!(
+            sm.datanodes()["inst-a"].registered_at_ms,
+            1_000,
+            "注册时刻随 op 传播（状态机不读钟）"
+        );
+        assert_ne!(sm.version(), v0, "新节点加入必须让客户端重建快照");
+
+        // ② 同 ID 同地址：**不推进版本**（节点重启的重复注册）
+        let v1 = sm.version();
+        let b = apply(
+            &mut sm,
+            &StateOp::RegisterDatanode {
+                member: member("10.0.0.7:50051"),
+                now_ms: 2_000,
+            },
+        )
+        .unwrap();
+        assert!(!b.accepted, "同 ID 同地址是无变化");
+        assert_eq!(sm.version(), v1, "重复注册不得推进版本");
+
+        // ③ 地址变了：更新 + 推进（查询侧必须改到新地址去拉热数据）
+        let c = apply(
+            &mut sm,
+            &StateOp::RegisterDatanode {
+                member: member("10.0.0.8:50051"),
+                now_ms: 3_000,
+            },
+        )
+        .unwrap();
+        assert!(c.accepted);
+        assert_eq!(sm.datanodes()["inst-a"].address, "10.0.0.8:50051");
+        assert_ne!(sm.version(), v1, "地址变化必须让客户端重建快照");
+    }
 }

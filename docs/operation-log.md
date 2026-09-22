@@ -4512,3 +4512,87 @@ test compaction_during_query_keeps_counts_monotonic ... FAILED
 
 修完连跑 3 遍稳定（每次 0.22s，样本数足够）。**教训**：夹具里任何"固定时间窗内计数"的断言，
 都在把机器快慢偷偷变成判定的一部分 —— 要么等到条件成立（带超时），要么断言与时间无关的量。
+
+---
+
+## 70. 构建提速 + T12.3 第二刀（上半）：数据节点注册走 raft（2026-09-23）
+
+### 70.1 先纠正一个假设：**磁盘不是瓶颈**
+
+怀疑是"`rust-lld` 慢、磁盘读写满"。实测数据不支持这个归因：
+
+| 观测 | 值 | 含义 |
+|---|---|---|
+| `vmstat` 的 `wa` | 1–7% | **I/O 等待几乎为零** —— 磁盘没满 |
+| `us` / `sy` | 92% / 7% | 瓶颈在 **CPU** |
+| 磁盘型号 | `sda` `ROTA=0` | SATA **SSD**（另有 NVMe 只挂了 `/boot`，用不上） |
+| 同时在跑的链接器 | **24**（12 核机器） | 3 倍超订 → `cs` 11 万次/秒的**上下文切换风暴** |
+| 当时的 load | **115** | 就是这场风暴 |
+
+真正的开销是**链接输入体量**：`[profile.release]` 早已把 `debug` 降到 `line-tables-only`
+（注释里写着"完整调试信息会让二进制达到 2.3GB"），但 **`[profile.dev]` 是默认的 `debug = true`**
+—— 每个测试二进制都塞满完整 DWARF。
+
+### 70.2 改了什么
+
+```toml
+[profile.dev]
+debug = "line-tables-only"      # 保留文件/行号：backtrace 仍能定位失败用例
+
+[profile.dev.package."*"]
+debug = false                   # 依赖（datafusion/arrow…）是体积大头
+```
+
+外加**构建时 `-j 8`**（12 核机器上让 12 个任务各再叉多线程 lld，只会互相抢核）。
+
+效果：同样的全量构建，load 从 **115 → 6.65**（不再有上下文切换风暴）。
+代价与用法：
+
+- **改 profile 会让构建缓存一次性失效**（要全量重建一遍，之后一直快）；
+- 调试只剩行号：需要变量/类型时用 `CARGO_PROFILE_DEV_DEBUG=2 cargo test …` 单次覆盖；
+- `target/debug` 现在 **18G**（含全部测试二进制）。
+
+### 70.3 T12.3 第二刀（上半）：注册 op 走 raft，名录进状态机与快照
+
+**为什么是 op 而不是旁路注册接口**：`architecture-with-chunk §3.1` 要求成员名录与
+schema/manifest **同版本**读出去 —— 否则查询侧会拿"新的文件清单 + 旧的节点集合"拼计划。
+而**心跳绝不走这条路**：秒级心跳会把 raft 写爆（`§3.2`），它属第二刀的下半。
+
+| 件 | 内容 |
+|---|---|
+| `meta.proto` | `Op.kind.register_datanode = 11` + `RegisterDatanodeOp { instance_id, address }` |
+| `yuntun-model` | `DatanodeMember { instance_id, address, registered_at_ms }`（做成 prost 消息，才能进快照） |
+| `CatalogState` | `datanodes` + `register_datanode()`（**同 ID 同地址 ⇒ 不推进版本**） |
+| `meta op` | `StateOp::RegisterDatanode` + decode + apply |
+| 快照载荷 | `CatalogStateSnapshot.datanodes = 12`，**并把 `SNAPSHOT_FORMAT_VERSION` 1 → 2** |
+
+**幂等为什么是关键**：节点每次重启都会重注册（同地址）。若每次都推进 `schema_ver`，
+全体客户端会被反复拉去**全量重建快照** —— 一个健康检查式的动作变成集群级抖动。用例把这条钉住了。
+
+**格式版本必须 bump**：旧构建读到新载荷会**明确拒绝**，而不是默默忽略未知字段 ——
+名录被静默丢掉，正是 `§69` 那类"查询静默少数据"。
+
+### 70.4 用例当场抓到的设计含糊：注册时刻有**两个来源**
+
+初版把 `registered_at_ms` 既放在载荷里、又在 `decode_op` 里填 `now_ms` ⇒ 测试直接构造 op 时
+两者不一致，断言立刻失败。改为**由 `apply` 用 op 的 `now_ms` 落章**（载荷不再自述时间）：
+时间戳是状态的一部分，若允许调用方随 op 带进来，同一串 op 在不同副本上会得到不同的名录时刻。
+
+**另一个教训（本仓第二次踩）**：往文件里插新类型时，锚点若选在**结构体行**，容易插进
+`#[derive(...)]` 与结构体之间 —— 于是 derive 挂到了新类型上、原类型丢掉 derive
+（上次是 `cache.rs` 的文档归属，这次是 `model/src/meta.rs` 的 `prost::Message`）。
+锚点一律选 `#[derive]`/注释行，别选结构体行。
+
+### 70.5 验证与遗留
+
+- `cargo test -p yuntun-model -p yuntun-catalog -p yuntun-meta` → 29 / 39 / 进程 e2e 全绿
+- 全量 `cargo test --workspace --no-fail-fast` → **329 passed / 0 failed**；clippy 本仓 **0**
+- 新增 `wire_compat` 用例：注册 op 载荷往返逐字段不变（仓库规矩：每加一种 op 都要有）
+
+**下半的遗留**：
+
+1. **读路径**：把名录下发出去（`PrefetchPayload.datanodes`）+ `LocalCatalog` 消费它
+   （`set_members`）—— 到那时"成员表自动发现"才真正闭环（`§69` 的成员表至今仍由装配层手填）；
+2. **心跳与超时摘除**：metanode 内存 + 独立 RPC（**永不进 raft**，`§3.2`）；
+3. **ingestor 自注册**：`yuntun-ingestor --meta <addr>` + 启动注册（`register_datanode_to_proto` 随它落地）；
+4. 改 profile 后**旧快照载荷（v1）会被拒绝** —— 本地开发数据需重建（`§70.2`）。

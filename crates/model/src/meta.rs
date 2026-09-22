@@ -232,8 +232,28 @@ pub enum FileStatus {
     Deleted = 2,
 }
 
+/// 数据节点名录里的一条（T12.3）。
+///
+/// **为什么进状态机而不是放配置**：成员名录必须与 schema/manifest **同版本**读出去
+/// （`architecture-with-chunk §3.1`）—— 否则查询侧会拿"新的文件清单 + 旧的节点集合"
+/// 拼计划。也因此它走 raft 的 op（`MetaService::Propose`），而不是某个旁路注册接口。
+///
+/// **心跳不在这里**：存活状态是秒级的，按设计走 metanode 内存 + 独立 RPC（`§3.2`）。
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct DatanodeMember {
+    #[prost(string, tag = "1")]
+    pub instance_id: String,
+    /// 数据面地址（`host:port`）
+    #[prost(string, tag = "2")]
+    pub address: String,
+    /// 注册时刻（由发起方打点并随 op 传播；状态机不读钟）
+    #[prost(uint64, tag = "3")]
+    pub registered_at_ms: u64,
+}
+
 /// 幂等键记录（【v8 修正 1】独立表，不随 FileManifest 删除而删除，§7.3.1）
 #[derive(Clone, PartialEq, prost::Message)]
+
 pub struct IdempotencyRecord {
     /// 主键
     #[prost(string, tag = "1")]
