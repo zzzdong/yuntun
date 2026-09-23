@@ -645,7 +645,20 @@ impl CatalogState {
         &mut self,
         old_batch_ids: &[String],
         new_files: Vec<FileManifest>,
-    ) -> u64 {
+        lease_epoch: u64,
+    ) -> Result<u64, LakeError> {
+        // 【栅栏】在途作业的防线：租约已被接管（当前代次更大）时**不许提交** ——
+        // 否则被罢黜的持有者仍会产出第二份合并文件（`§81.8` ②）。
+        // 判据用**代次水位**（不是"当前有没有持有者"）：释放后水位仍留着，正是为此。
+        // 无租约记录 ⇒ 不设栅栏（进程内直连形态与既有用例照常）。
+        if let Some(lease) = self.leases.get(yuntun_model::meta::COMPACTION_LEASE) {
+            if lease_epoch < lease.epoch {
+                return Err(LakeError::Other(format!(
+                    "compaction fenced: 提交携带的租约代次 {lease_epoch} 落后于当前 {}                     （持有者 {:?}）—— 本次合并作废",
+                    lease.epoch, lease.holder
+                )));
+            }
+        }
         let next = self.next_snapshot();
         // ⚠️ `BTreeSet` 而不是 `HashSet`（纪律 2）：下面的 `bump_manifest_ver` 会**按迭代序分配
         // 版本号**，用 `HashSet` 会让不同副本把同一个 `manifest_ver` 分给不同的表 → 静默分叉。
@@ -668,7 +681,7 @@ impl CatalogState {
         for t in &touched {
             self.bump_manifest_ver(t);
         }
-        next
+        Ok(next)
     }
 
     /// 已知 batch_id 列表（孤儿清理用）—— **排序**返回（纪律 2）。
@@ -1035,7 +1048,8 @@ mod tests {
             st.commit_files(commit_req("public.mem", "b2", &["k2"]), 1_004)
                 .unwrap();
             st.drop_shard("public.cpu", "s0");
-            st.commit_compaction(&["b2".to_string()], vec![merged_file("public.mem", "m1", 1)]);
+            st.commit_compaction(&["b2".to_string()], vec![merged_file("public.mem", "m1", 1)], 0)
+                .unwrap();
             st.sweep_expired_idempotency(24 * 3600, 1_010);
             st
         };
@@ -1092,7 +1106,9 @@ mod tests {
             st.commit_compaction(
                 &["b_b".to_string(), "b_a".to_string()],
                 vec![merged_file("public.aaa", "m", 2)],
-            );
+                0,
+            )
+            .unwrap();
             st
         };
         let a = build(["aaa", "bbb"]);
@@ -1310,9 +1326,6 @@ mod snapshot_tests {
 
     /// **维度覆盖**：状态机的**每个**维度都必须体现在快照里。
     ///
-    /// 这是专防"加字段忘了加进快照"的回归测试 —— 那种漏法不会让任何测试变红，
-    /// 只会让换主/重启后状态**静默回退**。所以每个维度都断言"改了它，产物必须变"。
-    #[test]
     // ---------------------------------------------------------------- 租约（T14.1）
 
     #[test]
@@ -1383,6 +1396,43 @@ mod snapshot_tests {
         assert_eq!(g.epoch, 2, "释放后再授予仍要推进代次");
     }
 
+    #[test]
+    fn compaction_fence_rejects_a_deposed_holder() {
+        let mut s = CatalogState::new();
+        // 本地构造（`merged_file` 在另一个测试模块里）
+        let mf = |id: &str| FileManifest {
+            batch_id: id.into(),
+            ..Default::default()
+        };
+        // 无租约记录 ⇒ 不设栅栏（进程内直连形态、既有用例照常）
+        assert!(s
+            .commit_compaction(&[], vec![mf("m1")], 0)
+            .is_ok());
+
+        // 租约代次 1：携带 1 可提交，携带 0（没有租约的旧代码）被拒
+        s.acquire_lease("compaction", "a", 1_000, 1_000);
+        assert!(s
+            .commit_compaction(&[], vec![mf("m2")], 1)
+            .is_ok());
+        let e = s
+            .commit_compaction(&[], vec![mf("m3")], 0)
+            .unwrap_err();
+        assert!(e.to_string().contains("fenced"), "{e}");
+
+        // **被接管（代次 2）⇒ 旧持有者（1）的在途提交必须被拒** —— 这就是栅栏的全部意义
+        s.acquire_lease("compaction", "b", 5_000, 1_000);
+        let e = s
+            .commit_compaction(&[], vec![mf("m4")], 1)
+            .unwrap_err();
+        assert!(e.to_string().contains("fenced"), "{e}");
+        // 新持有者（2）照常提交
+        assert!(s
+            .commit_compaction(&[], vec![mf("m5")], 2)
+            .is_ok());
+    }
+
+    /// 这是专防"加字段忘了加进快照"的回归测试 —— 那种漏法不会让任何测试变红，
+    /// 只会让换主/重启后状态**静默回退**。所以每个维度都断言"改了它，产物必须变"。
     #[test]
     fn snapshot_covers_every_state_dimension() {
         let base = rich_state();

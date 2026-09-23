@@ -1016,7 +1016,7 @@ async fn idempotency_survives_compaction() {
         format: yuntun_format::DataFormat::Parquet,
     };
     let snap = catalog.current_snapshot().await;
-    let new_snap = yuntun_compaction::compact_shard(&compactor, "public.idem", "s0", snap)
+    let new_snap = yuntun_compaction::compact_shard(&compactor, "public.idem", "s0", snap, 0)
         .await
         .unwrap()
         .expect("文件数达阈值应触发合并");
@@ -1125,7 +1125,7 @@ async fn compaction_during_query_keeps_counts_monotonic() {
             if round == 0 { 3 } else { 4 },
             "round {round}: 每轮 3 批 + 上轮合并产物 1 个"
         );
-        let merged = yuntun_compaction::compact_shard(&c, "public.cq", "s0", snap)
+        let merged = yuntun_compaction::compact_shard(&c, "public.cq", "s0", snap, 0)
             .await
             .unwrap();
         assert!(merged.is_some(), "round {round}: 文件数达阈值应触发合并");

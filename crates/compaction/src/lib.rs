@@ -47,7 +47,7 @@ impl Default for CompactionConfig {
             max_rows_per_output: 5_000_000,
             interval: Duration::from_secs(60),
             orphan_grace: Duration::from_secs(3600),
-            lease_purpose: "compaction".to_string(),
+            lease_purpose: yuntun_model::meta::COMPACTION_LEASE.to_string(),
             lease_ttl: Duration::from_secs(30),
         }
     }
@@ -165,11 +165,15 @@ impl LeaseGate {
 
 /// 合并单个 shard 的文件（详细设计 §9.1）。
 /// 返回新快照号；无可合并文件返回 None。
+///
+/// 末位 `lease_epoch` 是**栅栏**：干活时持有的租约代次（无租约传 0）。提交时随 op 过线，
+/// 状态机发现它落后于当前水位就**拒绝**（`§82`）。
 pub async fn compact_shard(
     compactor: &Compactor,
     table: &str,
     shard: &str,
     snapshot: u64,
+    lease_epoch: u64,
 ) -> Result<Option<u64>, LakeError> {
     let files = compactor
         .catalog
@@ -230,7 +234,8 @@ pub async fn compact_shard(
     };
     let old_ids: Vec<String> = files.iter().map(|f| f.batch_id.clone()).collect();
     let new_snapshot =
-        commit_compaction_files(compactor, table, shard, old_ids, new_manifest).await?;
+        commit_compaction_files(compactor, table, shard, old_ids, new_manifest, lease_epoch)
+            .await?;
 
     tracing::info!(
         table,
@@ -251,10 +256,11 @@ async fn commit_compaction_files(
     _shard: &str,
     old_ids: Vec<String>,
     new_manifest: FileManifest,
+    lease_epoch: u64,
 ) -> Result<u64, LakeError> {
     compactor
         .catalog
-        .commit_compaction(&old_ids, vec![new_manifest])
+        .commit_compaction(&old_ids, vec![new_manifest], lease_epoch)
         .await
 }
 
@@ -438,7 +444,9 @@ pub fn spawn_compaction_loop(
                     if group.len() < compactor.cfg.min_files {
                         continue;
                     }
-                    if let Err(e) = compact_shard(&compactor, &t.name, shard, snapshot).await {
+                    if let Err(e) =
+                        compact_shard(&compactor, &t.name, shard, snapshot, gate.epoch).await
+                    {
                         tracing::error!(error = %e, table = %t.name, shard, "compaction failed");
                     }
                 }
@@ -471,6 +479,43 @@ mod tests {
             vec![SArc::new(Int64Array::from(vec![1, 2, 3]))],
         )
         .unwrap()
+    }
+
+    /// **栅栏**：被接管后的"在途提交"必须被拒 —— 否则被罢黜的持有者会产出第二份合并文件。
+    ///
+    /// 这条用例把两处接起来：状态机的栅栏判定（`§82`）与"压缩侧真的把代次带下去"。
+    #[tokio::test]
+    async fn a_deposed_holder_cannot_commit_its_in_flight_merge() {
+        let cat: Arc<dyn CatalogOps> = Arc::new(yuntun_catalog::MemoryCatalog::new());
+        let g1 = cat
+            .acquire_lease("compaction", "a", 1_000, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(g1.epoch, 1);
+        let mf = |id: &str| FileManifest {
+            batch_id: id.into(),
+            ..Default::default()
+        };
+
+        // 持有代次 1 ⇒ 提交通过
+        assert!(cat.commit_compaction(&[], vec![mf("m1")], 1).await.is_ok());
+
+        // 租约过期、被别人接管 ⇒ 代次 2
+        let g2 = cat
+            .acquire_lease("compaction", "b", 5_000, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(g2.epoch, 2);
+
+        // **被罢黜者的在途提交（还带着 1）⇒ 必须被拒**（这就是"零重复产出"的保证）
+        let e = cat
+            .commit_compaction(&[], vec![mf("m2")], 1)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("fenced"), "{e}");
+
+        // 新持有者的提交照常
+        assert!(cat.commit_compaction(&[], vec![mf("m3")], 2).await.is_ok());
     }
 
     fn compactor(catalog: Arc<dyn CatalogOps>) -> Compactor {
@@ -561,7 +606,7 @@ mod tests {
         );
 
         // 执行合并
-        let new_snap = compact_shard(&c, "t", "s0", snap).await.unwrap().unwrap();
+        let new_snap = compact_shard(&c, "t", "s0", snap, 0).await.unwrap().unwrap();
 
         // 旧快照仍见 3 个（快照隔离）；新快照只见 1 个合并文件
         assert_eq!(
@@ -589,7 +634,7 @@ mod tests {
         let c = compactor(catalog.clone());
         let snap = catalog.current_snapshot().await;
         // 无文件 → None
-        assert!(compact_shard(&c, "t", "s0", snap).await.unwrap().is_none());
+        assert!(compact_shard(&c, "t", "s0", snap, 0).await.unwrap().is_none());
     }
 
     #[test]

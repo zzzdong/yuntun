@@ -278,6 +278,12 @@ pub struct LeaseEntry {
     pub expires_at_ms: u64,
 }
 
+/// 压缩作业的租约用途键（`§81`）。
+///
+/// **唯一来源**：状态机的栅栏判定与压缩侧的申请必须用同一个字符串 ——
+/// 两处各写一遍，改一处就静默失配（栅栏失效 = 白写）。
+pub const COMPACTION_LEASE: &str = "compaction";
+
 /// 取租约的结果（`AcquireLease` 的 op 结果；trait 返回值同形状）。
 // `prost::Message` 自带 `Debug`/`Default`，重复 derive 会冲突
 #[derive(Clone, PartialEq, prost::Message)]

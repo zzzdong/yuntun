@@ -67,6 +67,8 @@ pub enum StateOp {
     Compaction {
         old_batch_ids: Vec<String>,
         new_files: Vec<FileManifest>,
+        /// 栅栏：干活时持有的租约代次（无租约 = 0）
+        lease_epoch: u64,
         now_ms: u64,
     },
     /// 幂等**认领**（写入前的登记）。
@@ -285,6 +287,7 @@ pub fn decode_op(op: &pb::Op) -> Result<StateOp, MetaError> {
             now_ms,
         },
         pb::op::Kind::Compaction(c) => StateOp::Compaction {
+            lease_epoch: c.lease_epoch,
             old_batch_ids: c.old_batch_ids.clone(),
             new_files: c.new_files.iter().map(manifest_from_proto).collect(),
             now_ms,
@@ -756,9 +759,13 @@ pub fn apply(state: &mut CatalogState, op: &StateOp) -> Result<ApplyOutcome, Met
         StateOp::Compaction {
             old_batch_ids,
             new_files,
+            lease_epoch,
             ..
         } => {
-            state.commit_compaction(old_batch_ids, new_files.clone());
+            // 栅栏拒绝 = op **失败**（要让客户端看见"你被接管了"，而不是静默丢弃）
+            state
+                .commit_compaction(old_batch_ids, new_files.clone(), *lease_epoch)
+                .map_err(MetaError::from_lake)?;
             // affected = 本次写入的新文件数（调用方按它算"合并产出"）
             Ok(ApplyOutcome::new(true, new_files.len() as u64))
         }
@@ -1122,6 +1129,7 @@ mod tests {
         let f = rich_request().files[0].clone();
         match decode(
             pb::op::Kind::Compaction(pb::CompactionOp {
+                lease_epoch: 0,
                 old_batch_ids: vec!["b1".into(), "b2".into()],
                 new_files: vec![manifest_to_proto(&f)],
             }),

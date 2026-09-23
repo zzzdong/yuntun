@@ -482,14 +482,6 @@ fn actual_version_of(st: &tonic::Status) -> Option<u64> {
         .and_then(|v| v.parse().ok())
 }
 
-/// 墙钟毫秒（**发起方打点**：状态机不读钟，时刻随 op 过线 —— `§81`）。
-fn now_ms_wall() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// 从 op 结果字节里解出 [`yuntun_model::meta::LeaseGrant`]。
 ///
 /// 空结果 = 服务端没接线 `ProposeResponse.result`：**必须报错**，不能当"没授予"糊过去
@@ -589,7 +581,7 @@ impl CatalogOps for RemoteCatalog {
     ) -> Result<bool, LakeError> {
         let resp = self
             .propose(pb::Op {
-                now_ms: now_ms_wall(),
+                now_ms: now_ms(),
                 kind: Some(pb::op::Kind::ReleaseLease(pb::ReleaseLeaseOp {
                     purpose: purpose.to_string(),
                     holder: holder.to_string(),
@@ -881,12 +873,14 @@ impl CatalogOps for RemoteCatalog {
         &self,
         old_batch_ids: &[String],
         new_files: Vec<FileManifest>,
+        lease_epoch: u64,
     ) -> Result<u64, LakeError> {
         self.propose(pb::Op {
             now_ms: now_ms(),
             kind: Some(pb::op::Kind::Compaction(pb::CompactionOp {
                 old_batch_ids: old_batch_ids.to_vec(),
                 new_files: new_files.iter().map(op::manifest_to_proto_pub).collect(),
+                lease_epoch,
             })),
         })
         .await?;

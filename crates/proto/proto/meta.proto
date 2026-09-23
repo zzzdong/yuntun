@@ -451,6 +451,10 @@ message DropShardOp {
 message CompactionOp {
   repeated string          old_batch_ids = 1;
   repeated FileManifestMsg new_files     = 2;
+  // **栅栏**（R6）：提交时携带"我干活时持有的租约代次"。
+  // 落后于当前租约水位 ⇒ 状态机**拒绝**这次提交：被罢黜的持有者不该再产出合并文件
+  // （否则它与新持有者各产一份 —— 浪费，且孤儿 GC 还得收）。无租约时传 0。
+  uint64 lease_epoch = 3;
 }
 
 // 幂等记录（认领 / 提交后登记）。

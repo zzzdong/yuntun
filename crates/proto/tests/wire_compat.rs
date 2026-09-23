@@ -305,6 +305,8 @@ fn propose_request_roundtrips_for_every_op_variant() {
         op::Kind::Compaction(CompactionOp {
             old_batch_ids: vec!["b1".into()],
             new_files: vec![to_manifest(&FileManifest::default())],
+            // 非零值：这一条是**逐字段无损**测试，0 会让"忘了搬这个字段"看不出来
+            lease_epoch: 7,
         }),
         op::Kind::Idempotency(IdempotencyOp {
             record: Some(IdempotencyRecordMsg {

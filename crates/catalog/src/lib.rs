@@ -84,10 +84,15 @@ pub trait CatalogOps: Send + Sync {
     /// 【为什么必须在 trait 上】Compaction 与 Catalog 同进程是**部署事实**，
     /// 但**不能因此绑具体类型**：Catalog 转 gRPC（R3）时 `Arc<MemoryCatalog>` 会编译不过
     /// （`plan.md §5.1-B` 实测）。这是"单机可跑、分布式不返工"的关键接缝。
+    /// 提交合并结果。`lease_epoch` = 干活时持有的**租约代次**（无租约传 0）。
+    ///
+    /// 它是**栅栏**：代次落后于状态机里的租约水位 ⇒ 拒绝（"你已经被接管了"）。
+    /// 没有它，被罢黜的持有者仍能在返回途中提交第二份合并产物（`§81.8` ②）。
     async fn commit_compaction(
         &self,
         old_batch_ids: &[String],
         new_files: Vec<FileManifest>,
+        lease_epoch: u64,
     ) -> Result<u64, LakeError>;
 
     /// 全部已知 batch_id（孤儿清理对账用，§12.2.1）——同上，不得绑具体实现。
@@ -408,12 +413,12 @@ impl CatalogOps for MemoryCatalog {
         &self,
         old_batch_ids: &[String],
         new_files: Vec<FileManifest>,
+        lease_epoch: u64,
     ) -> Result<u64, LakeError> {
-        Ok(self
-            .state
+        self.state
             .write()
             .unwrap()
-            .commit_compaction(old_batch_ids, new_files))
+            .commit_compaction(old_batch_ids, new_files, lease_epoch)
     }
 
     async fn known_batch_ids(&self) -> Result<Vec<String>, LakeError> {
@@ -594,7 +599,7 @@ mod tests {
             row_count: 3,
             ..Default::default()
         };
-        c.commit_compaction(&["b1".to_string()], vec![new_file])
+        c.commit_compaction(&["b1".to_string()], vec![new_file], 0)
             .await
             .unwrap();
         assert!(c.version().await.manifest_ver > v0);
