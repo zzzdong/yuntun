@@ -230,6 +230,14 @@ pub async fn compact_shard(
         table: table.to_string(),
         shard: shard.to_string(),
         time_window: files[0].time_window.clone(),
+        // **合并产物不属于任何实例**（T14.4）—— 这里刻意**显式留空**，而不是靠
+        // `..Default::default()` 恰好是空串：
+        //
+        // 这个字段是 `architecture §4.4` 冷热切分的依据（"冷读该实例 ≤watermark 的文件"）。
+        // 产物把**多个实例**的行融在一起，归给其中任何一个，都会让那一方的热数据范围
+        // 被误当成"已经覆盖了这些行" ⇒ **重复计数**（`plan §5.3-1`：不报错，只是结果变多）。
+        // 留空 = "谁也不属于" ⇒ 它永远只从**冷数据**读，谁也不认领。
+        source_instance: String::new(),
         ..Default::default()
     };
     let old_ids: Vec<String> = files.iter().map(|f| f.batch_id.clone()).collect();

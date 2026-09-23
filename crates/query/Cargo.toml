@@ -31,6 +31,9 @@ yuntun-testkit = { path = "../testkit" }
 yuntun-ingest = { path = "../ingest" }
 # 仅测试：双实例对拍需要**真的** chunk store 当两个 datanode（库本身只依赖 `ShardReader` 缝）
 yuntun-chunk = { path = "../chunk" }
+# 仅测试：**跨实例合并**（T14.4）要先把两边的文件真的合并掉、再查一遍 ——
+# 合并绝不能改变行集（重复计数/漏读都只能靠"合并前后逐行对拍"抓住）
+yuntun-compaction = { path = "../compaction" }
 yuntun-wal = { path = "../wal" }
 yuntun-store = { path = "../store" }
 tokio-util = { workspace = true }

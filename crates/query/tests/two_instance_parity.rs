@@ -183,3 +183,174 @@ async fn single_registered_instance_sees_only_its_own_rows() {
     let only_a = engine_with(vec![("inst-a", a)]).await;
     assert_eq!(only_a, vec![1, 2, 3], "只注册 inst-a 时只能看到它自己的行");
 }
+
+// ---------------------------------------------------------------------------
+// T14.4：跨实例文件合并（`source_instance` 的多节点形态）
+// ---------------------------------------------------------------------------
+
+/// 把一个实例的**已落盘文件**写进共享对象存储并提交进目录。
+///
+/// `source_instance` 刻意填**该实例自己的 id** —— 这正是真实写入路径的形态
+/// （`ingest/src/flush.rs` 填的就是本实例 id），也是 `§4.4` 冷热切分的依据。
+async fn commit_file(
+    store: &Arc<dyn object_store::ObjectStore>,
+    catalog: &Arc<dyn CatalogOps>,
+    instance_id: &str,
+    vals: &[i64],
+) -> String {
+    const WINDOW: &str = "2026-09-21T10:00";
+    const SHARD: &str = "default";
+    let bid = format!("{instance_id}-{}", uuid::Uuid::now_v7());
+    let (path, size, rows) = yuntun_format::write_batch(
+        store,
+        TABLE,
+        SHARD,
+        WINDOW,
+        &bid,
+        &batch(vals),
+        yuntun_format::DataFormat::Parquet,
+    )
+    .await
+    .unwrap();
+    catalog
+        .commit_files(yuntun_model::ops::CommitFilesRequest {
+            table: TABLE.into(),
+            batch_id: bid.clone(),
+            client_request_id: None,
+            client_request_ids: vec![],
+            shard: SHARD.into(),
+            time_window: WINDOW.into(),
+            files: vec![yuntun_model::meta::FileManifest {
+                file_path: path,
+                batch_id: bid.clone(),
+                file_size: size,
+                row_count: rows,
+                table: TABLE.into(),
+                shard: SHARD.into(),
+                time_window: WINDOW.into(),
+                source_instance: instance_id.into(),
+                ..Default::default()
+            }],
+            schema_version: 1,
+            row_count: rows,
+        })
+        .await
+        .unwrap();
+    bid
+}
+
+/// 装配"共享冷存储 + 共享目录 + 若干实例的热数据"。
+///
+/// 与 [`engine_with`] 的差别：这个版本让**冷数据（真 parquet 文件）与热数据（真 chunk）
+/// 同时存在**，并且把 `store`/`catalog` 交给调用方 —— 便于"合并之后再查一遍"。
+async fn engine_with_cold_and_hot(
+    instances: Vec<(&str, Arc<ChunkStore>)>,
+    store: Arc<dyn object_store::ObjectStore>,
+    catalog: Arc<dyn CatalogOps>,
+) -> QueryEngine {
+    let cache = Arc::new(LocalCatalog::new());
+    cache.set_catalog_ops(catalog.clone());
+    for (id, s) in instances {
+        catalog
+            .register_datanode(yuntun_model::meta::DatanodeMember {
+                instance_id: id.to_string(),
+                address: String::new(),
+                registered_at_ms: 0,
+            })
+            .await
+            .unwrap();
+        cache.set_hot_shards(id, s);
+    }
+    cache.refresh(&catalog).await.unwrap();
+    QueryEngine::new(store, cache)
+}
+
+/// **T14.4 核心**：把**别人的**文件合并掉之后，结果必须一字不差。
+///
+/// 真实形态（`architecture §5.1`：多个 datanode 可能同时写同一 partition、各出各的文件）：
+/// 同一 shard 上，`inst-a` 有**已落盘文件** + **没落盘的热数据**，`inst-b` 同理。
+///
+/// 合并把 a、b 的文件融成一个产物，于是冒出一个只在多节点才出现的问题：
+/// **这个产物属于谁？** 答案是**谁也不属于** —— 因为按实例二维切分冷热（`§4.4`）时，
+/// 归给任何一方都会让那一方的热数据范围被误当成"覆盖了这些行"（**重复计数**）。
+///
+/// 所以这条用例钉三件事：
+/// ① 合并前后行集**逐行相等**（多 = 重复计数，少 = 漏读）；
+/// ② 产物 `source_instance` **为空**（中立实例）；
+/// ③ 老文件真的被替换（否则"合并"根本没发生，用例是空转）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cross_instance_merge_keeps_row_set_exact() {
+    let dir_a = yuntun_testkit::TestDir::tmpfs("xmerge-a");
+    let dir_b = yuntun_testkit::TestDir::tmpfs("xmerge-b");
+    let a = instance(&dir_a, "inst-a");
+    let b = instance(&dir_b, "inst-b");
+
+    let store = create_store(&StoreConfig::Memory).unwrap();
+    let catalog: Arc<dyn CatalogOps> = Arc::new(MemoryCatalog::new());
+    create_table(&catalog).await;
+
+    // 每个实例：**已落盘的文件**（3 行）+ **还没落盘的热数据**（1 行）
+    commit_file(&store, &catalog, "inst-a", &[1, 2, 3]).await;
+    commit_file(&store, &catalog, "inst-b", &[4, 5, 6]).await;
+    write(&a, &[7]);
+    write(&b, &[8]);
+
+    let expected: Vec<i64> = (1..=8).collect();
+
+    // ① 合并前：两边的冷文件 + 两边的热数据，一个不少
+    let before = {
+        let engine = engine_with_cold_and_hot(
+            vec![("inst-a", a.clone()), ("inst-b", b.clone())],
+            store.clone(),
+            catalog.clone(),
+        )
+        .await;
+        sorted_values(&engine).await
+    };
+    assert_eq!(before, expected, "合并前应看到两边的文件与两边的热数据");
+
+    // ② **跨实例合并**：inst-a 与 inst-b 的文件融成一个产物
+    let compactor = Arc::new(yuntun_compaction::Compactor {
+        lease_holder: "inst-a".into(),
+        cfg: yuntun_compaction::CompactionConfig {
+            min_files: 1,
+            ..Default::default()
+        },
+        catalog: catalog.clone(),
+        store: store.clone(),
+        format: yuntun_format::DataFormat::Parquet,
+    });
+    let snap = catalog.current_snapshot().await;
+    let merged = yuntun_compaction::compact_shard(&compactor, TABLE, "default", snap, 0)
+        .await
+        .unwrap();
+    assert!(merged.is_some(), "两个文件应当真的被合并");
+
+    // ③ 产物是**中立实例**（`§4.4` 冷热切分的前提），行数是输入之和
+    let after_snap = catalog.current_snapshot().await;
+    let files = catalog
+        .list_visible_files(TABLE, after_snap, None)
+        .await
+        .unwrap();
+    assert_eq!(files.len(), 1, "两个老文件应被合并产物替换");
+    assert_eq!(
+        files[0].source_instance, "",
+        "合并产物必须**不属于任何实例**：归给谁，谁的热数据范围就会被误当成覆盖了这些行"
+    );
+    assert_eq!(files[0].row_count, 6, "产物行数 = 两侧输入之和（3 + 3）");
+
+    // ④ 合并后：热数据照旧、冷数据换了身份，行集**逐行不变**
+    let after = {
+        let engine = engine_with_cold_and_hot(
+            vec![("inst-a", a.clone()), ("inst-b", b.clone())],
+            store.clone(),
+            catalog.clone(),
+        )
+        .await;
+        sorted_values(&engine).await
+    };
+    assert_eq!(
+        after, expected,
+        "跨实例合并**不得改变行集**：多一行 = 重复计数，少一行 = 漏读"
+    );
+}
