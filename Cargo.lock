@@ -5424,6 +5424,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "yuntun-compactord"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "clap",
+ "object_store",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "yuntun-catalog",
+ "yuntun-compaction",
+ "yuntun-format",
+ "yuntun-meta",
+ "yuntun-model",
+ "yuntun-store",
+]
+
+[[package]]
 name = "yuntun-format"
 version = "0.1.0"
 dependencies = [

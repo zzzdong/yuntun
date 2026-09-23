@@ -13,6 +13,7 @@ members = [
     "crates/ingest",
     "crates/ingestor",
     "crates/queryd",
+    "crates/compactord",
     "crates/query",
     "crates/compaction",
     "crates/sql",

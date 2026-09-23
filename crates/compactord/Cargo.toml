@@ -1,0 +1,25 @@
+[package]
+name = "yuntun-compactord"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# 压缩节点进程（R4 T12.1 第三刀）：只依赖**共享对象存储**与**元数据面**，
+# 不持有热数据、不接受写入 —— 与前两个进程天然正交（它不碰 WAL、不碰 chunk）。
+[dependencies]
+yuntun-catalog = { path = "../catalog" }
+yuntun-compaction = { path = "../compaction" }
+yuntun-format = { path = "../format" }
+yuntun-meta = { path = "../meta" }
+yuntun-store = { path = "../store" }
+arrow = { workspace = true }
+clap = { workspace = true }
+object_store = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+yuntun-model = { path = "../model" }
