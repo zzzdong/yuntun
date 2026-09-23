@@ -200,6 +200,9 @@ impl CatalogOps for BrokenCatalog {
     ) -> Result<Vec<yuntun_model::meta::DatanodeMember>, yuntun_model::LakeError> {
         self.inner.datanodes().await
     }
+    async fn heartbeat(&self, id: &str) -> Result<bool, yuntun_model::LakeError> {
+        self.inner.heartbeat(id).await
+    }
     async fn drop_schema(&self, n: &str) -> Result<(), yuntun_model::LakeError> {
         self.inner.drop_schema(n).await
     }

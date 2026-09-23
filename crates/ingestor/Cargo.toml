@@ -15,6 +15,9 @@ yuntun-wal = { path = "../wal" }
 yuntun-ingest = { path = "../ingest" }
 yuntun-store = { path = "../store" }
 yuntun-shardrpc = { path = "../shardrpc" }
+# 数据节点要**入册/保活**（T12.3）：注册走 raft、心跳走内存。
+# 这是装配层，tonic 到这里为止（`yuntun-ingest` 写入路径仍然干净）。
+yuntun-meta = { path = "../meta" }
 clap = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -24,5 +27,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 # 用例要在"查询侧"真的跑一遍引擎（数据面客户端 + 对拍）
 yuntun-query = { path = "../query" }
+yuntun-proto = { path = "../proto" }
 yuntun-testkit = { path = "../testkit" }
 arrow = { workspace = true }
+tokio-util = { workspace = true }

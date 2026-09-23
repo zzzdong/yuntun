@@ -61,6 +61,67 @@ struct Args {
     /// 热读服务监听地址；`127.0.0.1:0` = 内核分配，真实地址打印到 stdout（供上层发现）
     #[arg(long, default_value = "127.0.0.1:0")]
     listen: String,
+    /// metanode 地址（如 `127.0.0.1:50051`）。给了就**入册**（注册走 raft）并起**心跳保活**；
+    /// 不给则只在本进程内登记（单机形态，不涉及成员发现）。
+    #[arg(long)]
+    meta: Option<String>,
+    /// 心跳间隔（秒）。**必须与 metanode 的巡检口径配套**：metanode 默认 15s 没见到就摘，
+    /// 这里默认 5s（三次机会，抗一次网络抖动）。测试/调优时可改小。
+    #[arg(long, default_value_t = 5)]
+    heartbeat_secs: u64,
+}
+
+/// 入册（**best-effort**）：失败只告警，不返回错误。
+///
+/// 理由：数据节点的核心职责是"吸收自己的 WAL + 服务热读"，那件事不依赖元数据面。
+/// 元数据面晚一点起来，只意味着"暂时不在名录里"，而不是"数据节点起不来"。
+async fn register_datanode(catalog: &Arc<dyn CatalogOps>, id: &str, address: &str) {
+    match catalog
+        .register_datanode(yuntun_model::meta::DatanodeMember {
+            instance_id: id.to_string(),
+            address: address.to_string(),
+            registered_at_ms: 0,
+        })
+        .await
+    {
+        Ok(()) => tracing::info!(instance_id = %id, address = %address, "数据节点已入册"),
+        Err(e) => tracing::warn!(error = %e, "入册失败（元数据面不可达？）—— 心跳轮会重试"),
+    }
+}
+
+/// **心跳循环**（T12.3）：每 `EVERY` 报一次活；三种结果的处置与 metanode 侧一一对应。
+///
+/// - `Ok(true)`：正常（说明还在名录里）；
+/// - `Ok(false)`：**不在名录里** —— 被超时摘除、或从未入册成功 ⇒ **重新注册**（摘除可恢复）；
+/// - `Err(_)`：元数据面不可达 ⇒ 告警 + 下一轮重试（**不退出**：数据节点本地照常工作）。
+///
+/// 频率与 metanode 的巡检口径**必须配套**：默认这里 5s 一次、metanode 15s 没见到才摘
+/// （三次机会，抗一次网络抖动）。`--heartbeat-secs` 改这里时，那边要一起改。
+fn spawn_heartbeat(
+    catalog: Arc<dyn CatalogOps>,
+    id: String,
+    address: String,
+    every: std::time::Duration,
+    shutdown: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if shutdown.is_cancelled() {
+                break;
+            }
+            tokio::time::sleep(every).await;
+            match catalog.heartbeat(&id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(instance_id = %id, "不在名录里（被摘除或未入册）—— 重新注册");
+                    register_datanode(&catalog, &id, &address).await;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "心跳失败（元数据面不可达？），下一轮重试")
+                }
+            }
+        }
+    })
 }
 
 #[tokio::main]
@@ -107,9 +168,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .await?;
 
-    // ③ 元数据面 + 冷存根
-    //    （本地内存 catalog：T12.3 接 metanode；冷文件先落本机目录）
-    let catalog: Arc<dyn CatalogOps> = Arc::new(MemoryCatalog::new());
+    // ③ 元数据面：给了 `--meta` 就接 metanode（注册经 raft、心跳只碰内存），
+    //    否则只在本进程内登记（单机形态）。
+    //    冷存根两种形态一致：先落本机目录。
+    let catalog: Arc<dyn CatalogOps> = match &args.meta {
+        Some(addr) => Arc::new(yuntun_meta::RemoteCatalog::connect(vec![addr.clone()])?),
+        None => Arc::new(MemoryCatalog::new()),
+    };
     let store = create_store(&StoreConfig::Local {
         root: cold_root.to_string_lossy().into_owned(),
     })?;
@@ -134,17 +199,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(&args.listen).await?;
     let addr = listener.local_addr()?;
 
-    // ⑤ 登记进名录（T12.3）：数据节点进程是"名录里的成员"这一概念的第一个真实来源，
-    //    地址 = 数据面监听地址（查询侧据此装配热读器）。
-    //    ⚠️ 必须排在 bind 之后：`--listen 127.0.0.1:0` 时只有 bind 完才知道真实端口。
-    //    （本刀仍是**本地** catalog；接 metanode 时同一个 trait 方法会走 raft 的 op。）
-    catalog
-        .register_datanode(yuntun_model::meta::DatanodeMember {
-            instance_id: args.instance_id.clone(),
-            address: addr.to_string(),
-            registered_at_ms: 0,
-        })
-        .await?;
+    // ⑤ **入册 + 心跳保活**（T12.3 的收口）。
+    //    ⚠️ 入册必须排在 bind 之后：`--listen 127.0.0.1:0` 时只有 bind 完才知道真实端口。
+    //    入册是 **best-effort**：元数据面暂时不可达不该让数据节点停摆（它仍能本地吸收 WAL、
+    //    服务热读）；心跳轮会持续重试直到入册成功。
+    let (id, addr_s) = (args.instance_id.clone(), addr.to_string());
+    register_datanode(&catalog, &id, &addr_s).await;
+    let _heartbeat = spawn_heartbeat(
+        catalog.clone(),
+        id.clone(),
+        addr_s.clone(),
+        std::time::Duration::from_secs(args.heartbeat_secs),
+        shutdown.clone(),
+    );
     println!("LISTEN {addr}");
     tracing::info!(
         %addr,

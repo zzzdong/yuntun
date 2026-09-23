@@ -124,6 +124,12 @@ pub trait CatalogOps: Send + Sync {
     /// **没有默认实现是刻意的**：任何默认值（包括"空表"）都等于"没有数据节点" ——
     /// 查询会据此按空成员表算归属（`§69` 那类**静默少数据**）。
     async fn datanodes(&self) -> Result<Vec<DatanodeMember>, LakeError>;
+
+    /// **心跳**：告诉元数据面"我还活着"，返回我是否**仍在名录里**。
+    ///
+    /// `false` 的语义是"**你已被摘除，请重新注册**" —— 数据节点据此自愈（`§72.2`）。
+    /// 注意它**不是**写操作：元数据面只更新内存存活表，**绝不写 raft**（`§3.2`）。
+    async fn heartbeat(&self, instance_id: &str) -> Result<bool, LakeError>;
 }
 
 /// 归一化表标识：裸名 → `public.<name>`；限定名原样（兼容 v1 单 schema 数据/调用）。
@@ -301,6 +307,16 @@ impl CatalogOps for MemoryCatalog {
             .values()
             .cloned()
             .collect())
+    }
+
+    /// 本地实现：名录就在自己手里 ⇒ "我还在不在名录里"是个本地判断（规则与 metanode 一致）。
+    async fn heartbeat(&self, instance_id: &str) -> Result<bool, LakeError> {
+        Ok(self
+            .state
+            .read()
+            .unwrap()
+            .datanodes()
+            .contains_key(instance_id))
     }
 
     async fn manifest_delta(&self, since_manifest_ver: u64) -> Result<ManifestDelta, LakeError> {

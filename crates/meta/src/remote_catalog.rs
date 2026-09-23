@@ -484,6 +484,23 @@ fn actual_version_of(st: &tonic::Status) -> Option<u64> {
 
 #[async_trait::async_trait]
 impl CatalogOps for RemoteCatalog {
+    async fn heartbeat(&self, instance_id: &str) -> Result<bool, LakeError> {
+        // 与 `status`/`prefetch` 同形：轮换地址、带超时、全失败才返回错。
+        // ⚠️ 心跳**不进 raft**（元数据面只改内存存活表）—— 所以它便宜到可以每几秒一次。
+        let mut last: Option<LakeError> = None;
+        for i in 0..self.clients.len() {
+            let mut c = self.client(i);
+            let req = pb::HeartbeatRequest {
+                instance_id: instance_id.to_string(),
+            };
+            match tokio::time::timeout(READ_TIMEOUT, c.heartbeat(req)).await {
+                Ok(Ok(r)) => return Ok(r.into_inner().known),
+                Ok(Err(st)) => last = Some(map_status(st)),
+                Err(_) => last = Some(LakeError::Other("Heartbeat 超时".into())),
+            }
+        }
+        Err(last.unwrap_or_else(|| LakeError::Other("没有可用的 metanode（Heartbeat）".into())))
+    }
     async fn register_datanode(
         &self,
         m: yuntun_model::meta::DatanodeMember,
