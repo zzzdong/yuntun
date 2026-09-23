@@ -698,6 +698,22 @@ impl Drop for Cluster {
 /// 3. **摘除走 op**：名录变更必须与 schema/manifest 同版本传下去（`§3.1`）——
 ///    而**触发它的心跳**不进 raft（`§3.2`）。这两件事在代码里必须分开，否则要么写爆 raft，
 ///    要么让各副本对"谁存在"产生分歧。
+/// **在途登记的 TTL**（毫秒）：这是 grace 原本承担的那个职责（`§83`）。
+///
+/// 取 1h（与旧 grace 同量级）—— 它要盖住"写者从登记到提交"的**最坏**时长
+/// （大文件 / S3 抖动 / 长 GC）。太长 ⇒ 崩溃写者的残局保护过头（只是留着垃圾）；
+/// 太短 ⇒ 可能把**正在写**的文件放开给 GC（**真丢数据**）。两个方向不对称，
+/// 所以宁长勿短。
+const IN_FLIGHT_TTL_MS: u64 = 3_600_000;
+
+/// 墙钟毫秒（**发起方打点**：状态机不读钟 —— 时刻随 op 过线）。
+fn now_ms_wall() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 pub fn spawn_liveness_sweep(
     handle: NodeHandle,
     timeout: std::time::Duration,
@@ -716,6 +732,30 @@ pub fn spawn_liveness_sweep(
             let _ = tokio::task::spawn_blocking(move || {
                 if !hb.is_leader() {
                     return;
+                }
+
+                // 在途登记的 TTL 清扫（`§83.6` 遗留①）：与"摘除数据节点"**同一条巡检、
+                // 同一个 leader 闸门** —— 触发者是巡检（不进 raft），但结果（撤销保护）
+                // 必须进 raft（否则各节点对"还算不算在途"各说各话 ⇒ GC 按自己的理解删 ✗）。
+                //
+                // ⚠️ 只在**确实有过期条目**时才提议：否则每个 tick 都白写一次 raft。
+                let expired = hb
+                    .sm
+                    .lock()
+                    .unwrap()
+                    .count_expired_in_flight(IN_FLIGHT_TTL_MS, now_ms_wall());
+                if expired > 0 {
+                    let _ = hb.propose(
+                        yuntun_proto::meta::Op {
+                            now_ms: now_ms_wall(),
+                            kind: Some(yuntun_proto::meta::op::Kind::SweepInFlight(
+                                yuntun_proto::meta::SweepInFlightOp {
+                                    ttl_ms: IN_FLIGHT_TTL_MS,
+                                },
+                            )),
+                        },
+                        std::time::Duration::from_secs(5),
+                    );
                 }
                 let roster: Vec<String> = hb
                     .sm

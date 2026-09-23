@@ -476,6 +476,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc as SArc;
     use yuntun_catalog::MemoryCatalog;
+    use yuntun_format::{write_batch, DataFormat};
     use yuntun_model::ops::CommitFilesRequest;
     use yuntun_model::ops::CreateTableRequest;
 
@@ -485,6 +486,161 @@ mod tests {
             vec![SArc::new(Int64Array::from(vec![1, 2, 3]))],
         )
         .unwrap()
+    }
+
+    /// **R6 准出专项**：多写者持续写 + 孤儿 GC 开启 ⇒ **零误删**。
+    ///
+    /// 与上面那条回归的分工：那条钉**单次**语义（grace = 0 也不许删在途），这条跑
+    /// **并发压力** —— 两个写者真写文件、真登记、真提交，同时一个 GC 以 `grace = 0`
+    /// 反复扫。判据不是"GC 什么都没删"，而是三条**一起**：
+    ///
+    /// 1. 目录里每个**可见文件**的对象都**真的存在**（删错 = 目录指向空气 ⇒ 真丢数据）；
+    /// 2. 可见文件行数之和 == 写入行数之和（批次一个不少）；
+    /// 3. GC **确实干过活**（预埋的真孤儿必须消失）—— 否则这条用例可能只是"GC 没跑"。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multi_writer_plus_gc_never_deletes_a_committed_file() {
+        const TABLE: &str = "public.gcstress";
+        const SHARD: &str = "s0";
+        const WINDOW: &str = "w";
+        const WRITERS: usize = 2;
+        const ROUNDS: usize = 8;
+        const ROWS: u64 = 3;
+
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let catalog: Arc<dyn CatalogOps> = Arc::new(yuntun_catalog::MemoryCatalog::new());
+        catalog
+            .create_table(CreateTableRequest {
+                name: "gcstress".into(),
+                namespace: yuntun_model::ops::DEFAULT_SCHEMA.into(),
+                schema: SArc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)])),
+                partition_cols: vec![],
+                default_format: "parquet".into(),
+                ingest_config: Default::default(),
+            })
+            .await
+            .unwrap();
+
+        // 预埋一个**真孤儿**：没人登记、目录里也没有 —— 它必须被回收（防空转）
+        write_batch(
+            &store,
+            TABLE,
+            SHARD,
+            WINDOW,
+            "planted-orphan",
+            &batch(),
+            DataFormat::Parquet,
+        )
+        .await
+        .unwrap();
+
+        let shutdown = CancellationToken::new();
+        let _gc = spawn_orphan_cleanup_with_interval(
+            store.clone(),
+            catalog.clone(),
+            "yuntun/".to_string(),
+            Duration::ZERO, // **不靠时间假设**：全靠在途登记
+            Duration::from_millis(20),
+            shutdown.clone(),
+        );
+
+        // 两个写者并发：**先登记 → 再写文件 → 再提交**（真实写入顺序）
+        let mut tasks = Vec::new();
+        for w in 0..WRITERS {
+            let store = store.clone();
+            let catalog = catalog.clone();
+            tasks.push(tokio::spawn(async move {
+                for i in 0..ROUNDS {
+                    let id = format!("w{w}-b{i}");
+                    catalog.record_in_flight(&id, now_ms()).await.unwrap();
+                    let (path, size, rows) = write_batch(
+                        &store,
+                        TABLE,
+                        SHARD,
+                        WINDOW,
+                        &id,
+                        &batch(),
+                        DataFormat::Parquet,
+                    )
+                    .await
+                    .unwrap();
+
+                    // ⚠️ 这个 sleep **不是**为了抖时序，而是**让在途窗口真实存在**：
+                    // 内存存储的 PUT 几乎是瞬时的，"已上传未提交"的窗口只有微秒级 ⇒
+                    // GC（20ms 一轮）未必有机会扫到它 ⇒ 用例会**假通过**（只证明 GC 跑过，
+                    // 没证明它有过可乘之机）。50ms > GC 间隔 ⇒ **每个文件都必然在
+                    // "文件已存在、目录还不知道"的状态下被扫到过** —— 这正是 T14.3 要挡的那一下。
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+
+                    catalog
+                        .commit_files(CommitFilesRequest {
+                            table: TABLE.into(),
+                            batch_id: id.clone(),
+                            client_request_id: None,
+                            client_request_ids: vec![],
+                            shard: SHARD.into(),
+                            time_window: WINDOW.into(),
+                            files: vec![FileManifest {
+                                file_path: path,
+                                batch_id: id.clone(),
+                                file_size: size,
+                                row_count: rows,
+                                table: TABLE.into(),
+                                shard: SHARD.into(),
+                                time_window: WINDOW.into(),
+                                ..Default::default()
+                            }],
+                            schema_version: 1,
+                            row_count: rows,
+                        })
+                        .await
+                        .unwrap();
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        // 再让 GC 扫几轮：把"已提交"的文件也暴露在扫描之下（它们靠 files 保护）
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        shutdown.cancel();
+
+        // ---- 判据 ①：每个可见文件的对象**真的存在** ----
+        let snapshot = catalog.current_snapshot().await;
+        let visible = catalog
+            .list_visible_files(TABLE, snapshot, None)
+            .await
+            .unwrap();
+        assert_eq!(visible.len(), WRITERS * ROUNDS, "批次数不该少");
+        // 目录里此刻还躺着哪些对象（一次列举，判据 ① 与 ③ 共用）
+        let left: Vec<String> = list_s3_files(&store, "yuntun/")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+
+        // ---- 判据 ①：每个可见文件的对象**真的存在**（删错 = 目录指向空气）----
+        for f in &visible {
+            assert!(
+                left.iter().any(|p| p == &f.file_path),
+                "可见文件的对象不见了（误删 = 真丢数据）：{}",
+                f.file_path
+            );
+        }
+
+        // ---- 判据 ②：行数一个不少 ----
+        assert_eq!(
+            visible.iter().map(|f| f.row_count).sum::<u64>(),
+            (WRITERS * ROUNDS) as u64 * ROWS,
+            "可见行数必须等于写入行数"
+        );
+
+        // ---- 判据 ③：GC 真的干过活 ----
+        assert!(
+            !left.iter().any(|p| p.contains("planted-orphan")),
+            "埋下的真孤儿必须被回收 —— 否则这条用例是空转：{left:?}"
+        );
     }
 
     /// **T14.3 的回归用例**（`R-9`）：在途文件**连静置期都不用等**，GC 也不许删它。

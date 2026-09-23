@@ -93,6 +93,9 @@ message Op {
     // 走 raft 的理由：孤儿 GC 在**别的**节点上跑，它唯一能问的权威就是目录 ——
     // "已上传未提交"必须对**所有人**可见，否则删错文件就是**真丢数据**（`R-9`）。
     RecordInFlightOp record_in_flight = 16;
+    // **在途登记的超时清扫**（T14.3）：写者崩在半路时，登记不能永远保护一个没人认领的文件。
+    // 与摘除数据节点同形：**触发者是巡检（不进 raft），但结果（撤销保护）必须进**。
+    SweepInFlightOp sweep_in_flight = 17;
   }
 }
 
@@ -119,6 +122,11 @@ message RenewLeaseOp {
 // 在途登记（T14.3）：`batch_id` 已认领、正在/即将上传，尚未 `commit_files`。
 message RecordInFlightOp {
   string batch_id = 1;
+}
+
+// 在途登记的超时清扫（T14.3）。`ttl_ms` 由**提议方**给定（策略在巡检那一侧，不在状态机里）。
+message SweepInFlightOp {
+  uint64 ttl_ms = 1;
 }
 
 // 释放（优雅停机）：置为空闲并**保留代次水位**，让接手方不必干等 TTL。

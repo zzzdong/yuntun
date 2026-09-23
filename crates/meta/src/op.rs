@@ -113,6 +113,8 @@ pub enum StateOp {
     },
     /// **在途批次登记**（T14.3）：上传对象存储之前的声明，让孤儿 GC 看得见。
     RecordInFlight { batch_id: String, now_ms: u64 },
+    /// **在途登记的超时清扫**（T14.3）：与摘除同形 —— 触发者是巡检，结果进 raft。
+    SweepInFlight { ttl_ms: u64, now_ms: u64 },
 }
 
 // `CreateTableRequest` 里有 `SchemaRef`（`Arc<Schema>`）—— `Arc` 未使用会告警
@@ -139,7 +141,8 @@ impl StateOp {
             | StateOp::AcquireLease { now_ms, .. }
             | StateOp::RenewLease { now_ms, .. }
             | StateOp::ReleaseLease { now_ms, .. }
-            | StateOp::RecordInFlight { now_ms, .. } => *now_ms,
+            | StateOp::RecordInFlight { now_ms, .. }
+            | StateOp::SweepInFlight { now_ms, .. } => *now_ms,
         }
     }
 }
@@ -267,6 +270,10 @@ pub fn decode_op(op: &pb::Op) -> Result<StateOp, MetaError> {
         },
         pb::op::Kind::RecordInFlight(r) => StateOp::RecordInFlight {
             batch_id: r.batch_id.clone(),
+            now_ms,
+        },
+        pb::op::Kind::SweepInFlight(s) => StateOp::SweepInFlight {
+            ttl_ms: s.ttl_ms,
             now_ms,
         },
         pb::op::Kind::AcquireLease(a) => StateOp::AcquireLease {
@@ -717,6 +724,12 @@ pub fn apply(state: &mut CatalogState, op: &StateOp) -> Result<ApplyOutcome, Met
             // 幂等：重复登记保留首次时刻（失败重试不该无限续命）
             state.record_in_flight(batch_id, now);
             Ok(ApplyOutcome::one())
+        }
+        StateOp::SweepInFlight { ttl_ms, .. } => {
+            // 一个都没过期 ⇒ "无事可做"（`accepted=false`，不是错误）
+            Ok(ApplyOutcome::with_count(
+                state.sweep_expired_in_flight(*ttl_ms, now) as u64,
+            ))
         }
         // ---- 租约（T14.1）：判定**必须随结果过线**（`ProposeResponse.result`）----
         StateOp::AcquireLease {

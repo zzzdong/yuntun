@@ -724,6 +724,15 @@ impl CatalogState {
         self.in_flight.keys().cloned().collect()
     }
 
+    /// **有过期条目吗**（只读，不清理）：给巡检用 —— 没有就不提议，
+    /// 免得每个 tick 都白写一次 raft。
+    pub fn count_expired_in_flight(&self, ttl_ms: u64, now_ms: u64) -> usize {
+        self.in_flight
+            .values()
+            .filter(|announced| now_ms.saturating_sub(**announced) >= ttl_ms)
+            .count()
+    }
+
     /// 在途登记的超时清理：写者崩在半路时，登记不能永远保护一个已经没人认领的文件。
     ///
     /// `now_ms` 由调用方传入（纪律 1：状态机不读钟）。
