@@ -128,7 +128,11 @@ pub struct PreparedStatement {
 
 /// SQL 执行引擎：编排 query / ingest / catalog 三项能力（无自身状态）。
 pub struct SqlEngine {
-    pub(crate) ingest: Arc<Ingestor>,
+    /// 写入侧。**`None` = 本节点只读**（查询节点：不持有 WAL/chunk，只查）。
+    ///
+    /// 只读不是"把方法调用藏起来"，而是**装配事实**：查询节点上根本没有 Ingestor
+    /// （没有私有目录、没有 WAL）。`write_policy` 是它对外的声明，这里是没有能力。
+    pub(crate) ingest: Option<Arc<Ingestor>>,
     pub(crate) query: Arc<QueryEngine>,
     pub(crate) catalog: Arc<dyn CatalogOps>,
     pub write_policy: WritePolicy,
@@ -141,11 +145,29 @@ impl SqlEngine {
         catalog: Arc<dyn CatalogOps>,
     ) -> Self {
         Self {
-            ingest,
+            ingest: Some(ingest),
             query,
             catalog,
             write_policy: WritePolicy::AllowWrite,
         }
+    }
+
+    /// **只读装配**（查询节点）：没有写入侧，且 `write_policy` 明确声明只读。
+    ///
+    /// 两者一起才完整：策略让"写语句"得到**可读的拒绝**（`SqlError::ReadOnly`），
+    /// `None` 则保证即使策略被绕过也不会有人真的去写（下方各处 `ok_or` 兜底）。
+    pub fn new_readonly(query: Arc<QueryEngine>, catalog: Arc<dyn CatalogOps>) -> Self {
+        Self {
+            ingest: None,
+            query,
+            catalog,
+            write_policy: WritePolicy::ReadOnly,
+        }
+    }
+
+    /// 写入侧（只读装配下报 `ReadOnly`，而不是 panic）。
+    pub(crate) fn ingest_side(&self) -> Result<&Arc<Ingestor>, SqlError> {
+        self.ingest.as_ref().ok_or(SqlError::ReadOnly)
     }
 
     pub fn with_write_policy(mut self, policy: WritePolicy) -> Self {
@@ -402,14 +424,17 @@ impl SqlEngine {
                     .map(|k| yuntun_ingest::derive_batch_key(k, idx as u64)),
                 received_at: std::time::SystemTime::now(),
             };
-            self.ingest.ingest(ib).await.map_err(SqlError::from_lake)?;
+            self.ingest_side()?
+                .ingest(ib)
+                .await
+                .map_err(SqlError::from_lake)?;
         }
         Ok(())
     }
 
     /// DDL 事件追加 WAL（Catalog apply 成功后 append，顺序即因果，S1.7）。
     pub(crate) async fn append_ddl(&self, p: DdlPayload) -> Result<(), SqlError> {
-        self.ingest
+        self.ingest_side()?
             .wal
             .append(yuntun_model::wal_record::Record::Ddl(p))
             .await
@@ -587,7 +612,12 @@ impl SqlEngine {
                     return Err(SqlError::SchemaNotFound(ns.to_string()));
                 }
                 // CREATE TABLE 的 ingest 配置使用 General 模板（强制幂等键，plan §4.3）
-                let default_format = self.ingest.cfg.default_format.ext().to_string();
+                // 建表默认格式：只读节点没有写入侧配置，退化为 parquet（建表本身也会被策略拒绝）
+                let default_format = self
+                    .ingest
+                    .as_ref()
+                    .map(|i| i.cfg.default_format.ext().to_string())
+                    .unwrap_or_else(|| "parquet".to_string());
                 let req = CreateTableRequest {
                     name: bare.to_string(),
                     namespace: ns.to_string(),

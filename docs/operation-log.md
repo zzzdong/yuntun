@@ -4817,3 +4817,76 @@ schema/manifest 同版本传下去（`§3.1`）。两者混在一起会二选一
 1. **多 metanode 的存活判定一致性**（`§72.5` 第 2 条）：本刀只在 leader 上判定；
 2. **R5 的 fanout（T13.1）**：只向"活跃"成员拉数据 —— 存活表与名录就是它的输入；
 3. **T12.1 的其余两个进程**（`queryd` / `compactor`）与写入面仍未拆。
+
+---
+
+## 74. T12.1 第二刀：**查询节点进程** `yuntun-queryd`（2026-09-23）
+
+### 74.1 分工：数据节点写、查询节点查
+
+| | 数据节点（`yuntun-ingestor`） | **查询节点（`yuntun-queryd`）** |
+|---|---|---|
+| 私有状态 | WAL + chunk（**写**） | **无**（不持有任何本地数据） |
+| 元数据 | 向 metanode 注册 + 心跳 | **只读** metanode |
+| 热数据 | 自己持有、对外提供 | 向各数据节点**拉**（gRPC 数据面） |
+| 冷数据 | 写 | 读（共享对象存储） |
+| 写入面 | 接受 | **明确拒绝**（只读节点） |
+
+### 74.2 补上的那一环：谁按地址建 `GrpcShardFetch`
+
+`§71` 让名录（含**数据面地址**）随元数据下发，但当时没有答案的是——**谁拿地址去建连接**
+（`§71.5` 遗留第 3 条）。`reconcile_hot_readers` 就是那个答案，两步顺序刻意：
+
+1. `cache.refresh(catalog)` —— **成员表先落地**（摘除也在这里发生：名录里没有的实例会被
+   `set_members` 连热读器一起摘掉，`§69`）；
+2. 给"有名录但**还没接线**"的成员装 `GrpcShardFetch` → `RemoteShard` → `set_hot_shards`。
+
+**只补缺、不重建**：已接线的实例保住已有连接 —— 否则连接数会变成名录巡检频率的函数。
+
+### 74.3 "只读"写进**类型**里，而不是写在注释里
+
+查询节点没有写入侧不是策略选择，而是**装配事实**（没有 WAL、没有私有目录）：
+
+| 件 | 改动 |
+|---|---|
+| `SqlEngine.ingest` | `Option<Arc<Ingestor>>` + `new_readonly`（`WritePolicy::ReadOnly` 早在，`SqlError::ReadOnly` 也早在） |
+| `FlightServer.ingest` | `Option<Arc<Ingestor>>` + `new_readonly`；`DoPut` ⇒ `failed_precondition`（**可读的拒绝**） |
+
+两条路径（SQL 语句 / Flight DoPut）都给**可读的拒绝** —— 而不是让调用方以为写成功了。
+
+### 74.4 用例：`crates/ingestor/tests/queryd_e2e.rs`
+
+```text
+  ① metanode（进程内，真 gRPC 服务）
+       ▲ 注册/心跳                        ▲ 只读元数据（名录含数据面地址）
+  ② yuntun-ingestor 子进程            ③ yuntun-queryd（真 Flight 服务）
+       └────── ④ 数据面 gRPC：RemoteShard 拉热数据 ──────┘
+                          ▲ ⑤ 客户端发 SQL
+```
+
+① 建表（走**客户端那条路**：`RemoteCatalog` → Propose → raft）→ ② 起数据节点子进程
+（预置 WAL ⇒ 热数据在**另一个进程**里长出来）→ ③ 断言名录里的**地址 == 它打印的 LISTEN**
+（数据面地址这一环）→ ④ 起查询节点（进程内，启动即按名录接线）→ ⑤ `SELECT` 读到 3 行
+（**查询节点自己没有数据**）→ ⑥ `INSERT` 被拒（只读）。0.52s 跑完。
+
+**为什么查询节点跑在进程内**：集成测试只能引用**自己 crate 的** `CARGO_BIN_EXE_*`，
+而**数据节点必须是真子进程**（那才是"跨进程"的关键一半）。Flight 仍然是真的：真 TCP、
+真协议、真 `DoGet`。为此把 `queryd` 拆成 lib + 薄 bin（`Queryd::start` 返回真实地址）。
+
+### 74.5 验证、观察与遗留
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **335 passed / 0 failed（+1 ignored）**；
+  clippy 本仓 **0**
+- 规模：42,106 行 / 21 个 crate / 335 测试函数
+
+**观察（不是本次改动引起，但值得记）**：`-j 8` 那一轮里 chaos 的
+`disk_watermark_aborts_oldest_batch_then_releases_segments` 失败（耗时 54.76s），
+而**单独跑 0.11s 通过**、`-j 4` 全量也通过 —— 与前一条 flake 同一类：**负载把时序余量吃掉**。
+它的等待口径值得照 `§69.6` 的做法再收一遍（等到条件成立 + 宽松超时，而不是靠"机器够快"）。
+
+**遗留**：
+
+1. **`--meta` 的数据节点还没把 WAL 里的 DDL 重放进 metanode**（`§68` 的老账）——
+   所以用例里的建表是走客户端路径做的。数据节点重启后的"表在不在"要靠它，属元数据面 DDL 可见性；
+2. **`compactor` 未拆**（T12.1 的第三个进程）；
+3. 跨进程写入面仍未定（客户端把数据交给哪个数据节点 / 怎么路由）—— R5 的 fanout 与它相邻。

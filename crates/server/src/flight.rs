@@ -64,7 +64,8 @@ type DoGetStream =
 
 /// Flight gRPC 服务端：直接组合 ingest（写）/ query（读）/ catalog（meta）底层能力。
 pub struct FlightServer {
-    pub(crate) ingest: Arc<Ingestor>,
+    /// 写入侧。**`None` = 本节点只读**（查询节点不接受 DoPut）。
+    pub(crate) ingest: Option<Arc<Ingestor>>,
     pub(crate) query: Arc<QueryEngine>,
     /// SQL 处理层（v13：分流/prepare/元数据语义的唯一实现）
     pub(crate) sql: Arc<SqlEngine>,
@@ -95,7 +96,7 @@ impl FlightServer {
             catalog.clone(),
         ));
         Self {
-            ingest,
+            ingest: Some(ingest),
             query,
             sql,
             prepared: Mutex::new(HashMap::new()),
@@ -104,6 +105,17 @@ impl FlightServer {
 
     /// 复用外部 [`SqlEngine`]（standalone 装配：与 MySQL wire 端口共享同一实例，
     /// write_policy 等实例级配置单点生效）。
+    /// **只读装配**（查询节点）：不接受 `DoPut`，SQL 侧也按只读构造。
+    pub fn new_readonly(query: Arc<QueryEngine>, catalog: Arc<dyn CatalogOps>) -> Self {
+        let sql = Arc::new(SqlEngine::new_readonly(query.clone(), catalog));
+        Self {
+            ingest: None,
+            query,
+            sql,
+            prepared: Mutex::new(HashMap::new()),
+        }
+    }
+
     pub fn with_sql(mut self, sql: Arc<SqlEngine>) -> Self {
         self.sql = sql;
         self
@@ -323,8 +335,13 @@ impl FlightServer {
                             Status::invalid_argument("first FlightData must carry schema")
                         })?;
                         // S1.8：键优先级 = 每条 FlightData 的 app_metadata > prepared 语句上的键 > 生成
+                        let Some(ingest) = self.ingest.clone() else {
+                            return Err(Status::failed_precondition(
+                                "本节点只读（查询节点不接受写入）；请把写入发给数据节点",
+                            ));
+                        };
                         spawn_sql_ingest(
-                            self.ingest.clone(),
+                            ingest,
                             table,
                             schema,
                             stream,
@@ -351,7 +368,12 @@ impl FlightServer {
                 let schema = flight_schema_of(&first).ok_or_else(|| {
                     Status::invalid_argument("first FlightData must carry schema")
                 })?;
-                spawn_sql_ingest(self.ingest.clone(), table, schema, stream, tx, None);
+                let Some(ingest) = self.ingest.clone() else {
+                    return Err(Status::failed_precondition(
+                        "本节点只读（查询节点不接受写入）；请把写入发给数据节点",
+                    ));
+                };
+                spawn_sql_ingest(ingest, table, schema, stream, tx, None);
             }
         }
         Ok(())
@@ -542,7 +564,11 @@ impl FlightService for FlightServer {
             .ok_or_else(|| Status::invalid_argument("first FlightData must carry schema"))?;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<PutResult, Status>>(64);
-        let ingest = self.ingest.clone();
+        let Some(ingest) = self.ingest.clone() else {
+            return Err(Status::failed_precondition(
+                "本节点只读（查询节点不接受写入）；请把写入发给数据节点",
+            ));
+        };
 
         tokio::spawn(async move {
             let dict_ids: HashMap<i64, ArrayRef> = HashMap::new();

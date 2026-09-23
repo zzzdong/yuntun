@@ -31,3 +31,8 @@ yuntun-proto = { path = "../proto" }
 yuntun-testkit = { path = "../testkit" }
 arrow = { workspace = true }
 tokio-util = { workspace = true }
+yuntun-queryd = { path = "../queryd" }
+yuntun-server = { path = "../server" }
+arrow-flight = { workspace = true }
+futures = { workspace = true }
+tonic = { workspace = true }

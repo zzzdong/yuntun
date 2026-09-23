@@ -5474,9 +5474,12 @@ name = "yuntun-ingestor"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "arrow-flight",
  "clap",
+ "futures",
  "tokio",
  "tokio-util",
+ "tonic",
  "tracing",
  "tracing-subscriber",
  "yuntun-catalog",
@@ -5485,6 +5488,8 @@ dependencies = [
  "yuntun-model",
  "yuntun-proto",
  "yuntun-query",
+ "yuntun-queryd",
+ "yuntun-server",
  "yuntun-shardrpc",
  "yuntun-store",
  "yuntun-testkit",
@@ -5567,6 +5572,29 @@ dependencies = [
  "yuntun-store",
  "yuntun-testkit",
  "yuntun-wal",
+]
+
+[[package]]
+name = "yuntun-queryd"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "arrow-flight",
+ "clap",
+ "futures",
+ "tokio",
+ "tokio-util",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "yuntun-catalog",
+ "yuntun-meta",
+ "yuntun-model",
+ "yuntun-proto",
+ "yuntun-query",
+ "yuntun-server",
+ "yuntun-shardrpc",
+ "yuntun-store",
 ]
 
 [[package]]
