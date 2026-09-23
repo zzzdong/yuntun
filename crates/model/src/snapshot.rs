@@ -48,12 +48,12 @@ use crate::error::SnapshotError;
 /// 帧头 magic（含版本字母，便于十六进制 dump 时肉眼识别）。
 pub const SNAPSHOT_MAGIC: [u8; 8] = *b"YTSNAP01";
 /// 本实现写出的帧格式版本。
-/// 快照载荷布局版本。**改布局必须 +1**（例如 2：新增 `datanodes`；3：新增 `leases`）。
+/// 快照载荷布局版本。**改布局必须 +1**（例如 2：`datanodes`；3：`leases`；4：`in_flight`）。
 ///
 /// 为什么必须 bump：`decode_payload` 拿它做**严格相等**校验 —— 旧构建读到新载荷会
 /// **明确拒绝**，而不是默默忽略未知字段。名录这类字段一旦被静默丢掉，查询侧就会按
 /// 空成员表算归属（`§69` 那类"静默少数据"）。
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 4;
 /// 帧头长度。
 pub const SNAPSHOT_HEADER_LEN: usize = 36;
 /// 块头长度（`data_len` + `crc`）。
@@ -238,6 +238,19 @@ pub struct SnapshotIdempotencyEntry {
     pub record: Option<crate::meta::IdempotencyRecord>,
 }
 
+/// 快照里的一条**在途批次**（T14.3）：已认领（即将/正在上传对象存储）但尚未提交。
+///
+/// 进快照的理由与名录、租约同源：**丢一份就等于"没有在途"** ⇒ 孤儿 GC 会把别人正在写的
+/// 文件当垃圾删掉（`R-9`，删错文件是**真丢数据**）。
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct SnapshotInFlightEntry {
+    #[prost(string, tag = "1")]
+    pub batch_id: String,
+    /// 登记时刻（Unix 毫秒；**由发起方打点**，状态机不读钟）
+    #[prost(uint64, tag = "2")]
+    pub announced_at_ms: u64,
+}
+
 /// 快照里的一条"每表最后清单变更版本"。
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct SnapshotTableVerEntry {
@@ -298,6 +311,9 @@ pub struct CatalogStateSnapshot {
     /// **租约**（T14.1）：丢一份就等于"接手方以为没人持有" ⇒ 重复合并。
     #[prost(message, repeated, tag = "13")]
     pub leases: Vec<crate::meta::LeaseEntry>,
+    /// **在途批次**（T14.3）：丢一份就等于"没有在途" ⇒ 孤儿 GC 误删正在写的文件。
+    #[prost(message, repeated, tag = "14")]
+    pub in_flight: Vec<SnapshotInFlightEntry>,
 }
 
 // ---------------------------------------------------------------- 载荷编解码

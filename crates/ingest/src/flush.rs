@@ -162,7 +162,13 @@ pub async fn flush_chunk_with_id(
     deps.wal.append(pending.clone()).await?;
     deps.tracker.observe(&pending);
 
-    // ④ 编码写对象存储
+    // ④ **先在目录里登记"在途"**（T14.3），再上传。
+    //    顺序是刻意的：**先声明、后写文件** —— 反过来就有一个窗口，GC 恰好在此期间
+    //    扫到这个文件并（在静置期之后）把它当孤儿删掉。
+    //    这一步失败**不能**继续写：宁可不落这个文件，也不能写出一个 GC 看不见的在途文件。
+    deps.catalog.record_in_flight(&batch_id, now).await?;
+
+    // ⑤ 编码写对象存储
     let (file_path, file_size) = match write_to_object_store(deps, input, &batch_id, &merged).await {
         Ok(x) => x,
         Err(e) => {

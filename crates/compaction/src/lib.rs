@@ -289,9 +289,15 @@ pub fn classify_orphans(
 /// 每 interval 列举 `prefix` 下全部 S3 对象 → 与 Meta 已知 batch_id 对账
 /// → 未匹配的文件记录"首次发现时间"，**静置超过 grace 才删除**。
 ///
-/// 【正确性关键】grace 期内绝不删除 —— 防止误删"刚写完 S3、CommitFiles 还没落地"
-/// 的进行中批次文件；恢复路径（resume_recovered）在启动阶段先行重建 Meta，
-/// 因此重启场景下 known_batch_ids 在清理循环启动前已就绪。
+/// 【正确性关键】判据是 `known_batch_ids` = **已提交文件 ∪ 在途批次**（T14.3）。
+///
+/// 在 T14.3 之前这里靠**时间假设**兜底："刚写完 S3、CommitFiles 还没落地"的文件
+/// 靠 grace 期内不删来保护 —— 而一个**上传慢于 grace** 的写者（大文件 / S3 抖动 /
+/// 长 GC）就会被**误删**（`R-9`：删错文件是**真丢数据**，比重复合并严重得多）。
+///
+/// 现在写者在上传**之前**就把 `batch_id` 登记进目录（`CatalogOps::record_in_flight`），
+/// 提交时撤销 —— 于是"在途"对 GC **显式可见**，grace 退回它本来的角色：
+/// 只兜住"登记了但写者已死"的残局（配合在途 TTL 清扫）。
 pub fn spawn_orphan_cleanup(
     store: Arc<dyn object_store::ObjectStore>,
     catalog: Arc<dyn CatalogOps>,
@@ -479,6 +485,71 @@ mod tests {
             vec![SArc::new(Int64Array::from(vec![1, 2, 3]))],
         )
         .unwrap()
+    }
+
+    /// **T14.3 的回归用例**（`R-9`）：在途文件**连静置期都不用等**，GC 也不许删它。
+    ///
+    /// 这条用例在 T14.3 之前**必然失败**：那时判据只有"已提交文件"，一个刚上传、还没
+    /// `commit_files` 的文件在静置期一过就被当孤儿删掉（这里 grace 取 `ZERO` ⇒ 立刻删）。
+    /// 删错文件是**真丢数据**，比重复合并严重得多 —— 所以这条要有一条**对照**（真孤儿必须被回收），
+    /// 否则用例可能只是"GC 根本没跑"。
+    #[tokio::test]
+    async fn gc_never_deletes_an_in_flight_file_even_with_zero_grace() {
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let catalog: Arc<dyn CatalogOps> = Arc::new(yuntun_catalog::MemoryCatalog::new());
+
+        // 两个真文件：一个**登记为在途**，一个纯孤儿
+        let (inflight_path, _, _) = yuntun_format::write_batch(
+            &store,
+            "public.gc",
+            "s0",
+            "w",
+            "inflight-batch",
+            &batch(),
+            yuntun_format::DataFormat::Parquet,
+        )
+        .await
+        .unwrap();
+        let (orphan_path, _, _) = yuntun_format::write_batch(
+            &store,
+            "public.gc",
+            "s0",
+            "w",
+            "orphan-batch",
+            &batch(),
+            yuntun_format::DataFormat::Parquet,
+        )
+        .await
+        .unwrap();
+        catalog.record_in_flight("inflight-batch", now_ms()).await.unwrap();
+
+        let shutdown = CancellationToken::new();
+        let _gc = spawn_orphan_cleanup_with_interval(
+            store.clone(),
+            catalog.clone(),
+            "yuntun/".to_string(),
+            Duration::ZERO, // 静置期取 0：**不靠时间假设**，只靠"在途可见"
+            Duration::from_millis(20),
+            shutdown.clone(),
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        shutdown.cancel();
+
+        let left: Vec<String> = list_s3_files(&store, "yuntun/")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        assert!(
+            left.iter().any(|p| p == &inflight_path),
+            "在途文件绝不删（这正是 T14.3）：{left:?}"
+        );
+        assert!(
+            !left.iter().any(|p| p == &orphan_path),
+            "真孤儿应当被回收 —— 否则这条用例是空转：{left:?}"
+        );
     }
 
     /// **栅栏**：被接管后的"在途提交"必须被拒 —— 否则被罢黜的持有者会产出第二份合并文件。

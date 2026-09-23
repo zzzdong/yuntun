@@ -89,6 +89,10 @@ message Op {
     AcquireLeaseOp acquire_lease = 13;
     RenewLeaseOp   renew_lease   = 14;
     ReleaseLeaseOp release_lease = 15;
+    // **在途批次登记**（T14.3）：写者在上传对象存储**之前**声明"这个 batch_id 正在写"。
+    // 走 raft 的理由：孤儿 GC 在**别的**节点上跑，它唯一能问的权威就是目录 ——
+    // "已上传未提交"必须对**所有人**可见，否则删错文件就是**真丢数据**（`R-9`）。
+    RecordInFlightOp record_in_flight = 16;
   }
 }
 
@@ -110,6 +114,11 @@ message RenewLeaseOp {
   // 代次（栅栏）：不符 = 你已经不是持有者，**立刻停手**
   uint64 epoch   = 3;
   uint64 ttl_ms  = 4;
+}
+
+// 在途登记（T14.3）：`batch_id` 已认领、正在/即将上传，尚未 `commit_files`。
+message RecordInFlightOp {
+  string batch_id = 1;
 }
 
 // 释放（优雅停机）：置为空闲并**保留代次水位**，让接手方不必干等 TTL。

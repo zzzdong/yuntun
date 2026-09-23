@@ -172,6 +172,16 @@ pub trait CatalogOps: Send + Sync {
         holder: &str,
         epoch: u64,
     ) -> Result<bool, LakeError>;
+
+    // ---- 在途批次（T14.3：孤儿 GC 的多写者安全）----
+    /// **登记在途批次**：写者在上传对象存储**之前**声明"这个 `batch_id` 正在写"。
+    ///
+    /// 为什么必须走目录（而不是各节点自己记）：孤儿 GC 在**别的**节点上跑，
+    /// 它唯一能问的权威就是目录 —— "已上传未提交"必须对**所有人**可见，
+    /// 否则删错文件就是**真丢数据**（`R-9`）。
+    ///
+    /// `now_ms` 由调用方打点（纪律 1：状态机不读钟），远端形态下随 op 过线。
+    async fn record_in_flight(&self, batch_id: &str, now_ms: u64) -> Result<(), LakeError>;
 }
 
 /// 归一化表标识：裸名 → `public.<name>`；限定名原样（兼容 v1 单 schema 数据/调用）。
@@ -380,6 +390,14 @@ impl CatalogOps for MemoryCatalog {
             .write()
             .unwrap()
             .release_lease(purpose, holder, epoch))
+    }
+
+    async fn record_in_flight(&self, batch_id: &str, now_ms: u64) -> Result<(), LakeError> {
+        self.state
+            .write()
+            .unwrap()
+            .record_in_flight(batch_id, now_ms);
+        Ok(())
     }
 
     async fn datanodes(&self) -> Result<Vec<DatanodeMember>, LakeError> {

@@ -111,6 +111,8 @@ pub enum StateOp {
         epoch: u64,
         now_ms: u64,
     },
+    /// **在途批次登记**（T14.3）：上传对象存储之前的声明，让孤儿 GC 看得见。
+    RecordInFlight { batch_id: String, now_ms: u64 },
 }
 
 // `CreateTableRequest` 里有 `SchemaRef`（`Arc<Schema>`）—— `Arc` 未使用会告警
@@ -136,7 +138,8 @@ impl StateOp {
             | StateOp::RemoveDatanode { now_ms, .. }
             | StateOp::AcquireLease { now_ms, .. }
             | StateOp::RenewLease { now_ms, .. }
-            | StateOp::ReleaseLease { now_ms, .. } => *now_ms,
+            | StateOp::ReleaseLease { now_ms, .. }
+            | StateOp::RecordInFlight { now_ms, .. } => *now_ms,
         }
     }
 }
@@ -260,6 +263,10 @@ pub fn decode_op(op: &pb::Op) -> Result<StateOp, MetaError> {
                 // 时间戳留 0：**由 `apply` 用 op 的 `now_ms` 落章**（见 apply 里的注释）
                 registered_at_ms: 0,
             },
+            now_ms,
+        },
+        pb::op::Kind::RecordInFlight(r) => StateOp::RecordInFlight {
+            batch_id: r.batch_id.clone(),
             now_ms,
         },
         pb::op::Kind::AcquireLease(a) => StateOp::AcquireLease {
@@ -704,6 +711,11 @@ pub fn apply(state: &mut CatalogState, op: &StateOp) -> Result<ApplyOutcome, Met
             if !state.register_datanode(stamped) {
                 return Ok(ApplyOutcome::hit());
             }
+            Ok(ApplyOutcome::one())
+        }
+        StateOp::RecordInFlight { batch_id, .. } => {
+            // 幂等：重复登记保留首次时刻（失败重试不该无限续命）
+            state.record_in_flight(batch_id, now);
             Ok(ApplyOutcome::one())
         }
         // ---- 租约（T14.1）：判定**必须随结果过线**（`ProposeResponse.result`）----

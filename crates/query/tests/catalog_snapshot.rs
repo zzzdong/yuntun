@@ -227,6 +227,13 @@ impl CatalogOps for BrokenCatalog {
     ) -> Result<bool, yuntun_model::LakeError> {
         self.inner.release_lease(purpose, holder, epoch).await
     }
+    async fn record_in_flight(
+        &self,
+        batch_id: &str,
+        now_ms: u64,
+    ) -> Result<(), yuntun_model::LakeError> {
+        self.inner.record_in_flight(batch_id, now_ms).await
+    }
     async fn heartbeat(&self, id: &str) -> Result<bool, yuntun_model::LakeError> {
         self.inner.heartbeat(id).await
     }

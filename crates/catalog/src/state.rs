@@ -42,7 +42,7 @@ use crate::normalize_table;
 use yuntun_model::error::SnapshotError;
 use yuntun_model::snapshot::{
     CatalogStateSnapshot, SnapshotFileEntry, SnapshotIdempotencyEntry, SnapshotSchemaEntry,
-    SnapshotTableEntry, SnapshotTableVerEntry, SNAPSHOT_FORMAT_VERSION,
+    SnapshotInFlightEntry, SnapshotTableEntry, SnapshotTableVerEntry, SNAPSHOT_FORMAT_VERSION,
 };
 
 /// Catalog 的全部可变状态。
@@ -74,6 +74,12 @@ pub struct CatalogState {
     /// 放状态机里而非内存表：租约是**授权**，必须线性一致（`§3.1` 的反面教材是存活心跳 ——
     /// 那是"发现"，秒级、不进 raft）。
     leases: BTreeMap<String, LeaseEntry>,
+    /// **在途批次**（T14.3）：`batch_id` → 登记时刻（Unix 毫秒）。
+    ///
+    /// 语义：**已认领、正在/即将上传对象存储，但尚未 `commit_files`**。
+    /// 它存在的唯一理由是让**孤儿 GC 看得见** ——"已上传未提交"的文件不是垃圾，
+    /// 删了就是**真丢数据**（`R-9`）。此前这条判断只能靠 grace（时间假设）兜底。
+    in_flight: BTreeMap<String, u64>,
     /// 结构变更计数（表 / schema / schema 演进）—— 缓存**全量重建**的触发器（S2-5）
     schema_ver: u64,
     /// 文件清单变更计数 —— 缓存**增量刷新**的触发器（S2-5）
@@ -424,6 +430,10 @@ impl CatalogState {
             return Ok(self.dup_commit_response());
         }
 
+        // ①b 提交一旦开始，本条在途登记就完成使命（它已进 `files`，`known_batch_ids` 照样保护它）。
+        //     提交中途失败时该文件会退回"真孤儿"（写入方重试会产生新批次）—— 由静置期兜底。
+        self.clear_in_flight(&req.batch_id);
+
         // ② 幂等键唯一索引检查（§7.3 Meta 层全局去重）；
         //    `client_request_ids` 是**键集合**（一个 chunk 可聚合多个键，§27.5 遗留 #1）
         //
@@ -684,9 +694,44 @@ impl CatalogState {
         Ok(next)
     }
 
-    /// 已知 batch_id 列表（孤儿清理用）—— **排序**返回（纪律 2）。
+    /// **已知 batch_id 列表**（孤儿清理对账用）—— **排序**返回（纪律 2）。
+    ///
+    /// = 已提交的文件 ∪ **在途批次**。把在途算进来是 T14.3 的全部要点：
+    /// 前者是"已经在目录里的"，后者是"**马上要进目录的**"——只认前者，
+    /// GC 就会把正在写的文件当孤儿（`R-9`）。
     pub fn known_batch_ids(&self) -> Vec<String> {
-        self.files.keys().cloned().collect()
+        let mut ids: BTreeSet<String> = self.files.keys().cloned().collect();
+        ids.extend(self.in_flight.keys().cloned());
+        ids.into_iter().collect()
+    }
+
+    /// **登记在途批次**（上传对象存储**之前**调用）。
+    ///
+    /// 幂等：同一 `batch_id` 重复登记保留首次时刻（重试/恢复不该无限续命）。
+    pub fn record_in_flight(&mut self, batch_id: &str, now_ms: u64) {
+        self.in_flight
+            .entry(batch_id.to_string())
+            .or_insert(now_ms);
+    }
+
+    /// **撤销在途登记**（`commit_files` 成功时调用；失败重试时会重新登记）。
+    pub fn clear_in_flight(&mut self, batch_id: &str) -> bool {
+        self.in_flight.remove(batch_id).is_some()
+    }
+
+    /// 当前在途批次（诊断 / 测试用）。
+    pub fn in_flight_batch_ids(&self) -> Vec<String> {
+        self.in_flight.keys().cloned().collect()
+    }
+
+    /// 在途登记的超时清理：写者崩在半路时，登记不能永远保护一个已经没人认领的文件。
+    ///
+    /// `now_ms` 由调用方传入（纪律 1：状态机不读钟）。
+    pub fn sweep_expired_in_flight(&mut self, ttl_ms: u64, now_ms: u64) -> usize {
+        let before = self.in_flight.len();
+        self.in_flight
+            .retain(|_, announced| now_ms.saturating_sub(*announced) < ttl_ms);
+        before - self.in_flight.len()
     }
 
     // ---------------------------------------------------------------- 确定性编码
@@ -742,6 +787,14 @@ impl CatalogState {
                 .collect(),
             datanodes: self.datanodes.values().cloned().collect(),
             leases: self.leases.values().cloned().collect(),
+            in_flight: self
+                .in_flight
+                .iter()
+                .map(|(batch_id, announced_at_ms)| SnapshotInFlightEntry {
+                    batch_id: batch_id.clone(),
+                    announced_at_ms: *announced_at_ms,
+                })
+                .collect(),
             table_manifest_ver: self
                 .table_manifest_ver
                 .iter()
@@ -850,6 +903,18 @@ impl CatalogState {
                 )));
             }
         }
+        let mut in_flight: BTreeMap<String, u64> = BTreeMap::new();
+        for e in &msg.in_flight {
+            if in_flight
+                .insert(e.batch_id.clone(), e.announced_at_ms)
+                .is_some()
+            {
+                return Err(SnapshotError::InvalidState(format!(
+                    "在途批次 {} 重复",
+                    e.batch_id
+                )));
+            }
+        }
         let mut table_manifest_ver: BTreeMap<String, u64> = BTreeMap::new();
         for e in &msg.table_manifest_ver {
             if table_manifest_ver
@@ -870,6 +935,7 @@ impl CatalogState {
             idempotency,
             datanodes,
             leases,
+            in_flight,
             snapshot_version: msg.revision,
             last_applied: msg.last_applied,
             schema_ver: msg.schema_ver,
@@ -1397,6 +1463,38 @@ mod snapshot_tests {
     }
 
     #[test]
+    fn in_flight_batch_is_known_to_the_gc_until_it_is_cleared() {
+        let mut s = CatalogState::new();
+        assert!(s.in_flight_batch_ids().is_empty());
+
+        // **上传之前**登记 ⇒ 立刻对 GC 可见（这就是"在途显式可见"的全部内容）
+        s.record_in_flight("b-inflight", 1_000);
+        assert_eq!(s.in_flight_batch_ids(), vec!["b-inflight".to_string()]);
+        assert!(s.known_batch_ids().contains(&"b-inflight".to_string()));
+
+        // 重复登记保留**首次**时刻（失败重试不该无限续命）
+        s.record_in_flight("b-inflight", 9_999);
+        assert_eq!(s.sweep_expired_in_flight(1_000, 1_500), 0, "应保留首次时刻");
+
+        // 超时 ⇒ 撤销保护（写者崩在半路，登记不能永远保护一个没人认领的文件）
+        assert_eq!(s.sweep_expired_in_flight(1_000, 2_000), 1);
+        assert!(!s.known_batch_ids().contains(&"b-inflight".to_string()));
+    }
+
+    #[test]
+    fn committing_clears_the_in_flight_entry_but_protection_never_gaps() {
+        let mut s = rich_state();
+        s.record_in_flight("b5", 3_010);
+        assert!(s.known_batch_ids().contains(&"b5".to_string()));
+
+        s.commit_files(commit_req("public.cpu", "b5", &["k5"]), 4_000)
+            .unwrap();
+        assert!(s.in_flight_batch_ids().is_empty(), "提交后应撤销在途登记");
+        // **保护不断档**：文件已进 `files`，照样在 known 里（GC 没有可乘之机）
+        assert!(s.known_batch_ids().contains(&"b5".to_string()));
+    }
+
+    #[test]
     fn compaction_fence_rejects_a_deposed_holder() {
         let mut s = CatalogState::new();
         // 本地构造（`merged_file` 在另一个测试模块里）
@@ -1469,6 +1567,10 @@ mod snapshot_tests {
         let mut s = rich_state();
         s.acquire_lease("compaction", "inst-a", 3_004, 30_000);
         cases.push(("leases", s));
+
+        let mut s = rich_state();
+        s.record_in_flight("b-inflight", 3_005);
+        cases.push(("in_flight", s));
 
         let mut s = rich_state();
         s.record_idempotency(IdempotencyRecord {

@@ -573,6 +573,17 @@ impl CatalogOps for RemoteCatalog {
         Ok(decode_grant(&resp.result)?.granted)
     }
 
+    async fn record_in_flight(&self, batch_id: &str, now_ms: u64) -> Result<(), LakeError> {
+        self.propose(pb::Op {
+            now_ms,
+            kind: Some(pb::op::Kind::RecordInFlight(pb::RecordInFlightOp {
+                batch_id: batch_id.to_string(),
+            })),
+        })
+        .await?;
+        Ok(())
+    }
+
     async fn release_lease(
         &self,
         purpose: &str,
