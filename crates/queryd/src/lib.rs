@@ -52,6 +52,8 @@ pub struct QuerydConfig {
     pub cold_root: PathBuf,
     /// 名录巡检间隔（秒）。
     pub reconcile_secs: u64,
+    /// 部分结果策略（`architecture §4.2`）：`Allow`（默认）/ `Reject`。
+    pub partial: yuntun_query::PartialPolicy,
 }
 
 /// 起一个查询节点：绑定监听、装配好一切、**在后台开始服务**，返回真实地址与任务句柄。
@@ -82,7 +84,7 @@ pub async fn start(
     let store = create_store(&StoreConfig::Local {
         root: cfg.cold_root.to_string_lossy().into_owned(),
     })?;
-    let query = Arc::new(QueryEngine::new(store, cache));
+    let query = Arc::new(QueryEngine::new(store, cache).with_partial_policy(cfg.partial));
 
     // ④ 起服务：自己 bind，才能把**真实**端口交出去
     let listener = TcpListener::bind(&cfg.listen).await?;

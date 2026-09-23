@@ -28,6 +28,9 @@ struct Args {
     /// 名录巡检间隔（秒）：发现新数据节点，以及被摘除的成员
     #[arg(long, default_value_t = 5)]
     reconcile_secs: u64,
+    /// 读不到某个来源时的策略：`allow`（默认，返回部分结果 + 标记）或 `reject`（当场失败）
+    #[arg(long, default_value = "allow")]
+    partial: String,
 }
 
 #[tokio::main]
@@ -40,11 +43,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .init();
 
+    // 配置写错**启动即报错**：静默取默认会让"我配了 reject"变成一句谎言
+    let partial = yuntun_query::PartialPolicy::parse(&args.partial)
+        .ok_or_else(|| format!("invalid --partial {:?}: 只接受 \"allow\" 或 \"reject\"", args.partial))?;
     let (addr, serving) = start(QuerydConfig {
         meta: args.meta.clone(),
         listen: args.listen.clone(),
         cold_root: args.cold_root.clone(),
         reconcile_secs: args.reconcile_secs,
+        partial,
     })
     .await?;
 

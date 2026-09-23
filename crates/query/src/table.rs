@@ -65,6 +65,7 @@ use datafusion_datasource::PartitionedFile;
 use datafusion_datasource_parquet::source::ParquetSource;
 use std::sync::Arc;
 use crate::cache::HotShards;
+use crate::partial::{MissingSource, PartialSink};
 
 /// 一张 yuntun 表的 DataFusion 视图（**绑定在某个不可变 Catalog 快照上**）。
 #[derive(Debug)]
@@ -78,6 +79,9 @@ pub struct YuntunTableProvider {
     /// 热数据读侧（store 层 [`yuntun_store::ShardReader`]），**按实例**：scan 时逐实例读 chunk。
     /// 空 map = 未接线（单测），退化为纯磁盘分片（Manifest）可见性。
     hot: HotShards,
+    /// 读不到的来源往这里记（**每查询一个**）：`Allow` ⇒ 降级为部分结果并标记，
+    /// `Reject` ⇒ 当场失败点名（`crate::partial`）。
+    partial: Arc<PartialSink>,
 }
 
 impl YuntunTableProvider {
@@ -86,6 +90,7 @@ impl YuntunTableProvider {
         ident: impl Into<String>,
         schema: arrow::datatypes::SchemaRef,
         hot: HotShards,
+        partial: Arc<PartialSink>,
     ) -> Self {
         Self {
             snapshot,
@@ -94,6 +99,7 @@ impl YuntunTableProvider {
             store_url: ObjectStoreUrl::parse(crate::STORE_URL)
                 .unwrap_or_else(|_| ObjectStoreUrl::local_filesystem()),
             hot,
+            partial,
         }
     }
 }
@@ -128,14 +134,32 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
         // "已放弃本地副本的水位"，都用查询的快照版本去问，各自回答自己是否 STALE。
         // 键有序（`BTreeMap`）⇒ 批次拼接顺序确定 ⇒ 结果可复现。
         for (instance, reader) in &self.hot {
-            let read = reader
-                .read_table(&self.ident, self.snapshot.snapshot)
-                .await
-                .map_err(|e| {
-                    datafusion::error::DataFusionError::Execution(format!(
-                        "hot shard read ({instance}): {e}"
-                    ))
-                })?;
+            // 【T13.4】热读**失败**（连接拒绝 / 超时 / 内部错误）= "**拿不到**"：
+            // 按 `architecture §4.2/§4.3` 降级为**部分结果**并把来源记下来，
+            // `Reject` 策略下 `record` 会当场返回错误（点名缺了谁）。
+            //
+            // ⚠️ 这**不是** STALE 那条路，两者绝不可混同：STALE 是成员**答上来了**、
+            // 且答的是"我的水位超前于你的 manifest"（走下面 `read.stale`）—— 那是
+            // "**还没拿到**"（刷新 manifest 就拿到了），必须重试，**降级它等于静默少数据**。
+            let read = match reader.read_table(&self.ident, self.snapshot.snapshot).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let source = MissingSource {
+                        table: self.ident.to_string(),
+                        instance: instance.clone(),
+                        reason: e.to_string(),
+                    };
+                    tracing::warn!(
+                        table = %source.table,
+                        instance = %source.instance,
+                        error = %source.reason,
+                        policy = self.partial.policy().as_str(),
+                        "hot shard read failed; this source degrades to a PARTIAL result"
+                    );
+                    self.partial.record(source)?;
+                    continue;
+                }
+            };
             // `stale` ⇒ 本实例已放弃 (本次快照, 水位] 之间数据的本地副本，而本次快照的 manifest
             // 里还没有那些文件（`architecture-with-chunk §4.5` 的"两头都没有"窗口）。
             //

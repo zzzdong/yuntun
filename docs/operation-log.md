@@ -5006,3 +5006,85 @@ R4 的进程拆分到此成型（写入面另说）：
 1. **压缩租约 / 单一 compactor**（见 76.2）—— 部署不变量，代码尚未强制；
 2. **跨进程写入面未定**：客户端把数据交给哪个数据节点、怎么路由 —— 与 R5 的 fanout 相邻；
 3. `replay_wal_ddl` 每次启动整扫 WAL（幂等但啰嗦，`§75.4`）—— 性能项。
+
+---
+
+## 77. R5 / **T13.4 第一刀**：部分结果 —— 把"拿不到"与"还没拿到"分开（2026-09-23）
+
+### 77.1 症状：一个节点挂了，整条查询失败
+
+扇出（`crates/query/src/table.rs`）以前长这样：
+
+```rust
+let read = reader.read_table(&self.ident, self.snapshot.snapshot).await
+    .map_err(|e| ...)?;          // ← 任何失败 = 整条查询失败
+```
+
+而设计（`architecture-with-chunk §4.2` 第三条）写的是：
+
+> **partial response 默认允许**：节点失败时返回可用结果 + `partial: true` + 缺失来源列表。
+> 监控场景下"90% 数据 + 明确标记"远好过整体报错（**可配置拒绝**）。
+
+于是"一个监控节点挂了"变成"整个看板打不开"—— 与设计相反的默认。
+
+### 77.2 关键认识：两个通道**本来就是分开的**（错在把它们合并了）
+
+| | 信号从哪来 | 语义 | 该怎么办 |
+|---|---|---|---|
+| **STALE**（还没拿到） | `ShardRead.stale`（**读成功了**，携带水位） | 成员答上来了，答的是"我的水位超前于你的 manifest" | **刷新 + 重试**；追不上 ⇒ **响亮失败** |
+| **不可达 / 读失败**（拿不到） | `Err` | 成员**没能答**（连接拒绝、超时、内部错误） | **降级** + **明确标记缺了谁** |
+
+两者在类型层面一直是分开的，此前只是**被同一个 `?` 汇成了一条路**：把"**某个来源的事实**"
+当成了"**整条查询的结论**"。本刀只改后者那一侧的处理方式，前者一个字不动。
+
+### 77.3 最容易写错的地方：顺手把 STALE 也降级
+
+**绝不可以。** STALE 是"**拿得到**，只是我们的目录落后了"—— 对它降级 = 把**可修复的落后**
+当成**永久缺失** = 静默少数据，正是 `§63.3` / `§67` 反复抓到的那个错误形状（只是换了层）。
+
+所以：`partial` 只挂在 `Err` 通道上；STALE 仍然走 `HotReadStale` → `with_stale_retry` →
+三次追不上就**报错**（"不返回不完整结果"）。`partial_fanout` 的第 ④ 条用例专门守着这条边界，
+断言"永久 STALE ⇒ 失败，**且错误里不得出现 partial 的措辞**"。
+
+### 77.4 实现
+
+| 件 | 内容 |
+|---|---|
+| `crates/query/src/partial.rs`（新） | `MissingSource{table,instance,reason}`、`PartialRead`（`is_partial` / `missing` / `describe`）、`PartialPolicy{Allow,Reject}`、`PartialSink`（每查询一个）、`PartialRejected`（**类型**，与 `HotReadStale` 同一考虑：字符串匹配认不出来） |
+| `table.rs` | 扇出错 ⇒ `record` + `continue`（**降级**）；`Reject` 时 `record` 直接返回错误（**当场失败并点名**） |
+| `lib.rs` | `QueryOutcome{batches, partial}` + `sql_partial` / `sql_with_partial`；`sql()`/`sql_stream()` 保持签名（warn 日志），**完整性这个事实另有出口** |
+| `config.rs` / 装配 | `[query] partial = "allow"`（默认）/ `"reject"`；**配置写错启动即报错** |
+
+两个刻意的细节：
+
+1. **配置写错不许静默取默认**：那会让"我配了 `reject`"变成一句谎言，而它的后果正是
+   "用户拿到一份自己以为完整、其实缺了来源的结果" —— 本项目里最不该静默的那件事。
+2. **sink 每次尝试重建**（STALE 刷新重试时）：上一次尝试缺的来源，如果这次读到了就不该继续算缺，
+   否则会把**完整结果误标为部分**（假警报同样是错 —— 它会让调用方不敢信任何结果）。
+   用例 ③ 守着这条。
+
+### 77.5 用例（`crates/query/tests/partial_fanout.rs` + `partial.rs` 单测）
+
+| # | 场景 | 断言 |
+|---|---|---|
+| ① | 一个来源**连接拒绝** | 查询**成功**、健康来源的数据**完整**返回、`is_partial()` 为真、缺失列表**点名** `inst-b` 且带原因 |
+| ② | 同上 + `Reject` | **失败**，错误里含 `inst-b` 与"拒绝部分结果" |
+| ③ | 两个来源都健康 | **不许**标 partial（假警报也是错） |
+| ④ | 一个来源**永远 STALE** | **失败**、错误含 `STALE` 与"不返回不完整结果"、**不含** partial 措辞 |
+
+### 77.6 验证与遗留
+
+- `cargo test -p yuntun-query --test partial_fanout` → 4 passed；`partial` 单测 4 passed
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **344 passed / 0 failed（+1 ignored）**
+- 规模：43,275 行 / 22 个 crate / 344 测试函数
+
+**遗留**（按重要度）：
+
+1. **"超时"这一半还没兑现**：今天只有**显式错误**会被降级（连接拒绝立刻失败 ✓），而**挂住**的
+   节点会让查询一直等 ✗ —— 要真正实现 `§4.3` 的"失败/超时 ⇒ 退化为只读冷数据"，
+   还得给数据面 RPC 加**客户端超时**（否则第 ① 条用例覆盖的只是"拒绝"，不是"无响应"）；
+2. **wire 层还没把 `partial` 交给用户**：MySQL 的 warning / Flight SQL 的 metadata 都还没有这个
+   信息 —— 现在只有日志与 `sql_partial()` 的返回值。设计要求"返回 `partial: true`"，
+   这一步还差一层协议出口；
+3. 设计的另两条（**下推 partial aggregate**、**冷数据文件按 datanode 分配**）属 R5 正题
+   （T13.1 的另一半 / T13.2）。

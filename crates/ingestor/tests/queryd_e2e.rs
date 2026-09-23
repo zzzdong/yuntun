@@ -334,6 +334,8 @@ async fn datanode_writes_and_queryd_reads_it_over_the_wire() {
         listen: "127.0.0.1:0".into(),
         cold_root: tmpdir("qd-cold"),
         reconcile_secs: 1,
+        // 默认 Allow（`architecture §4.2`）：用例不关心 partial，取默认
+        partial: yuntun_query::PartialPolicy::default(),
     })
     .await
     .expect("起查询节点");

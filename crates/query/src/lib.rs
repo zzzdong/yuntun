@@ -11,6 +11,7 @@
 //! scan 由 `list_visible_files(snapshot)` 结果构造 Parquet 文件组。
 
 pub mod cache;
+pub mod partial;
 pub mod provider;
 pub mod table;
 
@@ -19,6 +20,7 @@ pub use cache::{
     RefreshOutcome,
     Member,
 };
+pub use partial::{MissingSource, PartialPolicy, PartialRead, PartialRejected, PartialSink};
 pub use provider::{YuntunCatalogProvider, YuntunSchemaProvider};
 pub use table::{HotReadStale, YuntunTableProvider};
 
@@ -58,6 +60,28 @@ pub struct QueryEngine {
     store: std::sync::Arc<dyn object_store::ObjectStore>,
     catalog: std::sync::Arc<LocalCatalog>,
     runtime: Option<std::sync::Arc<RuntimeEnv>>,
+    /// partial 策略（`crate::partial`）：**默认 `Allow`** —— `architecture §4.2` 第三条
+    /// "节点失败时返回可用结果 + 明确标记"；装配层可设为 `Reject`。
+    partial_policy: PartialPolicy,
+}
+
+/// 一次查询的结果：批次 + **完整性标记**（`crate::partial`）。
+///
+/// 为什么把 partial 随结果交出去、而不是只写日志：设计要求"返回可用结果 +
+/// `partial: true` + **缺失来源列表**"（`architecture §4.2`）—— 日志是给运维的，
+/// 而"这份结果可不可信"是给**调用方**的，两者不能互相替代。
+#[derive(Debug, Clone)]
+pub struct QueryOutcome {
+    pub batches: Vec<arrow::record_batch::RecordBatch>,
+    /// 缺失来源；`is_partial()` 为 false 时是空的
+    pub partial: PartialRead,
+}
+
+impl QueryOutcome {
+    /// 结果是否**部分**（有来源没读到）。
+    pub fn is_partial(&self) -> bool {
+        self.partial.is_partial()
+    }
 }
 
 impl QueryEngine {
@@ -69,6 +93,7 @@ impl QueryEngine {
             store,
             catalog,
             runtime: None,
+            partial_policy: PartialPolicy::default(),
         }
     }
 
@@ -90,6 +115,7 @@ impl QueryEngine {
             store,
             catalog,
             runtime: Some(std::sync::Arc::new(runtime)),
+            partial_policy: PartialPolicy::default(),
         })
     }
 
@@ -108,6 +134,17 @@ impl QueryEngine {
                 _ => None,
             }
         })
+    }
+
+    /// 设 partial 策略（装配层从配置来；默认 [`PartialPolicy::Allow`]）。
+    pub fn with_partial_policy(mut self, policy: PartialPolicy) -> Self {
+        self.partial_policy = policy;
+        self
+    }
+
+    /// 当前 partial 策略。
+    pub fn partial_policy(&self) -> PartialPolicy {
+        self.partial_policy
     }
 
     /// 本地 Catalog（物化视图：刷新由后台任务驱动）。
@@ -129,9 +166,25 @@ impl QueryEngine {
 
     /// 按 **schema**（MySQL 的 database 概念）构造会话：
     /// 非限定表名 `FROM t` 解析到 `${CATALOG_NAME}.${schema}`（多 schema 支持）。
+    ///
+    /// 不带 partial 记录的版本（sink 当场丢弃）：给只关心"能不能执行"的调用方用；
+    /// 想知道**结果完不完整**请用 [`Self::sql_with_partial`] / [`Self::session_with_partial`]。
     pub async fn session_with_schema(
         &self,
         schema: &str,
+    ) -> Result<SessionContext, DataFusionError> {
+        self.session_with_partial(
+            schema,
+            std::sync::Arc::new(PartialSink::new(self.partial_policy)),
+        )
+        .await
+    }
+
+    /// 按 schema 构造会话，并把"读不到的来源"记进 `partial`（**每查询一个** sink）。
+    pub async fn session_with_partial(
+        &self,
+        schema: &str,
+        partial: std::sync::Arc<PartialSink>,
     ) -> Result<SessionContext, DataFusionError> {
         let config = datafusion::prelude::SessionConfig::new()
             .with_information_schema(true)
@@ -155,7 +208,7 @@ impl QueryEngine {
         let hot = self.catalog.hot_shards();
         ctx.register_catalog(
             CATALOG_NAME,
-            std::sync::Arc::new(YuntunCatalogProvider::new(snapshot, hot)),
+            std::sync::Arc::new(YuntunCatalogProvider::new(snapshot, hot, partial)),
         );
         Ok(ctx)
     }
@@ -214,19 +267,55 @@ impl QueryEngine {
         self.sql_with_schema(query, SCHEMA_NAME).await
     }
 
-    /// 按 schema 执行 SQL（多 schema：非限定表名解析到该 schema）。
+    /// 按 schema 执行 SQL（多 schema：非限定表名解析到该 schema）；只返回批次。
+    ///
+    /// 降级（partial）发生在**内部**：策略 `Allow` 时返回可用部分并打一条 warn 日志；
+    /// 策略 `Reject` 时直接报错。**想要"结果完不完整"这个事实，请用
+    /// [`Self::sql_with_partial`]** —— 完整性不能只留在日志里。
     pub async fn sql_with_schema(
         &self,
         query: &str,
         schema: &str,
     ) -> Result<Vec<arrow::record_batch::RecordBatch>, DataFusionError> {
-        // 每次尝试都**重建会话**：provider 持有的是当次快照，刷新 manifest 之后必须换新的
-        self.with_stale_retry("sql", || async {
-            let ctx = self.session_with_schema(schema).await?;
-            let df = ctx.sql(query).await?;
-            df.collect().await
-        })
-        .await
+        Ok(self.sql_with_partial(query, schema).await?.batches)
+    }
+
+    /// 执行 SQL 并**带回完整性标记**（默认 schema = `public`）。
+    pub async fn sql_partial(&self, query: &str) -> Result<QueryOutcome, DataFusionError> {
+        self.sql_with_partial(query, SCHEMA_NAME).await
+    }
+
+    /// 执行 SQL 并**带回完整性标记**：批次 + 缺失来源（`crate::partial`）。
+    ///
+    /// 三个刻意的做法：
+    ///
+    /// 1. **每次尝试都重建会话 *与* sink**：provider 持有当次快照（刷新后必须换新的）；
+    ///    而 sink 是"**这一次尝试**"的事实 —— 上一次尝试缺的来源，若这次读到了就不该继续算缺，
+    ///    否则会把**完整结果误标为部分**（假警报比漏报好，但仍然是错的）；
+    /// 2. **降级不重试**：`§4.3` 说失败/超时 ⇒ 退化为只读冷数据 + 标记 partial，没有"再试一次"；
+    ///    `Reject` 策略下的拒绝同样不重试（对一个不可达的节点重试没有意义）；
+    /// 3. **STALE 仍然重试、仍然响亮失败**：那条路走 [`HotReadStale`]，与 partial 无关。
+    pub async fn sql_with_partial(
+        &self,
+        query: &str,
+        schema: &str,
+    ) -> Result<QueryOutcome, DataFusionError> {
+        let out = self
+            .with_stale_retry("sql", || async {
+                let partial = std::sync::Arc::new(PartialSink::new(self.partial_policy));
+                let ctx = self.session_with_partial(schema, partial.clone()).await?;
+                let df = ctx.sql(query).await?;
+                let batches = df.collect().await?;
+                Ok(QueryOutcome {
+                    batches,
+                    partial: partial.read(),
+                })
+            })
+            .await?;
+        if out.is_partial() {
+            tracing::warn!(detail = %out.partial.describe(), "query returned a PARTIAL result");
+        }
+        Ok(out)
     }
 
     /// 流式执行 SQL（S1.10）：返回 `RecordBatch` 流，**不 collect 全量**——
@@ -246,12 +335,19 @@ impl QueryEngine {
     ) -> Result<SendableRecordBatchStream, DataFusionError> {
         // 同上：`scan` 在物理计划期被调用（热读就在那里），所以 STALE 会在 `execute_stream`
         // 这一步冒出来 —— 此时流还没被消费，重试是干净的。
-        self.with_stale_retry("sql_stream", || async {
-            let ctx = self.session_with_schema(schema).await?;
-            let df = ctx.sql(query).await?;
-            df.execute_stream().await
-        })
-        .await
+        let (stream, partial) = self
+            .with_stale_retry("sql_stream", || async {
+                // 与 `sql_with_partial` 同理：每尝试一个 sink，免得把完整结果误标为部分
+                let partial = std::sync::Arc::new(PartialSink::new(self.partial_policy));
+                let ctx = self.session_with_partial(schema, partial.clone()).await?;
+                let df = ctx.sql(query).await?;
+                Ok((df.execute_stream().await?, partial.read()))
+            })
+            .await?;
+        if partial.is_partial() {
+            tracing::warn!(detail = %partial.describe(), "sql_stream returned a PARTIAL result");
+        }
+        Ok(stream)
     }
 
     /// 已收集批次 → 流：非 DataFusion 产出（方言 shim 的 canned 结果、SHOW TABLES

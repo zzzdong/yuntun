@@ -411,6 +411,15 @@ async fn build_embedded_catalog(
                 registered_at_ms: 0,
             })
             .await?;
+        // partial 策略（`architecture §4.2`）：配置写错**启动即报错** ——
+        // 静默取默认会让"我明明配了 reject"变成一句谎言，而它的后果是用户拿到
+        // 一份自己以为完整、其实缺了来源的结果。
+        let partial = yuntun_query::PartialPolicy::parse(&cfg.query.partial).ok_or_else(|| {
+            yuntun_model::error::LakeError::Other(format!(
+                "invalid [query] partial = {:?}: 只接受 \"allow\"（默认）或 \"reject\"",
+                cfg.query.partial
+            ))
+        })?;
         // query 执行区内存池 = 另一块独立预算，超限直接报错而不抢 chunk 内存（架构 §2.8）
         let query = Arc::new(
             QueryEngine::with_query_memory_limit(
@@ -420,7 +429,8 @@ async fn build_embedded_catalog(
             )
             .map_err(|e| {
                 yuntun_model::error::LakeError::Other(format!("query memory partition: {e}"))
-            })?,
+            })?
+            .with_partial_policy(partial),
         );
 
         // ⑦ SqlEngine（SQL 语义唯一实现；MySQL wire / Flight 共用同一份能力句柄）

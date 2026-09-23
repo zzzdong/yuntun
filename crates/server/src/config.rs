@@ -37,6 +37,8 @@
 //!
 //! [query]
 //! cache_ttl_secs = 30
+//! partial = "allow"                  # 读不到某个来源时：allow（默认，返回部分结果 + 标记）
+//!                                    # 或 reject（当场失败并点名缺了谁）
 //!
 //! [sql.mysql]
 //! enabled = true
@@ -280,11 +282,20 @@ impl Default for MetaSection {
 #[serde(default)]
 pub struct QuerySection {
     pub cache_ttl_secs: u64,
+    /// 部分结果策略（`architecture §4.2`）：`"allow"`（默认）或 `"reject"`。
+    ///
+    /// `allow` = 某个来源读不到时**降级为部分结果并标记缺失来源**；
+    /// `reject` = 当场失败并点名缺了谁。
+    /// 用字符串而不是枚举：配置面保持窄（解析失败会在启动时**报错退出**，见装配层）。
+    pub partial: String,
 }
 
 impl Default for QuerySection {
     fn default() -> Self {
-        Self { cache_ttl_secs: 30 }
+        Self {
+            cache_ttl_secs: 30,
+            partial: "allow".into(),
+        }
     }
 }
 

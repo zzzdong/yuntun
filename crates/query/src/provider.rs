@@ -7,6 +7,7 @@
 //! Catalog 版本**；`Arc` 共享也省掉了每次 `table()` 深拷贝文件清单的开销。
 
 use crate::cache::{CatalogSnapshot, HotShards};
+use crate::partial::PartialSink;
 use crate::table::YuntunTableProvider;
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
@@ -25,6 +26,8 @@ pub struct YuntunSchemaProvider {
     namespace: String,
     /// 热数据读侧（与快照同源注入；**空 map** = 未接线，退化为纯磁盘分片），按实例持有
     hot: HotShards,
+    /// 读不到的来源往这里记（每查询一个 sink）
+    partial: Arc<PartialSink>,
 }
 
 impl YuntunSchemaProvider {
@@ -32,11 +35,13 @@ impl YuntunSchemaProvider {
         snapshot: Arc<CatalogSnapshot>,
         namespace: impl Into<String>,
         hot: HotShards,
+        partial: Arc<PartialSink>,
     ) -> Self {
         Self {
             snapshot,
             namespace: namespace.into(),
             hot,
+            partial,
         }
     }
 }
@@ -55,6 +60,7 @@ impl SchemaProvider for YuntunSchemaProvider {
                 t.meta.qualified_name(),
                 t.schema.clone(),
                 self.hot.clone(),
+                self.partial.clone(),
             )))),
             None => Ok(None),
         }
@@ -97,11 +103,21 @@ impl SchemaProvider for YuntunSchemaProvider {
 pub struct YuntunCatalogProvider {
     snapshot: Arc<CatalogSnapshot>,
     hot: HotShards,
+    /// 读不到的来源往这里记（每查询一个 sink）
+    partial: Arc<PartialSink>,
 }
 
 impl YuntunCatalogProvider {
-    pub fn new(snapshot: Arc<CatalogSnapshot>, hot: HotShards) -> Self {
-        Self { snapshot, hot }
+    pub fn new(
+        snapshot: Arc<CatalogSnapshot>,
+        hot: HotShards,
+        partial: Arc<PartialSink>,
+    ) -> Self {
+        Self {
+            snapshot,
+            hot,
+            partial,
+        }
     }
 }
 
@@ -116,6 +132,7 @@ impl CatalogProvider for YuntunCatalogProvider {
                 self.snapshot.clone(),
                 name.to_string(),
                 self.hot.clone(),
+                self.partial.clone(),
             )))
         } else {
             None
