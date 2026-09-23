@@ -66,7 +66,7 @@ R2 已经把"访问形态"按远程形态定义好了（`operation-log §26`）�
                               │ ① 写：propose(op)
                               │ ② 读：Delta/Prefetch（本地缓存刷新）
         ┌─────────────────────┴──────────┐   ┌──────────────────────────────┐
-        │ datanode（当前形态：单进程）      │   │ queryd（R5 前与 datanode 同进程）│
+        │ datanode（当前形态：单进程）      │   │ 只查询的 datanode（R5 前同进程） │
         │ WAL → chunk → flush → CommitFiles│   │ LocalCatalog（版本驱动刷新）     │
         │ LocalCatalog（读路径不变）        │   │ ShardReader/HotShards          │
         └──────────────────────────────────┘   └──────────────────────────────┘

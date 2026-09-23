@@ -59,7 +59,7 @@
 - ❌ 心跳走 raft
 - ❌ spill 参与权威判定
 - ❌ 独立 ingestor 进程（会导致 INSERT 跨服务转发）
-- ❌ queryd（暂不建，触发条件见架构文档 K4）
+- ❌ 独立的 queryd 进程（不建：需要时用 `yuntun-datanode --no-ingest` 的只查询形态，触发条件见架构 K4）
 
 ---
 

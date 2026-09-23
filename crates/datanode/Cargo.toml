@@ -20,6 +20,13 @@ yuntun-shardrpc = { path = "../shardrpc" }
 # 数据节点要**入册/保活**（T12.3）：注册走 raft、心跳走内存。
 # 这是装配层，tonic 到这里为止（`yuntun-ingest` 写入路径仍然干净）。
 yuntun-meta = { path = "../meta" }
+# 查询侧（协调者 / 只查询形态）：查询引擎 + 只读 Flight SQL 服务面 + 数据面客户端。
+# `§79` 更正后它是**数据进程的一面**，不再是独立进程的依赖。
+yuntun-query = { path = "../query" }
+yuntun-server = { path = "../server" }
+arrow-flight = { workspace = true }
+futures = { workspace = true }
+tonic = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -27,16 +34,9 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-# 用例要在"查询侧"真的跑一遍引擎（数据面客户端 + 对拍）
-yuntun-query = { path = "../query" }
+# 用例要读元数据面（名录/心跳）的 proto 消息
 yuntun-proto = { path = "../proto" }
 yuntun-testkit = { path = "../testkit" }
 # 压缩用例要写真 parquet 文件（`arrow` 已在 dev-deps 里）
 yuntun-format = { path = "../format" }
 arrow = { workspace = true }
-tokio-util = { workspace = true }
-yuntun-queryd = { path = "../queryd" }
-yuntun-server = { path = "../server" }
-arrow-flight = { workspace = true }
-futures = { workspace = true }
-tonic = { workspace = true }

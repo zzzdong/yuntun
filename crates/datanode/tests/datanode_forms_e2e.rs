@@ -1,22 +1,23 @@
-//! R4 **T12.1 第二刀**：**查询节点**端到端 —— 数据写进数据节点进程，由查询节点查出来。
+//! **数据进程的两种形态**端到端（`operation-log §79` 的角色更正后重写）。
 //!
 //! ```text
 //!   ① metanode（进程内，真 gRPC 服务）
 //!        ▲ 注册/心跳                        ▲ 只读元数据（名录含**数据面地址**）
-//!   ② yuntun-datanode 子进程            ③ yuntun-queryd（真 Flight 服务）
+//!   ② yuntun-datanode --dir D            ③ yuntun-datanode --dir D --no-ingest --sql-listen
+//!      （ingest 形态：WAL⇒热数据+热读服务）  （只查询形态：不吃 WAL，只做协调者）
 //!        └──────── ④ 数据面 gRPC：RemoteShard 拉热数据 ────────┘
 //!                          ▲
-//!                     ⑤ 客户端发 SQL
+//!                     ⑤ 客户端发 SQL（经 Flight）
 //! ```
 //!
-//! **查询节点跑在进程内**是刻意的：集成测试只能引用自己 crate 的 `CARGO_BIN_EXE_*`，
-//! 而**数据节点必须是真子进程**（那才是"跨进程"的关键一半）。Flight 仍然是真的：
-//! 真 TCP、真协议、真 DoGet。
+//! **两个形态是同一条命令的两个开关组合**（`--no-ingest` / `--sql-listen`），不是两类进程 ——
+//! 所以这里两个都是**真子进程**（各自打自己的接口行：`LISTEN` / `SQL-LISTEN`）。
+//! Flight 仍然是真的：真 TCP、真协议、真 DoGet。
 //!
 //! 覆盖的语义（都是前面几刀留下、本轮第一次连起来跑的）：
 //! - `§71`：名录（含地址）下发 ⇒ `§71.5` 遗留第 3 条"谁按地址建 `GrpcShardFetch`"；
-//! - `§65`：按实例拉热数据（查询节点自己没有数据）；
-//! - 只读：查询节点对写入给出**可读的拒绝**，而不是假装成功。
+//! - `§65`：按实例拉热数据（只查询形态自己没有数据）；
+//! - 只读：SQL 面对写入给出**可读的拒绝**，而不是假装成功。
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
@@ -34,8 +35,10 @@ use tokio::net::TcpListener;
 use yuntun_catalog::CatalogOps as _;
 use yuntun_proto::meta as pb;
 
-const INGESTOR: &str = env!("CARGO_BIN_EXE_yuntun-datanode");
+const DATANODE: &str = env!("CARGO_BIN_EXE_yuntun-datanode");
 const INSTANCE: &str = "inst-a";
+/// 只查询形态的实例名（它**不**入册：名录的语义是"谁持有热数据"）
+const QUERY_ONLY: &str = "query-only";
 const TABLE: &str = "public.qd";
 const WINDOW: &str = "2026-09-23T10:00";
 
@@ -119,23 +122,8 @@ struct Proc {
 }
 
 impl Proc {
-    fn spawn_ingestor(data_dir: &std::path::Path, meta: SocketAddr) -> Self {
-        let mut child = Command::new(INGESTOR)
-            .arg("--instance-id")
-            .arg(INSTANCE)
-            .arg("--dir")
-            .arg(data_dir)
-            .arg("--listen")
-            .arg("127.0.0.1:0")
-            .arg("--meta")
-            .arg(meta.to_string())
-            .arg("--heartbeat-secs")
-            .arg("1")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("起 yuntun-datanode");
-
+    /// 把已 spawn 的子进程包上 stdout/stderr 采集。
+    fn wrap(mut child: Child) -> Self {
         let stdout = BufReader::new(child.stdout.take().expect("stdout"));
         let pipe = child.stderr.take().expect("stderr");
         let stderr = Arc::new(Mutex::new(String::new()));
@@ -151,6 +139,50 @@ impl Proc {
             stdout,
             stderr,
         }
+    }
+
+    /// **ingest 形态**：吸收自己的 WAL、持有热数据、对外提供热读，并**入册**。
+    fn spawn_data_node(data_dir: &std::path::Path, meta: SocketAddr) -> Self {
+        let child = Command::new(DATANODE)
+            .arg("--instance-id")
+            .arg(INSTANCE)
+            .arg("--dir")
+            .arg(data_dir)
+            .arg("--listen")
+            .arg("127.0.0.1:0")
+            .arg("--meta")
+            .arg(meta.to_string())
+            .arg("--heartbeat-secs")
+            .arg("1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("起 yuntun-datanode（ingest 形态）");
+        Self::wrap(child)
+    }
+
+    /// **只查询形态**（`--no-ingest`）：不吃 WAL、不留本地数据，只作为协调者拉别人的热数据。
+    ///
+    /// 与数据节点**共用同一个 `--dir`** 是刻意的：只查询形态**不占任何租约**（它没有私有状态），
+    /// 而 `<dir>/cold` 正是"同一份共享对象存储"在本机形态下的样子 —— 两个进程读同一份冷数据。
+    fn spawn_query_only(data_dir: &std::path::Path, meta: SocketAddr) -> Self {
+        let child = Command::new(DATANODE)
+            .arg("--instance-id")
+            .arg(QUERY_ONLY)
+            .arg("--dir")
+            .arg(data_dir)
+            .arg("--no-ingest")
+            .arg("--sql-listen")
+            .arg("127.0.0.1:0")
+            .arg("--meta")
+            .arg(meta.to_string())
+            .arg("--reconcile-secs")
+            .arg("1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("起 yuntun-datanode（只查询形态）");
+        Self::wrap(child)
     }
 
     /// 读 stdout 直到 `LISTEN <addr>`（= 它的**数据面**地址，名录里应当就是它）。
@@ -170,6 +202,26 @@ impl Proc {
                 return rest.parse().expect("解析 LISTEN 地址");
             }
             assert!(Instant::now() < deadline, "等待监听地址超时");
+        }
+    }
+
+    /// 读 stdout 直到 `SQL-LISTEN <addr>`（= 它的 **Flight SQL** 地址）。
+    fn wait_sql_listening(&mut self) -> SocketAddr {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = self.stdout.read_line(&mut line).expect("读子进程 stdout");
+            if n == 0 {
+                panic!(
+                    "子进程未打印 SQL-LISTEN 就退出了。stderr:\n{}",
+                    self.stderr.lock().unwrap()
+                );
+            }
+            if let Some(rest) = line.trim().strip_prefix("SQL-LISTEN ") {
+                return rest.parse().expect("解析 SQL-LISTEN 地址");
+            }
+            assert!(Instant::now() < deadline, "等待 SQL 监听地址超时");
         }
     }
 }
@@ -277,7 +329,7 @@ async fn sql(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn datanode_writes_and_queryd_reads_it_over_the_wire() {
+async fn ingest_form_writes_and_query_form_reads_it_over_the_wire() {
     // ---- ① metanode（进程内 + 真 gRPC 服务）----
     let meta_dir = tmpdir("qd-meta");
     let node = yuntun_meta::MetaNode::open(&meta_dir, 1, vec![1], HashMap::new()).expect("起单节点");
@@ -303,7 +355,7 @@ async fn datanode_writes_and_queryd_reads_it_over_the_wire() {
     // ---- ② 数据节点：真子进程（预置 WAL ⇒ 它会回放出 3 行热数据）----
     let data_dir = tmpdir("qd-data");
     seed_wal(&data_dir, &[1, 2, 3]).await;
-    let mut ingestor = Proc::spawn_ingestor(&data_dir, meta_addr);
+    let mut ingestor = Proc::spawn_data_node(&data_dir, meta_addr);
     let shard_addr = ingestor.wait_listening();
 
     // ---- ③ 名录里出现它，且**地址就是它打印的那个**（数据面地址这一环）----
@@ -328,20 +380,11 @@ async fn datanode_writes_and_queryd_reads_it_over_the_wire() {
         "数据节点的 WAL DDL 必须重放进元数据面（否则查询节点根本不知道有这张表）"
     );
 
-    // ---- ④ 查询节点：真 Flight 服务（进程内），启动即按名录接线热读器 ----
-    let (qd_addr, _serving) = yuntun_queryd::start(yuntun_queryd::QuerydConfig {
-        meta: meta_addr.to_string(),
-        listen: "127.0.0.1:0".into(),
-        cold_root: tmpdir("qd-cold"),
-        reconcile_secs: 1,
-        // 默认 Allow（`architecture §4.2`）：用例不关心 partial，取默认
-        partial: yuntun_query::PartialPolicy::default(),
-        hot_read_timeout: std::time::Duration::from_secs(5),
-    })
-    .await
-    .expect("起查询节点");
+    // ---- ④ **只查询形态**的数据进程：真子进程（`--no-ingest`），启动即按名录接线热读器 ----
+    let mut query_only = Proc::spawn_query_only(&data_dir, meta_addr);
+    let qd_addr = query_only.wait_sql_listening();
 
-    // ---- ⑤ 客户端发 SQL：数据在**另一个进程**里，查询节点自己没有数据 ----
+    // ---- ⑤ 客户端发 SQL：数据在**另一个进程**里（只查询形态自己没有热数据） ----
     let mut client = flight_client(qd_addr).await;
     let got = sql(&mut client, &format!("SELECT a FROM yuntun.{TABLE} ORDER BY a"))
         .await
@@ -349,7 +392,7 @@ async fn datanode_writes_and_queryd_reads_it_over_the_wire() {
     assert_eq!(
         got,
         vec![1, 2, 3],
-        "查询节点必须经数据面 gRPC 拉到数据节点进程里的热数据"
+        "只查询的数据进程必须经数据面 gRPC 拉到另一个进程里的热数据"
     );
 
     // ---- ⑥ 只读：写入必须被**可读地拒绝**，而不是假装成功 ----
@@ -360,6 +403,6 @@ async fn datanode_writes_and_queryd_reads_it_over_the_wire() {
     .await;
     assert!(
         rejected.is_err(),
-        "查询节点必须拒绝写入（只读），实际：{rejected:?}"
+        "SQL 面必须拒绝写入（本轮只读），实际：{rejected:?}"
     );
 }

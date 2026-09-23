@@ -12,7 +12,7 @@
 
 | # | 决策 | 说明 |
 |---|---|---|
-| D1 | 分离 **datanode** 与 **metanode** | 暂不建 queryd |
+| D1 | 分离 **datanode** 与 **metanode** | 不单独建 queryd —— 需要时用 `yuntun-datanode --no-ingest`（只查询形态，`§79`/`§80`） |
 | D2 | datanode 从 metanode 的 raft 感知伙伴，查询走分布式并发 | raft 管成员名录，不是心跳 |
 | D3 | datanode 同时承担 ingest 与 query | 读写同进程，INSERT 无需跨服务转发 |
 | D4 | **不做 shard** | 无路由、无归属、无迁移、无 rebalance |
@@ -382,7 +382,7 @@ DDL 跨节点可见性：CREATE 后在另一节点立即查可能查不到。DDL
 | K1 | **热数据 fanout 规模上限** | 发给全部 datanode，3–10 台无问题；再大需裁剪策略 |
 | K2 | 共享存储带宽成为瓶颈 | 所有节点从 S3 读，靠本地文件缓存缓解 |
 | K3 | 小文件更多 | 多节点各写各的，compaction 压力上升，它是唯一合并手段 |
-| K4 | 读写不能独立扩缩 | 需要时再加 queryd（本文不建，触发条件：查询负载明显挤占写入） |
+| K4 | 读写不能独立扩缩 | 需要时再加"只查询的数据进程"（`yuntun-datanode --no-ingest`；触发条件：查询负载明显挤占写入） |
 | K5 | datanode 有状态 | 扩缩容需处理 chunk/WAL，但**不搬已 flush 数据** |
 
 ---
