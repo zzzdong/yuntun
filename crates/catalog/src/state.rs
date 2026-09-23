@@ -685,6 +685,9 @@ impl CatalogState {
             nf.valid_from = next;
             nf.status = FileStatus::Active as u32;
             touched.insert(normalize_table(&nf.table));
+            // 产物已进目录 ⇒ 撤销它的在途登记（与 `commit_files` 同一条纪律）：
+            // 漏了不会丢数据（TTL 清扫兜底），但会让"在途集合"迟迟不空 —— 那是可观测性上的谎。
+            self.clear_in_flight(&nf.batch_id);
             self.files.insert(nf.batch_id.clone(), nf);
         }
         self.last_applied += 1;

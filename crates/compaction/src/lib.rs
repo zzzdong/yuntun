@@ -210,6 +210,19 @@ pub async fn compact_shard(
 
     // 写新文件（batch_id = 随机 UUIDv7，ADR-4；幂等由 Meta 层保证）
     let new_batch_id = uuid::Uuid::now_v7().to_string();
+
+    // 【T14.3 的纪律同样约束压缩**自己**】产物也是一个"**先有对象、后有目录**"的文件：
+    // 必须**先登记、再上传**。否则孤儿 GC（尤其 `orphan_grace` 取小时）会在
+    // `write_batch` 与 `commit_compaction` 之间把它当孤儿删掉 —— 而它一旦提交，
+    // 输入就转了墓碑 ⇒ **目录指向空气 = 真丢数据**（`R-9` 同类，只是主体从写者换成压缩器）。
+    //
+    // 提交成功时撤销（`commit_compaction` 内）；被栅栏拒绝/中途失败时留在集合里，
+    // 由在途 TTL 清扫兜底 —— 与写者的处置完全一致。
+    compactor
+        .catalog
+        .record_in_flight(&new_batch_id, now_ms())
+        .await?;
+
     let (new_path, new_size, _rows) = yuntun_format::write_batch(
         &compactor.store,
         table,
@@ -788,6 +801,319 @@ mod tests {
             .unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].row_count, 9, "3 个文件 × 3 行");
+    }
+
+    /// **R6 准出专项**：多节点持续写入 + 压缩 + GC 三者**同时**跑 ⇒ **文件数收敛到稳定区间**，
+    /// 且**行数一个不少**。
+    ///
+    /// 为什么单点用例凑不出这条结论：`§84`（不误删）、`§85`（真会删）、`§86`（合并不改行集）
+    /// 各自钉住一个性质，但都不回答"**持续跑下去会不会失控**" —— 而"文件数收敛"正是 R6 存在的
+    /// 理由（`plan §7.5` 准出）。
+    ///
+    /// 形态：两个写者（两个 `source_instance`，**同一 shard** —— 多节点写同一 partition 的真实
+    /// 形态）持续写；**真的**压缩循环（带租约）与**真的**孤儿 GC 同时跑。收尾后要同时满足：
+    ///
+    /// 1. **行数一个不少**（可见文件 `row_count` 之和 == 写入总行数）；
+    /// 2. **文件数收敛**（可见文件数 ≤ `min_files + 1`，而写入批次数是它的十几倍）；
+    /// 3. **每个可见文件的对象都真的存在**（这是本刀补的那个洞的直接检验：压缩产物若没登记
+    ///    在途，GC 可能在 PUT→commit 之间删掉它 —— 一旦提交，输入转墓碑 ⇒ 目录指向空气）；
+    /// 4. **空间真的回收 + 在途集合归零**（对象数远小于写过的批次数；保护集合 == 可见文件）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writers_compaction_and_gc_converge() {
+        const TABLE: &str = "public.converge";
+        const SHARD: &str = "s0";
+        const WINDOW: &str = "w";
+        const WRITERS: usize = 2;
+        const ROUNDS: usize = 16;
+        const MIN_FILES: usize = 3;
+        const ROWS: u64 = 3;
+
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let catalog: Arc<dyn CatalogOps> = Arc::new(yuntun_catalog::MemoryCatalog::new());
+        catalog
+            .create_table(CreateTableRequest {
+                name: "converge".into(),
+                namespace: yuntun_model::ops::DEFAULT_SCHEMA.into(),
+                schema: SArc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)])),
+                partition_cols: vec![],
+                default_format: "parquet".into(),
+                ingest_config: Default::default(),
+            })
+            .await
+            .unwrap();
+
+        let compactor = Arc::new(Compactor {
+            lease_holder: "comp-1".into(),
+            cfg: CompactionConfig {
+                min_files: MIN_FILES,
+                interval: Duration::from_millis(40),
+                // **grace = 0 是有意的**：这条用例不靠任何时间假设兜底 ——
+                // 所有保护都必须来自"结构可见"（在途登记 / 保护集合）。
+                // 注意：它**不是**"产物必须先登记"的确定性反证 —— 那个窗口（PUT 完成→提交）
+                // 只有毫秒级，测试里几乎撞不上；那条要求由 `a_fenced_merge_leaves_its_product_protected`
+                // 用"提交必被栅栏拒绝"的路径**确定性**地观察。
+                orphan_grace: Duration::ZERO,
+                lease_ttl: Duration::from_secs(30),
+                ..Default::default()
+            },
+            catalog: catalog.clone(),
+            store: store.clone(),
+            format: DataFormat::Parquet,
+        });
+
+        let shutdown = CancellationToken::new();
+        let loop_handle = spawn_compaction_loop(compactor.clone(), shutdown.clone());
+        let gc_handle = spawn_orphan_cleanup_with_interval(
+            store.clone(),
+            catalog.clone(),
+            "yuntun/".to_string(),
+            Duration::ZERO,
+            Duration::from_millis(20),
+            shutdown.clone(),
+        );
+
+        // 两个写者持续写（**先登记 → 写文件 → 提交**），压缩循环与 GC 同时在跑
+        let mut tasks = Vec::new();
+        for w in 0..WRITERS {
+            let store = store.clone();
+            let catalog = catalog.clone();
+            tasks.push(tokio::spawn(async move {
+                for i in 0..ROUNDS {
+                    let id = format!("w{w}-b{i}");
+                    catalog.record_in_flight(&id, now_ms()).await.unwrap();
+                    let (path, size, rows) = write_batch(
+                        &store,
+                        TABLE,
+                        SHARD,
+                        WINDOW,
+                        &id,
+                        &batch(),
+                        DataFormat::Parquet,
+                    )
+                    .await
+                    .unwrap();
+                    catalog
+                        .commit_files(CommitFilesRequest {
+                            table: TABLE.into(),
+                            batch_id: id.clone(),
+                            client_request_id: None,
+                            client_request_ids: vec![],
+                            shard: SHARD.into(),
+                            time_window: WINDOW.into(),
+                            files: vec![FileManifest {
+                                file_path: path,
+                                batch_id: id.clone(),
+                                file_size: size,
+                                row_count: rows,
+                                table: TABLE.into(),
+                                shard: SHARD.into(),
+                                time_window: WINDOW.into(),
+                                // 两个写者 = 两个实例（多节点形态）
+                                source_instance: format!("inst-{w}"),
+                                ..Default::default()
+                            }],
+                            schema_version: 1,
+                            row_count: rows,
+                        })
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+
+        // ---- 等收敛：可见文件数落到 `min_files + 1` 以内 ----
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut visible = Vec::new();
+        loop {
+            visible = catalog
+                .list_visible_files(TABLE, catalog.current_snapshot().await, None)
+                .await
+                .unwrap();
+            if visible.len() <= MIN_FILES + 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "文件数没有收敛：可见 {} 个（写入批次数 {}）",
+                visible.len(),
+                WRITERS * ROUNDS
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // ---- 判据 ①：行数一个不少 ----
+        let total: u64 = visible.iter().map(|f| f.row_count).sum();
+        assert_eq!(
+            total,
+            (WRITERS * ROUNDS) as u64 * ROWS,
+            "压缩持续跑了一路，行数必须一个不少"
+        );
+
+        // ---- 判据 ②：文件数收敛（写入 {} 次 → 只剩这么几个）----
+        assert!(
+            visible.len() <= MIN_FILES + 1,
+            "文件数应收敛到 {} 以内，实际 {}",
+            MIN_FILES + 1,
+            visible.len()
+        );
+        assert!(
+            visible.len() * 4 < WRITERS * ROUNDS,
+            "收敛必须是真的：可见 {} vs 写入 {}",
+            visible.len(),
+            WRITERS * ROUNDS
+        );
+
+        // ---- 判据 ③ + ④：对象真的在；空间回收；保护集合 == 可见文件 ----
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let objects: Vec<String> = list_s3_files(&store, "yuntun/")
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(p, _)| p)
+                .collect();
+            let known: Vec<String> = catalog.known_batch_ids().await.unwrap();
+            let all_present = visible.iter().all(|f| objects.contains(&f.file_path));
+            // 空间确实回收：对象数远小于写过的批次数
+            let reclaimed = objects.len() * 2 < WRITERS * ROUNDS;
+            // 在途集合归零：保护集合 == 可见文件（没有残留登记，也没有过期墓碑赖着）
+            let settled = known.len() == visible.len();
+            if all_present && reclaimed && settled {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "收尾未达成：
+  可见文件的对象都在? {all_present}
+  空间已回收? {reclaimed}（对象 {} vs 写入 {}）
+  保护集合==可见({})? {} （known {}）",
+                objects.len(),
+                WRITERS * ROUNDS,
+                visible.len(),
+                settled,
+                known.len()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        shutdown.cancel();
+        let _ = loop_handle.await;
+        let _ = gc_handle.await;
+    }
+
+    /// **压缩产物也必须"先登记、后上传"**（`R-9` 在压缩侧的形态）—— 确定性地观察这一步。
+    ///
+    /// 为什么不能靠压测观察：那个窗口是"对象已上传 → 目录已提交"之间的毫秒级缝隙
+    /// （真正决定它有多长的是提交那一次元数据往返），压测试了三次都撞不上 ⇒ 会**假通过**。
+    ///
+    /// 换个角度就能确定性观察：**让提交必然失败**（用一个落后于水位、必被栅栏拒绝的
+    /// `lease_epoch`）。此时产物的登记**不会**被撤销，于是：
+    ///
+    /// - 产物对象**真的在存储里**（说明窗口确实形成过）；
+    /// - 它的 `batch_id` **仍在保护集合里**（⇒ 孤儿 GC 不会在这个窗口里把它删掉）。
+    ///
+    /// 这后一条正是本刀的全部内容：**没有它，产物会在窗口里被当孤儿删掉，而它一旦提交，
+    /// 输入就转了墓碑 ⇒ 目录指向空气 = 真丢数据**（`R-9`）。去掉登记这一步，此用例必然失败。
+    #[tokio::test]
+    async fn a_fenced_merge_leaves_its_product_protected() {
+        let catalog: Arc<MemoryCatalog> = Arc::new(MemoryCatalog::new());
+        setup(&catalog).await;
+        let c = compactor(catalog.clone());
+
+        // 3 个真文件
+        let mut input_ids = Vec::new();
+        for _ in 0..3 {
+            let bid = uuid::Uuid::now_v7().to_string();
+            let (path, size, _rows) = write_batch(
+                &c.store,
+                "t",
+                "s0",
+                "w1",
+                &bid,
+                &batch(),
+                DataFormat::Parquet,
+            )
+            .await
+            .unwrap();
+            catalog
+                .commit_files(CommitFilesRequest {
+                    table: "t".into(),
+                    batch_id: bid.clone(),
+                    client_request_id: None,
+                    client_request_ids: vec![],
+                    shard: "s0".into(),
+                    time_window: "w1".into(),
+                    files: vec![FileManifest {
+                        file_path: path,
+                        batch_id: bid.clone(),
+                        file_size: size,
+                        row_count: 3,
+                        ..Default::default()
+                    }],
+                    schema_version: 1,
+                    row_count: 3,
+                })
+                .await
+                .unwrap();
+            input_ids.push(bid);
+        }
+
+        // 先立一条租约**水位**（代次 1）：随后用代次 0 提交 ⇒ 必被栅栏拒绝（`§82`）。
+        catalog
+            .acquire_lease("compaction", "someone-else", 60_000, now_ms())
+            .await
+            .unwrap();
+
+        let snap = catalog.current_snapshot().await;
+        let fenced = compact_shard(&c, "t", "s0", snap, 0).await;
+        assert!(fenced.is_err(), "代次落后必须被栅栏拒绝：{fenced:?}");
+
+        // 产物对象确实写出去了（窗口真的形成过）
+        let objects: Vec<String> = list_s3_files(&c.store, "yuntun/")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        let product_ids: Vec<String> = objects
+            .iter()
+            .filter_map(|p| yuntun_format::extract_batch_id(p))
+            .filter(|id| !input_ids.contains(id))
+            .collect();
+        assert_eq!(
+            product_ids.len(),
+            1,
+            "应当有且只有一个产物对象（窗口确实形成过）：{objects:?}"
+        );
+
+        // **关键断言**：产物还在保护集合里 ⇒ GC 不会在窗口里删它
+        let known: HashSet<String> = catalog
+            .known_batch_ids()
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert!(
+            known.contains(&product_ids[0]),
+            "上传后、提交前的产物必须在保护集合里（否则孤儿 GC 会删掉它，\
+             而它一旦提交、输入就转墓碑 ⇒ 目录指向空气）"
+        );
+
+        // 输入没被动过：合并没有发生（撤销在途是提交成功才做的事，这里提交失败了）
+        assert_eq!(
+            catalog
+                .list_visible_files("t", catalog.current_snapshot().await, Some("s0"))
+                .await
+                .unwrap()
+                .len(),
+            3,
+            "被栅栏拒绝的合并不得改动输入"
+        );
     }
 
     /// **T14.3 的回归用例**（`R-9`）：在途文件**连静置期都不用等**，GC 也不许删它。
