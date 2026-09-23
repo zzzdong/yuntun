@@ -537,6 +537,26 @@ pub fn idempotency_record_from_proto(m: &pb::IdempotencyRecordMsg) -> Idempotenc
     }
 }
 
+// ---------------------------------------------------------------- 数据节点名录（T12.3）
+
+/// 名录条目 → proto（下发用）。
+pub fn datanode_member_to_proto(m: &DatanodeMember) -> pb::DatanodeMemberMsg {
+    pb::DatanodeMemberMsg {
+        instance_id: m.instance_id.clone(),
+        address: m.address.clone(),
+        registered_at_ms: m.registered_at_ms,
+    }
+}
+
+/// proto → 名录条目（读回用）。
+pub fn datanode_member_from_proto(m: &pb::DatanodeMemberMsg) -> DatanodeMember {
+    DatanodeMember {
+        instance_id: m.instance_id.clone(),
+        address: m.address.clone(),
+        registered_at_ms: m.registered_at_ms,
+    }
+}
+
 pub fn apply(state: &mut CatalogState, op: &StateOp) -> Result<ApplyOutcome, MetaError> {
     let now = op.now_ms();
     match op {

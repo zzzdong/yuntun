@@ -260,6 +260,15 @@ async fn build_full_with_wal(
     // 读己之写：查询侧接热数据读侧（同 Lakehouse）
     cache.set_hot_shards("chaos".to_string(), chunks);
     cache.set_members(vec![yuntun_query::Member::local("chaos")]);
+    // 同上：本实例登记进名录，否则刷新（用名录整体替换）会把它摘掉
+    catalog
+        .register_datanode(yuntun_model::meta::DatanodeMember {
+            instance_id: "chaos".into(),
+            address: String::new(),
+            registered_at_ms: 0,
+        })
+        .await
+        .unwrap();
     let engine = Arc::new(QueryEngine::new(
         yuntun_store::create_store(&yuntun_store::StoreConfig::Local {
             root: store_root.to_string_lossy().to_string(),

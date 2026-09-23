@@ -340,6 +340,30 @@ impl LocalCatalog {
         &self,
         catalog: &Arc<dyn CatalogOps>,
     ) -> Result<RefreshOutcome, DataFusionError> {
+        // ① **名录先落地**（T12.3）：`architecture §3.1` 要求"分片归属"与
+        //    schema/manifest 同版本 —— 而快照里的 `nodes` 正是由成员表派生的（`§69`），
+        //    所以必须在构造快照**之前**更新。
+        //
+        //    读失败**不**降级成"没有成员"：宁可这次刷新失败（上层显式报错/重试），
+        //    也不能让查询按空成员表算归属 —— 那是 `§69` 那类静默少数据。
+        let roster = catalog
+            .datanodes()
+            .await
+            .map_err(|e| self.record_error(format!("读取数据节点名录失败：{e}")))?;
+        self.set_members(
+            roster
+                .into_iter()
+                .map(|m| {
+                    let id = m.instance_id;
+                    // 地址为空 = 同进程实例（没有数据面地址）—— 与 `Member::local` 同义
+                    if m.address.is_empty() {
+                        Member::local(id)
+                    } else {
+                        Member::at(id, m.address)
+                    }
+                })
+                .collect(),
+        );
         let version = catalog.version().await;
         let current = self.snapshot();
 

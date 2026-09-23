@@ -96,7 +96,17 @@ async fn query_reads_hot_data_through_remote_shard_reader() {
     assert_eq!(reader.tier(), ShardTier::Memory);
 
     let cache = Arc::new(LocalCatalog::new());
-    cache.set_hot_shards("standalone", reader);
+    // 名录是唯一真相（T12.3）：实例必须**登记进名录**，否则一次刷新
+    // 就会用名录整体替换成员表、把这个实例（连同它的热读器）摘掉。
+    catalog
+        .register_datanode(yuntun_model::meta::DatanodeMember {
+            instance_id: "standalone".to_string(),
+            address: String::new(),
+            registered_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        cache.set_hot_shards("standalone", reader);
     cache.refresh(&catalog).await.unwrap();
 
     let store = yuntun_store::create_store(&yuntun_store::StoreConfig::Memory).unwrap();
@@ -147,11 +157,31 @@ async fn hot_data_from_every_registered_instance_is_read() {
     );
 
     let cache = Arc::new(LocalCatalog::new());
-    cache.set_hot_shards(
+    // 名录是唯一真相（T12.3）：实例必须**登记进名录**，否则一次刷新
+    // 就会用名录整体替换成员表、把这个实例（连同它的热读器）摘掉。
+    catalog
+        .register_datanode(yuntun_model::meta::DatanodeMember {
+            instance_id: "inst-a".to_string(),
+            address: String::new(),
+            registered_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        cache.set_hot_shards(
         "inst-a",
         Arc::new(RemoteShard::new(Arc::new(CannedFetch { entries: a }))),
     );
-    cache.set_hot_shards(
+    // 名录是唯一真相（T12.3）：实例必须**登记进名录**，否则一次刷新
+    // 就会用名录整体替换成员表、把这个实例（连同它的热读器）摘掉。
+    catalog
+        .register_datanode(yuntun_model::meta::DatanodeMember {
+            instance_id: "inst-b".to_string(),
+            address: String::new(),
+            registered_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        cache.set_hot_shards(
         "inst-b",
         Arc::new(RemoteShard::new(Arc::new(CannedFetch { entries: b }))),
     );

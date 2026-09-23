@@ -295,6 +295,13 @@ impl NodeHandle {
                     .collect(),
                 // 整体替换语义（客户端据此丢弃已删 schema）
                 namespaces: st.list_schemas(),
+                // 名录与 schema/manifest **同一次响应**（`§3.1`）：分成两次读会出现
+                // "新文件清单 + 旧节点集合"的拼计划窗口。
+                datanodes: st
+                    .datanodes()
+                    .values()
+                    .map(crate::op::datanode_member_to_proto)
+                    .collect(),
                 idempotency_keys: keys,
             }),
             full_reload: full,

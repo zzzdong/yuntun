@@ -117,6 +117,16 @@ async fn engine_with(instances: Vec<(&str, Arc<ChunkStore>)>) -> Vec<i64> {
     let cache = Arc::new(LocalCatalog::new());
     cache.set_catalog_ops(catalog.clone());
     for (id, store) in instances {
+        // 名录是唯一真相（T12.3）：实例必须**登记进名录**，否则一次刷新
+        // 就会用名录整体替换成员表、把这个实例（连同它的热读器）摘掉。
+        catalog
+            .register_datanode(yuntun_model::meta::DatanodeMember {
+                instance_id: id.to_string(),
+                address: String::new(),
+                registered_at_ms: 0,
+            })
+            .await
+            .unwrap();
         cache.set_hot_shards(id, store);
     }
     cache.refresh(&catalog).await.unwrap();

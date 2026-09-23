@@ -424,3 +424,15 @@ fn register_datanode_op_roundtrips_field_by_field() {
         other => panic!("kind 往返后变了：{other:?}"),
     }
 }
+
+/// T12.3：名录条目（下发载荷）往返逐字段不变。
+#[test]
+fn datanode_member_msg_roundtrips_field_by_field() {
+    let m = DatanodeMemberMsg {
+        instance_id: "inst-a".into(),
+        address: "10.0.0.7:50051".into(),
+        registered_at_ms: 1_700_000_000_000,
+    };
+    let back = roundtrip(&m);
+    assert_eq!(back, m, "名录条目必须逐字段无损（含注册时刻）");
+}

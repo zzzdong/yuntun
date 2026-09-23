@@ -139,7 +139,17 @@ async fn stale_hot_read_is_retried_after_refreshing_manifest() {
     // 本刀的接线：查询路径要能在 STALE 时**自己刷新 manifest**
     cache.set_catalog_ops(catalog.clone());
     let hot = Arc::new(FlakyHot::new(cache.clone(), 2)); // setup 已刷过 1 次 ⇒ 首次仍 STALE，引擎刷新后追上
-    cache.set_hot_shards("inst-a", hot.clone());
+    // 名录是唯一真相（T12.3）：实例必须**登记进名录**，否则一次刷新
+    // 就会用名录整体替换成员表、把这个实例（连同它的热读器）摘掉。
+    catalog
+        .register_datanode(yuntun_model::meta::DatanodeMember {
+            instance_id: "inst-a".to_string(),
+            address: String::new(),
+            registered_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        cache.set_hot_shards("inst-a", hot.clone());
     cache.refresh(&catalog).await.unwrap();
     let refreshes_before = cache.stats().refreshes;
 
@@ -175,7 +185,17 @@ async fn permanent_stale_fails_loudly_instead_of_returning_partial_result() {
     let cache = Arc::new(LocalCatalog::new());
     cache.set_catalog_ops(catalog.clone());
     let hot = Arc::new(FlakyHot::new(cache.clone(), u64::MAX)); // 永远 STALE
-    cache.set_hot_shards("inst-a", hot.clone());
+    // 名录是唯一真相（T12.3）：实例必须**登记进名录**，否则一次刷新
+    // 就会用名录整体替换成员表、把这个实例（连同它的热读器）摘掉。
+    catalog
+        .register_datanode(yuntun_model::meta::DatanodeMember {
+            instance_id: "inst-a".to_string(),
+            address: String::new(),
+            registered_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        cache.set_hot_shards("inst-a", hot.clone());
     cache.refresh(&catalog).await.unwrap();
 
     let engine = QueryEngine::new(create_store(&StoreConfig::Memory).unwrap(), cache.clone());
@@ -203,7 +223,17 @@ async fn stale_without_wired_ops_fails_with_a_config_error() {
     let cache = Arc::new(LocalCatalog::new());
     // **故意不调** `set_catalog_ops`
     let hot = Arc::new(FlakyHot::new(cache.clone(), 2));
-    cache.set_hot_shards("inst-a", hot.clone());
+    // 名录是唯一真相（T12.3）：实例必须**登记进名录**，否则一次刷新
+    // 就会用名录整体替换成员表、把这个实例（连同它的热读器）摘掉。
+    catalog
+        .register_datanode(yuntun_model::meta::DatanodeMember {
+            instance_id: "inst-a".to_string(),
+            address: String::new(),
+            registered_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        cache.set_hot_shards("inst-a", hot.clone());
     cache.refresh(&catalog).await.unwrap();
 
     let engine = QueryEngine::new(create_store(&StoreConfig::Memory).unwrap(), cache.clone());
@@ -223,7 +253,17 @@ async fn caught_up_reader_does_not_trigger_retry() {
     let cache = Arc::new(LocalCatalog::new());
     cache.set_catalog_ops(catalog.clone());
     let hot = Arc::new(FlakyHot::new(cache.clone(), 1)); // setup 已刷过 1 次 ⇒ 从不报 STALE
-    cache.set_hot_shards("inst-a", hot.clone());
+    // 名录是唯一真相（T12.3）：实例必须**登记进名录**，否则一次刷新
+    // 就会用名录整体替换成员表、把这个实例（连同它的热读器）摘掉。
+    catalog
+        .register_datanode(yuntun_model::meta::DatanodeMember {
+            instance_id: "inst-a".to_string(),
+            address: String::new(),
+            registered_at_ms: 0,
+        })
+        .await
+        .unwrap();
+        cache.set_hot_shards("inst-a", hot.clone());
     cache.refresh(&catalog).await.unwrap();
     let refreshes_before = cache.stats().refreshes;
 

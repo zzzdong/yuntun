@@ -122,7 +122,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             ..Default::default()
         },
         wal,
-        catalog,
+        // 克隆 Arc（廉价）：后面还要用它把本实例登记进名录
+        catalog.clone(),
         store,
     ));
     let shutdown = CancellationToken::new();
@@ -132,6 +133,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     //    先 bind 再打印 ⇒ 上层拿到的是**真实**地址（`127.0.0.1:0` 的端口由内核分配）
     let listener = TcpListener::bind(&args.listen).await?;
     let addr = listener.local_addr()?;
+
+    // ⑤ 登记进名录（T12.3）：数据节点进程是"名录里的成员"这一概念的第一个真实来源，
+    //    地址 = 数据面监听地址（查询侧据此装配热读器）。
+    //    ⚠️ 必须排在 bind 之后：`--listen 127.0.0.1:0` 时只有 bind 完才知道真实端口。
+    //    （本刀仍是**本地** catalog；接 metanode 时同一个 trait 方法会走 raft 的 op。）
+    catalog
+        .register_datanode(yuntun_model::meta::DatanodeMember {
+            instance_id: args.instance_id.clone(),
+            address: addr.to_string(),
+            registered_at_ms: 0,
+        })
+        .await?;
     println!("LISTEN {addr}");
     tracing::info!(
         %addr,

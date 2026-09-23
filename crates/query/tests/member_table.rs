@@ -91,6 +91,16 @@ async fn setup(
     cache.set_catalog_ops(catalog.clone());
     for (id, store) in instances {
         let reader: Arc<dyn ShardReader> = store;
+        // 名录是唯一真相（T12.3）：实例必须**登记进名录**，否则一次刷新
+        // 就会用名录整体替换成员表、把这个实例（连同它的热读器）摘掉。
+        catalog
+            .register_datanode(yuntun_model::meta::DatanodeMember {
+                instance_id: id.to_string(),
+                address: String::new(),
+                registered_at_ms: 0,
+            })
+            .await
+            .unwrap();
         cache.set_hot_shards(id, reader);
     }
     cache.refresh(&catalog).await.unwrap();
@@ -187,5 +197,76 @@ async fn removing_a_member_takes_its_hot_shards_out_of_queries() {
         sorted_values(&engine).await,
         vec![1],
         "摘除后 inst-b 的热数据不该再参与查询"
+    );
+}
+
+/// ④ **名录自动发现闭环**（T12.3 下半第 1 步）：元数据里的名录 → 查询侧的成员表。
+///
+/// 这一步之前，成员表只能由装配层手填（`§69` 的"唯一真相"还缺一个来源）；
+/// 现在它随**同一次**元数据刷新下来 —— 顺带把**数据面地址**带下来，
+/// 于是"有哪些实例"第一次能变成"怎么连"。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn roster_from_metadata_populates_the_member_table() {
+    use yuntun_model::meta::DatanodeMember;
+
+    let dir = yuntun_testkit::TestDir::tmpfs("member-roster");
+    let a = instance(&dir, "inst-a");
+    write(&a, &[1]);
+
+    let catalog: Arc<dyn CatalogOps> = Arc::new(MemoryCatalog::new());
+    create_table(&catalog).await;
+    // 名录里两个数据节点，各自带**数据面地址**
+    catalog
+        .register_datanode(DatanodeMember {
+            instance_id: "inst-a".into(),
+            address: "10.0.0.7:50051".into(),
+            registered_at_ms: 1,
+        })
+        .await
+        .unwrap();
+    catalog
+        .register_datanode(DatanodeMember {
+            instance_id: "inst-b".into(),
+            address: "10.0.0.8:50051".into(),
+            registered_at_ms: 2,
+        })
+        .await
+        .unwrap();
+
+    let cache = Arc::new(LocalCatalog::new());
+    cache.set_catalog_ops(catalog.clone());
+    // 查询侧**只接线了 inst-a 的读侧**；inst-b 的存在完全靠名录发现
+    let reader: Arc<dyn ShardReader> = a;
+    cache.set_hot_shards("inst-a", reader);
+
+    cache.refresh(&catalog).await.unwrap();
+
+    let ms: Vec<_> = cache
+        .members()
+        .into_iter()
+        .map(|m| (m.instance_id, m.address))
+        .collect();
+    assert_eq!(
+        ms,
+        vec![
+            // inst-a 之前由 `set_hot_shards` 登记成"同进程（无地址）"，刷新后
+            // **地址来自名录** —— 名录是权威，这正是"有哪些实例"变成"怎么连"的那一步
+            ("inst-a".to_string(), Some("10.0.0.7:50051".to_string())),
+            // inst-b 完全没接线读侧，但它**存在**：这就是"发现"
+            ("inst-b".to_string(), Some("10.0.0.8:50051".to_string())),
+        ],
+        "成员表必须由名录派生（含地址）：否则查询不知道去哪儿拉数据"
+    );
+    assert_eq!(
+        cache.hot_shards().len(),
+        1,
+        "inst-a 在名录里 ⇒ 刷新不得摘掉它的热读器（`§70` 那个坑的反面）"
+    );
+
+    let engine = QueryEngine::new(create_store(&StoreConfig::Memory).unwrap(), cache.clone());
+    assert_eq!(
+        sorted_values(&engine).await,
+        vec![1],
+        "刷新之后热数据仍可读（读己之写不能被名录刷新打断）"
     );
 }

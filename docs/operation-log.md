@@ -4596,3 +4596,82 @@ schema/manifest **同版本**读出去 —— 否则查询侧会拿"新的文件
 2. **心跳与超时摘除**：metanode 内存 + 独立 RPC（**永不进 raft**，`§3.2`）；
 3. **ingestor 自注册**：`yuntun-ingestor --meta <addr>` + 启动注册（`register_datanode_to_proto` 随它落地）；
 4. 改 profile 后**旧快照载荷（v1）会被拒绝** —— 本地开发数据需重建（`§70.2`）。
+
+---
+
+## 71. T12.3 下半（第 1 步）：名录下发闭环 —— 成员表第一次**自己长出来**（2026-09-23）
+
+### 71.1 缺的那一环
+
+`§69` 把成员表立成"唯一真相"，`§70` 让数据节点能**注册进 raft**。但名录还停在元数据里 ——
+查询侧的成员表仍由装配层**手填**。本步把它接上：
+
+```text
+数据节点注册（op，走 raft）
+   → CatalogState.datanodes
+   → PrefetchPayload.datanodes（与 schema/manifest **同一次**响应，§3.1）
+   → LocalCatalog::refresh 消费 → set_members（含**数据面地址**）
+```
+
+**同一次响应**是刻意的：分两个接口读就会出现"新文件清单 + 旧节点集合"的拼计划窗口。
+而名录变化会推进 `schema_ver`（`§70.3`）⇒ 必然伴随一次全量刷新，所以只需 `Prefetch` 带它，
+不必让 `Delta` 也带 —— 设计在这里是自洽的。
+
+### 71.2 改了什么
+
+| 件 | 内容 |
+|---|---|
+| `meta.proto` | `PrefetchPayload.datanodes = 5` + `DatanodeMemberMsg{instance_id, address, registered_at_ms}` |
+| `CatalogOps` | `register_datanode`（写）+ `datanodes`（读）—— **都没有默认实现** |
+| `MemoryCatalog` | 直接读写自己的状态 |
+| `RemoteCatalog` | 写 = `Propose`（raft op）；读 = **先 `refresh()` 再读缓存** |
+| `LocalCatalog::refresh` | 名录**先落地**（在构造快照之前，`§3.1`）；**读失败 = 本次刷新失败** |
+| 装配层 + 6 个测试夹具 | 本实例登记进名录（见 71.4） |
+
+**为什么两个方法都不能有默认实现**：任何默认值（含"空表"）都等于"没有数据节点" ——
+查询会据此按空成员表算归属，正是 `§69` 那类**静默少数据**。
+
+### 71.3 用例揪出的坑：远端读必须在**已 prime** 的缓存上
+
+改完全量测试挂了 14 条，症状一律是"查询返回 **0 行**"。定位用了两步硬证据（不是猜）：
+
+1. 临时 `eprintln!` 打出名录与热读器键集 —— 立刻看到：
+
+   ```text
+   名录 ids=[]；当前 hot 键=["standalone"]     ← 刷新先来 ⇒ 把热读器摘了
+   名录 ids=["standalone"]；当前 hot 键=[]      ← 登记后也补不回来
+   ```
+
+   （同时印证：`tracing::warn!` 在测试里**无处可去**，所以"没看到告警"不能当证据。）
+2. 临时打 `Backtrace::force_capture()` —— 看到第一次刷新来自**后台刷新任务**，
+   而装配默认走 `MetaMode::Embedded` ⇒ 查询侧拿到的是 **`RemoteCatalog`**。
+
+**根因**：`RemoteCatalog::datanodes()` 读的是**客户端缓存**，而缓存由它自己的 `Prefetch` 填充；
+查询侧刷新把名录读放在了**最前面**，那一刻缓存还没 prime ⇒ 读到空名录 ⇒ 把自己的成员表清空。
+**修法**：`datanodes()` 与 `list_tables` 等读方法同形 —— **先 `self.refresh().await?`** 再读缓存。
+
+> 教训：一个"读缓存"的方法必须和它的兄弟方法走**同一条** prime 路径。
+> 少了这一步不会报错，只会静默给出"空"，而空的语义在这里恰好是**最危险**的那个。
+
+### 71.4 顺带的语义后果：夹具也得登记
+
+"名录是唯一真相"意味着**不登记 = 不存在**：装配层与 6 个测试夹具都补了本实例登记
+（`address` 空 = 同进程实例）。这不是测试的将就，而是这条语义的直接推论 ——
+新用例 `roster_from_metadata_populates_the_member_table` 把它写成正面断言：
+
+- 名录里的 `inst-b` **没接线读侧也出现在成员表**（这就是"发现"），且**带数据面地址**；
+- 名录里的地址**覆盖**本地登记（`inst-a` 从"无地址"变成 `10.0.0.7:50051`）—— 名录是权威；
+- `inst-a` 在名录里 ⇒ 刷新**不得摘掉**它的热读器（`§70` 那个坑的反面），读己之写不受影响。
+
+### 71.5 验证与遗留
+
+- 全量 `cargo test --workspace --no-fail-fast` → **331 passed / 0 failed**；clippy 本仓 **0**
+- 新增 `wire_compat` 用例：名录条目往返逐字段不变（仓库规矩：每加一种载荷都要有）
+
+**遗留**：
+
+1. **心跳与超时摘除**：metanode 内存 + 独立 RPC（**永不进 raft**，`§3.2`）；
+2. **ingestor 接 metanode**：`--meta <addr>`，让注册走真 raft（现在仍是本地 catalog；
+   同一个 trait 方法，装配点换一行即可）；
+3. 成员表里的成员若**没有接线热读器**，目前只是"存在但不参与拉取" —— 谁来接线（谁负责
+   按地址建 `GrpcShardFetch`）属 R5 的 fanout（T13.1）。

@@ -12,7 +12,10 @@ use arrow::datatypes::SchemaRef;
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use yuntun_model::error::LakeError;
-use yuntun_model::meta::{compute_stats_lite, FileManifest, IdempotencyRecord, TableMeta};
+use yuntun_model::meta::{
+    DatanodeMember, FileManifest, IdempotencyRecord, TableMeta,
+    compute_stats_lite,
+};
 use yuntun_model::ops::{
     qualified_name, split_qualified, CatalogVersion, CommitFilesRequest, CommitFilesResponse,
     CreateTableRequest, EvolveSchemaRequest, EvolveSchemaResponse, ManifestDelta,
@@ -108,6 +111,19 @@ pub trait CatalogOps: Send + Sync {
     /// 消费方只重拉 `changed_tables`，其余表缓存原样有效；
     /// 无法表达时返回 [`ManifestDelta::full`]（保守，宁可全量也不漏变更）。
     async fn manifest_delta(&self, since_manifest_ver: u64) -> Result<ManifestDelta, LakeError>;
+
+    // ---- 数据节点名录（T12.3）----
+    /// **注册数据节点**：本地实现写自己的状态；远端实现走 `Propose`（raft 的 op）。
+    ///
+    /// **必须是 op**：名录要与 schema/manifest **同版本**读出去（`architecture §3.1`）。
+    /// **存活状态（心跳）不走这里** —— 秒级心跳会把 raft 写爆（`§3.2`）。
+    async fn register_datanode(&self, m: DatanodeMember) -> Result<(), LakeError>;
+
+    /// **数据节点名录**：必须与 [`Self::version`] / 快照**同版本**读出来。
+    ///
+    /// **没有默认实现是刻意的**：任何默认值（包括"空表"）都等于"没有数据节点" ——
+    /// 查询会据此按空成员表算归属（`§69` 那类**静默少数据**）。
+    async fn datanodes(&self) -> Result<Vec<DatanodeMember>, LakeError>;
 }
 
 /// 归一化表标识：裸名 → `public.<name>`；限定名原样（兼容 v1 单 schema 数据/调用）。
@@ -269,6 +285,22 @@ impl CatalogOps for MemoryCatalog {
 
     async fn version(&self) -> CatalogVersion {
         self.state.read().unwrap().version()
+    }
+
+    async fn register_datanode(&self, m: DatanodeMember) -> Result<(), LakeError> {
+        self.state.write().unwrap().register_datanode(m);
+        Ok(())
+    }
+
+    async fn datanodes(&self) -> Result<Vec<DatanodeMember>, LakeError> {
+        Ok(self
+            .state
+            .read()
+            .unwrap()
+            .datanodes()
+            .values()
+            .cloned()
+            .collect())
     }
 
     async fn manifest_delta(&self, since_manifest_ver: u64) -> Result<ManifestDelta, LakeError> {

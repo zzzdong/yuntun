@@ -404,6 +404,16 @@ async fn build_embedded_catalog(
         // 节点列表进入快照（S2-4）：standalone = 本节点；R4 起由成员发现提供。
         // 放在快照里是为了让"分片归属"与 schema/manifest 同一版本，避免跨版本拼计划。
         cache.set_members(vec![yuntun_query::Member::local(cfg.chunk.instance_id.clone())]);
+        // 本实例也**登记进名录**：刷新时会用名录整体替换成员表（`§69`），
+        // 不登记就等于刷新一次把自己摘掉（`§70.5` 的"自动发现"闭环）。
+        // 地址为空 = 同进程实例（没有数据面地址）。
+        catalog
+            .register_datanode(yuntun_model::meta::DatanodeMember {
+                instance_id: cfg.chunk.instance_id.clone(),
+                address: String::new(),
+                registered_at_ms: 0,
+            })
+            .await?;
         // query 执行区内存池 = 另一块独立预算，超限直接报错而不抢 chunk 内存（架构 §2.8）
         let query = Arc::new(
             QueryEngine::with_query_memory_limit(

@@ -204,6 +204,14 @@ message PrefetchRequest {
   uint64 since_snapshot     = 5;
 }
 
+// 数据节点名录里的一条（下发用；与注册 op 的载荷不同：**带注册时刻**，
+// 因为它是状态里的样子，不是请求）。
+message DatanodeMemberMsg {
+  string instance_id      = 1;
+  string address          = 2;
+  uint64 registered_at_ms = 3;
+}
+
 message PrefetchResponse {
   uint64 schema_ver   = 1;
   uint64 manifest_ver = 2;
@@ -219,6 +227,11 @@ message PrefetchPayload {
   repeated TableMeta tables = 1;
   // schema 名（**每次刷新整体替换**：删掉的 schema 必须消失，否则远端 `USE db` 还能切进去）
   repeated string namespaces = 3;
+  // **数据节点名录**（T12.3）。与 schema/manifest **同一次响应**下发是刻意的：
+  // `architecture-with-chunk §3.1` 要求"分片归属"与 schema/manifest 同版本 ——
+  // 分两个接口读，就会出现"新文件清单 + 旧节点集合"的拼计划窗口。
+  // 注册会推进 `schema_ver` ⇒ 名录变化必然伴随一次全量刷新（`§70.3`）。
+  repeated DatanodeMemberMsg datanodes = 5;
   // 文件级增量（**含墓碑**：`deleted_at > since_snapshot` 的也要发）。
   // 只发"当前可见"会让客户端永远删不掉已删文件 → 查询读到已删数据（静默）。
   repeated FileEntry files  = 2;

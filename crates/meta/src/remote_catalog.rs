@@ -66,6 +66,9 @@ struct Cache {
     /// `batch_id` → 文件清单。**墓碑也留在里面**：查询会按**旧快照**读文件，
     /// 删掉墓碑就等于把"这个文件曾经存在"这件事抹了（`list_visible_files(旧快照)` 会少文件）。
     files: BTreeMap<String, FileManifest>,
+    /// **数据节点名录**（T12.3）：来自同一次 `Prefetch` 的载荷 —— 与上面几个版本号
+    /// 同源同版本，所以"按名录算归属"不会跨版本。
+    datanodes: BTreeMap<String, yuntun_model::meta::DatanodeMember>,
     /// 做过一次全量刷新（在此之前缓存是不可信的，读必须等）
     primed: bool,
     /// 墓碑回收的下界：**早于它的快照不可查**（见 `RemoteCatalog::file_retention`）
@@ -247,6 +250,17 @@ impl RemoteCatalog {
             c.read_index = st.applied_index;
             c.snapshot = probe.snapshot;
         }
+        // 名录**先于**零开销路径落地：探测响应本来每次都带（很小），
+        // 这样"什么都没变"的快路径不会把名录留在旧版本上。
+        if let Some(p) = probe.payload.as_ref() {
+            let mut c = self.cache.write().unwrap();
+            c.datanodes = p
+                .datanodes
+                .iter()
+                .map(|m| (m.instance_id.clone(), crate::op::datanode_member_from_proto(m)))
+                .collect();
+        }
+
         let unchanged = primed && probe.schema_ver == c_schema && probe.manifest_ver == c_manifest;
         if unchanged && !probe.full_reload {
             return Ok(()); // 零开销路径
@@ -470,6 +484,38 @@ fn actual_version_of(st: &tonic::Status) -> Option<u64> {
 
 #[async_trait::async_trait]
 impl CatalogOps for RemoteCatalog {
+    async fn register_datanode(
+        &self,
+        m: yuntun_model::meta::DatanodeMember,
+    ) -> Result<(), LakeError> {
+        // 远端：走 raft 的 op（名录必须与 schema/manifest 同版本）
+        self.propose(pb::Op {
+            now_ms: 0,
+            kind: Some(pb::op::Kind::RegisterDatanode(pb::RegisterDatanodeOp {
+                instance_id: m.instance_id,
+                address: m.address,
+            })),
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn datanodes(&self) -> Result<Vec<yuntun_model::meta::DatanodeMember>, LakeError> {
+        // **先刷新再读缓存** —— 与 `list_tables` 等读方法同形。
+        // 少了这一步就会拿到"**还没 prime** 的空名录"，而查询侧会据此把成员表整空
+        // （`§70` 的坑：装配期第一次刷新恰好早于 prime，于是热读器被摘掉、查询返回 0 行）。
+        self.refresh().await?;
+        // 用缓存里的名录（= 最近一次 Prefetch 的载荷）：它必然与缓存里的表/文件**同版本**。
+        // 另起一次 RPC 反而可能与本地快照错版本（`§3.1` 禁止的正是这个）。
+        Ok(self
+            .cache
+            .read()
+            .unwrap()
+            .datanodes
+            .values()
+            .cloned()
+            .collect())
+    }
     // ---------------------------------------------------------------- schema（写）
     async fn create_schema(&self, name: &str) -> Result<(), LakeError> {
         let r = self
@@ -905,6 +951,7 @@ mod tests {
                 snapshot,
                 full_reload: false,
                 payload: Some(pb::PrefetchPayload {
+                    datanodes: Vec::new(),
                     tables: Vec::new(),
                     files: vec![pb::FileEntry {
                         batch_id: "b1".into(),

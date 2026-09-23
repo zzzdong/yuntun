@@ -189,6 +189,17 @@ impl CatalogOps for BrokenCatalog {
     async fn create_schema(&self, n: &str) -> Result<(), yuntun_model::LakeError> {
         self.inner.create_schema(n).await
     }
+    async fn register_datanode(
+        &self,
+        m: yuntun_model::meta::DatanodeMember,
+    ) -> Result<(), yuntun_model::LakeError> {
+        self.inner.register_datanode(m).await
+    }
+    async fn datanodes(
+        &self,
+    ) -> Result<Vec<yuntun_model::meta::DatanodeMember>, yuntun_model::LakeError> {
+        self.inner.datanodes().await
+    }
     async fn drop_schema(&self, n: &str) -> Result<(), yuntun_model::LakeError> {
         self.inner.drop_schema(n).await
     }
