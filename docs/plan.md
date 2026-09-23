@@ -597,7 +597,7 @@ standalone 仍可单机运行（同一份装配的裁剪）。
 | T13.1 | 查询 fanout（按分片归属分发）+ 结果合并 | owner 侧过滤（架构 §4.3） |
 | T13.2 | 块级剪枝接入（`chunk::ColumnStats` + ZoneMap） | **v2.1 新增**：统计已算出但未消费，单节点同样受益 |
 | T13.3 | 对拍测试（硬要求，不可抽样） | 分布式并发结果 == 单节点串行结果 |
-| T13.4 | 查询中节点故障的降级语义 | **第一刀已落地**（`§77`）："拿不到"（`Err` 通道）⇒ **降级为部分结果 + 点名缺失来源**，`[query] partial = "allow"`（默认）/ `"reject"`（当场失败）；而"还没拿到"（STALE）**仍然刷新重试 / 响亮失败**，两者分处两条通道（用例守着边界）。**遗留**：数据面 RPC 的客户端**超时**（"挂住"的节点今天会让查询一直等）、wire 层（MySQL warning / Flight metadata）尚未把 `partial` 交给用户 |
+| T13.4 | 查询中节点故障的降级语义 | **第一刀已落地**（`§77`）："拿不到"（`Err` 通道）⇒ **降级为部分结果 + 点名缺失来源**，`[query] partial = "allow"`（默认）/ `"reject"`（当场失败）；而"还没拿到"（STALE）**仍然刷新重试 / 响亮失败**，两者分处两条通道（用例守着边界）。**第二刀已落地**（`§78`）：数据面 RPC 的**客户端超时**（`GrpcShardFetch` 带 timeout、`connect_with_timeout`、`DEFAULT_TIMEOUT=5s`、建连也受限；`queryd --hot-read-timeout-secs`）⇒ "无响应"也变成 `Err`，走同一条降级路径（组合用例：真 gRPC 假死节点 ⇒ 查询成功 + 点名"超时" + 耗时 < 3s）。**遗留**：扇出仍是串行的（N 个假死来源最坏 `N × timeout × RPC 数`，缺"每查询热读预算"或并行化）、wire 层（MySQL warning / Flight metadata）尚未把 `partial` 交给用户 |
 
 **准出**：T13.3 对拍通过；查询中杀节点，行为符合 T13.4 的声明。
 

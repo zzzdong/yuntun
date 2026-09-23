@@ -20,8 +20,23 @@
 //!    （谁能比自己更清楚"我放弃到哪了"）。
 //! 2. **批次编码复用 arrow IPC stream**（与 WAL 记录 / spill 同一形态）：系统里只该有一种
 //!    批次线上编码，多一套就多一处会漂移的地方。
+//!
+//! ## 超时：`§4.3` 的另一半（`operation-log §78`）
+//!
+//! `architecture-with-chunk §4.3` 写的是"**失败 / 超时** ⇒ 协调者退化为只读冷数据，标记 partial"。
+//! 这两件事**不是一回事**：
+//!
+//! | | 谁来发现 | 症状 |
+//! |---|---|---|
+//! | **失败**（连接拒绝 / 服务端错误） | 传输层**立刻**返回 `Err` | 早就被当成失败处理 |
+//! | **超时**（无响应） | **只有调用方能发现** —— 对方什么都没说 | 查询**一直等**下去 |
+//!
+//! "无响应"的现实形态：进程还在但被 CPU 抢光 / 长 GC 停顿 / 网络黑洞 / 假死。
+//! 客户端若不设上限，一个这样的节点就能把查询挂住 —— 而 `§77` 的降级路径**只对 `Err` 生效**，
+//! 所以必须由**传输层**把"等够了"变成 `Err`（只有它知道多久算等够）。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::record_batch::RecordBatch;
 use futures::future::BoxFuture;
@@ -166,9 +181,21 @@ pub async fn serve(
 
 // ---------------------------------------------------------------- 客户端（查询节点侧）
 
+/// 数据面 RPC 的**默认超时**。
+///
+/// 5 秒是权衡：热数据一次拉取通常远快于此（同机房 RTT 亚毫秒级），而查询端宁可降级为
+/// **带标记的部分结果**，也不该被一个假死节点拖住。
+///
+/// 注意粒度是"**每个 RPC**"：`RemoteShard::read_table` 的默认实现会走三个 RPC
+/// （枚举分片 → 读分片 → 取水位），所以**单个来源**最坏约 `3 × timeout`。
+/// 要收窄就得覆写 `read_table`（trait 允许 —— 合并成一次 RPC，见 `§67`）。
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// 查询节点侧：把远端数据节点的 gRPC 服务适配成 [`ShardFetch`]（→ 再包成 `RemoteShard`）。
 pub struct GrpcShardFetch {
     client: pb::shard_fetch_client::ShardFetchClient<tonic::transport::Channel>,
+    /// 每次 RPC 的上限（**含响应体**：热数据是随响应一起回来的）
+    timeout: Duration,
 }
 
 impl std::fmt::Debug for GrpcShardFetch {
@@ -178,17 +205,52 @@ impl std::fmt::Debug for GrpcShardFetch {
 }
 
 impl GrpcShardFetch {
-    /// 连一个数据节点（`addr` 形如 `127.0.0.1:50051`，不带 scheme）。
+    /// 连一个数据节点（`addr` 形如 `127.0.0.1:50051`，不带 scheme），用 [`DEFAULT_TIMEOUT`]。
     pub async fn connect(addr: &str) -> Result<Self, LakeError> {
+        Self::connect_with_timeout(addr, DEFAULT_TIMEOUT).await
+    }
+
+    /// 同 [`Self::connect`]，但指定**每次 RPC 的超时**。
+    ///
+    /// **建连也受它约束**（`connect_timeout`）：否则"节点不存在 / 端口是黑洞"时，
+    /// 查询侧会挂在**建连**这一步 —— 那也是"无响应"，不能只护住已建好的连接。
+    pub async fn connect_with_timeout(addr: &str, timeout: Duration) -> Result<Self, LakeError> {
         let ep = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
-            .map_err(|e| LakeError::Other(format!("shard rpc: bad addr {addr}: {e}")))?;
+            .map_err(|e| LakeError::Other(format!("shard rpc: bad addr {addr}: {e}")))?
+            .connect_timeout(timeout);
         let channel = ep
             .connect()
             .await
             .map_err(|e| LakeError::Other(format!("shard rpc: connect {addr}: {e}")))?;
         Ok(Self {
             client: pb::shard_fetch_client::ShardFetchClient::new(channel),
+            timeout,
         })
+    }
+
+    /// 当前超时（诊断用）。
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// 统一的"带超时的 RPC"包装。
+    ///
+    /// 超时**必须与其它失败可区分**：`§77` 的降级会把原因带进"缺失来源"里给排障的人看，
+    /// 若超时只是又一个 `deadline exceeded` 字符串，看的人分不清"节点拒绝了连接"（进程没了）
+    /// 与"节点没响应"（进程还在但卡住了）—— 这两者的处置完全不同。
+    async fn call<T>(
+        &self,
+        what: &str,
+        fut: impl std::future::Future<Output = Result<T, Status>>,
+    ) -> Result<T, LakeError> {
+        match tokio::time::timeout(self.timeout, fut).await {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(s)) => Err(LakeError::Other(format!("shard rpc: {what}: {s}"))),
+            Err(_) => Err(LakeError::Other(format!(
+                "shard rpc: {what}: 超时（{:?} 内无响应）",
+                self.timeout
+            ))),
+        }
     }
 }
 
@@ -200,12 +262,14 @@ impl ShardFetch for GrpcShardFetch {
         Box::pin(async move {
             // tonic 的 client 克隆很便宜（内部是 channel 句柄），所以每次调用 clone 一份
             let mut c = self.client.clone();
-            let resp = c
-                .fetch_shards(pb::FetchShardsRequest {
-                    table: table.to_string(),
-                })
-                .await
-                .map_err(|s| LakeError::Other(format!("shard rpc: fetch_shards: {s}")))?;
+            let resp = self
+                .call(
+                    "fetch_shards",
+                    c.fetch_shards(pb::FetchShardsRequest {
+                        table: table.to_string(),
+                    }),
+                )
+                .await?;
             Ok(resp.into_inner().shards.iter().map(from_msg).collect())
         })
     }
@@ -216,10 +280,12 @@ impl ShardFetch for GrpcShardFetch {
     ) -> BoxFuture<'a, Result<ShardRead, LakeError>> {
         Box::pin(async move {
             let mut c = self.client.clone();
-            let resp = c
-                .fetch_watermark(pb::FetchWatermarkRequest { known_manifest_ver })
-                .await
-                .map_err(|s| LakeError::Other(format!("shard rpc: fetch_watermark: {s}")))?;
+            let resp = self
+                .call(
+                    "fetch_watermark",
+                    c.fetch_watermark(pb::FetchWatermarkRequest { known_manifest_ver }),
+                )
+                .await?;
             let resp = resp.into_inner();
             Ok(ShardRead {
                 batches: Vec::new(),
@@ -236,13 +302,15 @@ impl ShardFetch for GrpcShardFetch {
     ) -> BoxFuture<'a, Result<ShardRead, LakeError>> {
         Box::pin(async move {
             let mut c = self.client.clone();
-            let resp = c
-                .fetch_shard(pb::FetchShardRequest {
-                    shard: Some(to_msg(id)),
-                    known_manifest_ver,
-                })
-                .await
-                .map_err(|s| LakeError::Other(format!("shard rpc: fetch_shard: {s}")))?;
+            let resp = self
+                .call(
+                    "fetch_shard",
+                    c.fetch_shard(pb::FetchShardRequest {
+                        shard: Some(to_msg(id)),
+                        known_manifest_ver,
+                    }),
+                )
+                .await?;
             let resp = resp.into_inner();
 
             let mut batches = Vec::with_capacity(resp.batches_ipc.len());

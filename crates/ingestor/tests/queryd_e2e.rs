@@ -336,6 +336,7 @@ async fn datanode_writes_and_queryd_reads_it_over_the_wire() {
         reconcile_secs: 1,
         // 默认 Allow（`architecture §4.2`）：用例不关心 partial，取默认
         partial: yuntun_query::PartialPolicy::default(),
+        hot_read_timeout: std::time::Duration::from_secs(5),
     })
     .await
     .expect("起查询节点");

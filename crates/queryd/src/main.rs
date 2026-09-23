@@ -31,6 +31,9 @@ struct Args {
     /// 读不到某个来源时的策略：`allow`（默认，返回部分结果 + 标记）或 `reject`（当场失败）
     #[arg(long, default_value = "allow")]
     partial: String,
+    /// 数据面 RPC 超时（秒）：超过它即视为"无响应"，该来源按 §4.3 降级
+    #[arg(long, default_value_t = 5)]
+    hot_read_timeout_secs: u64,
 }
 
 #[tokio::main]
@@ -52,6 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         cold_root: args.cold_root.clone(),
         reconcile_secs: args.reconcile_secs,
         partial,
+        hot_read_timeout: std::time::Duration::from_secs(args.hot_read_timeout_secs),
     })
     .await?;
 

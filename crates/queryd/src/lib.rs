@@ -54,6 +54,11 @@ pub struct QuerydConfig {
     pub reconcile_secs: u64,
     /// 部分结果策略（`architecture §4.2`）：`Allow`（默认）/ `Reject`。
     pub partial: yuntun_query::PartialPolicy,
+    /// 数据面 RPC 的超时（`architecture §4.3` 的"**超时** ⇒ 降级"那一半）。
+    ///
+    /// 为什么查询节点必须自己给上限：**只有调用方能发现"对方没响应"**（对方什么都没说）。
+    /// 没有它，一个假死的数据节点能把查询挂住 —— 而 `§77` 的降级只对 `Err` 生效。
+    pub hot_read_timeout: Duration,
 }
 
 /// 起一个查询节点：绑定监听、装配好一切、**在后台开始服务**，返回真实地址与任务句柄。
@@ -70,13 +75,14 @@ pub async fn start(
     // ② 本地快照 + 名录装配（含 `§71.5` 那一步：按地址建热读器）
     let cache = Arc::new(LocalCatalog::new());
     cache.set_catalog_ops(catalog.clone());
-    reconcile_hot_readers(&cache, &catalog).await?;
+    reconcile_hot_readers(&cache, &catalog, cfg.hot_read_timeout).await?;
 
     let shutdown = CancellationToken::new();
     let _reconcile = spawn_reconcile(
         cache.clone(),
         catalog.clone(),
         Duration::from_secs(cfg.reconcile_secs),
+        cfg.hot_read_timeout,
         shutdown.clone(),
     );
 
@@ -124,6 +130,7 @@ pub async fn start(
 pub async fn reconcile_hot_readers(
     cache: &Arc<LocalCatalog>,
     catalog: &Arc<dyn CatalogOps>,
+    hot_read_timeout: Duration,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     cache.refresh(catalog).await?;
     let wired = cache.hot_shards();
@@ -133,7 +140,22 @@ pub async fn reconcile_hot_readers(
         if m.address.is_empty() || wired.contains_key(&m.instance_id) {
             continue;
         }
-        let fetch = Arc::new(GrpcShardFetch::connect(&m.address).await?);
+        // 建连失败 / 超时**只影响这一个成员**：一个地址不通不该让**别的**成员接不上线
+        // （此前是 `?` 直接中断整轮巡检 —— 一个坏成员就能让新成员永远不上线）。
+        // 巡检是幂等的：下一轮会补，期间该成员按"读不到"参与 partial 判定。
+        let fetch =
+            match GrpcShardFetch::connect_with_timeout(&m.address, hot_read_timeout).await {
+                Ok(f) => Arc::new(f),
+                Err(e) => {
+                    tracing::warn!(
+                        instance = %m.instance_id,
+                        address = %m.address,
+                        error = %e,
+                        "热读器建连失败或超时；跳过该成员，下一轮重试"
+                    );
+                    continue;
+                }
+            };
         cache.set_hot_shards(m.instance_id.clone(), Arc::new(RemoteShard::new(fetch)));
         tracing::info!(instance = %m.instance_id, address = %m.address, "热读器已接线");
         added += 1;
@@ -146,6 +168,7 @@ fn spawn_reconcile(
     cache: Arc<LocalCatalog>,
     catalog: Arc<dyn CatalogOps>,
     every: Duration,
+    hot_read_timeout: Duration,
     shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -154,7 +177,7 @@ fn spawn_reconcile(
                 break;
             }
             tokio::time::sleep(every).await;
-            match reconcile_hot_readers(&cache, &catalog).await {
+            match reconcile_hot_readers(&cache, &catalog, hot_read_timeout).await {
                 Ok(n) if n > 0 => tracing::info!(added = n, "名录有新增数据节点"),
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "名录巡检失败，下一轮重试"),
