@@ -494,6 +494,7 @@ async fn build_embedded_catalog(
 
         // Compaction
         let compactor = Arc::new(yuntun_compaction::Compactor {
+            lease_holder: cfg.chunk.instance_id.clone(),
             cfg: yuntun_compaction::CompactionConfig {
                 min_files: cfg.compaction.min_files,
                 interval: Duration::from_secs(cfg.compaction.interval_secs),

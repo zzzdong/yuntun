@@ -87,6 +87,28 @@ pub enum StateOp {
         reason: String,
         now_ms: u64,
     },
+    /// **取租约**（T14.1，含接管）：全局作业的单持有者仲裁，结果 = `LeaseGrant`。
+    AcquireLease {
+        purpose: String,
+        holder: String,
+        ttl_ms: u64,
+        now_ms: u64,
+    },
+    /// **续租**（T14.1）：`epoch` 是栅栏 —— 代次不符 = 你已经不是持有者。
+    RenewLease {
+        purpose: String,
+        holder: String,
+        epoch: u64,
+        ttl_ms: u64,
+        now_ms: u64,
+    },
+    /// **释放**（T14.1，优雅停机）：让接手方不必干等 TTL。
+    ReleaseLease {
+        purpose: String,
+        holder: String,
+        epoch: u64,
+        now_ms: u64,
+    },
 }
 
 // `CreateTableRequest` 里有 `SchemaRef`（`Arc<Schema>`）—— `Arc` 未使用会告警
@@ -109,7 +131,10 @@ impl StateOp {
             | StateOp::Compaction { now_ms, .. }
             | StateOp::RecordIdempotency { now_ms, .. }
             | StateOp::RegisterDatanode { now_ms, .. }
-            | StateOp::RemoveDatanode { now_ms, .. } => *now_ms,
+            | StateOp::RemoveDatanode { now_ms, .. }
+            | StateOp::AcquireLease { now_ms, .. }
+            | StateOp::RenewLease { now_ms, .. }
+            | StateOp::ReleaseLease { now_ms, .. } => *now_ms,
         }
     }
 }
@@ -125,6 +150,11 @@ pub struct ApplyOutcome {
     /// 于是 `CatalogOps::drop_shard -> u64` 在远程形态下只能给 1/0 —— 调用方按它做对账会失真。
     /// 精确计数必须**跟着提交一起过线**（在 SM 里算，而不是在客户端猜）。
     pub affected: u64,
+    /// **逐 op 的结果字节**（形状由各 op 定；今天只有租约用它）。
+    ///
+    /// 为什么不能省：像"租约授没授予、新代次是多少"这样的**判定**，客户端无法从
+    /// `accepted`/`affected` 重建 —— 猜出来的东西在并发下一定是错的（`§81`）。
+    pub result: Vec<u8>,
 }
 
 impl ApplyOutcome {
@@ -132,7 +162,14 @@ impl ApplyOutcome {
         Self {
             accepted,
             affected: if accepted { affected } else { 0 },
+            result: Vec::new(),
         }
+    }
+
+    /// 带上逐 op 的结果字节（链式，便于 `ApplyOutcome::one().with_result(..)`）。
+    pub fn with_result(mut self, result: Vec<u8>) -> Self {
+        self.result = result;
+        self
     }
 
     /// 幂等命中（没改动任何东西）
@@ -149,6 +186,21 @@ impl ApplyOutcome {
     pub fn with_count(n: u64) -> Self {
         Self::new(n > 0, n)
     }
+}
+
+/// 续租/释放的结果字节：`granted` 是**本次动作**的成败，代次/到期取**当前**值
+/// （调用方据此判断"我是不是还持有"以及"现在归谁"）。
+///
+/// 形状与 `AcquireLease` 的结果**统一**（都是 `LeaseGrant`）—— 三个 op 三种形状会让
+/// 客户端与测试各写一套解码。
+fn current_grant(state: &CatalogState, purpose: &str, ok: bool) -> Vec<u8> {
+    let cur = state.leases().get(purpose);
+    yuntun_model::meta::LeaseGrant {
+        granted: ok,
+        epoch: cur.map(|l| l.epoch).unwrap_or(0),
+        expires_at_ms: cur.map(|l| l.expires_at_ms).unwrap_or(0),
+    }
+    .encode_to_vec()
 }
 
 // ---------------------------------------------------------------- proto → 进程内
@@ -206,6 +258,25 @@ pub fn decode_op(op: &pb::Op) -> Result<StateOp, MetaError> {
                 // 时间戳留 0：**由 `apply` 用 op 的 `now_ms` 落章**（见 apply 里的注释）
                 registered_at_ms: 0,
             },
+            now_ms,
+        },
+        pb::op::Kind::AcquireLease(a) => StateOp::AcquireLease {
+            purpose: a.purpose.clone(),
+            holder: a.holder.clone(),
+            ttl_ms: a.ttl_ms,
+            now_ms,
+        },
+        pb::op::Kind::RenewLease(r) => StateOp::RenewLease {
+            purpose: r.purpose.clone(),
+            holder: r.holder.clone(),
+            epoch: r.epoch,
+            ttl_ms: r.ttl_ms,
+            now_ms,
+        },
+        pb::op::Kind::ReleaseLease(r) => StateOp::ReleaseLease {
+            purpose: r.purpose.clone(),
+            holder: r.holder.clone(),
+            epoch: r.epoch,
             now_ms,
         },
         pb::op::Kind::DropShard(d) => StateOp::DropShard {
@@ -631,6 +702,36 @@ pub fn apply(state: &mut CatalogState, op: &StateOp) -> Result<ApplyOutcome, Met
                 return Ok(ApplyOutcome::hit());
             }
             Ok(ApplyOutcome::one())
+        }
+        // ---- 租约（T14.1）：判定**必须随结果过线**（`ProposeResponse.result`）----
+        StateOp::AcquireLease {
+            purpose,
+            holder,
+            ttl_ms,
+            ..
+        } => {
+            // `now` 来自 op 的 `now_ms`（纪律 1：状态机不读钟）⇒ 到期判定在所有副本上一致
+            let g = state.acquire_lease(purpose, holder, now, *ttl_ms);
+            Ok(ApplyOutcome::new(true, 0).with_result(g.encode_to_vec()))
+        }
+        StateOp::RenewLease {
+            purpose,
+            holder,
+            epoch,
+            ttl_ms,
+            ..
+        } => {
+            let ok = state.renew_lease(purpose, holder, *epoch, now, *ttl_ms);
+            Ok(ApplyOutcome::new(true, 0).with_result(current_grant(state, purpose, ok)))
+        }
+        StateOp::ReleaseLease {
+            purpose,
+            holder,
+            epoch,
+            ..
+        } => {
+            let ok = state.release_lease(purpose, holder, *epoch);
+            Ok(ApplyOutcome::new(true, 0).with_result(current_grant(state, purpose, ok)))
         }
         StateOp::DropSchema { name, .. } => {
             // 幂等：schema 不存在 = 目标状态已达成（`accepted=false` 而不是错误）

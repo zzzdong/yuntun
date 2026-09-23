@@ -28,7 +28,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use arrow::datatypes::SchemaRef;
 use yuntun_model::error::LakeError;
 use yuntun_model::meta::{
-    DatanodeMember, FileManifest, FileStatus, IdempotencyRecord, SchemaVersion, TableMeta,
+    DatanodeMember, FileManifest, FileStatus, IdempotencyRecord, LeaseEntry, LeaseGrant,
+    SchemaVersion, TableMeta,
 };
 use yuntun_model::ops::{
     qualified_name, split_qualified, validate_schema_name, validate_table_name, CatalogVersion,
@@ -68,6 +69,11 @@ pub struct CatalogState {
     ///
     /// 放状态机里而非配置：它必须与 schema/manifest **同版本**读出去（`§3.1`）。
     datanodes: BTreeMap<String, DatanodeMember>,
+    /// **租约表**（T14.1）：`purpose` → 当前持有者。
+    ///
+    /// 放状态机里而非内存表：租约是**授权**，必须线性一致（`§3.1` 的反面教材是存活心跳 ——
+    /// 那是"发现"，秒级、不进 raft）。
+    leases: BTreeMap<String, LeaseEntry>,
     /// 结构变更计数（表 / schema / schema 演进）—— 缓存**全量重建**的触发器（S2-5）
     schema_ver: u64,
     /// 文件清单变更计数 —— 缓存**增量刷新**的触发器（S2-5）
@@ -124,6 +130,112 @@ impl CatalogState {
     /// 数据节点名录（元数据读响应用它下发给查询侧）。
     pub fn datanodes(&self) -> &BTreeMap<String, DatanodeMember> {
         &self.datanodes
+    }
+
+    /// 当前租约（诊断 / 测试用）。空闲的条目**仍在表里**（`holder` 为空、代次保留）——
+    /// 那是代次水位，不是垃圾。
+    pub fn leases(&self) -> &BTreeMap<String, LeaseEntry> {
+        &self.leases
+    }
+
+    /// **取租约**（含**接管**）：空闲、或当前已过期（`now_ms >= expires_at_ms`）⇒ 授予；
+    /// 否则拒绝。同一持有者重复取 ⇒ **代次不变、期限顺延**（它可能只是重启了，别让它把自己踢掉）。
+    pub fn acquire_lease(
+        &mut self,
+        purpose: &str,
+        holder: &str,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> LeaseGrant {
+        let granted = |epoch: u64, expires_at_ms: u64| LeaseGrant {
+            granted: true,
+            epoch,
+            expires_at_ms,
+        };
+        match self.leases.get(purpose) {
+            // 别人正持有且未过期 ⇒ 拒绝（这里就是"只启动一个"的全部机制）
+            Some(cur) if cur.holder != holder && now_ms < cur.expires_at_ms => LeaseGrant {
+                granted: false,
+                epoch: cur.epoch,
+                expires_at_ms: cur.expires_at_ms,
+            },
+            // 本人重复取：代次**不变**（否则刚拿到手的 epoch 会立刻作废）
+            Some(cur) if cur.holder == holder => {
+                let epoch = cur.epoch;
+                let granted_at_ms = cur.granted_at_ms;
+                let expires_at_ms = now_ms.saturating_add(ttl_ms);
+                self.leases.insert(
+                    purpose.to_string(),
+                    LeaseEntry {
+                        purpose: purpose.to_string(),
+                        holder: holder.to_string(),
+                        epoch,
+                        granted_at_ms,
+                        expires_at_ms,
+                    },
+                );
+                granted(epoch, expires_at_ms)
+            }
+            // 空闲（`holder` 为空 = 被释放）或持有者已过期 ⇒ 授予（接管/再授予：代次 +1）
+            other => {
+                let epoch = other.map(|c| c.epoch).unwrap_or(0) + 1;
+                let expires_at_ms = now_ms.saturating_add(ttl_ms);
+                self.leases.insert(
+                    purpose.to_string(),
+                    LeaseEntry {
+                        purpose: purpose.to_string(),
+                        holder: holder.to_string(),
+                        epoch,
+                        granted_at_ms: now_ms,
+                        expires_at_ms,
+                    },
+                );
+                granted(epoch, expires_at_ms)
+            }
+        }
+    }
+
+    /// **续租**：只有"当前持有者 + `epoch` 匹配 + **未过期**"三者同时成立才成功。
+    ///
+    /// 过期就失败是刻意的：租约一旦过期即为**失效**，持有者必须重新走 [`Self::acquire_lease`]
+    /// （可能被别人抢先）。这堵住"持有者停了很久、回来一续又续上"的漏洞。
+    pub fn renew_lease(
+        &mut self,
+        purpose: &str,
+        holder: &str,
+        epoch: u64,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> bool {
+        let Some(cur) = self.leases.get(purpose) else {
+            return false;
+        };
+        if cur.holder != holder || cur.epoch != epoch || now_ms >= cur.expires_at_ms {
+            return false;
+        }
+        let mut next = cur.clone();
+        next.expires_at_ms = now_ms.saturating_add(ttl_ms);
+        self.leases.insert(purpose.to_string(), next);
+        true
+    }
+
+    /// **释放**（优雅停机）：只有持有者 + 代次匹配才生效 —— 让接手方不必干等 TTL。
+    ///
+    /// **不删条目，而是置为空闲并保留代次**：代次必须**单调**。若释放把它抹回 0，
+    /// 下一次授予又得到 epoch 1 —— 而"同名的旧身"（重启前那一份）手里正是 epoch 1，
+    /// 它的续租会因为**持有者与代次都匹配**而被接受 ⇒ 两个持有者同时干活。
+    /// 代次水位留着，这个洞就不存在。
+    pub fn release_lease(&mut self, purpose: &str, holder: &str, epoch: u64) -> bool {
+        match self.leases.get(purpose) {
+            Some(cur) if cur.holder == holder && cur.epoch == epoch => {
+                let mut next = cur.clone();
+                next.holder = String::new(); // 空闲（代次水位保留）
+                next.expires_at_ms = 0;
+                self.leases.insert(purpose.to_string(), next);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// 结构变更：推进 `schema_ver`（缓存全量重建）。
@@ -616,6 +728,7 @@ impl CatalogState {
                 })
                 .collect(),
             datanodes: self.datanodes.values().cloned().collect(),
+            leases: self.leases.values().cloned().collect(),
             table_manifest_ver: self
                 .table_manifest_ver
                 .iter()
@@ -715,6 +828,15 @@ impl CatalogState {
                 )));
             }
         }
+        let mut leases: BTreeMap<String, LeaseEntry> = BTreeMap::new();
+        for l in &msg.leases {
+            if leases.insert(l.purpose.clone(), l.clone()).is_some() {
+                return Err(SnapshotError::InvalidState(format!(
+                    "租约用途 {} 重复",
+                    l.purpose
+                )));
+            }
+        }
         let mut table_manifest_ver: BTreeMap<String, u64> = BTreeMap::new();
         for e in &msg.table_manifest_ver {
             if table_manifest_ver
@@ -734,6 +856,7 @@ impl CatalogState {
             files,
             idempotency,
             datanodes,
+            leases,
             snapshot_version: msg.revision,
             last_applied: msg.last_applied,
             schema_ver: msg.schema_ver,
@@ -1190,6 +1313,77 @@ mod snapshot_tests {
     /// 这是专防"加字段忘了加进快照"的回归测试 —— 那种漏法不会让任何测试变红，
     /// 只会让换主/重启后状态**静默回退**。所以每个维度都断言"改了它，产物必须变"。
     #[test]
+    // ---------------------------------------------------------------- 租约（T14.1）
+
+    #[test]
+    fn lease_is_granted_then_refused_until_expiry_then_taken_over() {
+        let mut s = CatalogState::new();
+        let g = s.acquire_lease("compaction", "a", 1_000, 30_000);
+        assert!(g.granted);
+        assert_eq!(g.epoch, 1);
+        assert_eq!(g.expires_at_ms, 31_000);
+
+        // 别人在到期**前**取：拒绝，并回带当前代次/到期（便于诊断"谁挡着我"）
+        let r = s.acquire_lease("compaction", "b", 30_999, 30_000);
+        assert!(!r.granted, "未过期不得被抢");
+        assert_eq!(r.epoch, 1);
+        assert_eq!(r.expires_at_ms, 31_000);
+        assert_eq!(s.leases()["compaction"].holder, "a");
+
+        // 恰好到期 ⇒ 可接管（边界是 `>=`：`expires_at_ms` 那一刻即失效）
+        let t = s.acquire_lease("compaction", "b", 31_000, 30_000);
+        assert!(t.granted, "到期即应能被接管");
+        assert_eq!(t.epoch, 2, "接管必须推进代次（旧持有者的续租随即失效）");
+        assert_eq!(s.leases()["compaction"].holder, "b");
+    }
+
+    #[test]
+    fn re_acquire_by_same_holder_keeps_epoch_and_extends() {
+        let mut s = CatalogState::new();
+        s.acquire_lease("compaction", "a", 1_000, 10_000);
+        // 本人"重启后又来取"：代次不变（否则它自己会把刚拿到手的 epoch 作废）
+        let again = s.acquire_lease("compaction", "a", 5_000, 10_000);
+        assert!(again.granted);
+        assert_eq!(again.epoch, 1);
+        assert_eq!(again.expires_at_ms, 15_000);
+    }
+
+    #[test]
+    fn renew_requires_holder_epoch_and_unexpired() {
+        let mut s = CatalogState::new();
+        s.acquire_lease("compaction", "a", 1_000, 30_000);
+        // 三者齐备 ⇒ 成功且期限顺延
+        assert!(s.renew_lease("compaction", "a", 1, 10_000, 30_000));
+        assert_eq!(s.leases()["compaction"].expires_at_ms, 40_000);
+
+        // 代次不对：旧持有者回来续租 ⇒ 必须失败（这正是代次存在的理由）
+        let mut s2 = CatalogState::new();
+        s2.acquire_lease("compaction", "a", 1_000, 1_000);
+        s2.acquire_lease("compaction", "b", 2_000, 30_000); // 接管 ⇒ epoch 2
+        assert!(!s2.renew_lease("compaction", "a", 1, 2_500, 30_000), "旧持有者不得续租");
+        assert!(s2.renew_lease("compaction", "b", 2, 2_500, 30_000));
+
+        // 已过期 ⇒ 不得续租（必须重新 acquire，可能被别人抢先）
+        let mut s3 = CatalogState::new();
+        s3.acquire_lease("compaction", "a", 1_000, 10_000);
+        assert!(!s3.renew_lease("compaction", "a", 1, 11_000, 10_000), "过期即失效");
+    }
+
+    #[test]
+    fn release_only_by_holder_and_epoch_and_frees_it_at_once() {
+        let mut s = CatalogState::new();
+        s.acquire_lease("compaction", "a", 1_000, 30_000);
+        assert!(!s.release_lease("compaction", "b", 1), "非持有者不得释放");
+        assert!(!s.release_lease("compaction", "a", 2), "代次不符不得释放");
+        assert!(s.release_lease("compaction", "a", 1));
+        // 释放后立刻可被别人取走（不必等 TTL）—— 这正是优雅停机的意义。
+        // 而代次**不回绕**（水位留着），否则"同名旧身"的续租会被误接受。
+        let g = s.acquire_lease("compaction", "b", 1_100, 30_000);
+        assert!(g.granted);
+        assert_eq!(g.epoch, 2, "释放后再授予仍要推进代次");
+    }
+
+    #[test]
     fn snapshot_covers_every_state_dimension() {
         let base = rich_state();
         let base_bytes = base.snapshot_artifact();
@@ -1221,6 +1415,10 @@ mod snapshot_tests {
         s.commit_files(commit_req("public.cpu", "b4", &["k4"]), 3_002)
             .unwrap();
         cases.push(("files", s));
+
+        let mut s = rich_state();
+        s.acquire_lease("compaction", "inst-a", 3_004, 30_000);
+        cases.push(("leases", s));
 
         let mut s = rich_state();
         s.record_idempotency(IdempotencyRecord {

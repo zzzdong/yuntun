@@ -196,6 +196,21 @@ impl NodeHandle {
 
     /// 运维状态（`Status` RPC 的返回）。
     pub fn status(&self) -> yuntun_proto::meta::StatusResponse {
+        // 先读**状态机**（另一个锁），再读 status 锁：锁序固定为 sm → status。
+        // 在持有 status 时去取 sm，会和别处相反的取法撞成死锁。
+        let leases = self
+            .sm
+            .lock()
+            .unwrap()
+            .leases()
+            .values()
+            .map(|l| yuntun_proto::meta::LeaseView {
+                purpose: l.purpose.clone(),
+                holder: l.holder.clone(),
+                epoch: l.epoch,
+                expires_at_ms: l.expires_at_ms,
+            })
+            .collect();
         let s = self.status.lock().unwrap();
         yuntun_proto::meta::StatusResponse {
             node_id: s.node_id,
@@ -208,6 +223,7 @@ impl NodeHandle {
             first_index: s.first_index,
             last_index: s.last_index,
             version: yuntun_proto::PROTO_VERSION.into(),
+            leases,
         }
     }
 
@@ -1213,8 +1229,8 @@ fn apply_committed(
                 revision: entry.index,
                 schema_ver: st.version().schema_ver,
                 manifest_ver: st.version().manifest_ver,
-                // 逐 op 的结果形状待定（operation-log §45.4）；关键数字已在上面几个字段
-                result: Vec::new(),
+                // 逐 op 的结果字节（形状由各 op 定；今天只有租约用它 —— `§81`）
+                result: o.result.clone(),
                 snapshot: st.current_snapshot(),
                 affected: o.affected,
             }),

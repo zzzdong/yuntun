@@ -251,6 +251,48 @@ pub struct DatanodeMember {
     pub registered_at_ms: u64,
 }
 
+/// **租约条目**（T14.1）：全局作业（今天 = 压缩）的**单持有者**仲裁。
+///
+/// 为什么它**必须进 raft**：租约是**授权**（"谁有权合并"）—— 两个节点各信各的内存视图，
+/// 就会**同时合并**（重复产物）。这与存活心跳**恰好相反**：心跳是**发现**（晚一点无所谓），
+/// 所以秒级心跳绝不进 raft（`architecture-with-chunk §3.2`）。
+///
+/// `granted_at_ms` / `expires_at_ms` 都是**由 op 携带的时刻**（状态机不读钟，纪律 1）：
+/// 到期判定是 `now_ms >= expires_at_ms`，而 `now_ms` 来自 `Op.now_ms` ——
+/// 于是同一串 op 在所有副本上得到**同一状态**。
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct LeaseEntry {
+    /// 用途键：本轮是 `compaction`（分片粒度以后可扩成 `compaction:{table}:{shard}`）
+    #[prost(string, tag = "1")]
+    pub purpose: String,
+    /// 持有者 `instance_id`
+    #[prost(string, tag = "2")]
+    pub holder: String,
+    /// **代次**：每次授予/接管 +1。持有者用它判断"我的租约是不是已经被别人拿走了"
+    /// —— **续租被拒即停手**，这是时钟偏斜下唯一的防线（`operation-log §81`）。
+    #[prost(uint64, tag = "3")]
+    pub epoch: u64,
+    #[prost(uint64, tag = "4")]
+    pub granted_at_ms: u64,
+    #[prost(uint64, tag = "5")]
+    pub expires_at_ms: u64,
+}
+
+/// 取租约的结果（`AcquireLease` 的 op 结果；trait 返回值同形状）。
+// `prost::Message` 自带 `Debug`/`Default`，重复 derive 会冲突
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct LeaseGrant {
+    /// 是否授予（`false` = 别人正持有**且未过期**）
+    #[prost(bool, tag = "1")]
+    pub granted: bool,
+    /// 授予时是**新**代次；拒绝时是**对方**的代次（便于诊断"谁挡着我"）
+    #[prost(uint64, tag = "2")]
+    pub epoch: u64,
+    /// 授予时是新的到期时刻；拒绝时是对方的
+    #[prost(uint64, tag = "3")]
+    pub expires_at_ms: u64,
+}
+
 /// 幂等键记录（【v8 修正 1】独立表，不随 FileManifest 删除而删除，§7.3.1）
 #[derive(Clone, PartialEq, prost::Message)]
 

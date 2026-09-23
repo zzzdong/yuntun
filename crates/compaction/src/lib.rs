@@ -28,6 +28,16 @@ pub struct CompactionConfig {
     pub interval: Duration,
     /// 孤儿文件静置期（默认 1h）
     pub orphan_grace: Duration,
+    /// 租约的**用途键**（`§81`）：全局作业的单持有者仲裁按它分组。
+    ///
+    /// 今天是固定的 `compaction`；**分片粒度**以后只需把键改成 `compaction:{table}:{shard}` ——
+    /// 协议不用动（`purpose` 本来就是字符串）。
+    pub lease_purpose: String,
+    /// 租约期限（默认 30s）：到期即失效（接管方不必等它点头）。
+    ///
+    /// 与心跳口径无关：心跳是**发现**（秒级、不进 raft），租约是**授权**（进 raft、低频）。
+    /// 期限越短接管越快，代价是续租（一次 raft 写）越频繁。
+    pub lease_ttl: Duration,
 }
 
 impl Default for CompactionConfig {
@@ -37,6 +47,8 @@ impl Default for CompactionConfig {
             max_rows_per_output: 5_000_000,
             interval: Duration::from_secs(60),
             orphan_grace: Duration::from_secs(3600),
+            lease_purpose: "compaction".to_string(),
+            lease_ttl: Duration::from_secs(30),
         }
     }
 }
@@ -52,6 +64,103 @@ pub struct Compactor {
     pub catalog: Arc<dyn CatalogOps>,
     pub store: Arc<dyn object_store::ObjectStore>,
     pub format: yuntun_format::DataFormat,
+    /// **租约持有者身份**（= 本进程的 `instance_id`）。
+    ///
+    /// 必须**显式**且**唯一**：状态机把"同一持有者重复取租约"当作**幂等**（代次不变、期限顺延），
+    /// 于是两个进程若共用一个身份，就会**双双拿到租约**。默认值在这里帮不上忙 ——
+    /// 默认 `"compactor"` 恰好是最危险的那个值。
+    pub lease_holder: String,
+}
+
+/// 墙钟毫秒（**发起方打点**：状态机不读钟，时刻随 op 过线 —— `§81`）。
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// **租约门**（T14.1）：压缩作业的"先拿租约再干活"。
+///
+/// 三条纪律（都来自 `§81`）：
+///
+/// 1. **拿不到就空转**：别人正持有 ⇒ 本轮跳过（不是错误，重复合并只是浪费）；
+/// 2. **续租被拒 ⇒ 立刻停手**：`renew` 返回 false 意味着代次已被别人推进
+///    （"我的租约已经不属于我了"）—— 这是时钟偏斜下唯一的防线；
+/// 3. **元数据面不可达 ⇒ 也不敢干**：拿不到权威的续租回执时，宁可停一轮，
+///    也不能凭"我觉得我还没到期"继续合并。
+struct LeaseGate {
+    purpose: String,
+    holder: String,
+    ttl_ms: u64,
+    /// 0 = 尚未持有
+    epoch: u64,
+    expires_at_ms: u64,
+}
+
+impl LeaseGate {
+    fn new(compactor: &Compactor) -> Self {
+        Self {
+            purpose: compactor.cfg.lease_purpose.clone(),
+            holder: compactor.lease_holder.clone(),
+            ttl_ms: compactor.cfg.lease_ttl.as_millis() as u64,
+            epoch: 0,
+            expires_at_ms: 0,
+        }
+    }
+
+    /// 这一轮是否由本节点干活。
+    async fn acquire_or_renew(&mut self, catalog: &Arc<dyn CatalogOps>) -> bool {
+        let now = now_ms();
+        if self.epoch == 0 {
+            return match catalog
+                .acquire_lease(&self.purpose, &self.holder, now, self.ttl_ms)
+                .await
+            {
+                Ok(g) if g.granted => {
+                    self.epoch = g.epoch;
+                    self.expires_at_ms = g.expires_at_ms;
+                    true
+                }
+                Ok(_) => false, // 别人持有：空转
+                Err(e) => {
+                    tracing::warn!(error = %e, "取租约失败（元数据面不可达？），本轮不合并");
+                    false
+                }
+            };
+        }
+
+        // 还剩超过 1/3 期限就不续：别让"每轮都写一次 raft"成为常态
+        if now + self.ttl_ms / 3 < self.expires_at_ms {
+            return true;
+        }
+        match catalog
+            .renew_lease(&self.purpose, &self.holder, self.epoch, now, self.ttl_ms)
+            .await
+        {
+            Ok(true) => {
+                self.expires_at_ms = now + self.ttl_ms;
+                true
+            }
+            Ok(false) => {
+                tracing::warn!(
+                    purpose = %self.purpose,
+                    holder = %self.holder,
+                    epoch = self.epoch,
+                    "续租被拒：本节点已不是租约持有者，停手（下一轮重新申请）"
+                );
+                self.epoch = 0;
+                self.expires_at_ms = 0;
+                false
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "续租失败（元数据面不可达？），本轮不合并");
+                self.epoch = 0;
+                self.expires_at_ms = 0;
+                false
+            }
+        }
+    }
 }
 
 /// 合并单个 shard 的文件（详细设计 §9.1）。
@@ -280,10 +389,27 @@ pub fn spawn_compaction_loop(
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(compactor.cfg.interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut gate = LeaseGate::new(&compactor);
         loop {
             tokio::select! {
-                _ = shutdown.cancelled() => break,
+                _ = shutdown.cancelled() => {
+                    // 优雅退出：把租约**还回去** —— 接手方不必干等 TTL（`§81`）。
+                    // 代次为 0（还没持有）时这次调用空转，无副作用。
+                    let _ = compactor
+                        .catalog
+                        .release_lease(
+                            &compactor.cfg.lease_purpose,
+                            &compactor.lease_holder,
+                            gate.epoch,
+                        )
+                        .await;
+                    break;
+                }
                 _ = interval.tick() => {}
+            }
+            // **先拿租约再干活**（T14.1）：拿不到就空转 —— 别的节点在干，重复合并只是浪费。
+            if !gate.acquire_or_renew(&compactor.catalog).await {
+                continue;
             }
             let Ok(tables) = compactor.catalog.list_tables().await else {
                 continue;
@@ -349,6 +475,7 @@ mod tests {
 
     fn compactor(catalog: Arc<dyn CatalogOps>) -> Compactor {
         Compactor {
+            lease_holder: "test-compactor".to_string(),
             cfg: CompactionConfig {
                 min_files: 3,
                 ..Default::default()

@@ -72,6 +72,21 @@ struct Proc {
 }
 
 impl Proc {
+    /// 把已 spawn 的子进程包上 stdout/stderr 采集。
+    fn wrap(mut child: Child) -> Self {
+        let stdout = BufReader::new(child.stdout.take().expect("stdout"));
+        let pipe = child.stderr.take().expect("stderr");
+        let stderr = Arc::new(Mutex::new(String::new()));
+        let sink = stderr.clone();
+        std::thread::spawn(move || {
+            let mut r = BufReader::new(pipe);
+            let mut buf = String::new();
+            let _ = r.read_to_string(&mut buf);
+            *sink.lock().unwrap() = buf;
+        });
+        Self { child, stdout, stderr }
+    }
+
     fn start(meta: SocketAddr, dir: &std::path::Path) -> Self {
         let mut child = Command::new(DATANODE)
             .arg("--instance-id")
@@ -106,6 +121,40 @@ impl Proc {
             stdout,
             stderr,
         }
+    }
+
+    /// 多节点形态：指定实例名、私有目录、**共享冷根**与租约期限。
+    ///
+    /// 私有目录必须**各归各的**（WAL/spill 被租约独占），而冷根必须**同一份**
+    /// —— 这正是"共享对象存储 + 私有状态"在一台机器上的样子。
+    fn start_node(
+        meta: SocketAddr,
+        dir: &std::path::Path,
+        id: &str,
+        cold_root: &std::path::Path,
+        ttl_secs: u64,
+    ) -> Self {
+        let child = Command::new(DATANODE)
+            .arg("--instance-id")
+            .arg(id)
+            .arg("--dir")
+            .arg(dir)
+            .arg("--cold-root")
+            .arg(cold_root)
+            .arg("--meta")
+            .arg(meta.to_string())
+            .arg("--compaction")
+            .arg("--compaction-min-files")
+            .arg(FILES.to_string())
+            .arg("--compaction-interval-secs")
+            .arg("1")
+            .arg("--compaction-ttl-secs")
+            .arg(ttl_secs.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("起 yuntun-datanode（多节点形态）");
+        Self::wrap(child)
     }
 
     /// 读 stdout 直到 `LISTEN ...`（= 装配完成、开始服务）。
@@ -275,4 +324,92 @@ async fn datanode_merges_files_from_shared_storage_and_commits_via_raft() {
         FILES as u64 * ROWS_PER_FILE as u64,
         "合并产物的行数必须是输入之和 —— 合并最经典的 bug 就是丢行"
     );
+}
+
+/// **仲裁与接管（T14.2 判据）**：两个都开 `--compaction`，但**只有一个**持有租约；
+/// 杀掉持有者 ⇒ 过 TTL 后另一个接管。
+///
+/// 观察点刻意选在 **metanode 的 Status（租约表）** 而不是"文件有没有被合并"：
+/// 后者在"一个干、一个空转"与"两个都干但幂等"之间**区分不出来** ——
+/// 而"谁在干全局作业"本来就是该被看见的东西（`§81`）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_one_compactor_holds_the_lease_and_it_is_taken_over_when_it_dies() {
+    use yuntun_proto::meta as pb;
+
+    // ---- metanode（进程内）----
+    let meta_dir = tmpdir("lease-meta");
+    let node = yuntun_meta::MetaNode::open(&meta_dir, 1, vec![1], HashMap::new()).expect("起单节点");
+    let h = node.handle();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let meta_addr = listener.local_addr().unwrap();
+    let served = h.clone();
+    tokio::spawn(async move {
+        let _ = yuntun_meta::serve(served, listener).await;
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while h.status().leader_id != 1 {
+        assert!(Instant::now() < deadline, "等待选主超时");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    /// 当前压缩租约的持有者（空 = 空闲/无人）
+    fn holder(h: &yuntun_meta::NodeHandle) -> Option<String> {
+        h.status()
+            .leases
+            .into_iter()
+            .find(|l| l.purpose == "compaction" && !l.holder.is_empty())
+            .map(|l| l.holder)
+    }
+
+    let cold_root = tmpdir("lease-cold");
+    let d1 = tmpdir("lease-d1");
+    let d2 = tmpdir("lease-d2");
+    // 两个数据进程：**私有目录各归各的，冷根同一份**（共享对象存储的本机形态）
+    let _a = Proc::start_node(meta_addr, &d1, "d1", &cold_root, 2);
+    let _b = Proc::start_node(meta_addr, &d2, "d2", &cold_root, 2);
+
+    // ---- 只有一个持有租约（这就是"meta 仲裁出唯一 compactor"的全部机制）----
+    let hw = h.clone();
+    wait_for(
+        move || {
+            let h = hw.clone();
+            async move { holder(&h).is_some() }
+        },
+        Duration::from_secs(30),
+        "有一个 compactor 取得租约",
+        &Arc::new(Mutex::new(String::new())),
+    )
+    .await;
+    let first = holder(&h).expect("应当有持有者");
+    assert!(first == "d1" || first == "d2", "持有者必须是本用例的两个节点之一：{first}");
+
+    // ---- 杀掉持有者 ⇒ 另一个在 TTL 之后接管 ----
+    let survivor = if first == "d1" { "d2" } else { "d1" };
+    drop(if first == "d1" { _a } else { _b }); // drop = kill + wait（见 Drop 实现）
+
+    let hw2 = h.clone();
+    let survivor_owned = survivor.to_string();
+    wait_for(
+        move || {
+            let h = hw2.clone();
+            let want = survivor_owned.clone();
+            async move { holder(&h).as_deref() == Some(want.as_str()) }
+        },
+        Duration::from_secs(30),
+        "幸存者接管了租约（过 TTL 后）",
+        &Arc::new(Mutex::new(String::new())),
+    )
+    .await;
+
+    // 顺带确认租约是**可见的**（运维角度：Status 里能读到它，而不是只能靠信任）
+    let view = h
+        .status()
+        .leases
+        .into_iter()
+        .find(|l| l.purpose == "compaction")
+        .expect("Status 里应当能看到压缩租约");
+    assert!(!view.holder.is_empty());
+    assert_eq!(view.holder, survivor);
+    assert!(view.epoch >= 2, "接管必须推进代次（当前 {}）", view.epoch);
+    let _ = pb::LeaseView::default();
 }

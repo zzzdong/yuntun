@@ -482,6 +482,28 @@ fn actual_version_of(st: &tonic::Status) -> Option<u64> {
         .and_then(|v| v.parse().ok())
 }
 
+/// 墙钟毫秒（**发起方打点**：状态机不读钟，时刻随 op 过线 —— `§81`）。
+fn now_ms_wall() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 从 op 结果字节里解出 [`yuntun_model::meta::LeaseGrant`]。
+///
+/// 空结果 = 服务端没接线 `ProposeResponse.result`：**必须报错**，不能当"没授予"糊过去
+/// —— 那会让压缩循环永远拿不到租约，且看不出是为什么。
+fn decode_grant(result: &[u8]) -> Result<yuntun_model::meta::LeaseGrant, LakeError> {
+    if result.is_empty() {
+        return Err(LakeError::Other(
+            "lease op 未返回结果（服务端没接线 ProposeResponse.result？）".into(),
+        ));
+    }
+    prost::Message::decode(result)
+        .map_err(|e| LakeError::Other(format!("decode LeaseGrant: {e}")))
+}
+
 #[async_trait::async_trait]
 impl CatalogOps for RemoteCatalog {
     async fn heartbeat(&self, instance_id: &str) -> Result<bool, LakeError> {
@@ -515,6 +537,67 @@ impl CatalogOps for RemoteCatalog {
         })
         .await?;
         Ok(())
+    }
+
+    async fn acquire_lease(
+        &self,
+        purpose: &str,
+        holder: &str,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<yuntun_model::meta::LeaseGrant, LakeError> {
+        let resp = self
+            .propose(pb::Op {
+                now_ms,
+                kind: Some(pb::op::Kind::AcquireLease(pb::AcquireLeaseOp {
+                    purpose: purpose.to_string(),
+                    holder: holder.to_string(),
+                    ttl_ms,
+                })),
+            })
+            .await?;
+        decode_grant(&resp.result)
+    }
+
+    async fn renew_lease(
+        &self,
+        purpose: &str,
+        holder: &str,
+        epoch: u64,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<bool, LakeError> {
+        let resp = self
+            .propose(pb::Op {
+                now_ms,
+                kind: Some(pb::op::Kind::RenewLease(pb::RenewLeaseOp {
+                    purpose: purpose.to_string(),
+                    holder: holder.to_string(),
+                    epoch,
+                    ttl_ms,
+                })),
+            })
+            .await?;
+        Ok(decode_grant(&resp.result)?.granted)
+    }
+
+    async fn release_lease(
+        &self,
+        purpose: &str,
+        holder: &str,
+        epoch: u64,
+    ) -> Result<bool, LakeError> {
+        let resp = self
+            .propose(pb::Op {
+                now_ms: now_ms_wall(),
+                kind: Some(pb::op::Kind::ReleaseLease(pb::ReleaseLeaseOp {
+                    purpose: purpose.to_string(),
+                    holder: holder.to_string(),
+                    epoch,
+                })),
+            })
+            .await?;
+        Ok(decode_grant(&resp.result)?.granted)
     }
 
     async fn datanodes(&self) -> Result<Vec<yuntun_model::meta::DatanodeMember>, LakeError> {

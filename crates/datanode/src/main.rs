@@ -79,9 +79,16 @@ struct Args {
     /// 实例标识（= `FileManifest.source_instance`；热数据按它归属，`§65`）
     #[arg(long)]
     instance_id: String,
-    /// 私有数据根目录（其下 `cold/` 两种形态都用；`wal/`+`spill/` 仅 ingest 形态）
+    /// 私有数据根目录（其下 `wal/`+`spill/` 仅 ingest 形态；`cold/` 是它的默认冷存储）
     #[arg(long)]
     dir: PathBuf,
+    /// 冷存储根目录（默认 `<dir>/cold`）。
+    ///
+    /// 为什么要能单独指：**多节点必须共享同一份冷存储，而私有目录必须各归各的**
+    /// （WAL/spill 被租约独占，同一目录第二个进程启动即被拒）。本机形态下这就意味着
+    /// "各给一个 `--dir`，但指同一个 `--cold-root`"——真实部署里它是 S3。
+    #[arg(long)]
+    cold_root: Option<PathBuf>,
     /// 数据面（热读）服务监听地址；仅 ingest 形态。`127.0.0.1:0` = 内核分配
     #[arg(long, default_value = "127.0.0.1:0")]
     listen: String,
@@ -124,6 +131,11 @@ struct Args {
     /// 孤儿文件静置期（秒）：早于它、又不在目录里的产物才会被删
     #[arg(long, default_value_t = 3600)]
     compaction_gc_grace_secs: u64,
+    /// 压缩租约的期限（秒）：到期即失效，接手方不必等它点头（`§81`）。
+    ///
+    /// 短 = 接管快、续租（一次 raft 写）频；长 = 反之。默认 30s 与"巡检/心跳都是秒级"配套。
+    #[arg(long, default_value_t = 30)]
+    compaction_ttl_secs: u64,
 }
 
 /// **启动即校验**（`§79` 的三种形态）：宁可起不来，也别起成一个语义含糊的进程。
@@ -218,7 +230,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let shutdown = CancellationToken::new();
     let wal_root = args.dir.join("wal");
     let spill_dir = args.dir.join("spill");
-    let cold_root = args.dir.join("cold");
+    // 冷存储：默认在私有目录下（单机形态），可显式指向别处（多节点共享同一份）
+    let cold_root = args
+        .cold_root
+        .clone()
+        .unwrap_or_else(|| args.dir.join("cold"));
     std::fs::create_dir_all(&cold_root)?;
 
     // ① 私有目录租约 —— **排在最前**：被拒的进程连 WAL 都不该打开。
@@ -302,10 +318,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // 放在吸收循环之后：本进程已经握着共享冷存储与目录句柄，压缩不需要新输入。
         if args.compaction {
             let compactor = Arc::new(yuntun_compaction::Compactor {
+                lease_holder: args.instance_id.clone(),
                 cfg: yuntun_compaction::CompactionConfig {
                     min_files: args.compaction_min_files,
                     interval: Duration::from_secs(args.compaction_interval_secs),
                     orphan_grace: Duration::from_secs(args.compaction_gc_grace_secs),
+                    // 租约期限：拿不到/续不上就停手（`§81`）
+                    lease_ttl: Duration::from_secs(args.compaction_ttl_secs),
                     ..Default::default()
                 },
                 catalog: catalog.clone(),

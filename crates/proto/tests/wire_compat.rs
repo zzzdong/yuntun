@@ -372,7 +372,8 @@ fn status_response_exposes_all_operational_fields() {
         first_index: 21,
         last_index: 30,
         version: yuntun_proto::PROTO_VERSION.into(),
-    };
+                leases: Vec::new(),
+        };
     let back = roundtrip(&s);
     assert_eq!(back, s);
     // 快照健康度的三个量必须都在（缺任一个都无法判断"该发快照了吗"）

@@ -77,7 +77,46 @@ message Op {
     // 摘除数据节点（T12.3）。**必须走 raft**：名录必须与 schema/manifest 同版本传下去
     // （`§3.1`）—— 而**触发它的心跳不走 raft**（秒级会写爆，`§3.2`）。
     RemoveDatanodeOp remove_datanode = 12;
+    // **租约**（T14.1）：全局作业（今天 = 压缩）的**单持有者**仲裁。
+    //
+    // **必须走 raft**：租约是**授权**（"谁有权合并"）—— 两个节点各信各的内存视图就会
+    // **同时合并**（重复产物）。这与存活心跳**恰好相反**：心跳是**发现**（晚一点无所谓），
+    // 所以秒级心跳绝不进 raft（`§3.2`）。到期时刻全部**随 op 携带**（状态机不读钟）。
+    //
+    // 三个 op 的结果形状统一是 `LeaseGrant`（`yuntun_model::meta::LeaseGrant` 编码后的字节，
+    // 走 `ProposeResponse.result`）—— **授予与否无法从 `accepted`/`affected` 重建**，
+    // 这正是 `result` 字段存在的理由。
+    AcquireLeaseOp acquire_lease = 13;
+    RenewLeaseOp   renew_lease   = 14;
+    ReleaseLeaseOp release_lease = 15;
   }
+}
+
+// 取租约（含**接管**）：空闲、或当前已过期（`Op.now_ms >= expires_at_ms`）⇒ 授予；
+// 同一持有者重复取 ⇒ 代次不变、期限顺延。
+message AcquireLeaseOp {
+  // 用途键：本轮是 `compaction`（分片粒度以后可扩成 `compaction:{table}:{shard}`）
+  string purpose = 1;
+  // 申请者 `instance_id`
+  string holder  = 2;
+  // 期望持有期（毫秒）
+  uint64 ttl_ms  = 3;
+}
+
+// 续租：只有"当前持有者 + 代次匹配 + **未过期**"三者齐备才成功。
+message RenewLeaseOp {
+  string purpose = 1;
+  string holder  = 2;
+  // 代次（栅栏）：不符 = 你已经不是持有者，**立刻停手**
+  uint64 epoch   = 3;
+  uint64 ttl_ms  = 4;
+}
+
+// 释放（优雅停机）：置为空闲并**保留代次水位**，让接手方不必干等 TTL。
+message ReleaseLeaseOp {
+  string purpose = 1;
+  string holder  = 2;
+  uint64 epoch   = 3;
 }
 
 // 数据节点名录里的一条。
@@ -313,6 +352,18 @@ message StatusResponse {
   uint64 first_index    = 8;
   uint64 last_index     = 9;
   string version        = 10;
+  // 当前租约（T14.1）。放进 Status 是刻意的：**"谁在干全局作业"必须是可观测的** ——
+  // 否则"只有一个 compactor"这件事只能靠信任，排障时无从确认。
+  repeated LeaseView leases = 11;
+}
+
+// 租约的运维视图（只读快照，不含任何调度语义）。
+message LeaseView {
+  string purpose       = 1;
+  // 空 = 空闲（已释放；条目仍在，因为**代次水位**要留着）
+  string holder        = 2;
+  uint64 epoch         = 3;
+  uint64 expires_at_ms = 4;
 }
 
 // ---------------------------------------------------------------- 成员

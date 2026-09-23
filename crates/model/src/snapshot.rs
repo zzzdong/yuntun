@@ -48,12 +48,12 @@ use crate::error::SnapshotError;
 /// 帧头 magic（含版本字母，便于十六进制 dump 时肉眼识别）。
 pub const SNAPSHOT_MAGIC: [u8; 8] = *b"YTSNAP01";
 /// 本实现写出的帧格式版本。
-/// 快照载荷布局版本。**改布局必须 +1**（例如 2：新增 `datanodes`）。
+/// 快照载荷布局版本。**改布局必须 +1**（例如 2：新增 `datanodes`；3：新增 `leases`）。
 ///
 /// 为什么必须 bump：`decode_payload` 拿它做**严格相等**校验 —— 旧构建读到新载荷会
 /// **明确拒绝**，而不是默默忽略未知字段。名录这类字段一旦被静默丢掉，查询侧就会按
 /// 空成员表算归属（`§69` 那类"静默少数据"）。
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
 /// 帧头长度。
 pub const SNAPSHOT_HEADER_LEN: usize = 36;
 /// 块头长度（`data_len` + `crc`）。
@@ -295,6 +295,9 @@ pub struct CatalogStateSnapshot {
     /// 丢一份就等于全体查询按空成员表算归属。
     #[prost(message, repeated, tag = "12")]
     pub datanodes: Vec<crate::meta::DatanodeMember>,
+    /// **租约**（T14.1）：丢一份就等于"接手方以为没人持有" ⇒ 重复合并。
+    #[prost(message, repeated, tag = "13")]
+    pub leases: Vec<crate::meta::LeaseEntry>,
 }
 
 // ---------------------------------------------------------------- 载荷编解码

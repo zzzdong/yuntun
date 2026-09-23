@@ -766,6 +766,7 @@ fn compactor(
     min_files: usize,
 ) -> yuntun_compaction::Compactor {
     yuntun_compaction::Compactor {
+        lease_holder: "chaos-compactor".to_string(),
         cfg: yuntun_compaction::CompactionConfig {
             min_files,
             ..Default::default()
@@ -1002,6 +1003,7 @@ async fn idempotency_survives_compaction() {
     // ③ compaction：3 文件 → 1 文件，旧文件 deleted_at
     let catalog: Arc<dyn CatalogOps> = setup.catalog.clone();
     let compactor = yuntun_compaction::Compactor {
+        lease_holder: "chaos-compactor".to_string(),
         cfg: yuntun_compaction::CompactionConfig {
             min_files: 3,
             ..Default::default()

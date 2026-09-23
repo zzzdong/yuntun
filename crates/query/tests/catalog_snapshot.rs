@@ -200,6 +200,33 @@ impl CatalogOps for BrokenCatalog {
     ) -> Result<Vec<yuntun_model::meta::DatanodeMember>, yuntun_model::LakeError> {
         self.inner.datanodes().await
     }
+    async fn acquire_lease(
+        &self,
+        purpose: &str,
+        holder: &str,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<yuntun_model::meta::LeaseGrant, yuntun_model::LakeError> {
+        self.inner.acquire_lease(purpose, holder, now_ms, ttl_ms).await
+    }
+    async fn renew_lease(
+        &self,
+        purpose: &str,
+        holder: &str,
+        epoch: u64,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<bool, yuntun_model::LakeError> {
+        self.inner.renew_lease(purpose, holder, epoch, now_ms, ttl_ms).await
+    }
+    async fn release_lease(
+        &self,
+        purpose: &str,
+        holder: &str,
+        epoch: u64,
+    ) -> Result<bool, yuntun_model::LakeError> {
+        self.inner.release_lease(purpose, holder, epoch).await
+    }
     async fn heartbeat(&self, id: &str) -> Result<bool, yuntun_model::LakeError> {
         self.inner.heartbeat(id).await
     }

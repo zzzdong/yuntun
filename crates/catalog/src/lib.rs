@@ -13,7 +13,7 @@ use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use yuntun_model::error::LakeError;
 use yuntun_model::meta::{
-    DatanodeMember, FileManifest, IdempotencyRecord, TableMeta,
+    DatanodeMember, LeaseGrant, FileManifest, IdempotencyRecord, TableMeta,
     compute_stats_lite,
 };
 use yuntun_model::ops::{
@@ -130,6 +130,43 @@ pub trait CatalogOps: Send + Sync {
     /// `false` 的语义是"**你已被摘除，请重新注册**" —— 数据节点据此自愈（`§72.2`）。
     /// 注意它**不是**写操作：元数据面只更新内存存活表，**绝不写 raft**（`§3.2`）。
     async fn heartbeat(&self, instance_id: &str) -> Result<bool, LakeError>;
+
+    // ---- 租约（T14.1：全局作业的单持有者仲裁）----
+    /// **取租约**（含**接管**）：空闲、或当前已过期 ⇒ 授予；否则拒绝。
+    ///
+    /// `now_ms` **由调用方打点**：状态机不读钟（纪律 1），远端形态下它随 op 过线 ——
+    /// 于是"到期了没有"在所有副本上是**同一个判断**。
+    ///
+    /// **没有默认实现是刻意的**：任何默认值（包括"总是授予"）都等于**关掉仲裁**，
+    /// 而仲裁一关，两个节点就会同时合并（重复产物，`§79.2`）。
+    async fn acquire_lease(
+        &self,
+        purpose: &str,
+        holder: &str,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<LeaseGrant, LakeError>;
+
+    /// **续租**：只有"当前持有者 + 代次匹配 + **未过期**"才成功。
+    ///
+    /// 返回 `false` 的语义是"**你已经不是持有者，立刻停手**"—— 这是时钟偏斜下
+    /// 唯一的防线（`§81`）。
+    async fn renew_lease(
+        &self,
+        purpose: &str,
+        holder: &str,
+        epoch: u64,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<bool, LakeError>;
+
+    /// **释放**（优雅停机）：置为空闲并保留代次水位，让接手方不必干等 TTL。
+    async fn release_lease(
+        &self,
+        purpose: &str,
+        holder: &str,
+        epoch: u64,
+    ) -> Result<bool, LakeError>;
 }
 
 /// 归一化表标识：裸名 → `public.<name>`；限定名原样（兼容 v1 单 schema 数据/调用）。
@@ -296,6 +333,48 @@ impl CatalogOps for MemoryCatalog {
     async fn register_datanode(&self, m: DatanodeMember) -> Result<(), LakeError> {
         self.state.write().unwrap().register_datanode(m);
         Ok(())
+    }
+
+    async fn acquire_lease(
+        &self,
+        purpose: &str,
+        holder: &str,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<LeaseGrant, LakeError> {
+        Ok(self
+            .state
+            .write()
+            .unwrap()
+            .acquire_lease(purpose, holder, now_ms, ttl_ms))
+    }
+
+    async fn renew_lease(
+        &self,
+        purpose: &str,
+        holder: &str,
+        epoch: u64,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<bool, LakeError> {
+        Ok(self
+            .state
+            .write()
+            .unwrap()
+            .renew_lease(purpose, holder, epoch, now_ms, ttl_ms))
+    }
+
+    async fn release_lease(
+        &self,
+        purpose: &str,
+        holder: &str,
+        epoch: u64,
+    ) -> Result<bool, LakeError> {
+        Ok(self
+            .state
+            .write()
+            .unwrap()
+            .release_lease(purpose, holder, epoch))
     }
 
     async fn datanodes(&self) -> Result<Vec<DatanodeMember>, LakeError> {
