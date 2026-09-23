@@ -694,13 +694,27 @@ impl CatalogState {
         Ok(next)
     }
 
-    /// **已知 batch_id 列表**（孤儿清理对账用）—— **排序**返回（纪律 2）。
+    /// **此刻仍需保护的 batch_id 列表**（孤儿清理对账基准）—— **排序**返回（纪律 2）。
     ///
-    /// = 已提交的文件 ∪ **在途批次**。把在途算进来是 T14.3 的全部要点：
-    /// 前者是"已经在目录里的"，后者是"**马上要进目录的**"——只认前者，
-    /// GC 就会把正在写的文件当孤儿（`R-9`）。
+    /// = **还没到期的**文件 ∪ **在途批次**。两项各对应一条纪律：
+    ///
+    /// - **在途**（T14.3）：写者上传**之前**的登记 —— GC 判据从 grace（时间假设）
+    ///   变成**结构可见**，`R-9` 的误删在这个方向上被封死；
+    /// - **保护期**（T14.5）：`deleted_at != 0` 的墓碑，一旦**当前快照越过它**
+    ///   （`!protects_at(snapshot_version)`）就**退出**这个集合 —— 否则墓碑永远是"已知"，
+    ///   被合并替换掉的旧对象**只增不减**（本刀之前正是如此）。这正是
+    ///   `architecture §4.6` 那句"等墓碑期 + 无在途引用才真正删除"的后半句。
+    ///
+    /// ⚠️ 与 [`Self::files_since`] 的分工：那个是**给客户端对账元数据**的（含墓碑 —— 客户端
+    /// 必须知道"哪些文件没了"，否则本地旧副本会读到脏数据）；这个是**给物理回收**的，
+    /// 两者**不能混用**。
     pub fn known_batch_ids(&self) -> Vec<String> {
-        let mut ids: BTreeSet<String> = self.files.keys().cloned().collect();
+        let mut ids: BTreeSet<String> = self
+            .files
+            .iter()
+            .filter(|(_, f)| f.protects_at(self.snapshot_version))
+            .map(|(id, _)| id.clone())
+            .collect();
         ids.extend(self.in_flight.keys().cloned());
         ids.into_iter().collect()
     }

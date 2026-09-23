@@ -222,7 +222,23 @@ impl FileManifest {
     /// 文件可见 ⟺ valid_from <= query_snapshot
     ///           AND (deleted_at == 0 OR query_snapshot < deleted_at)
     pub fn visible_at(&self, snapshot: u64) -> bool {
-        self.valid_from <= snapshot && (self.deleted_at == 0 || snapshot < self.deleted_at)
+        self.valid_from <= snapshot && self.protects_at(snapshot)
+    }
+
+    /// 这个文件在快照 `snapshot` 下**还需要被保护吗**（T14.5）。
+    ///
+    /// 与 [`Self::visible_at`] 只差一个 `valid_from`，但这个差别是**故意的**：
+    ///
+    /// - `visible_at` 回答"读者**看得见**吗"；
+    /// - `protects_at` 回答"**物理回收**会不会伤到谁" —— 一个 `valid_from` 还没到的
+    ///   合并产物（`valid_from = snapshot + 1`）此刻不可见，但它**必须被保护**：
+    ///   它是已经提交的真数据，只是还没到生效的那一刻。
+    ///
+    /// 于是回收判据是：**活着**（`deleted_at == 0`）或**墓碑期未过**
+    /// （`snapshot < deleted_at`，旧快照的读者还看得见它）。过了这一线，任何快照都
+    /// 看不见它了 —— 那就是"等墓碑期 + 无在途引用才真正删除"里的**墓碑期**（`architecture §4.6`）。
+    pub fn protects_at(&self, snapshot: u64) -> bool {
+        self.deleted_at == 0 || snapshot < self.deleted_at
     }
 }
 

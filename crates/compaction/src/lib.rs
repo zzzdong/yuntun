@@ -289,7 +289,15 @@ pub fn classify_orphans(
 /// 每 interval 列举 `prefix` 下全部 S3 对象 → 与 Meta 已知 batch_id 对账
 /// → 未匹配的文件记录"首次发现时间"，**静置超过 grace 才删除**。
 ///
-/// 【正确性关键】判据是 `known_batch_ids` = **已提交文件 ∪ 在途批次**（T14.3）。
+/// 【正确性关键】判据是 `known_batch_ids` = **保护期内的文件 ∪ 在途批次**。两项各守一个方向：
+///
+/// - **在途**（T14.3）：写者上传**之前**的登记 ⇒ 判据从 grace（时间假设）变成**结构可见**；
+/// - **保护期**（T14.5）：墓碑（`deleted_at != 0`）在当前快照越过它之后**退出**保护集合
+///   ⇒ 被合并替换掉的旧对象**能被真正回收**（在此之前它永远"已知" ⇒ 对象只增不减，
+///   与 `architecture §4.6` 的"等墓碑期 + 无在途引用才真正删除"正相反）。
+///
+/// `grace` 在这里的角色也随之变清楚：T14.3 之后写者安全**不再依赖它**，它只剩"给还在读
+/// 旧快照的读者一个窗口"这一件事 —— 也就是**墓碑期的时长**。
 ///
 /// 在 T14.3 之前这里靠**时间假设**兜底："刚写完 S3、CommitFiles 还没落地"的文件
 /// 靠 grace 期内不删来保护 —— 而一个**上传慢于 grace** 的写者（大文件 / S3 抖动 /
@@ -316,6 +324,10 @@ pub fn spawn_orphan_cleanup(
 }
 
 /// 同 [`spawn_orphan_cleanup`]，但可指定轮询间隔。
+///
+/// `grace` **同时就是墓碑期的时长**（T14.5）：一个墓碑退出保护集合后，还要再"静置"
+/// `grace` 才被删。设计推荐的运行值是 10–60s（`architecture §4.6`），默认给大是保守取值 —
+/// 因为**调小它是安全的**：写者安全由在途登记（结构保证）承担，不再由 grace 承担。
 ///
 /// 生产用 60s（见上，`grace` 才是安全边界，间隔只影响回收及时性）；
 /// **测试需要能把它压到毫秒级** —— 否则一条"不误删已知文件"的用例要跑一分钟以上，
@@ -641,6 +653,133 @@ mod tests {
             !left.iter().any(|p| p.contains("planted-orphan")),
             "埋下的真孤儿必须被回收 —— 否则这条用例是空转：{left:?}"
         );
+    }
+
+    /// **T14.5 的回收用例**：墓碑过期后，被合并替换掉的旧对象**必须**真的被回收。
+    ///
+    /// 这是 `§84` 那条的**镜像** —— 两个方向都要钉住，缺一个都不算对：
+    ///
+    /// - `§84` 证明"**不误删**"：在途的、可见的东西一个都不许动；
+    /// - 这条证明"**真会删**"：保护期一过，空间真的回来。
+    ///
+    /// 后者特别容易悄悄退化：本刀之前 `known_batch_ids` 取的是**全部** `files`（含墓碑）
+    /// ⇒ 墓碑永远"已知" ⇒ 这条用例**必然失败**（旧对象一个都不会少）。所以它不是一条
+    /// "应该通过"的用例，而是一条**守着机制**的用例（反证见 `§85.3`）。
+    #[tokio::test]
+    async fn expired_tombstones_are_reclaimed_by_gc() {
+        let catalog: Arc<MemoryCatalog> = Arc::new(MemoryCatalog::new());
+        setup(&catalog).await;
+        let c = compactor(catalog.clone());
+
+        // 3 个真文件 → 合并成 1 个（旧文件转墓碑）
+        let mut old_paths = Vec::new();
+        for _ in 0..3 {
+            let bid = uuid::Uuid::now_v7().to_string();
+            let (path, size, _rows) = write_batch(
+                &c.store,
+                "t",
+                "s0",
+                "w1",
+                &bid,
+                &batch(),
+                DataFormat::Parquet,
+            )
+            .await
+            .unwrap();
+            catalog
+                .commit_files(CommitFilesRequest {
+                    table: "t".into(),
+                    batch_id: bid.clone(),
+                    client_request_id: None,
+                    client_request_ids: vec![],
+                    shard: "s0".into(),
+                    time_window: "w1".into(),
+                    files: vec![FileManifest {
+                        file_path: path.clone(),
+                        batch_id: bid.clone(),
+                        file_size: size,
+                        row_count: 3,
+                        ..Default::default()
+                    }],
+                    schema_version: 1,
+                    row_count: 3,
+                })
+                .await
+                .unwrap();
+            old_paths.push(path);
+        }
+        let snap = catalog.current_snapshot().await;
+        let new_snap = compact_shard(&c, "t", "s0", snap, 0)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let visible = catalog
+            .list_visible_files("t", new_snap, Some("s0"))
+            .await
+            .unwrap();
+        assert_eq!(visible.len(), 1, "合并后只该有 1 个可见文件");
+        let merged_path = visible[0].file_path.clone();
+
+        // 【判据】旧文件已过保护期 ⇒ 退出保护集合；合并产物仍在其中
+        let known: HashSet<String> = catalog
+            .known_batch_ids()
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        for p in &old_paths {
+            let id = yuntun_format::extract_batch_id(p).unwrap();
+            assert!(
+                !known.contains(&id),
+                "过期的墓碑不该还在保护集合里（否则永远回收不了）：{id}"
+            );
+        }
+        assert!(
+            known.contains(&visible[0].batch_id),
+            "合并产物是活着的，必须仍在保护集合里"
+        );
+
+        // GC 跑起来：grace = ZERO（不靠时间假设）
+        let shutdown = CancellationToken::new();
+        let _gc = spawn_orphan_cleanup_with_interval(
+            c.store.clone(),
+            catalog.clone(),
+            "yuntun/".to_string(),
+            Duration::ZERO,
+            Duration::from_millis(20),
+            shutdown.clone(),
+        );
+
+        // 旧对象**真的消失**（空间回来了），同时合并产物**还在**（别删过头）
+        let store = c.store.clone();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let left: Vec<String> = list_s3_files(&store, "yuntun/")
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(p, _)| p)
+                .collect();
+            let olds_gone = old_paths.iter().all(|p| !left.contains(p));
+            if olds_gone && left.contains(&merged_path) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "回收超时。旧文件应消失、产物应保留：left={left:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        shutdown.cancel();
+
+        // 元数据不受影响：可见文件仍是那一个产物，行数仍是输入之和
+        let after = catalog
+            .list_visible_files("t", catalog.current_snapshot().await, Some("s0"))
+            .await
+            .unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].row_count, 9, "3 个文件 × 3 行");
     }
 
     /// **T14.3 的回归用例**（`R-9`）：在途文件**连静置期都不用等**，GC 也不许删它。

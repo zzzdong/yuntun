@@ -95,7 +95,10 @@ pub trait CatalogOps: Send + Sync {
         lease_epoch: u64,
     ) -> Result<u64, LakeError>;
 
-    /// 全部已知 batch_id（孤儿清理对账用，§12.2.1）——同上，不得绑具体实现。
+    /// **此刻仍需保护**的 batch_id（孤儿清理对账基准，§12.2.1 / T14.5）——同上，不得绑具体实现。
+    ///
+    /// = 保护期内的文件（活着，或墓碑期未过）∪ 在途批次。**过期的墓碑不在其中** ——
+    /// 那正是让物理空间能被回收的判据（`architecture §4.6`）。
     async fn known_batch_ids(&self) -> Result<Vec<String>, LakeError>;
 
     // ---- 幂等 ----
@@ -956,6 +959,33 @@ mod tests {
     }
 
     // C5：Catalog 仅存内存（结构上无落盘代码即满足；此处验证 snapshot 语义）
+    /// **T14.5 的判据表**：哪些文件还需要被保护（纯函数，不写任何真数据）。
+    ///
+    /// 三个角落各钉一条 —— 尤其是第三条：`visible_at` 与 `protects_at` 的**故意差别**。
+    #[test]
+    fn protects_at_covers_live_tombstone_and_pending() {
+        // ① 活着：任何快照下都保护（`valid_from` 还没到也一样，见 ③）
+        let mut live = manifest("live", "p/live.parquet");
+        live.valid_from = 100;
+        live.deleted_at = 0;
+        assert!(live.protects_at(0), "活着的文件永远要保护");
+        assert!(live.protects_at(100));
+
+        // ② 墓碑：快照越过它之前保护，越过之后放手（这一放手就是物理回收的前提）
+        let mut tomb = manifest("tomb", "p/tomb.parquet");
+        tomb.deleted_at = 50;
+        assert!(tomb.protects_at(49), "快照还没越过墓碑 ⇒ 还有读者看得见它");
+        assert!(!tomb.protects_at(50), "快照越过墓碑 ⇒ 任何快照都看不见了");
+        assert!(!tomb.protects_at(51));
+
+        // ③ 与 `visible_at` 的差别：**看不见 ≠ 可以删**
+        //    合并产物的 `valid_from = snapshot + 1`：此刻不可见，但它是已提交的真数据。
+        let mut pending = manifest("pending", "p/pending.parquet");
+        pending.valid_from = 200;
+        assert!(!pending.visible_at(100), "还没到生效快照 ⇒ 读者看不见");
+        assert!(pending.protects_at(100), "看不见不等于可以删");
+    }
+
     #[tokio::test]
     async fn snapshot_monotonic_and_read_index() {
         let c = catalog_with_table().await;

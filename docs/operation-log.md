@@ -5528,3 +5528,64 @@ proto 早就留了 `bytes result = 5`（注释："逐 op 的结果形状待定"�
 
 **保活仍未复用现有心跳**（续租仍是一次 raft op，每 TTL/3 一次）—— 这是"能省一次写"的优化，
 不是正确性缺口。
+
+---
+
+## 85. T14.5：墓碑回收 —— 保护集合从"全部已知"收窄成"仍在保护期"（2026-09-24）
+
+### 85.1 症状：墓碑永远不会被物理回收
+
+链条很短：`commit_compaction` 把旧文件标 `deleted_at` 之后**仍留在 `files` 里** ⇒
+`known_batch_ids()`（= `files.keys()` ∪ 在途）**永远含墓碑** ⇒ 孤儿 GC 的判据
+`!known.contains(batch_id)` 对它**永远为假** ⇒ 被合并替换掉的旧对象**只增不减**，
+集群越跑越大。而 `architecture §4.6` 末句要的正是相反的事：
+
+> 产出新文件、标记旧文件 `deleted_at`，等**墓碑期 + 无在途引用**才真正删除。
+
+### 85.2 这一刀
+
+| 件 | 改动 |
+|---|---|
+| `FileManifest::protects_at(snapshot)` | **新判据**（与 `visible_at` 并排）：**活着**（`deleted_at == 0`）或**墓碑期未过**（`snapshot < deleted_at`） |
+| `LakeState::known_batch_ids` | = `protects_at(当前快照)` 的文件 ∪ 在途 ⇒ **过期的墓碑退出保护集合**，物理回收才可能有对象可收 |
+| `orphan_grace` | 语义变清楚：T14.3 之后写者安全**不再依赖它** ⇒ 它**就是墓碑期的时长**（设计推荐 **10–60s**；默认 3600 是保守取值） |
+| **wire** | **零改动** —— 收窄发生在状态机**内部**（它自己知道当前快照），协议一个字没动 |
+
+### 85.2.1 为什么 `protects_at` 不等同于 `visible_at`
+
+只差一个 `valid_from`，但这个差别是**故意的**：合并产物的 `valid_from = snapshot + 1`
+此刻**不可见**，但它是**已提交的真数据** —— **看不见 ≠ 可以删**。判据表用例单钉了这一格。
+
+### 85.3 镜像反证（与 `§84` 互为镜像）
+
+"删除正确性"有两个方向，缺一个都不算对：
+
+| 刀 | 反证做法 | 期望与实测 |
+|---|---|---|
+| `§84` | 判据退回"只认已提交"（去掉在途） | 两条用例 **FAILED** ⇒ 守着"**不误删**" |
+| `§85` | 判据退回"全部已知"（含墓碑） | 回收用例 **FAILED**，而 `§84` 两条**仍 ok** ⇒ 守着"**真会删**" |
+
+```text
+  expired_tombstones_are_reclaimed_by_gc                  ... FAILED
+  gc_never_deletes_an_in_flight_file_even_with_zero_grace ... ok
+  multi_writer_plus_gc_never_deletes_a_committed_file     ... ok
+```
+
+方向相反、互不干扰 —— 这正是"两个方向都钉住"的样子。
+
+### 85.4 验证
+
+- 用例：判据表（纯函数，3 格）+ `expired_tombstones_are_reclaimed_by_gc`
+  （**真文件 → 真合并 → 旧对象消失 + 合并产物还在 + 行数不变**）
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **362 passed / 0 failed（+1 ignored）**
+- clippy 本仓 **0**；规模：45,311 行 / 20 个 crate / 362 测试函数
+
+### 85.5 R6 的账（更新）
+
+| 判据 | 状态 |
+|---|---|
+| T14.1 meta 租约独占 | ✅ `§81` |
+| T14.2 租约 + 过期接管（**无重复合并**） | ✅ `§81`（接管 e2e）+ `§82`（epoch 栅栏） |
+| T14.3 孤儿 GC 的多写者安全 | ✅ `§83` + `§84`（TTL 驱动 + 专项 + 反证） |
+| **T14.5 与 `deleted_at` 联动** | ✅ **本刀**：墓碑期（= `orphan_grace`）过后即可物理回收；"无在途引用"由 T14.3 的**在途登记**挡住 |
+| T14.4 跨节点文件合并（不同 `source_instance`） | ❌ **R6 只剩这一项** |
