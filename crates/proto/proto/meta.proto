@@ -43,6 +43,9 @@ service Meta {
   rpc Status   (StatusRequest)   returns (StatusResponse);
   // 成员变更（learner → voter）
   rpc Join     (JoinRequest)     returns (JoinResponse);
+  // **心跳**（T12.3）：数据节点保活用。只更新 metanode 的**内存**存活表，
+  // **绝不写 raft** —— 秒级心跳会把写路径压垮（`architecture-with-chunk §3.2`）。
+  rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
   // 节点间：一条 raft 消息（S3-3 传输）。**不是客户端接口** ——
   // 客户端用它没有意义（它只对 raft 有语义），单独列出来是为了让"哪些 RPC 是给谁的"一目了然。
   rpc Raft     (RaftRequest)     returns (RaftResponse);
@@ -71,6 +74,9 @@ message Op {
     // 读出去（`architecture-with-chunk §3.1`），否则查询侧会拿"新文件清单 + 旧节点集合"
     // 拼计划。注意**存活状态（心跳）不走这里** —— 秒级心跳会把 raft 写爆（`§3.2`）。
     RegisterDatanodeOp register_datanode = 11;
+    // 摘除数据节点（T12.3）。**必须走 raft**：名录必须与 schema/manifest 同版本传下去
+    // （`§3.1`）—— 而**触发它的心跳不走 raft**（秒级会写爆，`§3.2`）。
+    RemoveDatanodeOp remove_datanode = 12;
   }
 }
 
@@ -206,6 +212,21 @@ message PrefetchRequest {
 
 // 数据节点名录里的一条（下发用；与注册 op 的载荷不同：**带注册时刻**，
 // 因为它是状态里的样子，不是请求）。
+message HeartbeatRequest {
+  string instance_id = 1;
+}
+
+message HeartbeatResponse {
+  // 该实例是否**在名录里**。`false` ⇒ 它已被摘除，应当**重新注册**（而不是继续发心跳）。
+  bool known = 1;
+}
+
+message RemoveDatanodeOp {
+  string instance_id = 1;
+  // 摘除原因（进日志与状态，便于事后解释"这台为什么不见了"）
+  string reason      = 2;
+}
+
 message DatanodeMemberMsg {
   string instance_id      = 1;
   string address          = 2;

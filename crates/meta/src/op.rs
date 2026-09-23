@@ -80,6 +80,13 @@ pub enum StateOp {
         member: DatanodeMember,
         now_ms: u64,
     },
+    /// **摘除数据节点**（T12.3）：心跳超时后由 leader 提议。
+    /// 触发者（心跳）**不进 raft**，但结果（名录变更）必须进（`§3.2`）。
+    RemoveDatanode {
+        instance_id: String,
+        reason: String,
+        now_ms: u64,
+    },
 }
 
 // `CreateTableRequest` 里有 `SchemaRef`（`Arc<Schema>`）—— `Arc` 未使用会告警
@@ -101,7 +108,8 @@ impl StateOp {
             | StateOp::DropShard { now_ms, .. }
             | StateOp::Compaction { now_ms, .. }
             | StateOp::RecordIdempotency { now_ms, .. }
-            | StateOp::RegisterDatanode { now_ms, .. } => *now_ms,
+            | StateOp::RegisterDatanode { now_ms, .. }
+            | StateOp::RemoveDatanode { now_ms, .. } => *now_ms,
         }
     }
 }
@@ -184,6 +192,11 @@ pub fn decode_op(op: &pb::Op) -> Result<StateOp, MetaError> {
         },
         pb::op::Kind::EvolveSchema(e) => StateOp::EvolveSchema {
             request: evolve_schema_from_proto(e)?,
+            now_ms,
+        },
+        pb::op::Kind::RemoveDatanode(r) => StateOp::RemoveDatanode {
+            instance_id: r.instance_id.clone(),
+            reason: r.reason.clone(),
             now_ms,
         },
         pb::op::Kind::RegisterDatanode(r) => StateOp::RegisterDatanode {
@@ -595,6 +608,14 @@ pub fn apply(state: &mut CatalogState, op: &StateOp) -> Result<ApplyOutcome, Met
                 return Ok(ApplyOutcome::hit());
             }
             state.drop_table(name).map_err(MetaError::from_lake)?;
+            Ok(ApplyOutcome::one())
+        }
+        StateOp::RemoveDatanode { instance_id, .. } => {
+            // 幂等：不在名录里 = 目标状态已达成（`accepted=false` 而不是错误）——
+            // 心跳超时的巡检可能对同一个实例提议两次（提议重试 / 换主）
+            if !state.remove_datanode(instance_id) {
+                return Ok(ApplyOutcome::hit());
+            }
             Ok(ApplyOutcome::one())
         }
         StateOp::RegisterDatanode { member, .. } => {

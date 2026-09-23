@@ -85,6 +85,15 @@ impl pb::meta_server::Meta for MetaService {
         Ok(Response::new(self.node.status()))
     }
 
+    async fn heartbeat(
+        &self,
+        req: Request<pb::HeartbeatRequest>,
+    ) -> Result<Response<pb::HeartbeatResponse>, Status> {
+        // 只碰内存（`§3.2`）：心跳走 raft 会把写路径压垮
+        let known = self.node.heartbeat(&req.into_inner().instance_id);
+        Ok(Response::new(pb::HeartbeatResponse { known }))
+    }
+
     async fn join(
         &self,
         _req: Request<pb::JoinRequest>,

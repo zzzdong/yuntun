@@ -109,6 +109,18 @@ impl CatalogState {
         true
     }
 
+    /// 摘除一个数据节点。返回 `true` = 状态有变化。
+    ///
+    /// 与注册同源：摘除同样推进 `schema_ver`（⇒ 客户端全量重建快照）—— 名录是"分片归属"
+    /// 的输入，摘掉了还让缓存按旧名录拉数据，就是按不存在的节点算归属。
+    pub fn remove_datanode(&mut self, instance_id: &str) -> bool {
+        if self.datanodes.remove(instance_id).is_none() {
+            return false;
+        }
+        self.bump_schema_ver();
+        true
+    }
+
     /// 数据节点名录（元数据读响应用它下发给查询侧）。
     pub fn datanodes(&self) -> &BTreeMap<String, DatanodeMember> {
         &self.datanodes

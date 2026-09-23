@@ -66,6 +66,17 @@ fn run(args: &cli::Args) -> Result<(), Box<dyn std::error::Error>> {
             args.voters
         );
         std::io::Write::flush(&mut std::io::stdout())?;
+
+        // T12.3：**存活巡检**（leader-only）。心跳超时的数据节点会被摘出名录，
+        // 而摘除走的是 raft 的 op（心跳本身走内存，`§3.2`）。
+        // 默认口径：数据节点每 5s 心跳一次，**15s** 未见到即摘（3 次机会，抗一次抖动）。
+        let _sweep = yuntun_meta::spawn_liveness_sweep(
+            node.handle(),
+            std::time::Duration::from_secs(15),
+            std::time::Duration::from_secs(5),
+            tokio_util::sync::CancellationToken::new(),
+        );
+
         yuntun_meta::serve(node.handle(), listener).await?;
         Ok::<(), Box<dyn std::error::Error>>(())
     })

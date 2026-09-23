@@ -125,6 +125,14 @@ struct NodeState {
 #[derive(Debug, Clone, Default)]
 pub struct NodeStatus {
     pub node_id: u64,
+    /// **数据节点存活表**（T12.3）：`instance_id` → 最后一次心跳。
+    ///
+    /// 三条纪律都体现在这里：
+    /// 1. **只在内存**：秒级心跳写 raft 会把写路径压垮（`§3.2`）；每个副本各记一份；
+    /// 2. **不参与快照/状态机**：存活是瞬时信息，进快照就等于把"此刻谁活着"固化下来 ——
+    ///    与"名录必须与 schema/manifest 同版本"是两码事（名录走 raft，存活走内存）；
+    /// 3. 用 `Instant`（单调钟）：存活判定不该被墙钟跳变影响。
+    pub last_seen: std::collections::HashMap<String, std::time::Instant>,
     pub role: String,
     pub term: u64,
     /// 0 = 未知（客户端据此重试到正确节点）
@@ -151,6 +159,39 @@ pub struct NodeHandle {
 impl NodeHandle {
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// **心跳**：登记某数据节点还活着；返回它是否**在名录里**。
+    ///
+    /// `false` 的语义很重要：调用方应当**重新注册**（而不是继续发心跳）——
+    /// 否则一个被摘除的节点会永远安静地"心跳"下去，却不在任何人的名录里。
+    pub fn heartbeat(&self, instance_id: &str) -> bool {
+        let known = self
+            .sm
+            .lock()
+            .unwrap()
+            .datanodes()
+            .contains_key(instance_id);
+        self.status
+            .lock()
+            .unwrap()
+            .last_seen
+            .insert(instance_id.to_string(), std::time::Instant::now());
+        known
+    }
+
+    /// 巡检用：每个成员的最后一次心跳（缺席 = 本节点从未见过它）。
+    pub fn last_seen(&self) -> std::collections::HashMap<String, std::time::Instant> {
+        self.status.lock().unwrap().last_seen.clone()
+    }
+
+    /// **本节点是否当前 leader**（心跳巡检用：只有 leader 才提议摘除，follower 提议会撞一致性）。
+    ///
+    /// 用 `leader_id == self.id` 判定，而不是比 `role` 字符串：字符串是给人看的，
+    /// 且 `leader_id == 0` 表示"未知" ⇒ 未知时一律不提议（宁可晚摘，不可错摘）。
+    pub fn is_leader(&self) -> bool {
+        let st = self.status.lock().unwrap();
+        st.leader_id != 0 && st.leader_id == self.id
     }
 
     /// 运维状态（`Status` RPC 的返回）。
@@ -631,6 +672,78 @@ impl Drop for Cluster {
 /// | 规模 | 3 节点（进程内邮箱） | **只支持单 voter**（多节点要网络传输，下一步） |
 /// | 用途 | 验证机制 | 真正跑起来 |
 ///
+/// **存活巡检**（T12.3）：把"连续超时没心跳"的成员从名录里摘掉（**走 raft 的 op**）。
+///
+/// 三条纪律：
+/// 1. **只有 leader 提议**（follower 提议会撞一致性）；并且每次提议前重新判一次 ——
+///    巡检整轮期间可能已经换主；
+/// 2. **先播种、后判定**：名录里第一次见到的成员按"此刻还活着"记一笔。这一条防的是
+///    换主/巡检刚落地的瞬间把**全集群**一起摘掉（新 leader 的内存存活表是空的）；
+/// 3. **摘除走 op**：名录变更必须与 schema/manifest 同版本传下去（`§3.1`）——
+///    而**触发它的心跳**不进 raft（`§3.2`）。这两件事在代码里必须分开，否则要么写爆 raft，
+///    要么让各副本对"谁存在"产生分歧。
+pub fn spawn_liveness_sweep(
+    handle: NodeHandle,
+    timeout: std::time::Duration,
+    interval: std::time::Duration,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if shutdown.is_cancelled() {
+                break;
+            }
+            tokio::time::sleep(interval).await;
+
+            let hb = handle.clone();
+            // `propose` 是**阻塞**的（等提交），挪到阻塞线程池，别占着异步 worker
+            let _ = tokio::task::spawn_blocking(move || {
+                if !hb.is_leader() {
+                    return;
+                }
+                let roster: Vec<String> = hb
+                    .sm
+                    .lock()
+                    .unwrap()
+                    .datanodes()
+                    .keys()
+                    .cloned()
+                    .collect();
+                for id in roster {
+                    let stale = {
+                        let mut st = hb.status.lock().unwrap();
+                        let now = std::time::Instant::now();
+                        let seen = st.last_seen.entry(id.clone()).or_insert(now);
+                        now.duration_since(*seen) > timeout
+                    };
+                    if !stale {
+                        continue;
+                    }
+                    let op = yuntun_proto::meta::Op {
+                        now_ms: yuntun_model::batch::now_ms(),
+                        kind: Some(yuntun_proto::meta::op::Kind::RemoveDatanode(
+                            yuntun_proto::meta::RemoveDatanodeOp {
+                                instance_id: id.clone(),
+                                reason: format!("心跳超时（>{:?} 未收到）", timeout),
+                            },
+                        )),
+                    };
+                    match hb.propose(op, std::time::Duration::from_secs(5)) {
+                        Ok(_) => {
+                            // 摘掉存活记录：它若重新注册，会重新开始心跳
+                            hb.status.lock().unwrap().last_seen.remove(&id);
+                            tracing::warn!(instance = %id, "datanode evicted: heartbeat timeout");
+                        }
+                        // **不**在失败时清存活记录：下一轮还会看到它仍超时，于是重试
+                        Err(e) => tracing::warn!(instance = %id, error = %e, "摘除提议失败，下轮重试"),
+                    }
+                }
+            })
+            .await;
+        }
+    })
+}
+
 /// 关键点：落盘与恢复**完全共用**同一条链路（`FjallStorage::open_with_state` + `spawn_node`），
 /// 所以集群用例里验过的"重启后逐字节一致"对进程同样成立 —— 这也是进程级用例
 /// （`tests/metanode_process_e2e.rs`）能直接断言状态恢复、而不必重新证明一遍机制的原因。

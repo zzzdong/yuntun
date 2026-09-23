@@ -4675,3 +4675,78 @@ schema/manifest **同版本**读出去 —— 否则查询侧会拿"新的文件
    同一个 trait 方法，装配点换一行即可）；
 3. 成员表里的成员若**没有接线热读器**，目前只是"存在但不参与拉取" —— 谁来接线（谁负责
    按地址建 `GrpcShardFetch`）属 R5 的 fanout（T13.1）。
+
+---
+
+## 72. T12.3 下半（第 2 步）：心跳保活 + 超时摘除（2026-09-23）
+
+### 72.1 两条纪律必须在**代码里分开**
+
+`architecture-with-chunk §3.2` 把成员发现切成两层，这一刀落的就是它：
+
+| 层 | 内容 | 机制 | 频率 |
+|---|---|---|---|
+| 成员名录 | 有哪些 datanode、ID 与地址 | **raft**（`register` / `remove` 两个 op） | 上下线才变 |
+| 存活状态 | 谁还活着 | metanode **内存** + 心跳 | 秒级 |
+
+**心跳绝不进 raft**：秒级心跳会把写路径压垮。但**摘除必须进 raft**：名录要与
+schema/manifest 同版本传下去（`§3.1`）。两者混在一起会二选一地坏掉 —— 要么写爆 raft，
+要么让各副本对"谁存在"产生分歧。
+
+### 72.2 落点
+
+| 件 | 内容 |
+|---|---|
+| `NodeStatus.last_seen` | `HashMap<String, Instant>` —— 存活表（**内存**，不进状态机/快照） |
+| `NodeHandle::heartbeat(id)` | 更新存活 + 返回 **`known`**（是否还在名录里） |
+| `spawn_liveness_sweep(handle, timeout, interval, shutdown)` | leader-only 巡检；超时者经 `propose` 摘除 |
+| `meta.proto` | `rpc Heartbeat` + `RemoveDatanodeOp{instance_id, reason}`（oneof arm 12） |
+| `CatalogState::remove_datanode` | 摘除 + 推进 `schema_ver`（与注册同源） |
+| `metanode` 进程 | 装配巡检：**15s** 未心跳即摘（数据节点每 5s 一次，抗一次抖动） |
+
+三个刻意的选择：
+
+1. **存活表放 `NodeStatus`**（`Arc<Mutex<..>>`，两处构造点都在用）⇒ **构造点零改动** ——
+   `..Default::default()` 的老实好处；
+2. **用 `Instant`（单调钟）**：墙钟跳变不该改变"谁还活着"的判定；
+3. **`heartbeat` 返回 `known`**：`false` 的语义是"你已被摘除，**请重新注册**"——
+   少了它，一个被摘掉的节点会永远安静地空发心跳，而谁的名录里都没有它（另一种静默）。
+
+### 72.3 巡检的三条纪律（都有具体的坏后果）
+
+1. **只有 leader 提议**：判据是 `leader_id == self.id` **且 `leader_id != 0`** ——
+   未知时一律不提议（宁可晚摘，不可错摘）；
+2. **先播种、后判定**：名录里**第一次见到**的成员按"此刻还活着"记一笔。没有这一条，
+   新 leader（内存存活表是空的）第一轮巡检就会把**整个集群**摘掉；
+3. **摘除失败不清存活记录**：下一轮还会看到它仍超时，于是**重试**；
+   清掉就等于"提议失败 = 它活着"（把失败当成功）。
+
+`propose` 是**阻塞**的（等提交）⇒ 整个巡检体放在 `spawn_blocking` 里，不占异步 worker。
+
+### 72.4 用例（`crates/meta/tests/liveness_e2e.rs`）
+
+用**进程内**真节点（`MetaNode::open` 单节点 = 天然 leader），验的是语义链而不是传输：
+
+| 步 | 断言 |
+|---|---|
+| ⓪ | 等选主：单节点也要走完一次选举（判据用**对外**可见的 `leader_id`，1 = 本节点） |
+| ① | 注册（走 raft 的 op）⇒ 名录里有它 |
+| ② | `heartbeat` 的两种返回：在名录里 `true`；不在 `false`（**这就是"该重新注册"的信号**） |
+| ③ | 起巡检（超时 300ms / 巡检 50ms） |
+| ④ | 持续心跳 ⇒ **不被摘**（否则巡检就是在随机删节点） |
+| ⑤ | 停心跳 ⇒ 超时后**从名录消失**（读的是 `Prefetch` 载荷 ⇒ 确实经 raft 落了状态） |
+| ⑥ | 摘除后再心跳 ⇒ `known = false`（**摘除是可恢复的**） |
+
+### 72.5 验证与遗留
+
+- 全量 `cargo test --workspace --no-fail-fast` → **333 passed / 0 failed（+1 ignored）**；clippy 本仓 **0**
+- 规模：41,213 行 / 20 个 crate / 333 测试函数
+
+**遗留**：
+
+1. **数据节点侧的心跳循环还没写**：`yuntun-ingestor --meta <addr>` + 每 5s 一次 `Heartbeat`
+   （收到 `known=false` 就重新注册）—— 这是 T12.3 的最后一块拼图；
+2. **多 metanode 时存活表是「每副本各记一份」**：本刀只在 leader 上判定，follower 的表空着；
+   换主靠"先播种"兜住（不会误摘），但**换主后到播种之间的失联**要等下一轮才被发现 ——
+   真要收紧，得让心跳带上 leader 提示或让 follower 也参与判定（属多 metanode 的后续）；
+3. R5 的 fanout（T13.1）应当**只向"活跃"成员拉数据** —— 本刀给出的存活表就是它的输入。
