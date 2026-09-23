@@ -1,5 +1,5 @@
 [package]
-name = "yuntun-ingestor"
+name = "yuntun-datanode"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,6 +14,8 @@ yuntun-catalog = { path = "../catalog" }
 yuntun-wal = { path = "../wal" }
 yuntun-ingest = { path = "../ingest" }
 yuntun-store = { path = "../store" }
+# 压缩 + 孤儿 GC 是**数据进程的第二职能**（`--compaction`），不是独立的第三类进程
+yuntun-compaction = { path = "../compaction" }
 yuntun-shardrpc = { path = "../shardrpc" }
 # 数据节点要**入册/保活**（T12.3）：注册走 raft、心跳走内存。
 # 这是装配层，tonic 到这里为止（`yuntun-ingest` 写入路径仍然干净）。
@@ -29,6 +31,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 yuntun-query = { path = "../query" }
 yuntun-proto = { path = "../proto" }
 yuntun-testkit = { path = "../testkit" }
+# 压缩用例要写真 parquet 文件（`arrow` 已在 dev-deps 里）
+yuntun-format = { path = "../format" }
 arrow = { workspace = true }
 tokio-util = { workspace = true }
 yuntun-queryd = { path = "../queryd" }

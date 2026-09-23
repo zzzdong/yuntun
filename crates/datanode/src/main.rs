@@ -1,10 +1,25 @@
-//! `yuntun-ingestor` —— **数据节点进程**（R4 T12.1 第一刀）。
+//! `yuntun-datanode` —— **数据进程**。
+//!
+//! ## 角色模型：只有两类（`operation-log §79` 的更正）
+//!
+//! | 角色 | 进程 | 有什么 |
+//! |---|---|---|
+//! | **meta** | `yuntun-meta` | raft + 元数据权威（**不含数据**） |
+//! | **data** | **本进程** | 私有 WAL + 热 chunk + 共享冷存储 + **压缩/GC**（可选） |
+//!
+//! 曾经的 `yuntun-queryd` / `yuntun-compactor` 是**把角色当成了进程**：
+//!
+//! - "只查询、不吃 WAL"是**数据进程的特例**（`architecture §4.2`：接到 SQL 的 datanode
+//!   充当协调者）—— 它是同一角色的另一种开关组合，不是第三类进程；
+//! - 压缩是**数据进程的第二职能**（`plan.md §7.5` T14.1 明说它今天是"单进程后台任务"，
+//!   R6 才升格为带 meta 租约的全局作业）—— 单开一个 `compactord` 反而制造了
+//!   "只应有一个 compactor"这种**自己造出来的**约束。
 //!
 //! ## 它是什么
 //!
 //! 单进程形态下"吸收 WAL / 持有热数据 / 对外提供热读"三件事都挤在 `standalone` 里，
 //! 于是热读只能是**进程内函数调用**（装配层把 `Arc<ChunkStore>` 直接交给查询侧）。
-//! 本二进制把**数据节点**摘出来：它独占自己的私有目录（WAL + spill），吸收自己的 WAL
+//! 本二进制把**数据进程**摘出来：它独占自己的私有目录（WAL + spill），吸收自己的 WAL
 //! 得到热数据，并把热数据经数据面 gRPC（`yuntun-shardrpc`）对外提供。
 //!
 //! ## 与单进程形态**不是两套实现**
@@ -19,12 +34,22 @@
 //! 差别只在**传输**：查询侧从"拿到 `Arc<ChunkStore>`"变成"拿到 `GrpcShardFetch` 包出来的
 //! `RemoteShard`"。所以 `§66`/`§67` 那条对拍逻辑**一行都不用改**就能复用（见集成用例）。
 //!
-//! ## 第一刀的边界（记在 `§68`）
+//! ## 本刀补上的：**压缩 + 孤儿 GC**（`--compaction`，默认关）
 //!
-//! - 元数据面仍用**本地** `MemoryCatalog`（接 metanode 属 T12.3）；
-//! - 没有 WAL 超时监控 / compaction / 孤儿清理 —— 那些属**别的**进程（`compactor`）；
-//! - 写入面（客户端如何把数据交给它）**尚未定**：本刀由"它自己的 WAL"喂
-//!   （回放 = 崩溃恢复路径，最诚实的一种：数据节点重启后热数据必须自己长回来）。
+//! 此前这两个后台作业只活在 `standalone` 的装配里 ⇒ **按"meta + data"部署（也就是设计里
+//! 的形态）时，没有任何东西做压缩** —— 这不是措辞问题，是功能缺口。
+//! 现在数据进程自己就能承担：它已经握着共享冷存储与目录句柄，压缩**不需要任何新输入**。
+//!
+//! ⚠️ **默认关**，因为多数据节点时**只应有一个**打开它：`commit_compaction` 本身幂等，
+//! 但"读文件 → 合并 → 提交"这段窗口**没有租约**，两个节点同时合并同一 shard 会各产出一份
+//! 产物（**行数不会错**，多出来的那份由孤儿清理在静置期后回收 —— 是浪费，不是脏数据）。
+//! R6 的 meta 租约（T14.1/T14.2）会把这条**部署约束**变成机制。
+//!
+//! ## 边界
+//!
+//! - 写入面（客户端如何把数据交给它）**尚未定**：本刀仍由"它自己的 WAL"喂
+//!   （回放 = 崩溃恢复路径，最诚实的一种：数据节点重启后热数据必须自己长回来）；
+//! - WAL 超时监控仍未并进来（它属 `standalone` 的装配，另有其独立语义）。
 //!
 //! ## 关键约束：先占租约、再动盘
 //!
@@ -47,9 +72,9 @@ use yuntun_wal::writer::WalWriter;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "yuntun-ingestor",
+    name = "yuntun-datanode",
     version,
-    about = "数据节点：吸收自己的 WAL、持有热数据、对外提供热读"
+    about = "数据进程：吸收自己的 WAL、持有热数据、对外提供热读（可选：压缩/GC）"
 )]
 struct Args {
     /// 实例标识（= `FileManifest.source_instance`；热数据按它归属，`§65`）
@@ -69,6 +94,22 @@ struct Args {
     /// 这里默认 5s（三次机会，抗一次网络抖动）。测试/调优时可改小。
     #[arg(long, default_value_t = 5)]
     heartbeat_secs: u64,
+    /// 额外承担**压缩 + 孤儿 GC**（默认关）。
+    ///
+    /// ⚠️ 多数据节点时**只应有一个**打开它：合并的"读 → 合并 → 提交"窗口没有租约，
+    /// 两个节点同时合并同一 shard 会各产出一份产物（行数不会错，多出的那份会被孤儿清理回收）。
+    /// R6 的 meta 租约（T14.1/T14.2）会把这条部署约束变成机制。
+    #[arg(long)]
+    compaction: bool,
+    /// 压缩触发阈值：同一 shard 的可见文件数 ≥ 它才合并
+    #[arg(long, default_value_t = 5)]
+    compaction_min_files: usize,
+    /// 压缩作业间隔（秒）
+    #[arg(long, default_value_t = 60)]
+    compaction_interval_secs: u64,
+    /// 孤儿文件静置期（秒）：早于它、又不在目录里的产物才会被删
+    #[arg(long, default_value_t = 3600)]
+    compaction_gc_grace_secs: u64,
 }
 
 /// 入册（**best-effort**）：失败只告警，不返回错误。
@@ -194,12 +235,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             ..Default::default()
         },
         wal,
-        // 克隆 Arc（廉价）：后面还要用它把本实例登记进名录
+        // 克隆 Arc（廉价）：后面还要用它把本实例登记进名录、起压缩作业
         catalog.clone(),
-        store,
+        store.clone(),
     ));
     let shutdown = CancellationToken::new();
     let _accumulator = ingestor.clone().spawn_accumulator(shutdown.clone());
+
+    // ④b **压缩 + 孤儿 GC 角色**（数据进程的第二职能，`--compaction` 打开）。
+    //     放在吸收循环之后：本进程已经握着共享冷存储与目录句柄，压缩不需要新输入。
+    if args.compaction {
+        let compactor = Arc::new(yuntun_compaction::Compactor {
+            cfg: yuntun_compaction::CompactionConfig {
+                min_files: args.compaction_min_files,
+                interval: std::time::Duration::from_secs(args.compaction_interval_secs),
+                orphan_grace: std::time::Duration::from_secs(args.compaction_gc_grace_secs),
+                ..Default::default()
+            },
+            catalog: catalog.clone(),
+            store: store.clone(),
+            // 与写入侧**同一个格式**：合并必须读得懂自己写出去的东西
+            format: ingestor.cfg.default_format,
+        });
+        let _compaction = yuntun_compaction::spawn_compaction_loop(compactor, shutdown.clone());
+        let _gc = yuntun_compaction::spawn_orphan_cleanup(
+            store.clone(),
+            catalog.clone(),
+            "yuntun/".to_string(),
+            std::time::Duration::from_secs(args.compaction_gc_grace_secs),
+            shutdown.clone(),
+        );
+        tracing::info!(
+            min_files = args.compaction_min_files,
+            interval_secs = args.compaction_interval_secs,
+            "本数据节点额外承担压缩 + 孤儿 GC"
+        );
+    }
 
     // ⑤ 热读服务：本地 chunk store 作为 `ShardReader` 暴露。
     //    先 bind 再打印 ⇒ 上层拿到的是**真实**地址（`127.0.0.1:0` 的端口由内核分配）
@@ -224,7 +295,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         %addr,
         instance_id = %args.instance_id,
         dir = %args.dir.display(),
-        "ingestor serving hot shards"
+        "datanode serving hot shards"
     );
 
     yuntun_shardrpc::serve(ingestor.chunks(), listener).await?;

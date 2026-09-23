@@ -183,7 +183,8 @@ yuntun/
 
 > **v12 结构决策**：不再保留顶层 `bins/` 目录。每个可执行体独立成 crate
 > （standalone / client），分布式阶段（计划书阶段 3）再增 `yuntun-meta` /
-> `yuntun-ingestor` / `yuntun-queryd` / `yuntun-compactor`，全部复用同一组件，
+> **`yuntun-datanode`**（角色只有 **meta / data** 两类，见 `architecture-with-chunk §1.1` +
+> `operation-log §79`：压缩是数据进程内的作业，只查询的形态是同一角色的开关组合），全部复用同一组件，
 > `standalone` 保留为全组件参考装配。
 
 **依赖方向严格单向**：

@@ -3,7 +3,7 @@
 //! ```text
 //!   ① metanode（进程内，真 gRPC 服务）
 //!        ▲ 注册/心跳                        ▲ 只读元数据（名录含**数据面地址**）
-//!   ② yuntun-ingestor 子进程            ③ yuntun-queryd（真 Flight 服务）
+//!   ② yuntun-datanode 子进程            ③ yuntun-queryd（真 Flight 服务）
 //!        └──────── ④ 数据面 gRPC：RemoteShard 拉热数据 ────────┘
 //!                          ▲
 //!                     ⑤ 客户端发 SQL
@@ -34,7 +34,7 @@ use tokio::net::TcpListener;
 use yuntun_catalog::CatalogOps as _;
 use yuntun_proto::meta as pb;
 
-const INGESTOR: &str = env!("CARGO_BIN_EXE_yuntun-ingestor");
+const INGESTOR: &str = env!("CARGO_BIN_EXE_yuntun-datanode");
 const INSTANCE: &str = "inst-a";
 const TABLE: &str = "public.qd";
 const WINDOW: &str = "2026-09-23T10:00";
@@ -134,7 +134,7 @@ impl Proc {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("起 yuntun-ingestor");
+            .expect("起 yuntun-datanode");
 
         let stdout = BufReader::new(child.stdout.take().expect("stdout"));
         let pipe = child.stderr.take().expect("stderr");

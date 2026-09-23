@@ -5424,22 +5424,32 @@ dependencies = [
 ]
 
 [[package]]
-name = "yuntun-compactord"
+name = "yuntun-datanode"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "arrow-flight",
  "clap",
- "object_store",
+ "futures",
  "tokio",
  "tokio-util",
+ "tonic",
  "tracing",
  "tracing-subscriber",
  "yuntun-catalog",
  "yuntun-compaction",
  "yuntun-format",
+ "yuntun-ingest",
  "yuntun-meta",
  "yuntun-model",
+ "yuntun-proto",
+ "yuntun-query",
+ "yuntun-queryd",
+ "yuntun-server",
+ "yuntun-shardrpc",
  "yuntun-store",
+ "yuntun-testkit",
+ "yuntun-wal",
 ]
 
 [[package]]
@@ -5483,33 +5493,6 @@ dependencies = [
  "yuntun-chunk",
  "yuntun-format",
  "yuntun-model",
- "yuntun-store",
- "yuntun-testkit",
- "yuntun-wal",
-]
-
-[[package]]
-name = "yuntun-ingestor"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "arrow-flight",
- "clap",
- "futures",
- "tokio",
- "tokio-util",
- "tonic",
- "tracing",
- "tracing-subscriber",
- "yuntun-catalog",
- "yuntun-ingest",
- "yuntun-meta",
- "yuntun-model",
- "yuntun-proto",
- "yuntun-query",
- "yuntun-queryd",
- "yuntun-server",
- "yuntun-shardrpc",
  "yuntun-store",
  "yuntun-testkit",
  "yuntun-wal",

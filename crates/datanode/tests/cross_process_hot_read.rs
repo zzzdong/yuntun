@@ -4,7 +4,7 @@
 //! 把被替换掉的那一层从"函数调用"换成"**另一个操作系统进程**"：
 //!
 //! ```text
-//!   yuntun-ingestor 进程 ── 私有 WAL → 吸收 → chunk store（热数据）
+//!   yuntun-datanode 进程 ── 私有 WAL → 吸收 → chunk store（热数据）
 //!          │  gRPC（shard.proto）+ arrow IPC
 //!   查询侧（本用例进程）：GrpcShardFetch → RemoteShard → QueryEngine
 //! ```
@@ -40,7 +40,7 @@ use yuntun_wal::config::WalConfig;
 use yuntun_wal::writer::WalWriter;
 
 /// 被测二进制（cargo 为集成测试注入的路径变量；名字 = 包的 `[[bin]]`）。
-const BIN: &str = env!("CARGO_BIN_EXE_yuntun-ingestor");
+const BIN: &str = env!("CARGO_BIN_EXE_yuntun-datanode");
 
 const TABLE: &str = "public.proc";
 const WINDOW: &str = "2026-09-21T10:00";
@@ -105,7 +105,7 @@ impl IngestorProc {
             .arg("127.0.0.1:0")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = cmd.spawn().expect("启动 yuntun-ingestor");
+        let mut child = cmd.spawn().expect("启动 yuntun-datanode");
 
         let stdout = BufReader::new(child.stdout.take().expect("stdout"));
         let pipe = child.stderr.take().expect("stderr");
@@ -134,7 +134,7 @@ impl IngestorProc {
             let n = self.stdout.read_line(&mut line).expect("读子进程 stdout");
             if n == 0 {
                 panic!(
-                    "yuntun-ingestor 未打印监听地址就退出了。stderr:\n{}",
+                    "yuntun-datanode 未打印监听地址就退出了。stderr:\n{}",
                     self.stderr.lock().unwrap()
                 );
             }
@@ -313,7 +313,7 @@ async fn second_process_on_the_same_private_dir_is_rejected() {
         .arg("--listen")
         .arg("127.0.0.1:0")
         .output()
-        .expect("跑第二个 yuntun-ingestor");
+        .expect("跑第二个 yuntun-datanode");
     assert!(
         !out.status.success(),
         "同一私有目录的第二个消费者必须被拒（否则 R-13 那类重复持久化会重演）"

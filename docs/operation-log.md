@@ -5156,3 +5156,73 @@ let read = reader.read_table(&self.ident, self.snapshot.snapshot).await
 2. wire 层仍未把 `partial` 交给用户（MySQL warning / Flight SQL metadata，`§77.6` 第 2 条）；
 3. 超时是**客户端感知**：它不会终止对端的计算（对端可能仍在跑）。对"幂等的热读"无害，
    但将来若有副作用型 RPC，这条就得重新审。
+
+---
+
+## 79. **架构更正**：角色只有两类（meta / data）—— 压缩归数据进程、删 `compactord`、更名 `yuntun-datanode`（2026-09-23）
+
+### 79.1 我错在哪
+
+`plan.md` T12.1 那行写着"拆 `yuntun-ingestor` / `yuntun-queryd` / `yuntun-compactor`"，
+我照着做了三刀，还在 `§68`/`§74`/`§76` 里写"**进程拆分至此成型**" —— **错的**。
+
+设计文档 `architecture-with-chunk §1.1` 写得比我清楚（我该先读它）：
+
+| 角色 | 原文 |
+|---|---|
+| **metanode** | 有状态，raft 组，纯元数据服务，**永不中转数据** |
+| **datanode** | 有状态，WAL + 内存 chunk + 本地缓存；直接读写对象存储；**可对外提供 SQL** |
+| **compactor** | 全局作业，通过 meta 租约独占文件批次；**可作为 datanode 内后台任务或独立进程（后续决定）** |
+| **standalone** | **1 个 datanode + 内嵌 metanode** |
+
+配合 `§4.2`（"**接到 SQL 的 datanode 充当协调者**"）与 K4（"**需要时再加 queryd（本文不建**，
+触发条件：查询负载明显挤占写入）"），结论很明确：**角色只有 meta / data 两类**；
+`compactor` 是**作业**不是进程；`queryd` 是**同一角色的开关组合**。
+
+三处具体错误：
+
+1. 把 `plan.md` 一行的"二进制清单"当成了拓扑 —— 那行把**可选形态**与**角色**混在一起；
+2. `compactord` 独立进程把"压缩与 Catalog 同进程只是部署事实"**反着做**成了一种新拓扑，
+   于是 `§76.2` 那条"一个集群只能有一个 compactor"**不是设计事实，是这个拆法制造出来的**；
+3. 更实际的后果：按设计的形态部署（metanode + datanode）时，**没有任何东西做压缩** ——
+   这是**功能缺口**，不是措辞问题。
+
+### 79.2 代码怎么改
+
+| 动作 | 内容 |
+|---|---|
+| **压缩归位** | `yuntun-datanode --compaction`（**默认关**）：数据进程自己跑压缩 + 孤儿 GC —— 它已经握着共享冷存储与目录句柄，**不需要任何新输入** |
+| **删 `compactord`** | crate 与其用例删除（压缩代码留在 `yuntun-compaction`，需要时随时可复用） |
+| **更名** | `yuntun-ingestor` → **`yuntun-datanode`**：它从来不只做 ingest（读写数据 + 压缩） |
+| **多节点约束** | `--compaction` 默认**关**，因为多数据节点时只应有一个打开（R6 的 meta 租约 T14.1/T14.2 会把这条**部署约束**变成机制）。这是**显式部署约束**，不是"架构不变量" |
+
+**默认关是刻意的**：`commit_compaction` 本身幂等，但"读文件 → 合并 → 提交"这段窗口**没有租约**，
+两个节点同时合并同一 shard 会各产出一份产物（**行数不会错**，多出来的那份由孤儿清理在静置期后回收
+—— 是浪费，不是脏数据）。
+
+用例：`crates/datanode/tests/compaction_e2e.rs` —— 3 个真 parquet 文件写进 `<dir>/cold`，
+数据进程子进程（`--compaction`）合并后目录里**可见文件 3 → 1**、且合并产物**行数为输入之和**
+（合并最经典的 bug 就是丢行）。
+
+### 79.3 `queryd` 的去向（下一步）
+
+`queryd` **不是第三类进程**，而是**数据进程的特例**：`--ingest off`（不吃 WAL、不留本地数据，
+只作为协调者拉别人的热数据 —— `§4.2` 的形态）。它的代码（Flight SQL 服务面 + 按名录建
+`GrpcShardFetch`）随下一刀并进 `yuntun-datanode`，然后删除 `yuntun-queryd` crate。
+
+### 79.4 教训
+
+**`plan.md` 的"拆哪些二进制"不能替代设计里的"有哪几类角色"。**
+
+角色是**语义**（谁持有什么状态、谁对什么负责）；二进制是**部署**（同一角色可以有多种开关组合）。
+把清单当拓扑，就会造出"只应有一个 compactor"这种**自己给自己挖的坑** ——
+而真正的解法（meta 租约）本来就在 R6 的计划里。
+
+**另一条**：这次是用户当场指出的。凡是我在文档里写下"**至此成型**/不变量"这类**收口式断言**，
+都该先回到设计文档核对**角色与语义**，而不是顺着自己的实现往下推。
+
+### 79.5 验证
+
+- `cargo test -p yuntun-datanode` → 6 passed（含新增的 `compaction_e2e`）
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **349 passed / 0 failed（+1 ignored）**
+- 规模：43,687 行 / 21 个 crate / 349 测试函数

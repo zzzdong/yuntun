@@ -6,7 +6,7 @@
 //!   metanode（进程内起真 gRPC 服务，巡检口径调到秒级）
 //!        ▲  RegisterDatanode（raft op）      ▲  Heartbeat（只碰内存）
 //!        │                                  │
-//!   yuntun-ingestor 子进程（--meta + 心跳）
+//!   yuntun-datanode 子进程（--meta + 心跳）
 //! ```
 //!
 //! 观察点是**查询侧看名录的那条路**（`Prefetch` 载荷）—— 而不是内部字段：
@@ -23,7 +23,7 @@ use tokio::net::TcpListener;
 use yuntun_proto::meta as pb;
 
 /// 被测二进制（cargo 为集成测试注入）。
-const BIN: &str = env!("CARGO_BIN_EXE_yuntun-ingestor");
+const BIN: &str = env!("CARGO_BIN_EXE_yuntun-datanode");
 const INSTANCE: &str = "inst-a";
 
 fn tmpdir(tag: &str) -> PathBuf {
@@ -113,7 +113,7 @@ async fn datanode_registers_keeps_alive_and_is_evicted_when_it_dies() {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("起 yuntun-ingestor");
+        .expect("起 yuntun-datanode");
 
     let stderr = Arc::new(Mutex::new(String::new()));
     {

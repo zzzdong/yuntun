@@ -42,7 +42,11 @@
 
 - **metanode**：有状态，raft 组，纯元数据服务，**永不中转数据**
 - **datanode**：有状态，WAL + 内存 chunk + 本地缓存；直接读写对象存储；可对外提供 SQL（MySQL wire / Flight SQL）
-- **compactor**：全局作业，通过 meta 租约独占文件批次；可作为 datanode 内后台任务或独立进程（后续决定）
+  - 两种开关组合：默认 **ingest + query**（读写 + 服务 SQL）；**关掉 ingest = 只查询的 datanode**
+    （不吃 WAL、不留本地数据，只作为协调者拉别人的热数据，§4.2）—— **同一角色，不是第三类进程**
+- **compactor**：**不是一类进程，是一个作业** —— **定案（`operation-log §79`）**：默认作为
+  **datanode 内的后台任务**（`yuntun-datanode --compaction`，默认关：多数据节点时只应有一个承担）；
+  R6 起由 **meta 租约**独占文件批次（T14.1/T14.2），把这条部署约束变成机制
 - **standalone**：**1 个 datanode + 内嵌 metanode**，同一套代码，不是两套
 
 > 不变量：**standalone 是分布式的退化情形**。任何 crate 不得出现 `if standalone { ... } else { ... }` 的分支，差异只在装配层。

@@ -1,18 +1,19 @@
-//! R4 **T12.1 第三刀**：**压缩节点进程**端到端 —— 共享存储里的多个文件被合成一个。
+//! **压缩是数据进程的第二职能**（`operation-log §79` 的角色更正）。
+//!
+//! 这条用例存在的理由很具体：按"**meta + data**"两类角色部署时，压缩作业一度**没有任何载体**
+//! （它只活在 `standalone` 的装配里，或被单开成一个 `compactord` 进程）。而
+//! `plan.md §7.5` T14.1 明说它今天是"**单进程后台任务**"、R6 才升格为带 meta 租约的全局作业 ——
+//! 所以它该落在**数据进程**里，用 `--compaction` 显式打开。
 //!
 //! ```text
 //!   ① metanode（进程内，真 gRPC 服务）
-//!        ▲ commit_files（3 个真文件）        ▲ commit_compaction（合并结果）
-//!   测试进程（客户端）                    ③ yuntun-compactord 子进程
-//!        └──── ② 共享冷目录（真 parquet 文件）────┘
+//!        ▲ commit_files（3 个真文件）      ▲ commit_compaction（合并结果）
+//!   测试进程（客户端）                    ③ yuntun-datanode 子进程（--compaction）
+//!        └──── ② 共享冷目录 <dir>/cold（真 parquet 文件）────┘
 //! ```
 //!
-//! 三个角色都是真的：目录走真 raft、文件是真 parquet、合并由**独立进程**完成。
-//! 观察点全在**目录**上（可见文件数、行数）—— 而不是压缩进程内部状态：
-//! "合并到底有没有发生并且被提交"，只有从目录看得见才算数。
-//!
-//! 这一刀同时验证了压缩节点的**正交性**：它没有 WAL、没有 chunk、不知道有数据节点，
-//! 只读共享存储 + 提交一条 op —— 于是"压缩"从某个节点上的副作用变成一个可独立扩缩的角色。
+//! 观察点全在**目录**上（可见文件数、行数）—— "合并有没有发生、有没有被提交"，
+//! 只有从目录看得见才算数。
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
@@ -32,7 +33,7 @@ use yuntun_model::meta::FileManifest;
 use yuntun_model::ops::{CreateTableRequest, DEFAULT_SCHEMA};
 use yuntun_store::{StoreConfig, create_store};
 
-const COMPACTORD: &str = env!("CARGO_BIN_EXE_yuntun-compactord");
+const DATANODE: &str = env!("CARGO_BIN_EXE_yuntun-datanode");
 const TABLE: &str = "public.cq";
 const SHARD: &str = "s0";
 const WINDOW: &str = "2026-09-23T10:00";
@@ -63,7 +64,7 @@ fn batch(base: i64) -> RecordBatch {
     RecordBatch::try_new(schema(), vec![Arc::new(Int64Array::from(vals))]).unwrap()
 }
 
-/// 压缩节点子进程（读 stdout 的 `READY ...`；stderr 后台收集）。
+/// 数据进程子进程（读 stdout 的 `LISTEN ...`；stderr 后台收集）。
 struct Proc {
     child: Child,
     stdout: BufReader<ChildStdout>,
@@ -71,21 +72,24 @@ struct Proc {
 }
 
 impl Proc {
-    fn start(meta: SocketAddr, cold_root: &std::path::Path) -> Self {
-        let mut child = Command::new(COMPACTORD)
+    fn start(meta: SocketAddr, dir: &std::path::Path) -> Self {
+        let mut child = Command::new(DATANODE)
+            .arg("--instance-id")
+            .arg("d1")
+            .arg("--dir")
+            .arg(dir)
             .arg("--meta")
             .arg(meta.to_string())
-            .arg("--cold-root")
-            .arg(cold_root)
-            .arg("--min-files")
+            .arg("--compaction")
+            .arg("--compaction-min-files")
             .arg(FILES.to_string())
             // 作业间隔压到 1s：用例不必等一分钟
-            .arg("--interval-secs")
+            .arg("--compaction-interval-secs")
             .arg("1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("起 yuntun-compactord");
+            .expect("起 yuntun-datanode");
 
         let stdout = BufReader::new(child.stdout.take().expect("stdout"));
         let pipe = child.stderr.take().expect("stderr");
@@ -104,8 +108,8 @@ impl Proc {
         }
     }
 
-    /// 读 stdout 直到 `READY ...`（= 装配完成、循环已起）。
-    fn wait_ready(&mut self) {
+    /// 读 stdout 直到 `LISTEN ...`（= 装配完成、开始服务）。
+    fn wait_listen(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut line = String::new();
         loop {
@@ -113,14 +117,14 @@ impl Proc {
             let n = self.stdout.read_line(&mut line).expect("读子进程 stdout");
             if n == 0 {
                 panic!(
-                    "压缩节点未打印 READY 就退出了。stderr:\n{}",
+                    "数据进程未打印 LISTEN 就退出了。stderr:\n{}",
                     self.stderr.lock().unwrap()
                 );
             }
-            if line.trim_start().starts_with("READY ") {
+            if line.trim_start().starts_with("LISTEN ") {
                 return;
             }
-            assert!(Instant::now() < deadline, "等待 READY 超时");
+            assert!(Instant::now() < deadline, "等待 LISTEN 超时");
         }
     }
 }
@@ -145,7 +149,7 @@ where
         }
         assert!(
             Instant::now() < deadline,
-            "等待「{what}」超时。压缩节点 stderr:\n{}",
+            "等待「{what}」超时。数据进程 stderr:\n{}",
             stderr.lock().unwrap()
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -153,9 +157,9 @@ where
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn compactord_merges_files_from_shared_storage_and_commits_via_raft() {
+async fn datanode_merges_files_from_shared_storage_and_commits_via_raft() {
     // ---- ① metanode（进程内 + 真 gRPC 服务）----
-    let meta_dir = tmpdir("compact-meta");
+    let meta_dir = tmpdir("dn-compact-meta");
     let node = yuntun_meta::MetaNode::open(&meta_dir, 1, vec![1], HashMap::new()).expect("起单节点");
     let h = node.handle();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -170,12 +174,14 @@ async fn compactord_merges_files_from_shared_storage_and_commits_via_raft() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    // ---- ② 共享冷目录：建表 + 写 3 个**真文件**并提交（走客户端那条路）----
-    let cold_root = tmpdir("compact-cold");
+    // ---- ② 共享冷目录 = <dir>/cold：建表 + 写 3 个**真文件**并提交（走客户端那条路）----
+    let dir = tmpdir("dn-compact");
+    let cold_root = dir.join("cold");
     let store = create_store(&StoreConfig::Local {
         root: cold_root.to_string_lossy().into_owned(),
     })
     .expect("开共享存储");
+    // `RemoteCatalog` 不是 `Clone` ⇒ 用 `Arc` 共享（trait 方法经 Deref 照常可用）
     let client = Arc::new(
         yuntun_meta::RemoteCatalog::connect(vec![meta_addr.to_string()]).expect("连 metanode"),
     );
@@ -235,9 +241,9 @@ async fn compactord_merges_files_from_shared_storage_and_commits_via_raft() {
         .expect("读可见文件");
     assert_eq!(visible.len(), FILES, "合并前应当是 {FILES} 个可见文件");
 
-    // ---- ③ 起压缩节点子进程（同一个共享目录 + 同一个元数据面）----
-    let mut compactor = Proc::start(meta_addr, &cold_root);
-    compactor.wait_ready();
+    // ---- ③ 起**数据进程**子进程（带 --compaction）----
+    let mut datanode = Proc::start(meta_addr, &dir);
+    datanode.wait_listen();
 
     // ---- ④ 合并发生并被**提交**：目录里只剩 1 个可见文件，且行数是总和 ----
     let waiter = client.clone();
@@ -254,7 +260,7 @@ async fn compactord_merges_files_from_shared_storage_and_commits_via_raft() {
         },
         Duration::from_secs(60),
         "合并结果被提交（可见文件 3 → 1）",
-        &compactor.stderr,
+        &datanode.stderr,
     )
     .await;
 
