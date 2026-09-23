@@ -22,7 +22,7 @@
 
 ## 2. 能力矩阵（standalone 今天能做到什么）
 
-规模：**42,106 行 Rust / 21 个 crate / 335 个测试函数 / 335 个用例通过（+1 ignored） / clippy 0 警告**
+规模：**42,144 行 Rust / 21 个 crate / 335 个测试函数 / 335 个用例通过（+1 ignored） / clippy 0 警告**
 工具链：**rustc 1.98.1 + edition 2024**（20 个 crate 全走 `edition.workspace = true`；见 `operation-log §59`）；
 **MSRV 声明 `1.94`**（下界由依赖 `datafusion 55` 决定，**不是** policy 想取的 1.92；**尚未经真·1.94 编译验证**，见 `§60`）。
 全仓仅余 1 条**外部依赖**告警（`proc-macro-error2 v2.0.1`，来自 `opensrv-mysql`，非本仓代码）。

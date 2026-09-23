@@ -14,9 +14,6 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use yuntun_catalog::{CatalogOps, MemoryCatalog};
 use yuntun_ingest::Ingestor;
-use yuntun_model::meta::{deserialize_schema, IngestConfig};
-use yuntun_model::ops::CreateTableRequest;
-use yuntun_model::wal_record::{ddl_op, Record};
 use yuntun_query::QueryEngine;
 use yuntun_sql::SqlEngine;
 use yuntun_wal::writer::WalWriter;
@@ -359,7 +356,7 @@ async fn build_embedded_catalog(
         // DDL 记录由 yuntun-sql::SqlEngine 在 Catalog apply 成功后追加（顺序即因果）；
         // 重放幂等（create 已存在 / drop 不存在均忽略），保证 SQL 写入的数据
         // 崩溃重启后表存在、可恢复（S1.6 验收）。
-        replay_wal_ddl(&catalog, &wal).await?;
+        yuntun_ingest::replay_wal_ddl(&catalog, &wal).await?;
 
         // ③.9 配置自检：能启动但会静默劣化的项必须显式告警（不阻断启动）
         for w in cfg.warnings() {
@@ -579,82 +576,6 @@ pub fn spawn_metrics_log(
 /// 单节点重启后 MemoryCatalog 为空（C5），SQL CREATE/DROP 的表清单由 WAL Ddl
 /// 记录重建；重放幂等（TableAlreadyExists / TableNotFound 忽略），保证 SQL 写入的数据
 /// 崩溃重启后表存在、可恢复（S1.6 验收）。
-async fn replay_wal_ddl(
-    catalog: &Arc<dyn CatalogOps>,
-    wal: &WalWriter,
-) -> Result<(), yuntun_model::error::LakeError> {
-    let reader = yuntun_wal::reader::WalReader::new(wal.shard_dir());
-    let records = reader.scan_from(0)?;
-    let mut created = 0usize;
-    let mut dropped = 0usize;
-    for (_, rec) in records {
-        let Record::Ddl(p) = rec else { continue };
-        let res = match p.op {
-            ddl_op::CREATE_TABLE => {
-                let schema = deserialize_schema(&p.arrow_schema)?;
-                // 多 schema：WAL 中的表标识为全限定 `schema.table`
-                let (ns, bare) = yuntun_model::ops::split_qualified(&p.table);
-                let req = CreateTableRequest {
-                    name: bare.to_string(),
-                    namespace: ns.to_string(),
-                    schema,
-                    partition_cols: vec![],
-                    default_format: if p.default_format.is_empty() {
-                        "parquet".to_string()
-                    } else {
-                        p.default_format.clone()
-                    },
-                    ingest_config: IngestConfig::standard(),
-                };
-                match catalog.create_table(req).await {
-                    Ok(_) => {
-                        created += 1;
-                        Ok(())
-                    }
-                    Err(yuntun_model::error::LakeError::TableAlreadyExists(_)) => Ok(()),
-                    Err(e) => Err(e),
-                }
-            }
-            ddl_op::DROP_TABLE => match catalog.drop_table(&p.table).await {
-                Ok(()) => {
-                    dropped += 1;
-                    Ok(())
-                }
-                Err(yuntun_model::error::LakeError::TableNotFound(_)) => Ok(()),
-                Err(e) => Err(e),
-            },
-            // 多 schema：schema 事件（`DdlPayload.table` = schema 名）
-            ddl_op::CREATE_SCHEMA => match catalog.create_schema(&p.table).await {
-                Ok(()) => {
-                    created += 1;
-                    Ok(())
-                }
-                Err(yuntun_model::error::LakeError::SchemaAlreadyExists(_)) => Ok(()),
-                Err(e) => Err(e),
-            },
-            ddl_op::DROP_SCHEMA => match catalog.drop_schema(&p.table).await {
-                Ok(()) => {
-                    dropped += 1;
-                    Ok(())
-                }
-                Err(yuntun_model::error::LakeError::SchemaNotFound(_)) => Ok(()),
-                Err(e) => Err(e),
-            },
-            other => {
-                tracing::warn!(op = other, table = %p.table, "unknown ddl op in WAL, skipping");
-                Ok(())
-            }
-        };
-        if let Err(e) = res {
-            tracing::warn!(table = %p.table, error = %e, "replay WAL DDL failed");
-        }
-    }
-    if created > 0 || dropped > 0 {
-        tracing::info!(created, dropped, "replayed WAL DDL records");
-    }
-    Ok(())
-}
-
 /// 启动 MySQL wire 协议监听（设计 §6.3 `[sql.mysql]`，标准端口 :3306）。
 ///
 /// **bind 在本函数内同步完成**：端口被占用（如本机已有 MySQL）在启动阶段即以

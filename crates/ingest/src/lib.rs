@@ -13,6 +13,10 @@
 //! - **持久化上界** = `seal_time + max_flush_delay`（确定，无随机 jitter）。
 
 pub mod accumulator;
+pub mod ddl;
+
+/// WAL 里的 DDL 重放（启动恢复路径；`standalone` 与数据节点共用同一份实现）
+pub use ddl::replay_wal_ddl;
 pub mod flush;
 pub mod pipeline;
 pub mod schema_cache;

@@ -179,6 +179,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         root: cold_root.to_string_lossy().into_owned(),
     })?;
 
+    // ③b **重放 WAL 里的 DDL**（启动恢复）：数据节点自己的建表/删表历史要回到目录里。
+    //     给了 `--meta` 时这一步**经 raft 写进 metanode**（同一个 trait 方法），于是
+    //     "数据节点重启后表还认不认得"不再依赖客户端再建一次。
+    //     幂等：每次启动都整扫一遍 WAL，"已存在/已删除"当成功（`replay_wal_ddl` 的纪律）。
+    //     ⚠️ 必须在 `Ingestor::new` **之前**：那一步会把 `wal` 的所有权拿走。
+    yuntun_ingest::replay_wal_ddl(&catalog, &wal).await?;
+
     // ④ 吸收循环：`Ingestor::new` 自带 chunk store ⇒ 写侧与热读侧同一实例
     let ingestor = Arc::new(Ingestor::new(
         IngestorConfig {

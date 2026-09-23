@@ -79,6 +79,18 @@ async fn seed_wal(dir: &std::path::Path, rows: &[i64]) {
     .await
     .expect("打开 WAL 以预置数据");
 
+    // **先写 DDL**：数据节点启动时会重放它（`replay_wal_ddl`）⇒ 表进元数据面。
+    // 这一条是"数据节点自己把表带进元数据"的证据 —— 用例不再靠客户端建表。
+    let ddl = yuntun_model::meta::serialize_schema(&schema());
+    wal.append(Record::Ddl(yuntun_model::wal_record::DdlPayload {
+        op: yuntun_model::wal_record::ddl_op::CREATE_TABLE,
+        table: TABLE.to_string(),
+        arrow_schema: ddl,
+        default_format: "parquet".to_string(),
+    }))
+    .await
+    .expect("追加 DDL 记录");
+
     for (i, v) in rows.iter().enumerate() {
         let batch = arrow::record_batch::RecordBatch::try_new(
             schema(),
@@ -282,22 +294,11 @@ async fn datanode_writes_and_queryd_reads_it_over_the_wire() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    // ---- ①b 建表：**在元数据面**建（查询节点的表清单来自 metanode）。
-    //      这里走的是**客户端那条路**（`RemoteCatalog` → Propose → raft → 状态机），
-    //      而不是直接往内存状态里塞 —— 与真实客户端一致。
+    // ---- ①b 只有客户端**连上**元数据面（不再由客户端建表）----
+    //      建表这件事改由数据节点启动时**重放自己的 WAL DDL** 完成（见 `seed_wal`）：
+    //      这正是要验的那条 —— 数据节点把表带进元数据面。
     let client_catalog =
         yuntun_meta::RemoteCatalog::connect(vec![meta_addr.to_string()]).expect("连 metanode");
-    client_catalog
-        .create_table(yuntun_model::ops::CreateTableRequest {
-            name: "qd".into(),
-            namespace: yuntun_model::ops::DEFAULT_SCHEMA.into(),
-            schema: schema(),
-            partition_cols: vec![],
-            default_format: "parquet".into(),
-            ingest_config: Default::default(),
-        })
-        .await
-        .expect("在元数据面建表");
 
     // ---- ② 数据节点：真子进程（预置 WAL ⇒ 它会回放出 3 行热数据）----
     let data_dir = tmpdir("qd-data");
@@ -316,6 +317,16 @@ async fn datanode_writes_and_queryd_reads_it_over_the_wire() {
         &st1,
     )
     .await;
+
+    // ---- ③b 元数据面拿到了表：这就是 `replay_wal_ddl` 经 raft 写进去的 ----
+    let t = client_catalog
+        .get_table(TABLE)
+        .await
+        .expect("读表元数据");
+    assert!(
+        t.is_some(),
+        "数据节点的 WAL DDL 必须重放进元数据面（否则查询节点根本不知道有这张表）"
+    );
 
     // ---- ④ 查询节点：真 Flight 服务（进程内），启动即按名录接线热读器 ----
     let (qd_addr, _serving) = yuntun_queryd::start(yuntun_queryd::QuerydConfig {
