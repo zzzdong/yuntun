@@ -565,7 +565,7 @@ SQL `INSERT` 返回成功时数据仅落 WAL（与 Flight DoPut 语义一致）�
 > 错误码映射按约定 3 落地、三个集群用例改跑生产路径。
 > **gRPC 服务层与真端到端已落地**（`operation-log §47`）：`MetaService` + `NodeHandle`，客户端能真调
 > （写入/幂等重试/Status/Delta/UNIMPLEMENTED 全覆盖；阻塞提案走阻塞线程池）。
-> 遗留（S3-3）：~~CLI/`--init` bootstrap~~ ✅ **已落地**（`§48`：metanode 可作进程独立启动、`kill -9` 真崩溃恢复已验证）、~~多节点部署形态~~ ✅ **已落地**（`§50`：节点间 gRPC 传输 + 3 节点复制 + 换主不丢已提交）、其余 op 的镜像、两个时钟统一、
+> 遗留（S3-3）：~~CLI/`--init` bootstrap~~ ✅ **已落地**（`§48`：metanode 可作进程独立启动、`kill -9` 真崩溃恢复已验证）、~~多节点部署形态~~ ✅ **已落地**（`§50`：节点间 gRPC 传输 + 3 节点复制 + 换主不丢已提交；`§103` 补上 **3 个真进程**，并修掉"多节点真部署起不来"的启动顺序/选主判据两处缺陷）、其余 op 的镜像、两个时钟统一、
 > 快照触发/保留策略、真崩溃注入（子进程）。
 > **S3-1 选型闸门已过**（`operation-log §40`）：三节点收敛 + kill leader 不丢已提交数据 + 样板 124 行
 > → **保留 raft-rs**（openraft 降级为备选）；余 S3-1b 快照安装 + 日志压缩。
@@ -576,7 +576,7 @@ SQL `INSERT` 返回成功时数据仅落 WAL（与 Flight DoPut 语义一致）�
 | T11.2 | Catalog 内存快照 + **raft snapshot 持久化** | 只有一份权威数据（ADR-12：避免双写陷阱） |
 | T11.3 | Catalog gRPC 服务 + 客户端（`GrpcCatalogClient: CatalogOps`） | 注入切换，业务代码不动 |
 | T11.4 | 幂等键 TTL 扫描不进热路径（分片/定期） | §5.2 遗留风险 |
-| T11.5 | 3 节点 raft：杀 leader / 网络分区 / snapshot 重建 | 阶段 3 的 chaos |
+| T11.5 | 3 节点 raft：杀 leader / 网络分区 / snapshot 重建 | 阶段 3 的 chaos；**真进程**杀 leader 已做（`§103`），网络分区与 snapshot 重建仍未做 |
 
 **准出**：3 节点 raft 写入不中断；metanode 全量重启后 Catalog 与重启前一致；
 standalone 仍可单机运行（同一份装配的裁剪）。
@@ -685,11 +685,13 @@ R2 Catalog 冻结（✅ 已完成）──► R3 metanode + raft
 
 只有同时满足：M1–M4 全部达成 + M5 对拍通过 + M6 零误删。
 
-**门槛审计（`§90` → `§98`）**：**M2 ✅ / M3 ✅ / M4 ✅ / M5 ✅ / M6 ✅**。
+**门槛审计（`§90` → `§103`）**：**M2 ✅ / M3 ✅ / M4 ✅ / M5 ✅ / M6 ✅**。
 
 - **M3 ✅**：① `multi_node_grpc_e2e`（3 节点真 gRPC、换主不丢已提交）② `metanode_process_e2e`
   （`kill -9` 恢复）③ `§93`（standalone 接口行 `LISTEN <addr>` + 二进制冒烟"真起 + 真连 +
-  真答一条 SQL"）；装配层见 `§92`（standalone 只有 96 行 = `Config → Lakehouse → serve_flight`）。
+  真答一条 SQL"）④ `metanode_cluster_process_e2e`（**3 个真 metanode 进程**：换主不丢 + 进程级重启
+  追平；`§103` —— 顺出并修掉"多节点真部署根本起不来"的两处缺陷）；装配层见 `§92`（standalone
+  只有 96 行 = `Config → Lakehouse → serve_flight`）。
 - **M4 ✅（本刀 `§98` 关闭）**：门槛要的是"**多** datanode 并发写 + 查询，与单节点串行逐行相等"。
   `§91` 先补了"两个写者各自回放 WAL"（元数据/合并不重不漏）；`§95` 更正指出数据进程当时
   **没有接受写入的网络面**，遂**收回一格**（M4 🟡）；`§96` 把 ingest 形态的 SQL 面改成可写

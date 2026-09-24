@@ -930,6 +930,10 @@ impl MetaNode {
     ///
     /// 启动路径需要它：**在选出 leader 之前接受请求只会全部收到 `NotLeader`**，
     /// 客户端会以为"服务起来了但一直失败"。
+    ///
+    /// ⚠️ **只对单节点组成立**：raft 同一时刻只有一个 leader，多节点组里的 follower
+    /// **永远**等不到"自己当选" ⇒ 拿它当多节点的启动闸门会让每个 follower 超时退出
+    /// （`§103` 就是踩了这个坑才顺出来）。多节点用 [`Self::wait_any_leader`]。
     pub fn wait_leader(&self, timeout: std::time::Duration) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
@@ -939,6 +943,23 @@ impl MetaNode {
             thread::sleep(Duration::from_millis(10));
         }
         false
+    }
+
+    /// 等**集群里出现 leader**（不要求是自己），返回它的 id；超时返回 `None`。
+    ///
+    /// 与 [`Self::wait_leader`] 的分工是硬的：`leader_id == 0` 表示"未知"
+    /// （客户端据此重试到正确节点），所以这里的判据是 `leader_id != 0` ——
+    /// 多节点组里 follower 合法地不是 leader，但"集群已经有了 leader"对**每个**节点都成立。
+    pub fn wait_any_leader(&self, timeout: std::time::Duration) -> Option<u64> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let leader = self.handle.status().leader_id;
+            if leader != 0 {
+                return Some(leader);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        None
     }
 
     /// 停机：让 raft 线程退出并 join（模拟"干净关闭"；`kill -9` 走的是另一条路）。
