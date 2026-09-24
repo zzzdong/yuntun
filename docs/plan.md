@@ -688,7 +688,11 @@ R2 Catalog 冻结（✅ 已完成）──► R3 metanode + raft
 **门槛审计（`§90` / 复评 `§91`、`§93`）**：M2 ✅ / **M3 ⚠️**（③ **standalone 真启动**缺证据）/
 **M4 ✅**（`§91` 已补上"多 datanode 并发写"的证据：两个真写进程 + 共享 `--cold-root` + 只查询
 协调者 ⇒ 逐行精确相等）/ M5 ✅ / M6 ✅。
-⇒ **`§8.4` 的判据至此齐了**（M3 ③ 由 `§93` 关闭：`serve_flight` 打**接口行** `LISTEN <addr>` +
+⇒ ⚠️ **`§95` 更正**：**M4 要收回一格** —— 数据进程的 SQL 面是 `FlightServer::new_readonly`
+（带不了 `ingest`）⇒ **它今天没有任何"接受写入"的网络面**，`§91` 证的是"两个写进程各自回放 WAL"
+（元数据/合并层面不重不漏 ✓），**不是**"客户端真写进数据进程"。故现状为
+**M2 ✅ / M3 ✅ / M4 🟡（写入面未做）/ M5 ✅ / M6 ✅**。
+（`§93` 关闭 M3 ③ 的部分依然成立：：`serve_flight` 打**接口行** `LISTEN <addr>` +
 二进制冒烟"真起 yuntun + 真连 Flight + 真答一条 SQL"）。过程见 `§92`：
 **装配层已有证据**（standalone 只有 96 行 = `Config → Lakehouse → serve_flight`，
 与 `flight_e2e`/`assembly_parity` 是**同一个装配** ⇒ 覆盖合法转移）；
