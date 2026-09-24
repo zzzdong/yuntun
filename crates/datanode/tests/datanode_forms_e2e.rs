@@ -161,16 +161,63 @@ impl Proc {
         Self::wrap(child)
     }
 
+    /// **写进程**（可指定实例名 + 共享冷目录）：与 [`Self::spawn_data_node`] 同一形态，
+    /// 只是把两个多写者必需的东西开出来（`plan §8.3` 的 M4 要用）。
+    ///
+    /// - `--instance-id` 必须**各不相同**：`source_instance` 是"这条热数据属于谁"的唯一标识；
+    /// - `--dir` 必须**各不相同**：WAL / spill 是私有的，同一目录第二个消费者会被目录租约拒；
+    /// - `--cold-root` 必须**相同**：冷存储是共享的那一份（本机形态；真实部署里它是 S3）。
+    fn spawn_writer(
+        data_dir: &std::path::Path,
+        meta: SocketAddr,
+        instance_id: &str,
+        cold_root: &std::path::Path,
+    ) -> Self {
+        let child = Command::new(DATANODE)
+            .arg("--instance-id")
+            .arg(instance_id)
+            .arg("--dir")
+            .arg(data_dir)
+            .arg("--cold-root")
+            .arg(cold_root)
+            .arg("--listen")
+            .arg("127.0.0.1:0")
+            .arg("--meta")
+            .arg(meta.to_string())
+            .arg("--heartbeat-secs")
+            .arg("1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("起 yuntun-datanode（写进程）");
+        Self::wrap(child)
+    }
+
     /// **只查询形态**（`--no-ingest`）：不吃 WAL、不留本地数据，只作为协调者拉别人的热数据。
     ///
     /// 与数据节点**共用同一个 `--dir`** 是刻意的：只查询形态**不占任何租约**（它没有私有状态），
     /// 而 `<dir>/cold` 正是"同一份共享对象存储"在本机形态下的样子 —— 两个进程读同一份冷数据。
     fn spawn_query_only(data_dir: &std::path::Path, meta: SocketAddr) -> Self {
+        Self::spawn_query_only_with_cold(data_dir, meta, None)
+    }
+
+    /// 同 [`Self::spawn_query_only`]，但可指定**共享冷存储**（多写者场景必需：
+    /// 协调者必须看得见两个写者的落盘文件）。
+    fn spawn_query_only_with_cold(
+        data_dir: &std::path::Path,
+        meta: SocketAddr,
+        cold_root: Option<&std::path::Path>,
+    ) -> Self {
         let child = Command::new(DATANODE)
             .arg("--instance-id")
             .arg(QUERY_ONLY)
             .arg("--dir")
             .arg(data_dir)
+            .args(
+                cold_root
+                    .map(|c| vec!["--cold-root".to_string(), c.to_string_lossy().into_owned()])
+                    .unwrap_or_default(),
+            )
             .arg("--no-ingest")
             .arg("--sql-listen")
             .arg("127.0.0.1:0")
@@ -405,4 +452,107 @@ async fn ingest_form_writes_and_query_form_reads_it_over_the_wire() {
         rejected.is_err(),
         "SQL 面必须拒绝写入（本轮只读），实际：{rejected:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// M4 门槛的字面要求：**多** datanode 并发写
+// ---------------------------------------------------------------------------
+
+/// **两个写进程并发写同一张表、同一个 shard** ⇒ 查询结果必须与单节点串行**逐行精确相等**。
+///
+/// 为什么单独一条：`plan §8.3` 的 M4 门槛写的是"**多** datanode 并发写 + 查询"，
+/// 而现有跨进程用例都是**单写者**（`ingest_form_writes_and_query_form_reads_it_over_the_wire`
+/// 是"一写一查"）。这一格没实证之前，`§8.4` 的"分布式就绪"就还不能说。
+///
+/// 形态（`architecture §5.1` 的原话："多个 datanode 可能同时写同一 partition，各自出各自的
+/// 文件"）—— 三个真子进程 + 一个进程内 metanode：
+///
+/// ```text
+///   metanode（进程内，真 gRPC）
+///     ▲ 注册/心跳（两个**不同**实例名）        ▲ 名录（含各自数据面地址）
+///   datanode A ──┐                        ┌── datanode B
+///   --dir A      ├── 同一个 --cold-root ───┤   --dir B
+///   WAL: 1,2,3   ┘   （= 共享对象存储）    └── WAL: 4,5,6
+///                     ▲
+///           只查询进程（--no-ingest --sql-listen）→ SELECT ⇒ [1,2,3,4,5,6]
+/// ```
+///
+/// **两个 `--dir` 必须不同、一个 `--cold-root` 必须相同**，这不是偷懒：
+/// - 不同 `--dir`：WAL/spill 是私有的，同一目录第二个消费者会被目录租约当场拒绝（`T12.4`）；
+/// - 相同 `--cold-root`：冷存储是共享的那一份（`--cold-root` 的文档原话就是
+///   "各给一个 `--dir`，但指同一个 `--cold-root`"）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_writers_parity_with_single_node_serial() {
+    // ---- ① metanode（进程内 + 真 gRPC 服务）----
+    let meta_dir = tmpdir("mw-meta");
+    let node = yuntun_meta::MetaNode::open(&meta_dir, 1, vec![1], HashMap::new()).expect("起单节点");
+    let h = node.handle();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let meta_addr = listener.local_addr().unwrap();
+    let served = h.clone();
+    tokio::spawn(async move {
+        let _ = yuntun_meta::serve(served, listener).await;
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while h.status().leader_id != 1 {
+        assert!(Instant::now() < deadline, "等待选主超时");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let client_catalog =
+        yuntun_meta::RemoteCatalog::connect(vec![meta_addr.to_string()]).expect("连 metanode");
+
+    // ---- ② 两个写进程：私有 `--dir` + **共享 `--cold-root`** ----
+    let cold = tmpdir("mw-cold");
+    let dir_a = tmpdir("mw-a");
+    let dir_b = tmpdir("mw-b");
+    seed_wal(&dir_a, &[1, 2, 3]).await;
+    seed_wal(&dir_b, &[4, 5, 6]).await;
+    let mut a = Proc::spawn_writer(&dir_a, meta_addr, "inst-a", &cold);
+    let mut b = Proc::spawn_writer(&dir_b, meta_addr, "inst-b", &cold);
+    let addr_a = a.wait_listening();
+    let addr_b = b.wait_listening();
+
+    // ---- ③ 两个实例都入册（各自的数据面地址都在名录里）----
+    for (inst, addr) in [("inst-a", addr_a), ("inst-b", addr_b)] {
+        let h1 = h.clone();
+        let st = if inst == "inst-a" {
+            a.stderr.clone()
+        } else {
+            b.stderr.clone()
+        };
+        let want = (inst.to_string(), addr.to_string());
+        wait_until(
+            move || roster(&h1).contains(&want),
+            Duration::from_secs(15),
+            "写进程入册（含数据面地址）",
+            &st,
+        )
+        .await;
+    }
+
+    // ---- ④ 表已进元数据面（两个节点的 WAL DDL 都重放过；重复的那次应被容忍）----
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while client_catalog.get_table(TABLE).await.expect("读表元数据").is_none() {
+        assert!(Instant::now() < deadline, "两个写进程的 WAL DDL 应把表带进元数据面");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // ---- ⑤ 只查询进程（协调者）：看得见两个写者的数据 ----
+    let mut q = Proc::spawn_query_only_with_cold(&dir_a, meta_addr, Some(&cold));
+    let qd_addr = q.wait_sql_listening();
+    let mut client = flight_client(qd_addr).await;
+    let got = sql(&mut client, &format!("SELECT a FROM yuntun.{TABLE} ORDER BY a"))
+        .await
+        .expect("查询应成功");
+    assert_eq!(
+        got,
+        vec![1, 2, 3, 4, 5, 6],
+        "两个写进程各写一半 ⇒ 必须与单节点串行**逐行精确相等**：\
+         少行 = 漏读某个实例；多行 = 同一份数据被读两次"
+    );
+
+    // 收尾：显式停掉三个子进程（不留孤儿）
+    let _ = a.child.kill();
+    let _ = b.child.kill();
+    let _ = q.child.kill();
 }
