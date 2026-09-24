@@ -17,6 +17,8 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use prost::Message as _;
@@ -65,6 +67,36 @@ impl Drop for NodeProc {
             n.shutdown();
         }
         self.server.abort();
+    }
+}
+
+/// 起一个**进程内**节点 + 它的真 gRPC 服务任务。
+///
+/// `peers` = "**发往**各对端的地址"：直连时就是对端的监听地址；分区用例里指向**可切断的链路**
+/// （[`Links`]）。这个参数化正是分区用例能成立的原因 —— **切链路不需要动任何生产代码**：
+/// 节点只认 `peers` 里那个地址，我们把那个地址指到自己的转发器上即可。
+async fn spawn_node(
+    id: u64,
+    dir: PathBuf,
+    peers: HashMap<u64, String>,
+    listener: tokio::net::TcpListener,
+) -> NodeProc {
+    let node = MetaNode::open(dir, id, IDS.to_vec(), peers).expect("起节点");
+    // 起服务前：传输还没用过
+    let st = node.transport_stats();
+    assert_eq!(
+        st.delivered + st.failed + st.rejected + st.dropped,
+        0,
+        "启动时不该已经发过消息"
+    );
+    let served = node.handle();
+    let server = tokio::spawn(async move {
+        let _ = yuntun_meta::serve(served, listener).await;
+    });
+    NodeProc {
+        id,
+        node: Some(node),
+        server,
     }
 }
 
@@ -266,24 +298,8 @@ async fn three_nodes_replicate_over_grpc_and_survive_leader_loss() {
             .filter(|o| *o != id)
             .map(|o| (*o, addrs[o].to_string()))
             .collect();
-        let node = MetaNode::open(dir(*id), *id, IDS.to_vec(), peers).expect("起节点");
-        // 起服务前：传输还没用过
-        let st = node.transport_stats();
-        assert_eq!(
-            st.delivered + st.failed + st.rejected + st.dropped,
-            0,
-            "启动时不该已经发过消息"
-        );
-        let served = node.handle();
         let listener = listeners[i].take().expect("监听器只取一次");
-        let server = tokio::spawn(async move {
-            let _ = yuntun_meta::serve(served, listener).await;
-        });
-        nodes.push(NodeProc {
-            id: *id,
-            node: Some(node),
-            server,
-        });
+        nodes.push(spawn_node(*id, dir(*id), peers, listener).await);
     }
 
     let clients: HashMap<u64, Client> = {
@@ -384,6 +400,394 @@ async fn three_nodes_replicate_over_grpc_and_survive_leader_loss() {
     }
 
     // 收尾：停掉存活节点（`Drop` 会停；显式 drop 让"谁在什么时候停"一目了然）
+    for n in nodes {
+        drop(n);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 网络分区（`operation-log §104`）：可切断的链路 ⇒ 少数派不能提交 + 愈合后不丢不裂
+// ---------------------------------------------------------------------------
+
+/// 一条**可切断的有向链路**：在 `addr` 上监听，把每条进来的连接转发到 `target`。
+///
+/// 为什么用"TCP 转发 + 开关"而不是 `iptables` / 网络命名空间：后者要 root、进不了 CI；
+/// 而它**不需要动任何生产代码** —— 节点只认 `peers` 里那个地址，我们把它指向这里即可。
+/// 断了还能自己接上，是因为 `GrpcTransport` 用 `connect_lazy` + tonic 自带重连
+/// （`transport.rs` 模块文档里"对端没起来/重启中不需要我们写重连逻辑"就是这个意思）。
+struct Link {
+    addr: SocketAddr,
+    open: Arc<AtomicBool>,
+    /// 已建立的转发任务：切断时必须 `abort` 掉 —— 只拒绝新连接不够，**老连接还在替双方送消息**
+    live: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// 被拒的连接数（**证据**：证明这个开关真被触发过，而不是"以为切了"）
+    refused: Arc<AtomicU64>,
+    _accept: tokio::task::JoinHandle<()>,
+}
+
+impl Link {
+    async fn start(target: SocketAddr) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind 链路");
+        let addr = listener.local_addr().expect("local_addr");
+        let open = Arc::new(AtomicBool::new(true));
+        let live: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
+        let refused = Arc::new(AtomicU64::new(0));
+        let (o, l, r) = (open.clone(), live.clone(), refused.clone());
+        let accept = tokio::spawn(async move {
+            loop {
+                let Ok((mut inbound, _)) = listener.accept().await else {
+                    break;
+                };
+                if !o.load(Ordering::SeqCst) {
+                    // 断开：对端看到"连不上/连接被关"（= 链路断）
+                    r.fetch_add(1, Ordering::SeqCst);
+                    drop(inbound);
+                    continue;
+                }
+                let h = tokio::spawn(async move {
+                    if let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                });
+                let mut v = l.lock().unwrap();
+                v.retain(|h| !h.is_finished()); // 顺手回收，别让它无限长
+                v.push(h);
+            }
+        });
+        Self {
+            addr,
+            open,
+            live,
+            refused,
+            _accept: accept,
+        }
+    }
+
+    /// **切断**：关掉已建立的连接，并拒绝后续连接。
+    fn cut(&self) {
+        self.open.store(false, Ordering::SeqCst);
+        for h in self.live.lock().unwrap().drain(..) {
+            h.abort();
+        }
+    }
+
+    fn heal(&self) {
+        self.open.store(true, Ordering::SeqCst);
+    }
+}
+
+/// 三个节点**两两有序**共六条链路（`i→j` 各一条）。
+///
+/// 为什么不是"每节点一条"（三条）：那样切"通往 j 的链路"会连**别的节点到 j** 一起切断，
+/// 于是**多数派内部也断了**、根本选不出新 leader —— 就测不出"多数派照常工作"。
+/// 有序对是必须的：`i→j` 与 `j→i` 是两条独立的路。
+struct Links {
+    map: HashMap<(u64, u64), Link>,
+}
+
+impl Links {
+    async fn start(addrs: &HashMap<u64, SocketAddr>) -> Self {
+        let mut map = HashMap::new();
+        for i in IDS {
+            for j in IDS {
+                if i != j {
+                    map.insert((i, j), Link::start(addrs[&j]).await);
+                }
+            }
+        }
+        Self { map }
+    }
+
+    fn addr(&self, from: u64, to: u64) -> SocketAddr {
+        self.map[&(from, to)].addr
+    }
+
+    /// **隔离**某节点：切断**所有**与它相关的链路（两个方向），其余链路不动
+    /// ⇒ 本例里 `(2,3)`/`(3,2)` 仍然通，多数派还能投票。
+    fn isolate(&self, id: u64) {
+        for ((i, j), l) in &self.map {
+            if *i == id || *j == id {
+                l.cut();
+            }
+        }
+    }
+
+    fn heal_all(&self) {
+        for l in self.map.values() {
+            l.heal();
+        }
+    }
+
+    fn refused_total(&self) -> u64 {
+        self.map
+            .values()
+            .map(|l| l.refused.load(Ordering::SeqCst))
+            .sum()
+    }
+}
+
+/// 等**某一个**节点自称 leader（`live` 限定候选，避免把被隔离的节点算进来）。
+///
+/// ⚠️ **不能**拿它当"集群的 leader 就是它"来用（那要 [`wait_settled_leader`]）：
+/// 分区**愈合后**，被隔离过的旧 leader 会在自己那侧**仍然自认 leader**（它还没从多数派
+/// 那里学到更高的 term）—— 这时候"我问到一个自称 leader 的"答的是旧答案。
+async fn wait_some_leader(clients: &HashMap<u64, Client>, live: &[u64]) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        for id in live {
+            if status(&clients[id], *id).await.role == "Leader" {
+                return *id;
+            }
+        }
+        assert!(Instant::now() < deadline, "30s 内没选出 leader");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+}
+
+/// 等**所有** `ids` 就**同一个** leader 达成一致，返回它。
+///
+/// 与 [`wait_some_leader`] 的差别是愈合用例的必需品：只要还有节点"自认 leader"或"指着一个
+/// 不是 leader 的 id"，就还不算settled —— 那个窗口里任何"leader 是谁"的结论都可能是旧答案。
+async fn wait_settled_leader(clients: &HashMap<u64, Client>, ids: &[u64]) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut all = Vec::with_capacity(ids.len());
+        for id in ids {
+            all.push(status(&clients[id], *id).await);
+        }
+        let leader = all
+            .iter()
+            .find(|s| s.role == "Leader" && s.leader_id == s.node_id)
+            .map(|s| s.node_id);
+        if let Some(l) = leader
+            && all
+                .iter()
+                .all(|s| s.leader_id == l && (s.role == "Leader") == (s.node_id == l))
+        {
+            return l;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "30s 内没能就同一个 leader 达成一致：{all:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+}
+
+/// 向**被隔离**的节点提议一次，断言它在 `within` 内**没有被接受**。
+///
+/// 这是分区的**安全性**断言（脑裂防线）。三种表现都算通过：
+/// - 它已自知不是 leader ⇒ 服务端回 `NotLeader`（映射成可重试的 `UNAVAILABLE`）；
+/// - 它仍自认 leader，于是收下提案、append 进自己的日志，但**永远等不到应用**
+///   （没有多数派 ⇒ 提交不了）⇒ 我们这边的 `within` 先超时（服务端自己等 `PROPOSE_TIMEOUT` = 10s）；
+/// - 回执到了但 `accepted=false`。
+///
+/// **只有收到 `accepted=true` 才是错的** —— 那说明少数派自己提交了，脑裂成立。
+async fn assert_cannot_commit(client: &Client, id: u64, op: pb::Op, within: Duration) {
+    // 克隆要先落成变量：`client.clone().propose(..)` 的临时值活不过这个 `let`
+    // （我们要把 future 存起来再交给 `timeout`，不是在原地 `.await`）
+    let mut c = client.clone();
+    let call = c.propose(pb::ProposeRequest {
+        op: Some(op),
+        request_id: b"rid".to_vec(),
+        schema_ver: 0,
+    });
+    match tokio::time::timeout(within, call).await {
+        Ok(Err(_)) => {} // 服务端回绝（NotLeader / NoQuorum）
+        Ok(Ok(r)) => assert!(
+            !r.into_inner().accepted,
+            "被隔离的节点 {id} **接受了提交** —— 这就是脑裂"
+        ),
+        Err(_) => {} // 等不到回执：它收下了提案，但没有多数派、提交不了
+    }
+}
+
+/// **网络分区**：把 leader 与另外两个节点**双向切断** ⇒
+/// ① 少数派（被隔离者）**不能提交**（安全性：脑裂会让"换主不丢已提交"变成一句假话）；
+/// ② 多数派（另两个）**选出新 leader 并照常提交**（可用性）；
+/// ③ **愈合**后三方收敛：多数派在分区期间的提交**不丢**，少数派那条在途记录**不留**。
+///
+/// 形态（`i→j` 是"节点 i 发往节点 j"走的那条**可切断链路**）：
+///
+/// ```text
+///   node1 ──link(1,2)──► 转发 ──► node2      切断 = 关掉已建立的连接 + 拒绝新连接
+///   node1 ──link(1,3)──► 转发 ──► node3      隔离 1 ⇒ 切 (1,2)(1,3)(2,1)(3,1) 四条，
+///   node2 ◄──link(2,3)──► 转发 ──► node3            **(2,3)/(3,2) 保持通畅 ⇒ 多数派还能选主**
+/// ```
+///
+/// 客户端读 `Status` 走的是**直连**（不经过链路），所以分区期间仍能同时观察两边各自的状态
+/// —— 这正是本用例能"对着两边分别断言"的原因。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partitioned_leader_cannot_commit_and_heals_without_loss() {
+    let root = TempDir::new("meta-partition");
+    let dir = |id: u64| -> PathBuf { Path::new(&root.0).join(format!("node{id}")) };
+
+    // ---- ① 监听器先 bind 且**不释放**（`:0` + 不松手 ⇒ 无 TOCTOU）----
+    let mut listeners = Vec::new();
+    for _ in IDS {
+        listeners.push(Some(
+            tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind 127.0.0.1:0"),
+        ));
+    }
+    let addrs: HashMap<u64, SocketAddr> = IDS
+        .iter()
+        .zip(&listeners)
+        .map(|(id, l)| (*id, l.as_ref().expect("已 bind").local_addr().expect("local_addr")))
+        .collect();
+
+    // ---- ② 六条链路；各节点的 peer 表指向**链路**而不是对端 ----
+    let links = Links::start(&addrs).await;
+    let mut nodes: Vec<NodeProc> = Vec::new();
+    for (i, id) in IDS.iter().enumerate() {
+        let peers: HashMap<u64, String> = IDS
+            .iter()
+            .filter(|o| *o != id)
+            .map(|o| (*o, links.addr(*id, *o).to_string()))
+            .collect();
+        let listener = listeners[i].take().expect("监听器只取一次");
+        nodes.push(spawn_node(*id, dir(*id), peers, listener).await);
+    }
+
+    let clients: HashMap<u64, Client> = {
+        let mut m = HashMap::new();
+        for id in IDS {
+            m.insert(id, connect(addrs[&id]).await);
+        }
+        m
+    };
+
+    // ---- ③ 选主 ----
+    let leader = wait_some_leader(&clients, &IDS).await;
+    wait_leader_agreement(&clients, &IDS, leader).await;
+
+    // ---- ④ 分区**之前**先提交一份：它要跨过"换主 + 分区 + 愈合"活下来 ----
+    assert!(
+        propose_following_leader(&clients, &IDS, create_schema_op("analytics", 1_000))
+            .await
+            .accepted
+    );
+    assert!(
+        propose_following_leader(&clients, &IDS, create_table_op("cpu", 1_001))
+            .await
+            .accepted
+    );
+    let r1 = propose_following_leader(&clients, &IDS, commit_op("b1", "key-b1", 1_002)).await;
+    assert!(r1.accepted, "分区前的提交必须成功");
+    let ver_before = r1.manifest_ver;
+    wait_converged(&clients, &IDS).await;
+
+    // ---- ⑤ 反证：**未分区**时，同一个调用**必须被接受** ----
+    //      没有这一条，⑦ 的"没被接受"什么都证明不了（可能是"这个调用天生就成不了"）。
+    //      同一次运行里把"健康 ⇒ 接受"与"被隔离 ⇒ 不接受"都摆出来，⑦ 才有鉴别力。
+    {
+        let mut c = clients[&leader].clone();
+        let r = c
+            .propose(pb::ProposeRequest {
+                op: Some(commit_op("probe", "key-probe", 1_500)),
+                request_id: b"probe".to_vec(),
+                schema_ver: 0,
+            })
+            .await
+            .expect("健康集群里提议应当成功");
+        assert!(
+            r.into_inner().accepted,
+            "未分区时 leader 必须接受提交（否则这条用例的'分区下不接受'毫无意义）"
+        );
+    }
+
+    // ---- 切断 leader 的四条链路 ⇒ 它成了少数派 ----
+    links.isolate(leader);
+    let survivors: Vec<u64> = IDS.iter().copied().filter(|i| *i != leader).collect();
+    let live: HashMap<u64, Client> = survivors
+        .iter()
+        .map(|id| (*id, clients[id].clone()))
+        .collect();
+
+    // ---- ⑥ 多数派：选出**新** leader 并照常提交（可用性）----
+    let new_leader = wait_some_leader(&live, &survivors).await;
+    assert_ne!(new_leader, leader, "被隔离的节点拉不到票，不可能当选");
+    wait_leader_agreement(&live, &survivors, new_leader).await;
+    let r2 = propose_following_leader(&live, &survivors, commit_op("b2", "key-b2", 2_000)).await;
+    assert!(r2.accepted, "多数派（2/3）必须能提交 —— 少数派失联不该让集群停写");
+    assert!(
+        r2.manifest_ver > ver_before,
+        "多数派的提交必须推进版本号（{ver_before} → {}）",
+        r2.manifest_ver
+    );
+
+    // ---- ⑦ 少数派：**不能提交**（安全性，本用例的核心）----
+    assert_cannot_commit(
+        &clients[&leader],
+        leader,
+        commit_op("b3", "key-b3", 3_000),
+        Duration::from_secs(3),
+    )
+    .await;
+
+    // ---- ⑧ 证据：链路**真的**被切过（否则"少数派不能提交"可能只是因为别的原因）----
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let failed: u64 = nodes
+            .iter()
+            .map(|n| n.node.as_ref().expect("节点还活着").transport_stats().failed)
+            .sum();
+        let refused = links.refused_total();
+        if failed > 0 && refused > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "10s 内没拿到「链路被切断」的证据：failed={failed} refused={refused}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // ---- ⑨ 愈合 ----
+    links.heal_all();
+
+    // ---- ⑩ 收敛：三方同一条日志（被隔离者的分歧尾部会被新 leader 覆盖）----
+    //      用 `wait_settled_leader`（三方就同一个 leader 一致），**不能**用 `wait_some_leader`：
+    //      愈合后原 leader 会在自己那侧仍自认 leader 一小会儿（它还没学到更高 term），
+    //      那时"我问到一个自称 leader 的"会答出旧答案 —— 这是本用例自己踩过的坑。
+    let healed_leader = wait_settled_leader(&clients, &IDS).await;
+    assert_ne!(
+        healed_leader, leader,
+        "被隔离过的旧 leader 不可能仍然是 leader（它的 term 落后）"
+    );
+    let converged = wait_converged(&clients, &IDS).await;
+    // `wait_converged` 要求**每个**节点 `applied == last` 且三者的 `last_index` 相同 ⇒
+    // 被隔离者那条「append 了但没提交」的记录要么被覆盖、要么它压根没 append：
+    // 两种情况的共同点是「它日志里没有未应用（= 未提交）的尾巴」，而「提交了什么」由下面三条断言钉住。
+    let first_last = converged[&IDS[0]];
+    assert!(
+        converged.values().all(|v| *v == first_last),
+        "愈合后三方必须同一条日志，实际：{converged:?}"
+    );
+
+    // ---- ⑪ 分区期间多数派的提交：**不丢**（在被隔离者身上也能重放命中）----
+    let replay_b2 = propose_following_leader(&clients, &IDS, commit_op("b2", "key-b2", 2_000)).await;
+    assert!(
+        !replay_b2.accepted,
+        "分区期间多数派提交的记录丢了 —— 这正是「愈合后少数派把多数派的成果顶掉」的失败模样"
+    );
+
+    // ---- ⑫ 少数派那条在途记录：**不该**被提交过 ⇒ 现在提交必须能成功 ----
+    // 这条是"没有脑裂"的正向证据：当时若被接受过，这里就会命中幂等键（accepted=false）。
+    let b3 = propose_following_leader(&clients, &IDS, commit_op("b3", "key-b3", 3_000)).await;
+    assert!(
+        b3.accepted,
+        "少数派那条在分区期间**不该**生效；现在提交成功 ⇒ 它确实没被提交（无脑裂）"
+    );
+
+    // ---- ⑬ 分区**之前**那条也还在 ----
+    let replay_b1 = propose_following_leader(&clients, &IDS, commit_op("b1", "key-b1", 1_002)).await;
+    assert!(!replay_b1.accepted, "分区前提交的记录跨过换主 + 分区丢了");
+
+    // 收尾：停掉三个节点（`Drop` 会停）
     for n in nodes {
         drop(n);
     }
