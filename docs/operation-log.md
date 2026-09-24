@@ -6016,3 +6016,41 @@ Config(TOML) → Lakehouse 装配 → yuntun_server::serve_flight(&lakehouse, &l
 
 - 全量 `cargo test --workspace --no-fail-fast -j 4` → **372 passed / 0 failed（+1 ignored）**
 - clippy 本仓 **0**；规模：46,875 行 / 20 个 crate / 372 测试函数
+
+---
+
+## 94. `§91.5` 的第一半：**跨节点重试的幂等**（2026-09-24）
+
+### 94.1 为什么先做这一半
+
+`§91.5` 记的"两个节点同时在途写"里，有一个**更容易被忽略、后果更重**的分支：
+
+> 客户端超时了，把**同一批**数据重发到了**另一个** datanode。
+
+这不是"各出各的文件"（那是设计要的正常形态，由查询侧合并），而是**同一批数据的第二次落地**：
+一旦幂等键按实例隔离，就会**悄悄写两份** —— 不报错，只是结果变多。
+
+### 94.2 结论：幂等键在**目录**这一层就是全局的
+
+`LakeState.idempotency: BTreeMap<String, IdempotencyRecord>` —— **扁平、没有实例维度**。
+所以跨节点重试天然去重。这条性质**此前没有用例钉它**，本刀补上，并且**两个方向都钉**：
+
+| 用例 | 断言 |
+|---|---|
+| `same_client_key_from_another_instance_writes_only_once` | 同一个 `client_request_id` 从**另一个实例**重试（不同 `batch_id`、不同 `source_instance`）⇒ 只有**一个赢家**（`accepted=false`），目录里只有赢家那一份，且它的 `source_instance` 是**第一次**那个 |
+| `different_keys_from_two_instances_both_land` | **不同** key、不同实例 ⇒ 两份**都**合法存在 |
+
+第二条件是第一条件的**护栏**：把"跨实例去重"写成"跨实例一律拒绝"同样是错的 ——
+那会堵死 `architecture §5.1` 的"多个 datanode 各出各的文件"这条正常路径。
+
+### 94.3 仍未做（`§91.5` 的另一半）
+
+两个 ingest 节点**都开 `--sql-listen`**（"数据节点 + 协调者"本就是同一进程的两个面），
+**并发 INSERT、同一瞬间在途写** ⇒ 再对拍。
+配方已定：两节点**同一 `--cold-root`**、各自 `--dir`/`--instance-id`、都开 `--sql-listen`；
+夹具沿用 `§91.3`（`spawn_writer` / `spawn_query_only_with_cold` / `wait_until` / `sql`）。
+
+### 94.4 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **374 passed / 0 failed（+1 ignored）**
+- clippy 本仓 **0**；规模：46,994 行 / 20 个 crate / 374 测试函数

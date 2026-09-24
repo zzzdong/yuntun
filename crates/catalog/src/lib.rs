@@ -1135,3 +1135,122 @@ mod tests {
         );
     }
 }
+
+/// **多写者（跨节点）重试的幂等** —— M4 那一族（`§91.5` 的第一半）。
+///
+/// 多 datanode 并发写时最常见的真实形态不是"两个节点写两批不同的数据"（那是合法的，
+/// 设计要的就是"各出各的文件"，由查询侧合并），而是：
+///
+/// > 客户端超时了，把**同一批**数据重发到了**另一个** datanode。
+///
+/// 这时幂等键必须在**目录**这一层是**全局**的：按实例隔离，就会悄悄写两份
+/// （不报错、只是结果变多 —— 最难查的那类错）。
+///
+/// 这条用例把"另一个实例"这个维度显式写出来：第二个提交带着**不同的 batch_id、
+/// 不同的 source_instance**，只有 `client_request_id` 相同 ⇒ 必须**只有一个赢家**。
+#[cfg(test)]
+mod multi_writer_retry {
+    use super::*;
+    use std::sync::Arc;
+
+    use yuntun_model::meta::FileManifest;
+    use yuntun_model::ops::{CommitFilesRequest, CreateTableRequest};
+
+    const TABLE: &str = "public.mwretry";
+
+    fn req(batch_id: &str, key: &str, instance: &str, path: &str) -> CommitFilesRequest {
+        CommitFilesRequest {
+            table: TABLE.into(),
+            batch_id: batch_id.into(),
+            client_request_id: Some(key.into()),
+            client_request_ids: vec![],
+            shard: "s0".into(),
+            time_window: "w".into(),
+            files: vec![FileManifest {
+                file_path: path.into(),
+                batch_id: batch_id.into(),
+                file_size: 1,
+                row_count: 1,
+                table: TABLE.into(),
+                shard: "s0".into(),
+                time_window: "w".into(),
+                // 两个"实例"各写各的文件 —— 这不是问题，问题是**同一个幂等键**
+                source_instance: instance.into(),
+                ..Default::default()
+            }],
+            schema_version: 1,
+            row_count: 1,
+        }
+    }
+
+    async fn catalog_with_table() -> MemoryCatalog {
+        let c = MemoryCatalog::new();
+        c.create_table(CreateTableRequest {
+            name: "mwretry".into(),
+            namespace: yuntun_model::ops::DEFAULT_SCHEMA.into(),
+            schema: Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("a", arrow::datatypes::DataType::Int64, true),
+            ])),
+            partition_cols: vec![],
+            default_format: "parquet".into(),
+            ingest_config: Default::default(),
+        })
+        .await
+        .unwrap();
+        c
+    }
+
+    /// 实例 A 提交 → **实例 B 拿同一个 `client_request_id` 重试** ⇒ 只许有一个赢家。
+    #[tokio::test]
+    async fn same_client_key_from_another_instance_writes_only_once() {
+        let c = catalog_with_table().await;
+
+        let r1 = c
+            .commit_files(req("b-a", "client-key-1", "inst-a", "p/a.parquet"))
+            .await
+            .unwrap();
+        assert!(r1.accepted, "第一次提交应当被接受");
+
+        let r2 = c
+            .commit_files(req("b-b", "client-key-1", "inst-b", "p/b.parquet"))
+            .await
+            .unwrap();
+        assert!(
+            !r2.accepted,
+            "同一个幂等键从**另一个实例**重试，必须有且只有一个赢家：\
+             否则客户端超时重发就会在**另一个节点**落第二份数据（不报错，只是结果变多）"
+        );
+
+        // 目录里只有赢家那一份
+        let files = c
+            .list_visible_files(TABLE, c.current_snapshot().await, None)
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 1, "只该有一份数据：{files:?}");
+        assert_eq!(files[0].source_instance, "inst-a", "赢家是第一次那个实例");
+    }
+
+    /// **不同的**幂等键（两个节点各写自己那批）⇒ 两份都合法地存在。
+    ///
+    /// 这条是上一条的护栏：把"跨实例去重"写成"跨实例一律拒绝"同样是错的 ——
+    /// 那会把"多 datanode 各出各的文件"（`architecture §5.1`）这条正常路径堵死。
+    #[tokio::test]
+    async fn different_keys_from_two_instances_both_land() {
+        let c = catalog_with_table().await;
+        let r1 = c
+            .commit_files(req("b-a", "key-a", "inst-a", "p/a.parquet"))
+            .await
+            .unwrap();
+        let r2 = c
+            .commit_files(req("b-b", "key-b", "inst-b", "p/b.parquet"))
+            .await
+            .unwrap();
+        assert!(r1.accepted && r2.accepted, "两个不同的键各写各的，都该被接受");
+
+        let files = c
+            .list_visible_files(TABLE, c.current_snapshot().await, None)
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 2, "两个实例各出各的文件 —— 这是设计的正常形态");
+    }
+}
