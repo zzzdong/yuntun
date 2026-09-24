@@ -15,7 +15,7 @@
 
 use std::time::Duration;
 
-use yuntun_meta::{cli, MetaNode};
+use yuntun_meta::{cli, MetaNode, MetaOptions};
 
 fn main() {
     // clap 统一处理 `--help`/`--version`（退 0）与用法错（退 2）；语义错也归"用法错"。
@@ -40,7 +40,15 @@ fn run(args: &cli::Args) -> Result<(), Box<dyn std::error::Error>> {
     let _guard = rt.enter();
 
     // ① 起节点：打开存储 → 按盘上状态重建状态机 → 拉起 raft 线程（+ 多节点传输）
-    let node = MetaNode::open(&args.dir, args.id, args.voters.clone(), args.peer_map())?;
+    let node = MetaNode::open_with(
+        &args.dir,
+        args.id,
+        args.voters.clone(),
+        args.peer_map(),
+        MetaOptions {
+            compact_log_entries: args.snapshot_log_entries,
+        },
+    )?;
 
     // ② 起服务 + 等选主
     rt.block_on(async move {

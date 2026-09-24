@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use prost::Message as _;
-use yuntun_meta::MetaNode;
+use yuntun_meta::{MetaNode, MetaOptions};
 use yuntun_proto::meta as pb;
 use yuntun_proto::meta::meta_client::MetaClient;
 
@@ -75,13 +75,16 @@ impl Drop for NodeProc {
 /// `peers` = "**发往**各对端的地址"：直连时就是对端的监听地址；分区用例里指向**可切断的链路**
 /// （[`Links`]）。这个参数化正是分区用例能成立的原因 —— **切链路不需要动任何生产代码**：
 /// 节点只认 `peers` 里那个地址，我们把那个地址指到自己的转发器上即可。
+///
+/// `opts` = 运行期策略（快照用例把压缩阈值调小，让快照**由策略自然产生**）。
 async fn spawn_node(
     id: u64,
     dir: PathBuf,
     peers: HashMap<u64, String>,
     listener: tokio::net::TcpListener,
+    opts: MetaOptions,
 ) -> NodeProc {
-    let node = MetaNode::open(dir, id, IDS.to_vec(), peers).expect("起节点");
+    let node = MetaNode::open_with(dir, id, IDS.to_vec(), peers, opts).expect("起节点");
     // 起服务前：传输还没用过
     let st = node.transport_stats();
     assert_eq!(
@@ -299,7 +302,7 @@ async fn three_nodes_replicate_over_grpc_and_survive_leader_loss() {
             .map(|o| (*o, addrs[o].to_string()))
             .collect();
         let listener = listeners[i].take().expect("监听器只取一次");
-        nodes.push(spawn_node(*id, dir(*id), peers, listener).await);
+        nodes.push(spawn_node(*id, dir(*id), peers, listener, MetaOptions::default()).await);
     }
 
     let clients: HashMap<u64, Client> = {
@@ -649,7 +652,7 @@ async fn partitioned_leader_cannot_commit_and_heals_without_loss() {
             .map(|o| (*o, links.addr(*id, *o).to_string()))
             .collect();
         let listener = listeners[i].take().expect("监听器只取一次");
-        nodes.push(spawn_node(*id, dir(*id), peers, listener).await);
+        nodes.push(spawn_node(*id, dir(*id), peers, listener, MetaOptions::default()).await);
     }
 
     let clients: HashMap<u64, Client> = {
@@ -792,3 +795,74 @@ async fn partitioned_leader_cannot_commit_and_heals_without_loss() {
         drop(n);
     }
 }
+
+// ---------------------------------------------------------------------------
+// 压缩触发策略（`operation-log §105`，`plan T11.5` 第三项的前置）
+// ---------------------------------------------------------------------------
+
+/// **压缩由策略自然触发**（设计 §4.4：日志条数 > N）—— 这是"快照"这一整套机制的第一环。
+///
+/// # 为什么是单节点形态
+///
+/// 多节点 + 极小阈值会踩到一个**尚未根因**的写停摆（`§105.3`：阈值 4 + 有 follower 落后 ⇒
+/// 集群 30s 写不进去；已排除传输层、缓存 leader、raft 线程 fatal 等，复现步骤见那一节）。
+/// 在把它查清之前，本用例只在**单节点**形态下钉住"策略真的会触发"这一条 ——
+/// 它可证、可复现，且**不依赖**那条坏路径。
+///
+/// # 反证
+///
+/// 把 `compact_log_entries` 设成 0（或不设策略）⇒ `snapshot_index` 恒为 0 ⇒ 这条断言有鉴别力。
+#[test]
+fn snapshot_trigger_compacts_the_log_by_policy() {
+    let root = TempDir::new("meta-compact");
+    let dir = Path::new(&root.0).join("node1");
+    let opts = MetaOptions {
+        compact_log_entries: 4,
+    };
+    let node = MetaNode::open_with(&dir, 1, vec![1], HashMap::new(), opts).expect("起单节点");
+    // 用 `NodeHandle`（= gRPC 服务层用的那个句柄）：它同时给 Status 与 Propose
+    let h = node.handle();
+
+    // 单节点自选不需要网络；等它就位（`open` 起来时已经是 leader，这里只是不赌时序）
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while h.status().role != "Leader" {
+        assert!(Instant::now() < deadline, "单节点 10s 内没当选");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // 建 schema/表（`commit_op` 要求表已存在）
+    for op in [
+        create_schema_op("analytics", 1_000),
+        create_table_op("cpu", 1_001),
+    ] {
+        let r = h.propose(op, Duration::from_secs(5)).expect("提议应成功");
+        assert!(r.accepted, "DDL 必须被接受");
+    }
+
+    // 写够条数 ⇒ 按阈值（4）触发压缩
+    for k in 0..10u64 {
+        let r = h
+            .propose(
+                commit_op(&format!("c{k}"), &format!("key-c{k}"), 2_000 + k),
+                Duration::from_secs(5),
+            )
+            .expect("提议应成功");
+        assert!(r.accepted, "第 {k} 条必须被接受（压缩不该影响写入）");
+    }
+
+    let st = h.status();
+    assert!(
+        st.snapshot_index > 0,
+        "阈值 4、写了 12 条 op，压缩**必须**已经发生（`snapshot_index` 仍为 0 ⇒ 触发策略没生效）"
+    );
+    assert!(
+        st.applied_index >= st.snapshot_index,
+        "压缩位置不该超过已应用位置（`storage.rs` 的坐标纪律：只能压已应用的）"
+    );
+    assert_eq!(
+        st.first_index,
+        st.snapshot_index + 1,
+        "`first_index` 必须紧跟压缩位置（两者是同一个坐标，`storage.rs` 的坐标纪律）"
+    );
+}
+

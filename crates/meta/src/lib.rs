@@ -484,6 +484,11 @@ impl Cluster {
                 debug.clone(),
                 status.clone(),
                 cmd_rx,
+                // 进程内测试簇**不自动压缩**：它的用例靠手动 `Cluster::compact` 精确控制
+                // "压到哪一条"，自动触发会让那些用例的确定性变差（且它们写的条目远少于阈值）。
+                MetaOptions {
+                    compact_log_entries: 0,
+                },
             ),
         );
         // 本节点的收件箱 = `Cluster::start` 为它建的邮箱发送端
@@ -814,8 +819,45 @@ pub struct MetaNode {
     stats: Arc<TransportStats>,
 }
 
+/// 节点的运行期策略（`Default` = 按设计 `metanode-design §4.4` 取值）。
+///
+/// 为什么要有这个、而不是把常数写死在驱动循环里：**压缩触发必须在集成层可复现**。
+/// `§42.4b` 记的"稳定触发快照安装未拿到"，根因就是驱动层**根本没有触发**
+/// （`compact_applied` 只被测试用的 `Cluster::compact` 调过）—— 于是进程形态的日志只增不减、
+/// "落后节点靠快照追上"这条路径在真实部署里**永远走不到**（`operation-log §105`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetaOptions {
+    /// 日志条数（`last_index - first_index + 1`）超过它就**压缩到已应用位置**
+    /// （生成快照产物 + 丢弃老日志）。`0` = 关（测试簇改用手动 `Cluster::compact`）。
+    ///
+    /// ⚠️ 数的是**日志条数**，不是 op 数：no-op 与 ConfChange 也占索引（`storage.rs` 的坐标纪律）。
+    /// 设计 §4.4 的另一个判据（状态 > 256MB）**未实现**，见 `operation-log §105.4`。
+    pub compact_log_entries: usize,
+}
+
+impl Default for MetaOptions {
+    fn default() -> Self {
+        Self {
+            // 设计 §4.4 定的上界：日志条数 > 10 万
+            compact_log_entries: 100_000,
+        }
+    }
+}
+
 impl MetaNode {
-    /// 打开（或按盘上状态恢复）一个 metanode。
+    /// 打开（或按盘上状态恢复）一个 metanode（**按设计的默认策略**，见 [`MetaOptions`]）。
+    ///
+    /// 要调策略（比如测试里把压缩阈值调小，以便**稳定复现**快照路径）用 [`Self::open_with`]。
+    pub fn open(
+        dir: impl AsRef<std::path::Path>,
+        id: u64,
+        voters: Vec<u64>,
+        peers: HashMap<u64, String>,
+    ) -> Result<Self, MetaNodeError> {
+        Self::open_with(dir, id, voters, peers, MetaOptions::default())
+    }
+
+    /// 打开（或按盘上状态恢复）一个 metanode，**带运行期策略**。
     ///
     /// 四道检查都在**动手之前**做完，任何一道不过就拒绝启动：
     ///
@@ -829,11 +871,13 @@ impl MetaNode {
     /// - `voters`：成员表（**持久化状态**，只在首次写入；之后必须与盘上一致）。
     /// - `peers`：`节点 id → "host:port"`。**只需列别的节点**（列了自己会被忽略）。
     ///   单节点传空表：这时不碰网络、也不需要 tokio 上下文。
-    pub fn open(
+    /// - `opts`：运行期策略（默认 = 设计取值）。
+    pub fn open_with(
         dir: impl AsRef<std::path::Path>,
         id: u64,
         voters: Vec<u64>,
         peers: HashMap<u64, String>,
+        opts: MetaOptions,
     ) -> Result<Self, MetaNodeError> {
         let dir = dir.as_ref();
         let (storage, sm) = FjallStorage::open_with_state(dir, id, voters.clone())
@@ -898,7 +942,7 @@ impl MetaNode {
             raft_inbox: inbox_tx,
         };
         let thread = spawn_node(
-            id, rx, transport, sm, storage, role, applied, debug, status, cmd_rx,
+            id, rx, transport, sm, storage, role, applied, debug, status, cmd_rx, opts,
         );
         Ok(Self {
             id,
@@ -998,6 +1042,7 @@ fn spawn_node(
     debug: Arc<Mutex<String>>,
     status: Arc<Mutex<NodeStatus>>,
     cmd_rx: Receiver<Command>,
+    opts: MetaOptions,
 ) -> thread::JoinHandle<Receiver<Message>> {
     thread::spawn(move || {
         let logger = raft::default_logger();
@@ -1192,6 +1237,28 @@ fn spawn_node(
                     &mut pending,
                 );
                 raw.advance_apply();
+
+                // ⑤ **压缩触发**（设计 §4.4：日志条数 > N）。
+                //
+                // 为什么在这里：`compact_applied` 的纪律是"只允许应用线程调用"
+                // （产物与 `applied` 必须同一瞬间取到），而这里正是应用线程、且刚 apply 完。
+                // 为什么要触发：没有它，进程形态的日志**只增不减** —— `§42.4b` 的"稳定触发快照
+                // 安装未拿到"根因就在这（当时 `compact_applied` 只被测试用的 `Cluster::compact`
+                // 调过，进程/驱动层没有任何触发）。
+                //
+                // ⚠️ 压到 `applied` 意味着**可能压掉 follower 还需要的那段**，那就得靠快照补 ——
+                // 实测那个组合会让**写停摆**（`§105.3` 有复现与已排除项；尚未根因），
+                // 所以**别把 `--snapshot-log-entries` 调到很小**（默认 10 万不受影响）。
+                let retained = storage
+                    .last_index()
+                    .unwrap_or(0)
+                    .saturating_sub(storage.first_index().unwrap_or(1))
+                    + 1;
+                if opts.compact_log_entries > 0 && retained > opts.compact_log_entries as u64 {
+                    storage
+                        .compact_applied()
+                        .unwrap_or_else(|e| fatal(id, "压缩日志", e));
+                }
             }
             thread::sleep(Duration::from_millis(2));
         }

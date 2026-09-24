@@ -62,6 +62,13 @@ pub struct Args {
     /// 首次启动：显式声明「这个目录是新集群」
     #[arg(long)]
     pub init: bool,
+
+    /// 日志条数超过它就**压缩**（生成快照 + 丢弃老日志）；`0` = 关。
+    ///
+    /// 设计 §4.4 定的上界是 **10 万**。它决定"快照什么时候产生"—— 没有它日志只增不减，
+    /// 落后的 follower 也就没法靠快照追上（`operation-log §105`）。
+    #[arg(long, default_value_t = 100_000)]
+    pub snapshot_log_entries: usize,
 }
 
 /// `--peer` 的取值：`<id>@<host:port>`。

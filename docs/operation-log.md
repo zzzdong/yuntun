@@ -6660,3 +6660,74 @@ term），那时"我问到一个自称 leader 的"会答出**旧答案**。改�
   常驻反证见上表 ⑤；
 - `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
 - 规模：48,671 行 / 20 个 crate / 379 个测试函数。
+
+---
+
+## 105. 压缩**触发策略**（`--snapshot-log-entries`）：补上"快照从没被触发过"这一环 + 一个**未根因**的写停摆（2026-09-24）
+
+### 105.1 缺口：驱动层根本没有压缩触发
+
+`plan T11.5` 的第三项是"snapshot 重建"，而 `§42.4b` / `§42.7` 遗留 4 一直写着
+"快照**触发策略**（§4.4：日志条数 > N / 状态 > M）未做"。查代码：
+`compact_applied` 在整个仓库里**只被测试用的 `Cluster::compact(id)` 调过** —— 也就是说
+**进程形态的 metanode 永远不会产生快照**，日志只增不减，"落后节点追快照"这条路在真实部署里
+根本走不到。**这就是 `§42.4b`"稳定触发快照安装未拿到"的根因**（不是 raft 的问题）。
+
+### 105.2 交付
+
+| 位置 | 内容 |
+|---|---|
+| `crates/meta/src/lib.rs` | `MetaOptions { compact_log_entries }`（默认 **100_000** = 设计 §4.4）+ `MetaNode::open_with`（`open` 委托默认值）；驱动循环里"应用后按阈值压到已应用位置" |
+| `crates/meta/src/cli.rs` | `--snapshot-log-entries`（`0` = 关） |
+| `crates/meta/tests/multi_node_grpc_e2e.rs` | `snapshot_trigger_compacts_the_log_by_policy` |
+
+触发点为什么放在应用线程：`compact_applied` 的纪律是"**产物与 `applied` 必须同一瞬间取到**"，
+只有应用线程能保证（`storage.rs` 的坐标纪律）。**反证**：阈值设 0 ⇒ `snapshot_index` 恒为 0
+⇒ 用例失败 ✓（实测）。
+
+### 105.3 ⚠️ 一个**未根因**的写停摆（如实登记，不粉饰）
+
+把阈值调到很小（4）**并且**有 follower 落后时，会出现：**集群 30s+ 写不进去**
+（`propose_following_leader` 拿不到被接受的响应）。同一时刻的旁证：
+
+- 传输层**健康**：三个节点 `failed=0 / rejected=0`（唯一失败来自被隔离的那个节点）；
+- leader 的 `role` 仍是 **Leader**（不是"没选主"）：它的 `last_index` 在前进，
+  而**两个 follower 的 `committed` 卡住不动**；
+- **没有** raft 线程 panic（raft-rs `fatal!` 那条路可排除）；
+- 消息轨迹里 leader 反复发**空 append**（`ents=0`）；
+- 与"是否隔离"无关：三方全通时同样复现。
+
+**已排除**：① 传输层；② "没有 leader"（leader 在，只是提交不了）；③ raft 线程 fatal；
+④ **缓存 leader**（这是我第一次误诊的原因：测试缓存了 ② 那一刻的 leader，小阈值下选主会抖动，
+于是把 `NotLeader` 读成了"集群停摆" —— 改成跟随 leader 之后**仍在 30s 层面复现**，所以不是同一个原因）。
+
+**尚未试**：给 `Raft` 换一个真的会输出的 slog logger（现在的 `default_logger()` 不输出，
+所以看不到 "Skipping sending to X, it's paused" / "sent snapshot" 这类关键判定）；
+以及把 `Progress` 的 `next_idx/matched` 与 `raft_log` 视图逐条对齐。**这是下一刀的事。**
+
+**一条试过并撤掉的修法**（如实记）：给压缩加"**安全水位**"（只在**所有 peer 都拿到**已应用位置
+时才压 —— TiKV 的 `min_matched` 思路）。实测**没能**止住上面那个停摆（阈值 4 + 隔离 follower
+仍 30s 写不进），所以我**没有**把它留在代码里：不留没被证实有效的东西。它另有一个坏处 ——
+follower 长期不在线会把日志拖大，而"落后 → 走快照"恰恰是设计想要的路径。
+
+### 105.4 覆盖到哪、没覆盖到哪（如实说）
+
+- ✅ **覆盖**：**触发策略本身**（`snapshot_index` 由策略推进，反证成立）；设计默认值（10 万）下行为
+  与从前一致（既有用例全绿）；
+- ❌ **没覆盖（T11.5 第三项因此仍未关闭）**：**快照安装的集成层稳定复现**。要在 3 节点里稳定压出
+  "追快照"，必须让 leader 压掉 follower 还需要的那一段 —— 而那里正是 105.3 那个停摆所在区间。
+  这与 `§42.4b` 自己的结论一致：稳定复现的正路是**成员变更**（新节点加入，S3-6 / `Join`）；
+- ❌ **未实现**：设计 §4.4 的另一个判据（**状态 > 256MB**）；快照的**保留策略**
+  （按表 checkpoint + 归档旧条目，`§42.7` 遗留 4 的后半）；
+- ⚠️ **一条与本刀无关的观察**：本轮全量**第一次**跑时，chaos 的
+  `disk_watermark_aborts_oldest_batch_then_releases_segments` 失败一次
+  （`WAL 恢复出的批次应全部终态：[("…", Pending)]`，`-j 4` 并行负载下）；**单跑 3/3 绿**、
+  重跑全量 381/0 绿 ⇒ 登记为**负载敏感的抖动**，本刀**未修**。
+
+### 105.5 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **381 passed / 0 failed / 0 ignored**
+  （基线 380 + 本刀 1）；第一次跑出现上述 chaos 抖动 1 次，重跑干净；
+- 新用例连跑 3 次均绿（约 0.2s）；反证（阈值 0）实测失败 ✓；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 规模：48,827 行 / 20 个 crate / 380 个测试函数。

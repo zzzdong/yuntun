@@ -16,7 +16,7 @@
 - **分布式**：**控制平面与数据平面都已落地** —— metanode/raft（含进程独立启动与装配切换）、
   数据进程的读写面、冷热边界按实例、全局压缩租约 + GC。`plan §8.4` 的门槛
   （M1–M4 达成 + M5 对拍通过 + M6 零误删）**已齐**（账见下表）。
-- **质量网**：380 用例全绿（0 ignored） / clippy 本仓 0 告警 / chaos **11/11** / T8 基线已入库 /
+- **质量网**：381 用例全绿（0 ignored） / clippy 本仓 0 告警 / chaos **11/11** / T8 基线已入库 /
   **五个真缺陷全部已修**（含最后一条 `§28.1` 的读侧栅栏，`§99`）；`§103` 又抓出并修掉两处
   （多节点真部署的启动顺序 + 选主判据，**都只在多节点暴露**）。
 - **对外口径**：单机可实际使用；多节点**已可写、可压、可 GC，且不重不漏**（`§91`/`§98`/`§99`）。
@@ -38,7 +38,7 @@
 
 ## 2. 能力矩阵（standalone 今天能做到什么）
 
-规模：**48,671 行 Rust / 20 个 crate / 379 个测试函数 / 380 个用例通过（0 ignored） / clippy 0 警告**
+规模：**48,827 行 Rust / 20 个 crate / 380 个测试函数 / 381 个用例通过（0 ignored） / clippy 0 警告**
 工具链：**rustc 1.98.1 + edition 2024**（20 个 crate 全走 `edition.workspace = true`；见 `operation-log §59`）；
 **MSRV 声明 `1.94`**（下界由依赖 `datafusion 55` 决定，**不是** policy 想取的 1.92；**尚未经真·1.94 编译验证**，见 `§60`）。
 全仓仅余 1 条**外部依赖**告警（`proc-macro-error2 v2.0.1`，来自 `opensrv-mysql`，非本仓代码）。
@@ -108,7 +108,7 @@ MySQL 端口 **trust 无鉴权**（按网络隔离部署）；MySQL 轨结果集
 
 | 层 | 证据 | 位置 |
 |---|---|---|
-| 单元 / 集成 | **380 passed / 0 failed / 0 ignored**；379 个测试函数；`clippy --workspace --all-targets` 0 警告（本仓） | `cargo test --workspace` |
+| 单元 / 集成 | **381 passed / 0 failed / 0 ignored**；380 个测试函数；`clippy --workspace --all-targets` 0 警告（本仓） | `cargo test --workspace` |
 | chaos（真实磁盘 + 跨重启 + 并发） | **11/11** 场景；进程中抓出**五个真缺陷**（**全部已修**，含 `§28.1` 读侧栅栏 `§99`） | `crates/chaos` 模块文档 + `operation-log §27–§31`/`§99` |
 | 性能基线 | 提交时刻分布 / 峰值提交数 / `seal→committed` / 文件数·天 / 单文件行数 | `operation-log §32`（`bench_baseline`） |
 | 阈值与背压基线 | 账本口径 B/行 / 内存水位峰值 / 背压档 / RowGroup 数 / 单文件字节 | `operation-log §33`（同程序，`pad`/`bytes_threshold`/读者开关） |
@@ -118,7 +118,7 @@ MySQL 端口 **trust 无鉴权**（按网络隔离部署）；MySQL 轨结果集
 | **R3 网络分区**（T11.5 第二项） | 可切断**链路**（零生产改动）：少数派**不能提交**（脑裂防线，含**常驻反证**"未分区时同一调用必须被接受"）+ 多数派照常提交 + 愈合后不丢不裂 | `operation-log §104` + `crates/meta/tests/multi_node_grpc_e2e.rs` |
 | R3 快照编解码 | 帧头+块 CRC 三层保护（任一偏移截断/任一字节翻转都检出）；载荷无损 + 11 维度覆盖；严格拒绝非法载荷 | `operation-log §41` + `model/src/snapshot.rs` |
 | R3 快照安装（S3-1b） | **机制**：自实现 `Storage`（`MemStorage` 不可用）+ 帧/载荷双重校验 + 安装路径 + 反证（不还原状态机 → installs=1 但状态不一致）；**重启语义**：`Config.applied` 必须报（否则 raft 重放 → 静默分叉，反证成立） | `operation-log §42` + `crates/meta/src/storage.rs` |
-| R3 快照安装（**遗留**，不阻塞里程碑） | **集成层稳定触发未拿到**：同一场景出现过 `installs=0 但已收敛`（leader 发出已压缩的条目 `first=8` 却有 `append 6..7`）→ 归因中；正路 = S3-6 成员变更 / 真实触发策略 | `operation-log §42.4b` / §42.7 |
+| R3 快照安装（**遗留**，不阻塞里程碑） | **集成层稳定触发未拿到**：`§42.4b` 记的 `installs=0 但已收敛` 已归因（**根因是驱动层没有压缩触发**）；`§105` 补上 `--snapshot-log-entries` 后用**单节点**钉住"策略真的会触发"（反证成立）；**但多节点稳定触发仍未拿到**（`§105.3` 一个小阈值下未根因的写停摆）；正路 = 成员变更（S3-6/`Join`） | `operation-log §42.4b` / `§42.7` / `§105` |
 | **R3 gRPC 服务层（S3-3）** | `MetaService`（propose/delta/status 真实现 + prefetch/join 明确 UNIMPLEMENTED）+ `NodeHandle` + `NodeStatus`；**真 gRPC 端到端用例**（含幂等重试与反证）；阻塞提案走阻塞线程池 | `operation-log §47` + `crates/meta/src/service.rs` |
 | **R3 op 生产路径（S3-3）** | proto `Op` 为唯一权威编码（日志 payload 同构）；`StateOp`/`decode_op`/`apply` + 双向转换器；错误码映射（约定 3，穷尽 match）；集群用例跑生产路径 | `operation-log §46` + `crates/meta/src/{op,error}.rs` |
 | **R3 gRPC 面（S3-0）** | `Meta` 服务面（Propose/Prefetch/Delta/Status/Join）冻结；op 面已迁移（含 `CommitFiles` 全字段镜像）；wire-compat 用例（round-trip + 逐字段对齐 + 反证） | `operation-log §45` + `crates/proto/` |
@@ -221,7 +221,7 @@ window_closed    files= 3
 | 文档 | 定位 | 时效（2026-09-24） | 本轮动作 / 欠账 |
 |---|---|---|---|
 | **`status.md`（本文）** | 现状基线 | ✅ 最新 | v1.1：里程碑账（M1–M6 齐）、多节点边界、缺口重排、证据网补 R4–R6 |
-| `operation-log.md` | 实施日志 + **偏差与证据**（§1–§104） | ✅ 最新 | 每刀一节的纪律保持；§98（M4 并发真写）/ §99（读侧栅栏）/ §100（客户端落点）/ §101（真实 S3 单机读写）/ §102（数据进程接 S3 + 多节点真 S3 对拍）/ §103（3 个真 metanode 进程 + 修掉多节点启动缺陷）/ §104（网络分区：少数派不能提交） |
+| `operation-log.md` | 实施日志 + **偏差与证据**（§1–§105） | ✅ 最新 | 每刀一节的纪律保持；§98（M4 并发真写）/ §99（读侧栅栏）/ §100（客户端落点）/ §101（真实 S3 单机读写）/ §102（数据进程接 S3 + 多节点真 S3 对拍）/ §103（3 个真 metanode 进程 + 修掉多节点启动缺陷）/ §104（网络分区：少数派不能提交）/ §105（压缩触发策略 + 一个未根因的写停摆） |
 | `plan.md` | 开发计划任务书（阶段 WBS / 里程碑 / 风险） | ✅ 已同步 | §8.4 门槛账更新为 M2–M6 全 ✅（引用 §98/§99）；§2.1/§七 缺陷状态同步 |
 | `architecture.md` | 架构设计（12 个 ADR + 域设计） | ✅ 已修版本漂移 | v12：ADR-10 正式修订（含"≤1 文件/窗口"的限定语 + **"客户端软路由未实现"现状注**）；**欠**：§4 ADR-9 的 RPO 口径表述 |
 | `design.md` | 详细设计（模块/接口/状态机/配置） | ⚠️ 部分章节是阶段 0 意图，实现有偏差 | 已声明"实现偏差以 operation-log 为准"；**欠**：§11 `[chunk]` 段与 `idle_timeout` 整段重写 |
