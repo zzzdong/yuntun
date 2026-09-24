@@ -661,13 +661,13 @@ impl CatalogState {
         // 否则被罢黜的持有者仍会产出第二份合并文件（`§81.8` ②）。
         // 判据用**代次水位**（不是"当前有没有持有者"）：释放后水位仍留着，正是为此。
         // 无租约记录 ⇒ 不设栅栏（进程内直连形态与既有用例照常）。
-        if let Some(lease) = self.leases.get(yuntun_model::meta::COMPACTION_LEASE) {
-            if lease_epoch < lease.epoch {
-                return Err(LakeError::Other(format!(
-                    "compaction fenced: 提交携带的租约代次 {lease_epoch} 落后于当前 {}                     （持有者 {:?}）—— 本次合并作废",
-                    lease.epoch, lease.holder
-                )));
-            }
+        if let Some(lease) = self.leases.get(yuntun_model::meta::COMPACTION_LEASE)
+            && lease_epoch < lease.epoch
+        {
+            return Err(LakeError::Other(format!(
+                "compaction fenced: 提交携带的租约代次 {lease_epoch} 落后于当前 {}                     （持有者 {:?}）—— 本次合并作废",
+                lease.epoch, lease.holder
+            )));
         }
         let next = self.next_snapshot();
         // ⚠️ `BTreeSet` 而不是 `HashSet`（纪律 2）：下面的 `bump_manifest_ver` 会**按迭代序分配

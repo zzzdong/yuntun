@@ -928,23 +928,22 @@ mod tests {
 
         // ---- 等收敛：可见文件数落到 `min_files + 1` 以内 ----
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        let mut visible = Vec::new();
-        loop {
-            visible = catalog
+        let visible = loop {
+            let files = catalog
                 .list_visible_files(TABLE, catalog.current_snapshot().await, None)
                 .await
                 .unwrap();
-            if visible.len() <= MIN_FILES + 1 {
-                break;
+            if files.len() <= MIN_FILES + 1 {
+                break files;
             }
             assert!(
                 std::time::Instant::now() < deadline,
                 "文件数没有收敛：可见 {} 个（写入批次数 {}）",
-                visible.len(),
+                files.len(),
                 WRITERS * ROUNDS
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        };
 
         // ---- 判据 ①：行数一个不少 ----
         let total: u64 = visible.iter().map(|f| f.row_count).sum();

@@ -17,7 +17,8 @@
 //! 覆盖的语义（都是前面几刀留下、本轮第一次连起来跑的）：
 //! - `§71`：名录（含地址）下发 ⇒ `§71.5` 遗留第 3 条"谁按地址建 `GrpcShardFetch`"；
 //! - `§65`：按实例拉热数据（只查询形态自己没有数据）；
-//! - 只读：SQL 面对写入给出**可读的拒绝**，而不是假装成功。
+//! - 只读：SQL 面对写入给出**可读的拒绝**，而不是假装成功；
+//! - `§98`：两个**可写**写进程并发真写（都开 `--sql-listen`）⇒ 各自查询与单节点串行逐行相等。
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
@@ -28,6 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arrow_flight::flight_service_client::FlightServiceClient;
+use arrow_flight::{FlightData, FlightDescriptor};
 use futures::StreamExt as _;
 use arrow_flight::sql::CommandStatementQuery;
 use tokio::net::TcpListener;
@@ -173,8 +175,33 @@ impl Proc {
         instance_id: &str,
         cold_root: &std::path::Path,
     ) -> Self {
-        let child = Command::new(DATANODE)
-            .arg("--instance-id")
+        Self::spawn_writer_impl(data_dir, meta, instance_id, cold_root, false)
+    }
+
+    /// 与 [`Self::spawn_writer`] 同形态，但**同时开 SQL 面**（`--sql-listen 127.0.0.1:0`）。
+    ///
+    /// 这是 M4 最后那格（`operation-log §98`）的要件："数据节点 + 协调者"本就是
+    /// **同一进程的两个面**（`architecture §4.2`）—— 两个写者要**既写又被查**，
+    /// 所以写入面（`§96` 的 `FlightServer::new`）与查询面都得开。
+    /// `--reconcile-secs 1` 让"看得见对方"更快稳定（数据面靠名录 + 巡检发现）。
+    fn spawn_writer_with_sql(
+        data_dir: &std::path::Path,
+        meta: SocketAddr,
+        instance_id: &str,
+        cold_root: &std::path::Path,
+    ) -> Self {
+        Self::spawn_writer_impl(data_dir, meta, instance_id, cold_root, true)
+    }
+
+    fn spawn_writer_impl(
+        data_dir: &std::path::Path,
+        meta: SocketAddr,
+        instance_id: &str,
+        cold_root: &std::path::Path,
+        sql: bool,
+    ) -> Self {
+        let mut cmd = Command::new(DATANODE);
+        cmd.arg("--instance-id")
             .arg(instance_id)
             .arg("--dir")
             .arg(data_dir)
@@ -185,7 +212,14 @@ impl Proc {
             .arg("--meta")
             .arg(meta.to_string())
             .arg("--heartbeat-secs")
-            .arg("1")
+            .arg("1");
+        if sql {
+            cmd.arg("--sql-listen")
+                .arg("127.0.0.1:0")
+                .arg("--reconcile-secs")
+                .arg("1");
+        }
+        let child = cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -555,4 +589,236 @@ async fn two_writers_parity_with_single_node_serial() {
     let _ = a.child.kill();
     let _ = b.child.kill();
     let _ = q.child.kill();
+}
+
+// ---------------------------------------------------------------------------
+// M4 最后一格：两个写进程**同时真写**（`§91.5` 的第二半，`operation-log §98`）
+// ---------------------------------------------------------------------------
+
+/// 单行 `RecordBatch`（列 `a`，与文件常量 `schema()` 配套）。
+fn one_row(value: i64) -> arrow::record_batch::RecordBatch {
+    arrow::record_batch::RecordBatch::try_new(
+        schema(),
+        vec![Arc::new(arrow::array::Int64Array::from(vec![value]))],
+    )
+    .expect("构造单行 batch")
+}
+
+/// **简易轨写入一行**（`flight_sql_e2e.rs` 同法）：schema 消息带
+/// `FlightDescriptor{r#type:1, path=[table, shard]}`，数据消息带 `{"idempotency_key": key}`。
+///
+/// 与 [`seed_wal`] 的区别是**关键**：那条是把记录预先摆进 WAL，本函数让数据进程**通过
+/// 自己的 SQL 面真的收到写入** —— 正是 `§96` 补上的那个面（`FlightServer::new`）。
+async fn insert_row(
+    client: &mut FlightServiceClient<tonic::transport::Channel>,
+    table: &str,
+    shard: &str,
+    value: i64,
+    key: &str,
+) {
+    let mut msgs =
+        arrow_flight::utils::batches_to_flight_data(schema().as_ref(), vec![one_row(value)])
+            .expect("flight msgs");
+    let mut data = msgs.remove(1);
+    data.app_metadata = format!(r#"{{"idempotency_key":"{key}"}}"#)
+        .into_bytes()
+        .into();
+    let schema_msg = FlightData {
+        flight_descriptor: Some(FlightDescriptor {
+            r#type: 1,
+            path: vec![table.into(), shard.into()],
+            cmd: Default::default(),
+        }),
+        ..msgs.remove(0)
+    };
+    // 用本 crate 已有的 `futures`（不额外引 `tokio-stream`）：tonic 对**任意**
+    // `Stream + Send + 'static` 都实现 `IntoStreamingRequest`，与 `tokio_stream::iter` 等价。
+    let mut acks = client
+        .do_put(futures::stream::iter(vec![schema_msg, data]))
+        .await
+        .expect("do_put")
+        .into_inner();
+    acks.next()
+        .await
+        .expect("DoPut 必须回执")
+        .expect("DoPut 回执必须是 Ok（写入必须真的落进 WAL）");
+}
+
+/// 轮询直到查询结果**逐行精确等于** `expect`。
+///
+/// 需要轮询而不是睡固定时长，是因为"写进去了"与"查得到"之间隔着两段**异步传播**：
+/// ① 写 WAL → 一个扫描周期后进 chunk（可见性上界，`architecture §5.2`，不等 flush）；
+/// ② 名录巡检发现对方 → 数据面 gRPC 拉热数据。
+///
+/// 超时仍不等 ⇒ 带**最后一次实际结果**失败：把"少行（漏读某实例）/ 多行（同一份读两次）"
+/// 直接摆进断言消息，而不是只说一句"超时"。
+async fn wait_rows(
+    client: &mut FlightServiceClient<tonic::transport::Channel>,
+    q: &str,
+    expect: &[i64],
+    what: &str,
+    stderr: &Arc<Mutex<String>>,
+) -> Vec<i64> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let last = sql(client, q).await;
+        if matches!(&last, Ok(v) if v.as_slice() == expect) {
+            return expect.to_vec();
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "等待「{what}」得到 {expect:?} 超时；最后一次实际结果：{last:?}\n子进程 stderr:\n{}",
+                stderr.lock().unwrap()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// **两个写进程同时真写**同一张表、同一个 shard ⇒ 各自查询都必须与单节点串行
+/// **逐行精确相等**。
+///
+/// 这条与 [`two_writers_parity_with_single_node_serial`]（`§91`）**不是重复**：
+/// - `§91` 的两个写者各自**回放自己的 WAL**（数据在启动前就摆好）⇒ 证的是元数据/合并层面的
+///   "多实例不重不漏"；
+/// - 本条的两个写者**都开 `--sql-listen`、并发 `INSERT`（真 `DoPut`）** ⇒ 数据是这一瞬间
+///   **真的写进去的**，是 `§91.5` 的第二半，也是 `§96` 补上"接受写入的面"之后的**首条**用例。
+///
+/// 形态（两个写者**各写各的 WAL/私有目录、共用一份冷存储**；两边**都**是"数据节点 + 协调者"）：
+///
+/// ```text
+///   metanode（进程内，真 gRPC）
+///     ▲ 注册/心跳（inst-a / inst-b）        ▲ 名录（含各自数据面地址）
+///   datanode A（--sql-listen）──┐      ┌── datanode B（--sql-listen）
+///   --dir A / WAL 只有 DDL      ├─同一──┤   --dir B / WAL 只有 DDL
+///   并发真写 1,2,3 ────────────┘ 冷存储 └─────────── 并发真写 4,5,6
+///                     ▲                         ▲
+///              A 查一次 [1..6]           B 查一次 [1..6]
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn two_concurrent_writers_real_ingest_parity() {
+    // ---- ① metanode（进程内 + 真 gRPC 服务）----
+    let meta_dir = tmpdir("cm-meta");
+    let node = yuntun_meta::MetaNode::open(&meta_dir, 1, vec![1], HashMap::new()).expect("起单节点");
+    let h = node.handle();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let meta_addr = listener.local_addr().unwrap();
+    let served = h.clone();
+    tokio::spawn(async move {
+        let _ = yuntun_meta::serve(served, listener).await;
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while h.status().leader_id != 1 {
+        assert!(Instant::now() < deadline, "等待选主超时");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let client_catalog =
+        yuntun_meta::RemoteCatalog::connect(vec![meta_addr.to_string()]).expect("连 metanode");
+
+    // ---- ② 两个**可写**写进程：私有 `--dir` + 共享 `--cold-root` + 各自 SQL 面 ----
+    //      WAL **只预置 DDL**（空行切片）⇒ 表进元数据面，数据一行都不预置 —— 全靠真写入。
+    let cold = tmpdir("cm-cold");
+    let dir_a = tmpdir("cm-a");
+    let dir_b = tmpdir("cm-b");
+    seed_wal(&dir_a, &[]).await;
+    seed_wal(&dir_b, &[]).await;
+    let mut a = Proc::spawn_writer_with_sql(&dir_a, meta_addr, "inst-a", &cold);
+    let mut b = Proc::spawn_writer_with_sql(&dir_b, meta_addr, "inst-b", &cold);
+    let addr_a = a.wait_listening();
+    let addr_b = b.wait_listening();
+    let sql_a = a.wait_sql_listening();
+    let sql_b = b.wait_sql_listening();
+
+    // ---- ③ 两个实例都入册（各自的数据面地址都在名录里）----
+    for (inst, addr, st) in [
+        ("inst-a", addr_a, a.stderr.clone()),
+        ("inst-b", addr_b, b.stderr.clone()),
+    ] {
+        let h1 = h.clone();
+        let want = (inst.to_string(), addr.to_string());
+        wait_until(
+            move || roster(&h1).contains(&want),
+            Duration::from_secs(15),
+            "写进程入册（含数据面地址）",
+            &st,
+        )
+        .await;
+    }
+
+    // ---- ④ 表已进元数据面（两个节点的 WAL DDL 都重放过；重复的那次应被容忍）----
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while client_catalog.get_table(TABLE).await.expect("读表元数据").is_none() {
+        assert!(Instant::now() < deadline, "两个写进程的 WAL DDL 应把表带进元数据面");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // ---- ⑤ **并发真写**：两个 `tokio::spawn` 各连**自己的** SQL 面，各写 3 行 ----
+    //      值域不重叠 ⇒ 少行/多行都能一眼看出是谁的问题。
+    let ta = tokio::spawn(async move {
+        let mut c = flight_client(sql_a).await;
+        for v in [1, 2, 3] {
+            insert_row(&mut c, TABLE, "default", v, &format!("cm-a-{v}")).await;
+        }
+    });
+    let tb = tokio::spawn(async move {
+        let mut c = flight_client(sql_b).await;
+        for v in [4, 5, 6] {
+            insert_row(&mut c, TABLE, "default", v, &format!("cm-b-{v}")).await;
+        }
+    });
+    ta.await.expect("写任务 A");
+    tb.await.expect("写任务 B");
+
+    // ---- ⑥ 对拍：两边各自查一次，都必须得到**全部 6 行**、每行只出一次 ----
+    let expect = vec![1, 2, 3, 4, 5, 6];
+    let q = format!("SELECT a FROM yuntun.{TABLE} ORDER BY a");
+    let mut qa = flight_client(sql_a).await;
+    let mut qb = flight_client(sql_b).await;
+    let got_a = wait_rows(
+        &mut qa,
+        &q,
+        &expect,
+        "节点 A 的查询（自己 1..3 + 对方 4..6）",
+        &a.stderr,
+    )
+    .await;
+    let got_b = wait_rows(
+        &mut qb,
+        &q,
+        &expect,
+        "节点 B 的查询（自己 4..6 + 对方 1..3）",
+        &b.stderr,
+    )
+    .await;
+    assert_eq!(
+        got_a, expect,
+        "A 必须看到两个写者的全部 6 行（少行 = 漏读对方；多行 = 同一份被读两次）"
+    );
+    assert_eq!(
+        got_b, expect,
+        "B 必须看到两个写者的全部 6 行（少行 = 漏读对方；多行 = 同一份被读两次）"
+    );
+
+    // ---- ⑦ 反证：杀掉 B ⇒ A 只剩 [1,2,3] ----
+    //      钉住"⑥ 里那 3 行确实经数据面从 B 拉来"，而不是 A 不知怎么自己就有了 6 行。
+    //      杀的时刻远早于 B 的首次 flush（最早 = chunk 创建 + `min_resident` 默认 5s），
+    //      所以 B 的数据只可能在它自己那**已死的热 chunk** 里 —— 不会因"已落盘共享冷存储"
+    //      而仍然可见。（A 侧的降级/丢源由 `--partial allow` 默认兜住，结果就是 3 行。）
+    let _ = b.child.kill();
+    let got_after = wait_rows(
+        &mut qa,
+        &q,
+        &[1, 2, 3],
+        "节点 A 在 B 死后的查询（只应剩自己写的 3 行）",
+        &a.stderr,
+    )
+    .await;
+    assert_eq!(
+        got_after,
+        vec![1, 2, 3],
+        "B 死后 A 仍能看到 4,5,6 ⇒ 那 3 行不是从 B 拉的（反证失败）"
+    );
+
+    // 收尾：显式停掉两个子进程（不留孤儿；`Drop` 会再兜一次，无害）
+    let _ = a.child.kill();
 }
