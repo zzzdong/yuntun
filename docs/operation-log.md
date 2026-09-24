@@ -1459,6 +1459,10 @@ crates/chaos: commit_to_mark_window_must_not_double_count
 **测试状态**：`commit_to_mark_window_must_not_double_count` 已就位并标 `#[ignore]`（一键复现）；
 其余用例在精确断言前统一调用 `wait_hot_drained()`（等热数据退场，把瞬时窗口排除掉）。
 
+> **更新（`§99`，2026-09-24）**：**读侧栅栏已落地** —— `batch_id` 在 `commit_files` 之前登记到 chunk，
+> 热读接缝带上"调用方已知的 batch 集合"（本地与远端都过滤）。本条**已修复**：探针取消 `#[ignore]` 并转绿，
+> `compaction_during_query_keeps_counts_monotonic` 的松弛量（`+9`）也已收紧为 0。
+
 ### 28.2 发现 B：崩溃恢复产出**重复文件**（已定位并修复）
 
 **症状**：夹具接上热数据读侧后（见 28.3），`crash_recovery_no_data_loss` **稳定失败**：
@@ -6224,3 +6228,74 @@ yuntun_server::FlightServer::new_readonly(engine, catalog.clone())
 - `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**
   （`grep -cE '^\s+--> crates/'` = 0）；
 - 规模：47,276 行 / 20 个 crate / 375 个测试函数。
+
+---
+
+## 99. 关闭最后一个真缺陷：**读侧栅栏** —— 「提交→标记」窗口不再重复计数（`§28.1`）（2026-09-24）
+
+### 99.1 缺陷与它为什么必须这么修
+
+`§28.1` 记录的机制：`Chunk::visible` 对 `committed_snapshot = None` 返回 `true`（"还没提交 ⇒
+对所有快照可见"），而 flush 的 `commit_files`（快照 S，文件 `valid_from = S`）到调用方
+`chunks.mark_committed(id, S)` 之间隔着一次 WAL fsync —— 这段时间里快照 ≥ S 的查询**同时**
+读到"已提交文件"与"热数据"，把同一批算两遍（实测 4→6、9→12）。
+
+它当时被记为"与 R3 同批设计"，并明确**否掉三条快修**（提前 mark / 本地锁串行化 / 粗粒度水位），
+只留一条正路：**读侧栅栏** —— 热数据是否可见，应由"**调用方那份 manifest 快照里是否已含这批
+数据**"决定，而不是由 chunk 的本地标志决定。本轮把这条正路做完。
+
+### 99.2 做法：`batch_id` 提前登记 + 接缝带上「已知 batch 集合」
+
+四处改动（缺一不可）：
+
+| # | 层 | 改动 |
+|---|---|---|
+| 1 | `chunk` | `Chunk` 增 `batch_id: Option<String>` + `ChunkStore::note_batch_id`；读路径增 `visible_chunks_excluding` / `read_table_excluding_sync`：**属于 `exclude` 的 chunk 一律不出** |
+| 2 | `ingest` | `flush_chunk_by_id` / `flush_now` 在 `commit_files` **之前**生成 `batch_id` 并 `note_batch_id`（恢复路径没有在世 chunk，无需登记） |
+| 3 | `store` | `ShardReader` 增 `read_shard_excluding` / `read_table_excluding`（默认**忽略** `exclude` —— 只有"本地热数据即权威"的 `ChunkStore` 覆写）；`ShardFetch::fetch_shard` 增 `known_batch_ids` |
+| 4 | `proto` + `shardrpc` + `query` | `FetchShardRequest.known_batch_ids`；服务端把集合**原样喂给本地 reader** 过滤（不自己查 catalog）；provider 把"本次快照可见文件的 `batch_id`"交给每个热读器 |
+
+**为什么 `batch_id` 必须提前**：栅栏要的是"**与时机无关**"。若等 `mark_committed` 才登记，
+窗口只缩到几条指令、**仍然存在**（`§28.1` 已论证）；提前到 commit 之前登记后，
+"调用方在 manifest 里看到该 batch ⇒ 隐藏热副本"这条判据与时序**完全解耦**。
+
+**为什么不按 `source_instance` 分实例**：`batch_id` 全局唯一（ADR-4 随机 UUIDv7），
+别家的 id 落进某实例的读集合是**空匹配**；按实例分反而把"热读器键 == 写入侧 `instance_id`"
+这条隐式一致性变成了正确性前提 —— 本刀**第一版就是这么写坏的**：chaos 夹具里
+`IngestorConfig.instance_id` 是默认值 `"standalone"`、而热读器键是 `"chaos"`，过滤后集合为空、
+栅栏静默失效（探针当场抓到，4→6）。按表给全量即可。
+
+**为什么远端在服务端过滤、而不是服务端查 catalog**：`RemoteCatalog::list_visible_files` 会先
+`refresh()`（一次网络往返），放进每次分片拉取的热路径上代价太大；而"哪些数据已进调用方的
+manifest"**只有调用方知道** —— 让它把集合带过来最省也最准。
+
+### 99.3 证据（两个方向都钉）
+
+| 用例 | 断言 |
+|---|---|
+| `chaos::commit_to_mark_window_must_not_double_count`（**取消 `#[ignore]`**） | 用 `flush_now`（提交但不标记）把窗口固定住：**无栅栏读仍 3 行**（缺陷机制本身还在）、**带栅栏读 0 行**、**端到端查询 3 行**（原来 6） |
+| `shardrpc::known_batch_ids_fence_survives_the_wire`（新） | 真 gRPC 往返：无栅栏 3 行、带 `known_batch_ids` 0 行、**带不相干 id 仍 3 行**（反证不误伤） |
+| `chaos::compaction_during_query_keeps_counts_monotonic`（**收紧**） | 并发采样的松弛 `max <= acked + 9` 收紧为 `max <= acked` —— 那 +9 正是本窗口的松弛量，现在不再需要 |
+
+### 99.4 覆盖到哪、没覆盖到哪（如实说）
+
+- ✅ **覆盖**：单机（`ChunkStore` 本地读）与远端（`RemoteShard` + gRPC + proto）两条路都过栅栏；
+  `§28.1` 里被否掉的三条快修留下的"不可证窗口"不存在了 —— 判据是"manifest 里有没有"，不是"标没标记"。
+- ⚠️ **未覆盖（更强而非缺失）**：`known_batch_ids` 是**该表在当前快照下的全部可见文件**（按表全量、
+  不按实例/分片细分）。文件数经 compaction 收敛后通常很小，但**极端多文件**时这个集合会随请求变大 ——
+  本轮没做"按分片细分 / 用摘要替代"的优化。
+- ⚠️ **未覆盖（约定，非缺陷）**：`ShardReader` 现在有两个"读整表"入口 ——
+  `read_table` 只是 `read_table_excluding(…, &[])` 的特例。**新实现必须覆写 `read_table_excluding`**，
+  否则查询路径的行为会被绕过（一个测试假实现踩过：`query/tests/partial_fanout.rs::SlowButAnswers`）。
+
+### 99.5 顺带
+
+- `crates/chaos` 模块文档与"两条写用例的规矩"同步改写：**五个真缺陷全部已修、当前已无 `#[ignore]` 用例**。
+- `oplog §28.1` 原文保留（历史），末尾加一行指向本节。
+
+### 99.6 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **377 passed / 0 failed / 0 ignored**
+  （375 + 探针转正 1 + 新远端用例 1）；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 规模：47,520 行 / 20 个 crate / 376 个测试函数。

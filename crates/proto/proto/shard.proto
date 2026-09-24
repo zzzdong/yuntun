@@ -55,6 +55,13 @@ message FetchShardRequest {
   ShardIdMsg shard = 1;
   // 调用方所依据的 manifest 版本（= 它那次查询的 Catalog 快照号）
   uint64 known_manifest_ver = 2;
+  // **调用方已经能读到的批次**（它那份 manifest 快照里可见文件的 `batch_id`）。
+  //
+  // 语义是**栅栏**：属于这些批次的本地热副本不得再回一次 —— 否则在
+  // 「commit_files 成功 → 调用方 mark_committed」的窗口里，同一批数据会**同时**
+  // 从"已提交文件"与"热数据"被读到（重复计数，`operation-log §28.1`）。
+  // 服务端**只按调用方给的这个集合过滤**，不自行推断（`read_shard_excluding` 文档）。
+  repeated string known_batch_ids = 3;
 }
 
 message FetchShardResponse {

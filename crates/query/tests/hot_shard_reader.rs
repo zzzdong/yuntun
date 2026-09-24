@@ -46,6 +46,7 @@ impl ShardFetch for CannedFetch {
         &'a self,
         id: &'a ShardId,
         _known_manifest_ver: u64,
+        _known_batch_ids: Vec<String>,
     ) -> futures::future::BoxFuture<'a, Result<ShardRead, LakeError>> {
         Box::pin(async move {
             // 本用例只验"查询能经远端接缝读到热数据"：水位取 0（不高于 known）⇒ 不报 STALE。

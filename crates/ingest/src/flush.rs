@@ -124,18 +124,25 @@ pub async fn flush_chunk(
     flush_chunk_with_id(input, deps, None).await
 }
 
-/// 同 [`flush_chunk`]，但允许指定 batch_id（恢复场景：§5.6 复用原 batch_id，
-/// Meta 按 batch_id 幂等，保证重放安全）。正常路径必须传 None（ADR-4 随机 UUIDv7）。
+/// 同 [`flush_chunk`]，但由**调用方指定** `batch_id`（`None` = 本函数内生成）。
+///
+/// 调用方为什么必须能指定（`operation-log §28.1` 的读侧栅栏）：`batch_id` 要在
+/// `commit_files` **之前**登记到 chunk，读侧才能在"提交→标记"窗口里按它隐藏热副本；
+/// 若让本函数内部生成，调用方拿不到它、也就没法提前登记。
+///
+/// 两条调用路径都指定它：
+/// - 正常/`flush_now`：调用方生成随机 UUIDv7 并先 `note_batch_id`；
+/// - 恢复（§5.6）：复用 WAL 里的原 `batch_id`，Meta 按它幂等，保证重放安全。
+///
+/// ADR-4: batch_id is random UUIDv7, NOT derived from content.
+/// Idempotency is guaranteed by BatchStateStore + client_request_id (§7.3),
+/// NOT by batch_id determinism. Do NOT "optimize" this into a content hash.
 pub async fn flush_chunk_with_id(
     input: &ChunkFlushInput,
     deps: &FlushDeps,
     reuse_batch_id: Option<String>,
 ) -> Result<FlushOutcome, LakeError> {
-    // ③ 生成 batch_id
-    // ADR-4: batch_id is random UUIDv7, NOT derived from content.
-    // Idempotency is guaranteed by BatchStateStore + client_request_id (§7.3),
-    // NOT by batch_id determinism. Do NOT "optimize" this into a content hash.
-    // 例外：恢复路径（§5.6）复用原 batch_id —— Meta 幂等保证重放安全。
+    // ③ 确定 batch_id（调用方给的优先；缺省则此处随机生成）
     let batch_id = reuse_batch_id.unwrap_or_else(|| Uuid::now_v7().to_string());
 
     let merged = merge_batches(&input.batches, &input.schema)?;

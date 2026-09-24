@@ -15,14 +15,14 @@
 - **Standalone**：**可交付的本地时序/可观测数据库**（单二进制 + 一份 TOML 即可用，两个 SQL 协议端口）。
 - **分布式**：**数据平面地基已打完**（拆进程零返工的部分）；**控制平面为 0 起步**
   （不是"把本地调用换成 gRPC"，而是新增语义：成员/租约/快照/水位传播）。
-- **质量网**：375 用例全绿（+1 ignored） / clippy 0 警告（**全仓**，非热缓存读数）/ chaos **11/11** / T8 基线已入库 / 五个真缺陷已抓出（4 修 1 待）。
+- **质量网**：377 用例全绿（0 ignored） / clippy 0 警告（**全仓**，非热缓存读数）/ chaos **11/11** / T8 基线已入库 / 五个真缺陷已抓出（**5 修 0 待**）。
 - **对外口径**：单机可实际使用；**多节点只能算实验性部署**（必须单写者 + 不开后台作业竞争）。
 
 ---
 
 ## 2. 能力矩阵（standalone 今天能做到什么）
 
-规模：**47,276 行 Rust / 20 个 crate / 375 个测试函数 / 375 个用例通过（+1 ignored） / clippy 0 警告**
+规模：**47,520 行 Rust / 20 个 crate / 376 个测试函数 / 377 个用例通过（0 ignored） / clippy 0 警告**
 工具链：**rustc 1.98.1 + edition 2024**（20 个 crate 全走 `edition.workspace = true`；见 `operation-log §59`）；
 **MSRV 声明 `1.94`**（下界由依赖 `datafusion 55` 决定，**不是** policy 想取的 1.92；**尚未经真·1.94 编译验证**，见 `§60`）。
 全仓仅余 1 条**外部依赖**告警（`proc-macro-error2 v2.0.1`，来自 `opensrv-mysql`，非本仓代码）。
@@ -87,7 +87,7 @@ MySQL 端口 **trust 无鉴权**（按网络隔离部署）；MySQL 轨结果集
 
 | 层 | 证据 | 位置 |
 |---|---|---|
-| 单元 / 集成 | **375 passed / 0 failed**；375 个测试函数；`clippy --workspace --all-targets` 0 警告（本仓） | `cargo test --workspace` |
+| 单元 / 集成 | **377 passed / 0 failed / 0 ignored**；376 个测试函数；`clippy --workspace --all-targets` 0 警告（本仓） | `cargo test --workspace` |
 | chaos（真实磁盘 + 跨重启 + 并发） | **11/11** 场景；进程中抓出**五个真缺陷** | `crates/chaos` 模块文档 + `operation-log §27–§31` |
 | 性能基线 | 提交时刻分布 / 峰值提交数 / `seal→committed` / 文件数·天 / 单文件行数 | `operation-log §32`（`bench_baseline`） |
 | 阈值与背压基线 | 账本口径 B/行 / 内存水位峰值 / 背压档 / RowGroup 数 / 单文件字节 | `operation-log §33`（同程序，`pad`/`bytes_threshold`/读者开关） |
@@ -113,7 +113,7 @@ MySQL 端口 **trust 无鉴权**（按网络隔离部署）；MySQL 轨结果集
 | 2 | 恢复产出重复文件 | ✅ §28.2 已修 |
 | 3 | WAL 撕裂不可自愈 | ✅ §29.1 已修 |
 | 4 | 监控 abort 后不同步视图 → segment 永不释放 / 重复写 | ✅ §30 已修 |
-| 5 | 提交成功后、标记前崩溃 → 重复计数 | ⏳ 待修（需读侧栅栏，与 R3 同批） |
+| 5 | 提交成功后、标记前崩溃 → 重复计数 | ✅ §99 已修（读侧栅栏：`batch_id` 提前登记 + 热读带上"已知 batch 集合"，本地/远端都过滤） |
 
 **已知 flaky**：`yuntun-chaos` 与其余 46 个 test binary 并行争 CPU/IO → 30s 恢复上限不足（单跑 1.3s）。
 已放宽到 60s 并写明理由；根治（chaos 独立跑 / 去 flaky）属 `plan.md` T6.1。

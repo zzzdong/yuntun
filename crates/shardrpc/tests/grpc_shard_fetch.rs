@@ -8,6 +8,8 @@
 //! 2. `parity_holds_with_instances_behind_grpc`：`§66` 那条**对拍**在远端形态下同样成立 ——
 //!    单节点串行 vs 两个数据节点各写一半，结果逐行相等。这是 `§66.5` 说的"跨进程形态复用同一条
 //!    对拍逻辑"的兑现（这里走的是**真 gRPC + TCP + IPC 编解码**，不是进程内的函数调用）。
+//! 3. `known_batch_ids_fence_survives_the_wire`：**读侧栅栏过网络**（`operation-log §28.1`）——
+//!    调用方把自己"已经能读到的批次"带过去，服务端必须据此挡掉对应热副本。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -208,4 +210,44 @@ async fn parity_holds_with_instances_behind_grpc() {
         split, all,
         "远端形态的对拍必须同样成立：少一行 = 漏读某个数据节点；多一行 = 同一份数据读两次"
     );
+}
+
+/// ③ **读侧栅栏过网络**（`operation-log §28.1`）：调用方把"我已能读到的批次"
+/// （`FileManifest.batch_id`）随请求带过去，服务端必须据此挡掉对应的热副本。
+///
+/// 这条钉的是"**提交 → 标记**"窗口在**远端形态**下也不会重复计数：窗口内
+/// `committed_snapshot` 还是 `None`（chunk 对任何快照都"可见"），但调用方已经能在自己的
+/// manifest 快照里读到那个 batch ⇒ 服务端必须隐藏热副本（栅栏不能只在进程内有效）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn known_batch_ids_fence_survives_the_wire() {
+    let dir = yuntun_testkit::TestDir::tmpfs("shardrpc-fence");
+    let store = instance(&dir, "inst-a");
+    let chunk = write(&store, &[1, 2, 3]);
+    // flush **之前**登记 batch_id（真实路径里由 `Ingestor` 生成并 `note_batch_id`）——
+    // 此刻 `committed_snapshot` 仍是 `None`，正是"提交→标记"窗口的样子。
+    store.note_batch_id(chunk, "b-committed".to_string());
+
+    let addr = serve(store.clone()).await;
+    let reader = remote_reader(&addr).await;
+
+    // 无栅栏：热副本可见（3 行）—— 缺陷的机制本身还在
+    assert_eq!(reader.read_table(TABLE, 0).await.unwrap().rows(), 3);
+
+    // 带上"我已经读到的 batch"：服务端必须挡住它（0 行）
+    let fenced = reader
+        .read_table_excluding(TABLE, 0, &["b-committed".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(
+        fenced.rows(),
+        0,
+        "调用方已能读到该 batch ⇒ 热副本不得再回一次（否则远端形态同样重复计数）"
+    );
+
+    // 反证：带一个**不相干**的 batch id 不得误伤（防"一有 exclude 就全挡"）
+    let unrelated = reader
+        .read_table_excluding(TABLE, 0, &["b-other".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(unrelated.rows(), 3, "不相干的 batch 不得误伤热数据");
 }

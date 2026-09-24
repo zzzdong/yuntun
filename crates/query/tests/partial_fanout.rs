@@ -107,8 +107,8 @@ impl ShardReader for AlwaysStale {
 
 /// **慢但会答**的来源：`delay` 之后返回 `rows` 行。
 ///
-/// 覆写 `read_table`（trait 的默认实现是"枚举 + 逐分片 + 取水位"）：这里要的是一个
-/// **可控的等待**，用来观察"多个来源的等待是**相加**还是**取最大**"。
+/// 覆写 `read_table_excluding`（**查询路径走的正是它**；`read_table` 只是它 `exclude = []` 的
+/// 特例）：这里要的是一个**可控的等待**，用来观察"多个来源的等待是**相加**还是**取最大**"。
 #[derive(Debug)]
 struct SlowButAnswers {
     delay: Duration,
@@ -132,7 +132,12 @@ impl ShardReader for SlowButAnswers {
     async fn watermark(&self, known: u64) -> Result<ShardRead, LakeError> {
         Ok(ShardRead::empty(known, known))
     }
-    async fn read_table(&self, _table: &str, known: u64) -> Result<ShardRead, LakeError> {
+    async fn read_table_excluding(
+        &self,
+        _table: &str,
+        known: u64,
+        _exclude: &[String],
+    ) -> Result<ShardRead, LakeError> {
         tokio::time::sleep(self.delay).await;
         Ok(ShardRead {
             batches: vec![batch(&self.rows)],

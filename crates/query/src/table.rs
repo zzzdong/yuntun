@@ -5,8 +5,9 @@
 //!    （阶段 0 = 进程内 chunk store；分离部署 = `RemoteShard`）—— 写后立即可查；
 //! ② **磁盘分片**：已落对象存储的 Parquet 文件组（Manifest 驱动，快照隔离）。
 //!
-//! 交接无空洞/无重复：chunk 在 `commit_files` 成功且**查询缓存追上该快照**之前一直可见
-//! （架构 §4.5 / I4）。
+//! 交接无空洞/无重复（架构 §4.5 / I4）：chunk 在 `commit_files` 成功且查询缓存追上该快照
+//! 之前一直可见；**"提交 → 标记"**那道窗口由**读侧栅栏**关闭 —— 热读带上"本次快照里
+//! 该实例已提交的 batch 集合"（`operation-log §28.1`），已进 manifest 的批次不再从热副本出。
 //!
 //! **快照一致性（S2-4）**：provider 持有的是 `Arc<CatalogSnapshot>`（规划期取一次），
 //! 因此"可见文件清单"与"schema"必然同版本 —— 不会出现 schema 是新的、文件是旧的。
@@ -171,15 +172,34 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
         // 而 STALE 是"**还没拿到**"（必须刷新重试）—— 它照样让整次尝试失败。
         let budget = self.hot_read_budget;
         let deadline = tokio::time::Instant::now() + budget;
-        let outcomes = futures::future::join_all(self.hot.iter().map(|(instance, reader)| {
-            let instance = instance.clone();
-            let reader = reader.clone();
+
+        // 【`§28.1` 读侧栅栏】把"**本次快照**里可见文件的批次"（`FileManifest.batch_id`）
+        // 交给每个热读器：属于它们的本地热副本**不得**再读一次。
+        //
+        // 判据取自 `self.snapshot`（不可变 Catalog 快照，快照隔离），**不依赖**任何
+        // "标记没标记"的本地状态 —— 于是「commit_files 成功 → mark_committed」那道窗口
+        // 被结构性关掉（旧写法只靠 chunk 的 `committed_snapshot`，窗口内会把同一批算两遍）。
+        //
+        // ⚠️ **不按 `source_instance` 分实例**：`batch_id` 全局唯一（ADR-4 随机 UUIDv7），
+        // 别家的 id 落进某实例的读集合也是空匹配；而按实例分就把"热读器键 == 写入侧
+        // `instance_id`"这条**隐式一致性**变成了正确性前提（夹具/装配稍有不一致就静默失效）。
+        let files = table.map(|t| t.files.as_slice()).unwrap_or(&[]);
+        let all_batch_ids: Vec<String> = files.iter().map(|f| f.batch_id.clone()).collect();
+        let plan: Vec<_> = self
+            .hot
+            .iter()
+            .map(|(instance, reader)| {
+                (instance.clone(), reader.clone(), all_batch_ids.clone())
+            })
+            .collect();
+
+        let outcomes = futures::future::join_all(plan.into_iter().map(|(instance, reader, exclude)| {
             let ident = self.ident.clone();
             let snapshot = self.snapshot.snapshot;
             async move {
                 let outcome = match tokio::time::timeout_at(
                     deadline,
-                    reader.read_table(&ident, snapshot),
+                    reader.read_table_excluding(&ident, snapshot, &exclude),
                 )
                 .await
                 {

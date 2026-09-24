@@ -777,6 +777,21 @@ impl ChunkStore {
         }))
     }
 
+    /// **登记本 chunk flush 将使用的 `batch_id`** —— 必须在 `commit_files` **之前**调用。
+    ///
+    /// 读侧栅栏的关键一环（`operation-log §28.1`）：登记后，调用方一旦在自己的 manifest
+    /// 快照里看到该 `batch_id` 的文件，热副本就会被 [`Self::read_table_excluding_sync`] 隐藏
+    /// —— **不依赖**随后是否 `mark_committed`，于是"提交→标记"那道窗口被彻底关掉
+    /// （不再靠"把窗口缩到几条指令"这种不可证的收窄）。
+    ///
+    /// chunk 已不在（被回收 / 世代替换）时静默成功：它已经不可能被读到，无需登记。
+    pub fn note_batch_id(&self, id: ChunkId, batch_id: String) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(c) = inner.chunks.get_mut(&id) {
+            c.batch_id = Some(batch_id);
+        }
+    }
+
     /// flush 成功 + `commit_files` 成功：标记 `Flushed`（**不释放数据**，I4）。
     pub fn mark_committed(&self, id: ChunkId, snapshot: u64) -> Result<(), LakeError> {
         {
@@ -883,7 +898,19 @@ impl ChunkStore {
     // ------------------------------------------------------------ 读侧
 
     /// 可见的 chunk 快照（供查询路径；锁内克隆、锁外读盘）。
-    fn visible_chunks(&self, table: Option<&str>, cached_snapshot: u64) -> Vec<Chunk> {
+    ///
+    /// `exclude` = 调用方**已经能在自己那份 manifest 快照里读到**的批次
+    /// （`FileManifest.batch_id`）：属于它们的本地热副本一律**不返回** —— 这是
+    /// `operation-log §28.1` 的**读侧栅栏**。空 `exclude` = 旧语义（只按 `committed_snapshot` 判断）。
+    fn visible_chunks_excluding(
+        &self,
+        table: Option<&str>,
+        cached_snapshot: u64,
+        exclude: &[String],
+    ) -> Vec<Chunk> {
+        // 集合很小（= 该实例在该表的可见文件数），建一次哈希比逐 chunk 线性扫便宜
+        let excluded: std::collections::HashSet<&str> =
+            exclude.iter().map(|s| s.as_str()).collect();
         let inner = self.inner.lock().unwrap();
         inner
             .chunks
@@ -897,6 +924,8 @@ impl ChunkStore {
                     .unwrap_or_default();
                 l.exists && l.epoch == c.key.epoch
             })
+            // **栅栏**：已进 manifest 的批次不再从热副本出（否则"提交→标记"窗口内重复计数）
+            .filter(|c| !c.batch_id.as_deref().is_some_and(|b| excluded.contains(b)))
             .filter(|c| c.visible(cached_snapshot))
             .cloned()
             .collect()
@@ -904,8 +933,18 @@ impl ChunkStore {
 
     /// 同步读入口（内部 / 单测）：返回该表对 `cached_snapshot` 尚不可见的热数据。
     pub fn read_table_sync(&self, table: &str, cached_snapshot: u64) -> Vec<RecordBatch> {
+        self.read_table_excluding_sync(table, cached_snapshot, &[])
+    }
+
+    /// 同 [`Self::read_table_sync`]，但**排除**调用方已提交的批次（读侧栅栏，`§28.1`）。
+    pub fn read_table_excluding_sync(
+        &self,
+        table: &str,
+        cached_snapshot: u64,
+        exclude: &[String],
+    ) -> Vec<RecordBatch> {
         let mut out = Vec::new();
-        for c in self.visible_chunks(Some(table), cached_snapshot) {
+        for c in self.visible_chunks_excluding(Some(table), cached_snapshot, exclude) {
             match c.read() {
                 Ok(b) => out.extend(b),
                 Err(e) => tracing::warn!(chunk = %c.id, error = %e,
@@ -1009,8 +1048,18 @@ impl ShardReader for ChunkStore {
         id: &ShardId,
         known_manifest_ver: u64,
     ) -> Result<ShardRead, LakeError> {
+        self.read_shard_excluding(id, known_manifest_ver, &[]).await
+    }
+
+    // **读侧栅栏**（`§28.1`）：调用方已提交的批次（`exclude`）不再从热副本出。
+    async fn read_shard_excluding(
+        &self,
+        id: &ShardId,
+        known_manifest_ver: u64,
+        exclude: &[String],
+    ) -> Result<ShardRead, LakeError> {
         let mut out = Vec::new();
-        for c in self.visible_chunks(Some(&id.table), known_manifest_ver) {
+        for c in self.visible_chunks_excluding(Some(&id.table), known_manifest_ver, exclude) {
             if &c.key.shard != id {
                 continue;
             }
@@ -1043,9 +1092,19 @@ impl ShardReader for ChunkStore {
         table: &str,
         known_manifest_ver: u64,
     ) -> Result<ShardRead, LakeError> {
+        self.read_table_excluding(table, known_manifest_ver, &[]).await
+    }
+
+    // **读侧栅栏**（`§28.1`）：整表读也带 `exclude`。
+    async fn read_table_excluding(
+        &self,
+        table: &str,
+        known_manifest_ver: u64,
+        exclude: &[String],
+    ) -> Result<ShardRead, LakeError> {
         let watermark = self.flushed_watermark();
         Ok(ShardRead {
-            batches: self.read_table_sync(table, known_manifest_ver),
+            batches: self.read_table_excluding_sync(table, known_manifest_ver, exclude),
             flushed_watermark: watermark,
             stale: watermark > known_manifest_ver,
         })

@@ -125,6 +125,25 @@ pub trait ShardReader: Send + Sync + std::fmt::Debug {
         known_manifest_ver: u64,
     ) -> Result<ShardRead, LakeError>;
 
+    /// **带栅栏**地读单个分片（`operation-log §28.1` 的读侧栅栏）。
+    ///
+    /// `exclude` = 调用方**已经能在自己那份 manifest 快照里读到**的批次
+    /// （可见文件的 `batch_id`）：属于它们的本地热副本**不得**再回一次，否则在
+    /// 「`commit_files` 成功 → 调用方 `mark_committed`」的窗口里，同一批数据会**同时**
+    /// 从"已提交文件"与"热数据"被读到（重复计数）。
+    ///
+    /// 默认实现**忽略** `exclude`：对"本地热数据即权威"的实现（`ChunkStore`）必须覆写；
+    /// 远端实现在**服务端**落这道栅栏（见 [`ShardFetch::fetch_shard`] 的 `known_batch_ids`）。
+    async fn read_shard_excluding(
+        &self,
+        id: &ShardId,
+        known_manifest_ver: u64,
+        exclude: &[String],
+    ) -> Result<ShardRead, LakeError> {
+        let _ = exclude;
+        self.read_shard(id, known_manifest_ver).await
+    }
+
     /// **本实例的水位**（`operation-log §63.2` 的语义：已 flush 且**已放弃本地副本**的最高版本）。
     ///
     /// **必须单独实现，不能从分片推**：水位是**实例级**属性，与"当前有没有分片"无关 ——
@@ -144,9 +163,26 @@ pub trait ShardReader: Send + Sync + std::fmt::Debug {
         table: &str,
         known_manifest_ver: u64,
     ) -> Result<ShardRead, LakeError> {
+        self.read_table_excluding(table, known_manifest_ver, &[]).await
+    }
+
+    /// 同 [`Self::read_table`]，但带**读侧栅栏**（`exclude` 见 [`Self::read_shard_excluding`]）。
+    ///
+    /// 查询侧必须走这条（把快照里"该实例已提交的 batch 集合"带上）；
+    /// [`Self::read_table`] 只留给"没有 manifest 视图"的调用方（单测/诊断）。
+    async fn read_table_excluding(
+        &self,
+        table: &str,
+        known_manifest_ver: u64,
+        exclude: &[String],
+    ) -> Result<ShardRead, LakeError> {
         let mut out = Vec::new();
         for id in self.shards_of(table).await? {
-            out.extend(self.read_shard(&id, known_manifest_ver).await?.batches);
+            out.extend(
+                self.read_shard_excluding(&id, known_manifest_ver, exclude)
+                    .await?
+                    .batches,
+            );
         }
         let wm = self.watermark(known_manifest_ver).await?;
         Ok(ShardRead {
@@ -178,10 +214,15 @@ pub trait ShardFetch: Send + Sync {
     /// **响应必须带边界信息**（`architecture-with-chunk §4.4`：水位随 pull 响应回来，
     /// 而不是靠推送）—— 远端实现若拿不到真实水位，**不能**用 0 装作"没有已放弃的数据"，
     /// 那会把 STALE 静默关掉；正确做法是让服务端把它的 watermark 一起返回（S5-6）。
+    ///
+    /// `known_batch_ids` = 调用方**已经能读到的批次**（读侧栅栏，`operation-log §28.1`）：
+    /// 服务端**按它过滤**，不得自行推断 —— "哪些数据已进调用方的 manifest"只有调用方知道。
+    /// 用 owned `Vec` 而不是借用，是为了不被 `&'a self` 的生命周期绑住。
     fn fetch_shard<'a>(
         &'a self,
         id: &'a ShardId,
         known_manifest_ver: u64,
+        known_batch_ids: Vec<String>,
     ) -> futures::future::BoxFuture<'a, Result<ShardRead, LakeError>>;
 
     /// **实例级水位**（`FetchShard` 的边界信息走这里，而不是从分片推）。
@@ -238,7 +279,22 @@ impl ShardReader for RemoteShard {
         id: &ShardId,
         known_manifest_ver: u64,
     ) -> Result<ShardRead, LakeError> {
-        self.fetch.fetch_shard(id, known_manifest_ver).await
+        self.fetch
+            .fetch_shard(id, known_manifest_ver, Vec::new())
+            .await
+    }
+
+    /// 栅栏在**服务端**落（`§28.1`）：把调用方已知的批集合原样传过去，本地不做判断
+    /// —— 本地只有"怎么连"，没有"哪些数据已提交"。
+    async fn read_shard_excluding(
+        &self,
+        id: &ShardId,
+        known_manifest_ver: u64,
+        exclude: &[String],
+    ) -> Result<ShardRead, LakeError> {
+        self.fetch
+            .fetch_shard(id, known_manifest_ver, exclude.to_vec())
+            .await
     }
 
     async fn watermark(&self, known_manifest_ver: u64) -> Result<ShardRead, LakeError> {
@@ -350,6 +406,7 @@ mod tests {
             &'a self,
             id: &'a ShardId,
             known_manifest_ver: u64,
+            _known_batch_ids: Vec<String>,
         ) -> futures::future::BoxFuture<'a, Result<ShardRead, LakeError>> {
             Box::pin(async move {
                 let batches = self.entries.get(id).cloned().unwrap_or_default();

@@ -139,9 +139,13 @@ impl pb::shard_fetch_server::ShardFetch for ShardService {
         );
         // 水位 / STALE **由本地 reader 判定后原样转发**，服务端不重算：
         // 只有持有副本的那一方知道"我放弃到哪了"（`§63.2`）。
+        //
+        // 【`§28.1` 读侧栅栏】`known_batch_ids` = 调用方已能读到的批次，**原样喂给本地 reader**
+        // 做过滤：服务端不自己查 catalog —— "哪些数据已进调用方的 manifest"只有调用方知道，
+        // 而且服务端查会在每次分片拉取上多一跳（`RemoteCatalog::list_visible_files` 会 refresh）。
         let read = self
             .reader
-            .read_shard(&id, req.known_manifest_ver)
+            .read_shard_excluding(&id, req.known_manifest_ver, &req.known_batch_ids)
             .await
             .map_err(internal)?;
 
@@ -299,6 +303,7 @@ impl ShardFetch for GrpcShardFetch {
         &'a self,
         id: &'a ShardId,
         known_manifest_ver: u64,
+        known_batch_ids: Vec<String>,
     ) -> BoxFuture<'a, Result<ShardRead, LakeError>> {
         Box::pin(async move {
             let mut c = self.client.clone();
@@ -308,6 +313,7 @@ impl ShardFetch for GrpcShardFetch {
                     c.fetch_shard(pb::FetchShardRequest {
                         shard: Some(to_msg(id)),
                         known_manifest_ver,
+                        known_batch_ids,
                     }),
                 )
                 .await?;

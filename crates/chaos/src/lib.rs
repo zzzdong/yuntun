@@ -23,8 +23,9 @@
 //! ## 场景清单与进度（`design.md` §12.3 的 11 项）—— **11/11 已完成**
 //!
 //! 11 项全部具备"真实磁盘 + 跨重启 + 并发"下的端到端证据。
-//! 过程中抓出五个真缺陷、修掉四个（`operation-log` §27 / §28.2 / §29.1 / §30 已修，
-//! §28.1 待与 R3 同批）。
+//! 过程中抓出**五个真缺陷，全部已修**：`§27`（幂等键不生效）/ `§28.2`（恢复产出重复文件）/
+//! `§29.1`（WAL 撕裂不可自愈）/ `§30`（监控 abort 后视图不同步）/ **`§28.1`（提交→标记
+//! 窗口重复计数 —— 读侧栅栏，落地见 `operation-log §99`）**。
 //!
 //! | # | 场景 | chaos 层 | 备注 |
 //! |---|---|---|---|
@@ -45,11 +46,13 @@
 //!
 //! ## 两条写用例的规矩（`operation-log §28.4`）
 //!
-//! 1. **断言"最终行数"前先 [`wait_hot_drained`]**：`§28.1` 的"提交→标记"窗口内，
-//!    同一批数据会同时从文件与热数据两处可见 —— 不等窗口关闭，断言的是瞬时中间态，
-//!    会把**系统缺陷**误报成"用例不稳定"。
-//! 2. **已知缺陷标 `#[ignore]` + 保留确定性探针**：不写"当前行为"的断言（等于把缺陷
-//!    固化成规格），也不静默删掉用例。
+//! 1. **断言"最终行数"前先 [`wait_hot_drained`]**：让 flush / 回收真正落定再断言持久化
+//!    结果，避免把"还在写"误判成"丢了"。（`§28.1` 修好前它还有一层职责 —— 躲开"提交→
+//!    标记"那个会把同一批算两遍的窗口；读侧栅栏落地后，正确性不再依赖它。）
+//! 2. **已知缺陷标 `#[ignore]` + 保留确定性探针**：不把缺陷固化成规格，也不静默删用例；
+//!    修好后取消 `#[ignore]`。`§28.1` 正是这条规矩的样板：探针先留着（一键复现），
+//!    读侧栅栏落地后转绿（见 [`commit_to_mark_window_must_not_double_count`]）。
+//!    **当前已无 `#[ignore]` 用例。**
 
 // 本 crate 当前只含验收测试（E2/E3/T6.4/T6.8）与压测示例；以下导入均为测试专用。
 #[cfg(test)]
@@ -782,9 +785,10 @@ fn compactor(
 
 /// 等热数据完全退场：所有 chunk 已提交、且被查询侧 `reclaim` 回收。
 ///
-/// **为什么断言"最终行数"前必须等它**：`operation-log §28.1` 的"提交→标记"窗口内，
-/// 同一批数据会**同时**以"已提交文件"和"热数据"两处可见 —— 此刻读到的是瞬时中间态。
-/// 断言最终一致性必须等窗口关闭，否则用例会随负载偶发多计（实测 9 行读成 12 行）。
+/// **为什么断言"最终行数"前等它**：让 flush + 回收真正落定，断言的是**持久化后的稳态**
+/// 而不是"还在写"的中间态 —— 这比"等一个 sleep"可证。
+/// （`§28.1` 修好前它还必须用来躲开"提交→标记"的重复计数窗口；读侧栅栏落地后，
+/// 精确行数不再依赖窗口关闭。）
 #[cfg(test)]
 async fn wait_hot_drained(setup: &Setup) {
     // 上界 120s：这不是延迟断言，只兜"永不退场"。
@@ -1171,13 +1175,13 @@ async fn compaction_during_query_keeps_counts_monotonic() {
         observed.len()
     );
 
-    // 并发采样期间**只做有松弛的断言**：`§28.1`（提交→标记窗口）会让采样值瞬时多计
-    // 一批；松弛量 = 一轮 3 批 × 3 行 = 9（理论上限 = 同时在飞的 flush 数 × 批行数）。
-    // ⚠️ `§28.1` 修好后这里必须收紧为 `max <= acked`。
+    // 并发采样期间**不允许超过已 ack 行数**：超出就是重复计数。`§28.1` 的读侧栅栏
+    // 落地后这条不再需要松弛 —— 热副本不会再与"已提交文件"同时被算。
+    // （旧写法是 `max <= acked + 9`，那 +9 正是"提交→标记窗口"的松弛量。）
     if let Some(&max) = observed.iter().max() {
         assert!(
-            max <= acked + 9,
-            "并发采样超出理论上限：观测 {max} 行 > acked {acked} + 9：{observed:?}"
+            max <= acked,
+            "并发采样出现重复计数：观测 {max} 行 > acked {acked}：{observed:?}"
         );
     }
 
@@ -1201,13 +1205,14 @@ async fn compaction_during_query_keeps_counts_monotonic() {
 ///
 /// 这里用 `flush_now`（提交但不标记）把这个窗口**固定下来**，比靠并发去撞它可靠。
 ///
-/// ⚠️ **当前是已知缺陷**（`operation-log §28`）：窗口内查询会把同一批数据算两遍
-/// （实测 3 行 → 6 行）。窗口 = 一次 WAL fsync（`BatchCommitted` 的 append），
-/// 量级 0.1–5ms，所以症状是**偶发多计**而非稳定错误。
-/// 修复需要动 `ShardReader` 接缝（读侧要知道"这个快照里已经有哪些文件"），
-/// 与 R3/R4 的 `pull(table, range, known_manifest_ver)`（`refactor.md` S5-4）同向，
-/// 故不在本轮打补丁 —— 但**测试先留着**，修好前它必须变绿。
-#[ignore = "已知缺陷：提交→标记窗口内重复计数（operation-log §28）"]
+/// **已修**（`operation-log §28.1` 的读侧栅栏，落地记录见 §99）：热副本的可见性不再由
+/// chunk 的本地标志（`committed_snapshot`）单独决定 —— 读侧带上"**本次快照里该实例
+/// 已提交的 batch 集合**"（`FileManifest.batch_id`），已进 manifest 的批次一律不再从热副本出。
+/// 于是窗口内：
+/// - **无栅栏读**仍会多算（缺陷的机制本身还在 —— 正是它证明"是栅栏在起作用"，
+///   而不是 chunk 状态碰巧变了）；
+/// - **带栅栏读**（调用方带上它已知的 batch）必须退场；
+/// - 端到端查询只看到 3 行（下面 ② 的断言）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn commit_to_mark_window_must_not_double_count() {
     let _gate = CHAOS_GATE.lock().await;
@@ -1272,15 +1277,31 @@ async fn commit_to_mark_window_must_not_double_count() {
         "提交窗口内查询重复计数：文件 {file_rows} 行 + 热数据被算了第二遍"
     );
 
-    // ③ 机制：同一快照上热数据必须**已经退场**
-    let hot_at_s: usize = chunks
+    // ③ 机制（读侧栅栏）：先证明**缺陷的机制本身还在** —— 无栅栏读在窗口内仍会把
+    //    同一批数据算两遍（`visible(S)` 因 `committed_snapshot == None` 仍为真）。
+    let hot_unfenced: usize = chunks
         .read_table_sync("public.cw", out.snapshot)
         .iter()
         .map(|b| b.num_rows())
         .sum();
     assert_eq!(
-        hot_at_s, 0,
-        "快照 S 已包含该批数据的文件，热数据不得同时可见（重复计数窗口）"
+        hot_unfenced, 3,
+        "无栅栏读在窗口内本就该重复 —— 这是栅栏要治的机制本身"
+    );
+
+    //    再证明**栅栏确实在起作用**：带上"调用方已知的 batch 集合"后，同一快照上该 chunk 退场。
+    let hot_fenced: usize = chunks
+        .read_table_excluding_sync(
+            "public.cw",
+            out.snapshot,
+            std::slice::from_ref(&out.batch_id),
+        )
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    assert_eq!(
+        hot_fenced, 0,
+        "快照 S 已含该 batch 的文件 ⇒ 热副本必须被栅栏挡住（重复计数窗口关闭）"
     );
 }
 

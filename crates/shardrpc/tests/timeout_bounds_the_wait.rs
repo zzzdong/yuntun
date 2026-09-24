@@ -111,7 +111,10 @@ async fn a_hung_node_fails_within_the_bound_and_says_it_timed_out() {
         "错误要能区分『没响应』与『拒绝连接』：{e}"
     );
 
-    let e = fetch.fetch_shard(&id, 0).await.expect_err("假死 ⇒ 必须失败");
+    let e = fetch
+        .fetch_shard(&id, 0, Vec::new())
+        .await
+        .expect_err("假死 ⇒ 必须失败");
     assert!(e.to_string().contains("超时"), "{e}");
     let e = fetch
         .fetch_watermark(0)

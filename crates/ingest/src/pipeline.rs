@@ -27,9 +27,10 @@ use yuntun_model::error::LakeError;
 use yuntun_model::wal_record::{DataPayload, Record};
 use yuntun_store::ShardId;
 use yuntun_wal::writer::WalWriter;
+use uuid::Uuid;
 
 use crate::accumulator::{extract_event_time_ms, now_ms};
-use crate::flush::{flush_chunk, flush_chunk_with_id, recommit_into_catalog, FlushDeps, LiveBatchTracker};
+use crate::flush::{flush_chunk_with_id, recommit_into_catalog, FlushDeps, LiveBatchTracker};
 use crate::schema_cache::{resolve_schema_version, SchemaCache};
 use crate::source::{IngestBatch, IngestSource, Receipt};
 
@@ -556,7 +557,12 @@ impl Ingestor {
         }
 
         let deps = self.deps();
-        match flush_chunk(&input, &deps).await {
+        // 【`§28.1` 读侧栅栏】batch_id 在 `commit_files` **之前**生成并登记到 chunk：
+        // 于是"提交成功 → `mark_committed`"那道窗口里，读侧只要在自己的 manifest 快照里
+        // 看到这个 batch_id，就会隐藏热副本 —— **与标记时机无关**，窗口被结构性关掉。
+        let batch_id = Uuid::now_v7().to_string();
+        self.chunks.note_batch_id(id, batch_id.clone());
+        match flush_chunk_with_id(&input, &deps, Some(batch_id)).await {
             Ok(out) => {
                 tracing::info!(
                     batch_id = %out.batch_id,
@@ -771,11 +777,19 @@ impl Ingestor {
     }
 
     /// 供测试/运维：手动 flush 指定 chunk 快照。
+    ///
+    /// 与到期执行体同一条纪律：**batch_id 先登记到 chunk、再 flush**（`§28.1` 读侧栅栏）——
+    /// 否则这条路径会复现"提交→标记"窗口（`commit_to_mark_window_must_not_double_count`
+    /// 正是冲它来的）。恢复路径（`ChunkFlushInput.id == None`）没有在世 chunk，无需登记。
     pub async fn flush_now(
         &self,
         input: yuntun_chunk::store::ChunkFlushInput,
     ) -> Result<crate::flush::FlushOutcome, LakeError> {
-        flush_chunk(&input, &self.deps()).await
+        let batch_id = Uuid::now_v7().to_string();
+        if let Some(id) = input.id {
+            self.chunks.note_batch_id(id, batch_id.clone());
+        }
+        flush_chunk_with_id(&input, &self.deps(), Some(batch_id)).await
     }
 }
 

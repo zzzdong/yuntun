@@ -211,6 +211,14 @@ pub struct Chunk {
     pub wal_seq_range: Range<u64>,
     /// `commit_files` 成功后的 manifest 快照号；`None` = 未提交
     pub committed_snapshot: Option<u64>,
+    /// **本 chunk flush 时会用的 `batch_id`**，在 `commit_files` **之前**登记（读侧栅栏，`§28.1`）。
+    ///
+    /// 为什么必须提前：`commit_files` 一成功，快照 ≥ S 的查询就能从 manifest 读到这批数据，
+    /// 而 `committed_snapshot` 要等调用方 `mark_committed` 才置位 —— 中间那道窗口里，
+    /// 只按 `committed_snapshot` 判断可见性会把同一批数据**算两遍**。
+    /// 提前登记 `batch_id` 后，读侧可以按"这个快照的 manifest 里是否已含这个 batch"
+    /// 来隐藏热副本：**与"标没标记"无关，只与调用方手里的文件清单有关**。
+    pub batch_id: Option<String>,
     /// flush 连续失败次数（指数退避用；失败后批次保持非终态，由 WAL 超时监控兜底）
     pub flush_attempts: u32,
     /// 下次允许再次尝试 flush 的时刻（退避窗口内不重复打 S3，避免失败风暴）
@@ -244,6 +252,7 @@ impl Chunk {
             seqs: Vec::new(),
             wal_seq_range: 0..0,
             committed_snapshot: None,
+            batch_id: None,
             flush_attempts: 0,
             retry_after_ms: 0,
         }
