@@ -5918,3 +5918,52 @@ MySQL 的 warning 计数在**结果集结束包（EOF）**里，而 `opensrv-mys
 
 - 全量 `cargo test --workspace --no-fail-fast -j 4` → **371 passed / 0 failed（+1 ignored）**
 - clippy 本仓 **0**；规模：46,698 行 / 20 个 crate / 371 测试函数
+
+---
+
+## 92. M3 ③ 的处置：standalone 与其它形态**共用同一个装配**（2026-09-24）
+
+### 92.1 门槛
+
+M3 的第三格是"**standalone 仍可单机运行**"。而 `standalone/tests/cli.rs` 只测
+`--version` / `--help`，且自己写明"真启动会绑端口、建目录、起后台任务 —— 那是端到端测试的事"，
+**而那条端到端不在** ⇒ 这一格此前是空的（`§90` 记为 ⚠️）。
+
+### 92.2 能站住的那句话（先给证据，再说还缺什么）
+
+`crates/standalone/src/main.rs` 只有 **96 行**，它的全部工作就是：
+
+```text
+Config(TOML) → Lakehouse 装配 → yuntun_server::serve_flight(&lakehouse, &listen)
+```
+
+⇒ **standalone 没有任何自己的装配逻辑**：它与 `server/tests/flight_e2e.rs`、
+`server/tests/assembly_parity.rs` 跑的是**同一个 `Lakehouse`、同一个 `serve_flight`**。
+因此那两条用例的覆盖**合法地转移**到 standalone 上：它们证明的装配，**就是** standalone 的装配。
+
+也就是说："standalone 能单机运行"在**装配层**已经有证据了。
+
+### 92.3 还缺的那一半（二进制层冒烟），以及为什么它不该"顺手补"
+
+缺的是"**真起 `yuntun` 二进制 + 连上去查一次**"。
+
+做它之前要先解决一个**真实障碍**：standalone 的监听地址来自 **TOML 配置**
+（不像数据进程会打印一行 `LISTEN <addr>`），于是测试只有两条路：
+
+1. **选一个固定端口** ⇒ 并发/重复跑会撞端口，且"空闲"是猜的（`§37` 的 TOCTOU 批评）；
+2. `bind(127.0.0.1:0)` 拿到端口 → 释放 → 把端口交给子进程 ⇒ 同样有竞态窗口（`§37` 明确批评过这个写法）。
+
+⇒ 干净的做法是**先给 `yuntun` 加一行接口行**（`LISTEN <addr>`，与数据进程/metanode 同形 ——
+"**是接口，不是日志**"，`§38`/`§73` 一路的纪律），然后照 `datanode_forms_e2e` 的夹具写冒烟。
+这是**下一步**要做的一件事，不是"顺手补一下"。
+
+### 92.4 结论：`§8.4` 的账（更新）
+
+| 里程碑 | 状态 |
+|---|---|
+| M2 / M4 / M5 / M6 | ✅ |
+| M3 ①②（3 节点真 gRPC raft / `kill -9` 恢复） | ✅ |
+| **M3 ③（standalone 可单机运行）** | 🟡 **装配层已有证据**（92.2）；**二进制层冒烟未做**（92.3 给了无竞态的补法） |
+
+⇒ 严格按 `§8.4` 的判据，还差 M3 ③ 这一格；但它**不再是一句空话** ——
+装配证据已在，剩下的部分有明确且**无竞态**的补法（先加 `LISTEN <addr>` 接口行）。
