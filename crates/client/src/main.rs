@@ -34,6 +34,10 @@ use yuntun_client::{Client, InputFormat};
 struct Cli {
     /// 服务地址（默认取环境变量 YUNTUN_ADDR，否则 127.0.0.1:50051）
     ///
+    /// **连任一能接 SQL 的端点即可**（standalone 的 Flight 端口，或某个数据进程的
+    /// `--sql-listen`）：多节点时扇出由该节点负责，客户端无需知道其余节点
+    /// （落点为显式给定的 contact point，见 `yuntun-client::Client::connect`）。
+    ///
     /// `global`：可以放在子命令前面或后面，两种写法都行。
     #[arg(long, env = "YUNTUN_ADDR", default_value = "127.0.0.1:50051", global = true)]
     addr: String,

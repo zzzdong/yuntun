@@ -375,6 +375,13 @@ flush_moment = seal_time + max_flush_delay + (fnv1a(instance_id, table, shard, w
 
 **与 ADR-8 的关系**：软路由是**优化**而非**约束**——任何时候任何节点仍可写任何数据，保持 ADR-3 的"互不感知"。
 
+> ⚠️ **现状（决策 `D13` / `operation-log §100`，2026-09-24）**：**客户端软路由未实现，且当前不计划**。
+> 客户端落点由**部署显式给定**（standalone 的 Flight 端口，或某个 datanode 的 `--sql-listen`）——
+> 这是设计内的 **contact point** 模型：`architecture §5` 的"任选一个"由**调用方**完成。
+> 连**一个**即可：扇出/合并由该节点（协调者）负责（`§4.2`），客户端无需知道其余 datanode。
+> 若要"自助发现"，正路是**种子列表**（客户端配置）；**不要**让客户端读 metanode 名录
+> —— 名录里那一条是**数据面**地址（供热读 fanout），**不是 SQL 面地址**。两条路都没做。
+
 > 📌 **v12 修订说明**：v7/v8 原文是"`flush_moment = window_start + hash % 60`"（随机抖动）。
 > 实现从未按此落地：窗口对齐（决策 1）使 seal 发生在窗口关闭时刻，锚点已改为 `seal_time`，
 > 且抖动量是**确定性**的（同一 shard 每次相同），量级由 T8 基线定案为 `spread=30s` / `md=0`。

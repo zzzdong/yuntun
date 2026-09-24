@@ -93,6 +93,13 @@ pub struct Client {
 
 impl Client {
     /// 连接 Flight 端点；`addr` 支持 `host:port` 或 `http://host:port`。
+    ///
+    /// **连任一"能接 SQL"的端点即可**：standalone 的 Flight 端口，或某个数据进程的
+    /// `--sql-listen`。多节点时**扇出 / 合并由该节点（协调者）负责**（`architecture §4.2`），
+    /// 客户端**不需要**知道其余数据进程。
+    ///
+    /// 落点由**部署显式给定**（**contact point**，设计如此）——客户端**不做**名录发现、
+    /// 一致性哈希软路由或存活感知（决策 `D13` / `operation-log §100`）。
     pub async fn connect(addr: &str) -> Result<Self> {
         let url = if addr.starts_with("http://") || addr.starts_with("https://") {
             addr.to_string()
