@@ -6102,3 +6102,35 @@ yuntun_server::FlightServer::new_readonly(engine, catalog.clone())
    "选哪个"**不该进数据模型**；但要让"任选"这件事有据可依（名录 + 存活），而不是碰运气。
 
 形态定了再写用例（那时 `§91.5` 的第二半才有意义）。
+
+---
+
+## 96. 补上"接受写入的面"：ingest 形态下数据进程的 SQL 面**可写**（2026-09-24）
+
+### 96.1 改了什么
+
+`crates/datanode/src/main.rs` 的 SQL 面此前**恒为** `FlightServer::new_readonly(engine, catalog)`
+⇒ 数据进程**没有接受写入的网络面**（`§95`）。现在按**形态**决定能力，而不是一刀切：
+
+| 形态 | SQL 面 | 为什么 |
+|---|---|---|
+| **ingest**（本进程握着 WAL + chunk store） | **`FlightServer::new(ingestor, engine, catalog)`** | 与 `standalone` / `serve_flight` **同一条已验路径** |
+| `--no-ingest`（只查询） | 保持 `new_readonly` | 没有本地数据、没有 WAL ⇒ **写不了就不假装能写** |
+
+### 96.2 这让哪句话从设计变成行为
+
+`architecture §5`："**任意 datanode 收到写入（无路由）**" ⇒ 现在任一 ingest 形态的数据进程
+都能通过自己的 SQL 面（Flight `DoPut`）接受写入。`§91.3` 的夹具（`spawn_writer` 已经有
+`--sql-listen` 的位置）因此可以直接升级成"**真在途写**"。
+
+### 96.3 还没做的（如实）
+
+- **没有对拍用例**：`§91.5` 的第二半（两个节点并发**在途**写 ⇒ 逐行相等）还没写。
+  形态已具备，但夹具要新增（DoPut 写入流 + 并发驱动）；
+- **"客户端给谁"仍无据**：设计说无路由 ⇒ 任选；但"任选"的依据（名录 + 存活）还没接进客户端；
+- 只读形态仍**拒绝**写入（既有用例继续钉着这一点：`datanode_forms_e2e` 第 ⑥ 步）。
+
+### 96.4 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **374 passed / 0 failed**
+- clippy 本仓 **0**；规模：47,010 行 / 20 个 crate / 374 测试函数

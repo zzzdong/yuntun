@@ -293,6 +293,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ③ 本地热读器：ingest 形态下**本进程自己**就是一个来源（读己之写）。
     //    查询侧装配时先把它塞进 `hot_shards` ⇒ 名录巡检会跳过自连（`query::reconcile_hot_readers`）。
     let mut local_reader: Option<Arc<dyn ShardReader>> = None;
+    // **接受写入的面**（`§96`）：ingest 形态下，这个进程本来就握着 WAL + chunk store
+    // （"任意 datanode 收到写入（无路由）"，`architecture §5`）—— 所以它的 SQL 面**可写**。
+    // 只查询形态没有本地数据、也没有 WAL ⇒ 保持只读（它写不了，不该假装能写）。
+    let mut sql_ingestor: Option<Arc<Ingestor>> = None;
 
     if !args.no_ingest {
         // ---- 数据侧：WAL → DDL 重放 → Ingestor → 数据面服务 + 入册/心跳 ----
@@ -324,6 +328,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             catalog.clone(),
             store.clone(),
         ));
+        sql_ingestor = Some(ingestor.clone());
         let _accumulator = ingestor.clone().spawn_accumulator(shutdown.clone());
 
         // **压缩 + 孤儿 GC 角色**（数据进程的第二职能，`--compaction` 打开）。
@@ -442,9 +447,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
         let listener = TcpListener::bind(sql_listen).await?;
         let addr = listener.local_addr()?;
-        let svc = arrow_flight::flight_service_server::FlightServiceServer::new(
-            yuntun_server::FlightServer::new_readonly(engine, catalog.clone()),
-        );
+        // 【`§96`】**把"收到写入"的面补上**：此前这里**恒为** `new_readonly` ⇒
+        // 数据进程根本没有接受写入的网络面（WAL 只能靠启动回放或外部写文件）。
+        // 形态决定能力，而不是一刀切：
+        // - ingest 形态：本进程握着 WAL + chunk store ⇒ **可写**（`FlightServer::new`，
+        //   与 `standalone`/`serve_flight` 跑的是同一条已验路径）⇒ "任意 datanode 收到写入（无路由）"
+        //   从设计里的一句话变成可调用的行为；
+        // - 只查询形态（`--no-ingest`）：没有本地数据、没有 WAL ⇒ **只读**（保持原样）。
+        let flight = match &sql_ingestor {
+            Some(ing) => {
+                yuntun_server::FlightServer::new(ing.clone(), engine, catalog.clone())
+            }
+            None => yuntun_server::FlightServer::new_readonly(engine, catalog.clone()),
+        };
+        let svc = arrow_flight::flight_service_server::FlightServiceServer::new(flight);
         // 与 metanode / shardrpc 同一手法：`futures::stream::unfold` 把 accept 循环包成 Stream
         let incoming = futures::stream::unfold(listener, |l| async move {
             match l.accept().await {
