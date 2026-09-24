@@ -86,9 +86,30 @@ struct Args {
     ///
     /// 为什么要能单独指：**多节点必须共享同一份冷存储，而私有目录必须各归各的**
     /// （WAL/spill 被租约独占，同一目录第二个进程启动即被拒）。本机形态下这就意味着
-    /// "各给一个 `--dir`，但指同一个 `--cold-root`"——真实部署里它是 S3。
+    /// "各给一个 `--dir`，但指同一个 `--cold-root`"。
     #[arg(long)]
     cold_root: Option<PathBuf>,
+    /// **冷存储走 S3**（与 `--cold-root` 互斥）：bucket 名。给了它就启用 S3。
+    ///
+    /// 这是多节点的**真实部署**形态（`--cold-root` 只是"本机多进程共享目录"的替身）：
+    /// 各节点私有 `--dir` 各归各的，冷存储**一处**——两个写者产出的文件在同一个桶里，
+    /// 于是"对方的文件"对谁都可见。
+    ///
+    /// 本机 SeaweedFS / MinIO 的完整配方见 `scripts/s3_multinode_smoke.sh`。
+    #[arg(long)]
+    s3_bucket: Option<String>,
+    /// S3 端点，如 `http://127.0.0.1:8333`（MinIO / SeaweedFS）；**与 `--s3-bucket` 必须一起给**
+    #[arg(long)]
+    s3_endpoint: Option<String>,
+    /// S3 access key（SeaweedFS 默认无鉴权时任意值即可）
+    #[arg(long, default_value = "any")]
+    s3_access_key: String,
+    /// S3 secret key
+    #[arg(long, default_value = "any")]
+    s3_secret_key: String,
+    /// 允许明文 http：**本机 MinIO/SeaweedFS 必须开**（不开会按 https 去连，连不上）
+    #[arg(long)]
+    s3_allow_http: bool,
     /// 数据面（热读）服务监听地址；仅 ingest 形态。`127.0.0.1:0` = 内核分配
     #[arg(long, default_value = "127.0.0.1:0")]
     listen: String,
@@ -170,6 +191,21 @@ fn validate(args: &Args) -> Result<(), String> {
                 .into(),
         );
     }
+    // 冷存储**只能有一个根**：本地目录与 S3 是两种形态，混着给说明配置没想清；
+    // 而 `--s3-bucket` 少了 endpoint 会以"连不上 AWS"收场（含糊），不如起不来。
+    if args.s3_bucket.is_some() != args.s3_endpoint.is_some() {
+        return Err(
+            "--s3-bucket 与 --s3-endpoint 必须一起给（`StoreConfig::S3` 的 endpoint 是必填；\
+             真实 AWS 也给，不要留空）"
+                .into(),
+        );
+    }
+    if args.s3_bucket.is_some() && args.cold_root.is_some() {
+        return Err(
+            "--cold-root 与 --s3-bucket 互斥：冷存储只能有一个根（S3 形态下 `--dir` 只放私有状态）"
+                .into(),
+        );
+    }
     Ok(())
 }
 
@@ -242,12 +278,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let shutdown = CancellationToken::new();
     let wal_root = args.dir.join("wal");
     let spill_dir = args.dir.join("spill");
-    // 冷存储：默认在私有目录下（单机形态），可显式指向别处（多节点共享同一份）
-    let cold_root = args
-        .cold_root
-        .clone()
-        .unwrap_or_else(|| args.dir.join("cold"));
-    std::fs::create_dir_all(&cold_root)?;
+    // 冷存储的根在下面 ② 处按形态决定（本地目录 / S3）—— 这里不再预设，免得 S3 形态下
+    // 白白在本地建一个没人用的 `cold/`，让人以为数据落到本地了。
 
     // ① 私有目录租约 —— **排在最前**：被拒的进程连 WAL 都不该打开。
     //    （错误信息会点名 instance_id / role / pid，见 `§62`）
@@ -286,9 +318,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Some(addr) => Arc::new(yuntun_meta::RemoteCatalog::connect(vec![addr.clone()])?),
         None => Arc::new(MemoryCatalog::new()),
     };
-    let store = create_store(&StoreConfig::Local {
-        root: cold_root.to_string_lossy().into_owned(),
-    })?;
+    // 冷存储：**一处创建、多处共享**（`Ingestor` / `Compactor` / 孤儿 GC / `QueryEngine` 都接它，
+    // 见 ③/④）—— 所以形态只在这里判一次，下面各处都拿同一份。
+    let store = match &args.s3_bucket {
+        // S3：真实部署形态（`--cold-root` 只是"本机多进程共享目录"的替身）
+        Some(bucket) => {
+            let endpoint = args.s3_endpoint.clone().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--s3-bucket 必须与 --s3-endpoint 一起给",
+                )
+            })?;
+            tracing::info!(%bucket, %endpoint, "冷存储 = S3");
+            create_store(&StoreConfig::S3 {
+                bucket: bucket.clone(),
+                endpoint,
+                access_key_id: args.s3_access_key.clone(),
+                secret_access_key: args.s3_secret_key.clone(),
+                allow_http: args.s3_allow_http,
+            })?
+        }
+        // 本地目录：单机，或"多进程共享同一目录"（各给 `--dir`、共给 `--cold-root`）
+        None => {
+            let cold_root = args
+                .cold_root
+                .clone()
+                .unwrap_or_else(|| args.dir.join("cold"));
+            std::fs::create_dir_all(&cold_root)?;
+            tracing::info!(cold_root = %cold_root.display(), "冷存储 = 本地目录");
+            create_store(&StoreConfig::Local {
+                root: cold_root.to_string_lossy().into_owned(),
+            })?
+        }
+    };
 
     // ③ 本地热读器：ingest 形态下**本进程自己**就是一个来源（读己之写）。
     //    查询侧装配时先把它塞进 `hot_shards` ⇒ 名录巡检会跳过自连（`query::reconcile_hot_readers`）。

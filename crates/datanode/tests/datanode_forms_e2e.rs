@@ -822,3 +822,52 @@ async fn two_concurrent_writers_real_ingest_parity() {
     // 收尾：显式停掉两个子进程（不留孤儿；`Drop` 会再兜一次，无害）
     let _ = a.child.kill();
 }
+
+// ---------------------------------------------------------------------------
+// 冷存储形态的**启动校验**（`operation-log §102`：数据进程接 S3）
+// ---------------------------------------------------------------------------
+
+/// 两种冷存储配置错误必须**起不来**，而不是跑成一个语义含糊的进程：
+///
+/// ① 只给 `--s3-bucket`、不给 `--s3-endpoint` —— 那会以"连不上 AWS"收场（含糊）；
+/// ② 同时给 `--cold-root` 与 `--s3-bucket` —— 冷存储只能有一个根，混着给说明没想清，
+///    后果是"以为在写 S3，其实在写本地"（`§101` 那类"数据落哪了"的误判）。
+///
+/// 照 metanode 的 `process_refuses_*`：断言**退出码**与**点名的错误**，不只断言"失败"。
+#[test]
+fn s3_cold_store_misconfiguration_is_refused() {
+    let dir = tmpdir("dn-s3-badcfg");
+
+    // ① 缺 endpoint
+    let out = Command::new(DATANODE)
+        .args(["--instance-id", "inst-a", "--dir"])
+        .arg(&dir)
+        .args(["--s3-bucket", "b"])
+        .output()
+        .expect("跑二进制");
+    assert_eq!(out.status.code(), Some(1), "配置错应以非零退出");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("必须一起给"),
+        "错误要点名缺的是 endpoint：{err}"
+    );
+
+    // ② 冷存储两个根
+    let out = Command::new(DATANODE)
+        .args(["--instance-id", "inst-a", "--dir"])
+        .arg(&dir)
+        .arg("--cold-root")
+        .arg(dir.join("cold"))
+        .args(["--s3-bucket", "b", "--s3-endpoint", "http://127.0.0.1:8333"])
+        .output()
+        .expect("跑二进制");
+    assert_eq!(out.status.code(), Some(1), "配置错应以非零退出");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("互斥"), "错误要点名冲突项：{err}");
+
+    // 反证：S3 形态**不**在本地建 `cold/` —— 建了就会让人以为数据落在本地
+    assert!(
+        !dir.join("cold").exists(),
+        "S3 形态下不该创建本地 cold/ 目录"
+    );
+}

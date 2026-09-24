@@ -6414,3 +6414,82 @@ S3_ENDPOINT=http://127.0.0.1:8333 S3_BUCKET=yuntun-lake scripts/s3_smoke.sh
 
 - `scripts/s3_smoke.sh` 连跑 2 次：写 / 热读 / 冷读三段全 PASS，退出后无残留进程；
 - 纯脚本 + 文档，无 Rust 代码改动 ⇒ 全量 `cargo test` 不受影响（377 passed / 0 failed 未变）。
+
+---
+
+## 102. 数据进程接 **S3 冷存储** + 多节点在真实 S3 上的对拍（`§98` / `§101` 合流）（2026-09-24）
+
+### 102.1 缺口：数据进程的冷存储只能指本地目录
+
+`§101` 把"单机 ↔ 真实 S3"验掉了，但 `§98` 的 M4 对拍用的仍是**本机多进程共享一个
+`--cold-root` 目录**（`status.md §5.2` 一直把它记作"共享目录"的替身）。查代码：`yuntun-datanode`
+的冷存储是 `args.cold_root → StoreConfig::Local`，**CLI 上没有任何 S3 入口** ——
+它的注释自己写着"真实部署里它是 S3"，也就是这一格从来没被接上。
+
+### 102.2 改动：形态在**装配点**判一次，之后各处共享同一份
+
+- `yuntun-datanode` 新增 `--s3-bucket` / `--s3-endpoint` / `--s3-access-key` /
+  `--s3-secret-key` / `--s3-allow-http`；
+- **一处创建、多处共享**：`store` 本来就由 `Ingestor` / `Compactor` / 孤儿 GC / `QueryEngine`
+  接同一份（`main.rs` ②③④），所以形态只判一次 ⇒ 写入面与查询面**必然**看同一个桶；
+- **启动即校验**（`§79` 的纪律：宁可起不来）：
+
+  | 配置 | 处置 |
+  |---|---|
+  | `--s3-bucket` 与 `--s3-endpoint` 只给一个 | 拒绝（少 endpoint 会以"连不上 AWS"收场，含糊） |
+  | `--cold-root` 与 `--s3-bucket` 同时给 | 拒绝（冷存储只能有一个根；混着给 = "以为在写 S3，其实在写本地"） |
+
+- **S3 形态不再预建本地 `cold/`**：原来那次 `create_dir_all(cold_root)` 无条件发生在最前面，
+  S3 部署里会凭空多一个空目录，让人以为数据落了本地。现在只有本地形态才建。
+
+零新增依赖：`StoreConfig::S3` 早已支持自定义 `endpoint`（path-style + `allow_http`，`§101`）。
+
+### 102.3 用例（`crates/datanode/tests/datanode_forms_e2e.rs`，进程层）
+
+`s3_cold_store_misconfiguration_is_refused`：照 metanode 的 `process_refuses_*` 写法，
+断言**退出码 + 点名的错误**（不只断言"失败"），并反证"没有建本地 `cold/`"。
+
+### 102.4 多节点 + 真实 S3：`scripts/s3_multinode_smoke.sh`
+
+把 `§98` 的形态（metanode 真进程 + 两个**可写**数据进程 + 并发真写 + 对拍）的冷存储换成
+**S3 端点**，并补"删本地 WAL 后冷读"一段：
+
+```text
+metanode（真进程，raft 落盘）
+  ▲ 注册/心跳                      ▲ 名录（含各自数据面地址）
+datanode A ──┐  各 --dir 私有    ┌── datanode B
+--sql-listen │  ┌──── S3 ────┐   │   --sql-listen
+真写 1,2,3 ──┴─►│ 同一个桶    │◄──┴─ 真写 4,5,6
+                └────────────┘
+ A 查 [1..6]                    B 查 [1..6]
+```
+
+实测（本机 SeaweedFS `http://127.0.0.1:8333`，桶 `yuntun-lake`）：
+
+| 段 | 结果 |
+|---|---|
+| ③ 目录同步 | A 建表（DDL 经 raft）后，B **1s 内**也看到该表（`spawn_reconcile` 每次都 `cache.refresh`） |
+| ⑤ 对拍 | A=[1,2,3,4,5,6]，B=[1,2,3,4,5,6]（**逐行相等、每行只出一次**；对方 3 行经数据面 gRPC 拉） |
+| ⑥ 写 S3 | 该表前缀下**恰好 2 个** parquet；两节点各自日志各 1 次 `chunk flushed` ⇒ **两个写者都 PUT 了** |
+| ⑦ 冷读 | 删各自 `wal/`+`spill/`、保留 metanode 目录重启 ⇒ 两边仍 `[1..6]` ⇒ 只能来自 S3 的 HTTP GET |
+
+一个必须写清楚的等待：数据进程用**生产默认的 seal/flush 节奏**（窗口关闭 seal + 确定性相位），
+3 行的批次要等窗口关闭或 `max_resident`(60s) 才落盘，脚本因此把"等 S3 出现对象"的上限放到 180s。
+**不为此加测试专用旋钮** —— 那会把"默认配置下真的能落盘"这条证据换掉。
+
+### 102.5 覆盖到哪、没覆盖到哪（如实说）
+
+- ✅ **覆盖**：多进程 + **真实 S3** 冷存储的"并发真写对拍"与"删 WAL 后冷读"；两个写者的文件
+  确实都进了同一个桶；
+- ⚠️ **未覆盖**：**跨机**（本刀与 `§101` 都是同机多进程；跨机差的是网络与时钟，不是这条链路）、
+  真云 S3（TLS / 签名 / 限流）、Multipart、S3 PUT 的绝对延迟与 P99；
+- ⚠️ **未覆盖**：脚本靠 `metanode` + 两个 `datanode` 真进程编排，**未进 CI**（需要外部 S3）——
+  与 `scripts/bench_multi.sh` 同属"手动 / 按需"档。
+
+### 102.6 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **378 passed / 0 failed / 0 ignored**
+  （基线 377 + 本刀 1）；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- `scripts/s3_multinode_smoke.sh` 对本地 SeaweedFS 连跑通过（三段 PASS，退出后无残留进程）；
+- 规模：47,642 行 / 20 个 crate / 377 个测试函数。
