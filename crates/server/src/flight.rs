@@ -283,9 +283,25 @@ impl FlightServer {
             .await
             .map_err(sql_status)?
         {
-            SqlStreamResult::Rows { schema, stream } => {
+            SqlStreamResult::Rows {
+                schema,
+                stream,
+                partial,
+            } => {
+                // 【§89】这里可以直接读 sink，因为**热读已经在物理计划期发生完了**：
+                // `TableProvider::scan`（fanout 就在里面）是**规划期**被调用的，
+                // 所以 `execute_stream` 返回时，"结果完不完整"已经是一个**事实**。
+                //
+                // （我一开始以为要"先把流推进一步"才敢读，还据此写了一段注释 —— 反证用例
+                // 把这一步删掉后**照样通过**，说明那个解释是错的：多余的一步删了，注释也改了。
+                // 教训：**先按机制写断言，再让反证告诉你机制是不是你想的那样**。）
+                //
+                // 把这个结论挂在 **schema 消息**的 `app_metadata` 上（Flight 侧唯一能放它的地方）：
+                // 这正是 `architecture §4.2` 要的"返回可用结果 + `partial: true` + 缺失来源列表"。
+                let meta = partial_metadata(&partial.read());
                 let flights = FlightDataEncoderBuilder::new()
                     .with_schema(schema)
+                    .with_metadata(meta)
                     .build(stream.map(|r| r.map_err(|e| FlightError::ExternalError(Box::new(e)))))
                     .map(|r| r.map_err(|e| Status::internal(format!("flight encode: {e}"))));
                 Ok(Response::new(Box::pin(flights)))
@@ -815,6 +831,41 @@ impl FlightService for FlightServer {
 // ------------------------------------------------------------- 路由辅助
 
 /// SqlError → tonic Status（sql-access-design §10.1 错误分类）。
+/// 把"结果完不完整"编码成 Flight 的 `app_metadata`（JSON）。
+///
+/// **完整时给空 metadata**（而不是 `{"partial":false}`）：
+/// 空 = 什么也没说，客户端不必为一个恒存在的字段做分支；而"部分结果"必须**显式且可点名** ——
+/// 否则用户拿到的就是一份自己以为完整、其实缺了来源的结果（`architecture §4.2` 第三、四条）。
+///
+/// 形状（示例）：
+/// ```json
+/// {"partial": true,
+///  "missing": [{"instance":"inst-b","table":"public.t","reason":"connection refused"}],
+///  "detail": "部分结果：缺 1 个来源（inst-b@public.t：connection refused）"}
+/// ```
+fn partial_metadata(read: &yuntun_query::PartialRead) -> prost::bytes::Bytes {
+    if !read.is_partial() {
+        return prost::bytes::Bytes::new();
+    }
+    let missing: Vec<serde_json::Value> = read
+        .missing()
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "instance": m.instance,
+                "table": m.table,
+                "reason": m.reason,
+            })
+        })
+        .collect();
+    let v = serde_json::json!({
+        "partial": true,
+        "missing": missing,
+        "detail": read.describe(),
+    });
+    prost::bytes::Bytes::from(v.to_string())
+}
+
 fn sql_status(e: SqlError) -> Status {
     use yuntun_sql::SqlError as E;
     match &e {

@@ -100,7 +100,23 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MysqlBackend {
     ) -> io::Result<()> {
         tracing::debug!(sql = %sql_snippet_short(sql), "wire cmd: COM_QUERY");
         match self.engine.execute(sql, &mut self.session).await {
-            Ok(SqlResult::Rows { schema, batches }) => {
+            // 【§89 的遗留，写在这里免得下一个人重新发现一遍】
+            //
+            // `rows.partial` 是"这份结果缺了来源"的结论（引擎已经把它算出来了），但
+            // **MySQL 的结果集里没有地方放它**：warning 计数在**结果集结束包（EOF）**里，
+            // 而 `opensrv` 的 `ResultSetWriter::finish()` 把它**写死为 0**
+            // （`opensrv-mysql-0.7.0/src/writers.rs`：`w.write_all(&[0x00, 0x00])?; // no warnings`）。
+            // 只有 OK 包（`OkResponse { warnings, .. }`）能带 —— 那是"无结果集"的语句才走的路径。
+            //
+            // 所以今天只能：**日志里有**（引擎侧已 warn）、**wire 上不给**。
+            // 要做全只有三条路：① 换/升级 opensrv（它给了带计数的 finish）；② 自己写结束包；
+            // ③ 走 `SHOW WARNINGS` + 客户端主动查（但客户端拿不到计数，就不会主动查）。
+            // 在这三条里选之前，**不假装已经交付**。
+            Ok(SqlResult::Rows {
+                schema,
+                batches,
+                partial: _,
+            }) => {
                 let cols = encode::columns_of(&schema);
                 let mut rw = results.start(&cols).await?;
                 for batch in &batches {
@@ -195,7 +211,11 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MysqlBackend {
             .execute_prepared(&stmt, &vals, &mut self.session)
             .await
         {
-            Ok(SqlResult::Rows { schema, batches }) => {
+            Ok(SqlResult::Rows {
+                schema,
+                batches,
+                partial: _, // 同上：结果集结束包放不下 warning 计数（opensrv 写死 0）
+            }) => {
                 let n: usize = batches.iter().map(|b| b.num_rows()).sum();
                 tracing::debug!(stmt_id = id, rows = n, "stmt execute result rows");
                 let cols = encode::columns_of(&schema);

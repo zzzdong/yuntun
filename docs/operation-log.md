@@ -5765,3 +5765,64 @@ STALE 也取**顺序上的第一个**（与串行时代逐字一致）。"错误
 - **wire 层仍未把 `partial` 交给用户**（MySQL warning / Flight SQL metadata）—— 现在只有日志与
   `sql_partial()` 的返回值；
 - **预算只覆盖热读**：冷 parquet 读（对象存储）不在其中，慢对象存储仍会拖住查询。
+
+---
+
+## 89. 把"结果不完整"交给用户：Flight SQL metadata（MySQL 被 opensrv 卡住）（2026-09-24）
+
+### 89.1 事实早就有了，只是一路被丢掉
+
+`§77` 起引擎就算得出"这次结果缺了哪些来源"。但从引擎到协议层这条路上，它被丢了三次：
+
+| 层 | 当时的状态 |
+|---|---|
+| `QueryEngine::sql_stream_with_schema` | 读 sink 的**时机**不对（流还没跑）⇒ 那句 `if partial.is_partial()` 的告警**恒不成立**（**一句恒假的日志比没有日志更糟**：它让人以为"流式路径从没缺过来源"） |
+| `SqlResult` / `SqlStreamResult` | **没有 partial 字段** ⇒ 结论到 SQL 层就消失 |
+| `flight.rs` / `sqlwire` | 只调 `sql_with_schema` ⇒ 协议层根本拿不到 |
+
+### 89.2 这一刀
+
+- `QueryEngine::sql_stream_with_partial` 交出 sink；
+- `SqlResult::Rows` 带 `PartialRead`、`SqlStreamResult::Rows` 带 `PartialWatch`
+  （**两种载体**，因为两条路拿到结论的**时机**不同：eager 路径"发第一行之前就知道"，
+  流式路径"流读完才知道"；用一个类型硬凑会让调用方在错误的时刻读到"完整"）；
+- **Flight**：结论挂到 **schema 消息**的 `app_metadata`
+  （`{"partial":true,"missing":[{"instance","table","reason"}],"detail":"…"}`；**完整时为空** —— 不许假警报）。
+
+### 89.3 一个我先写错、被反证纠正的解释（值得记）
+
+我原以为"读 sink 必须在流被第一次轮询之后"，于是加了一步 `peek` 并写了一整段注释解释这个时机。
+**反证把 `peek` 删掉 ⇒ 用例照样通过** ⇒ 我的解释是错的：`TableProvider::scan`（fanout 就在里面）
+是**规划期**调用的 ⇒ `execute_stream` 返回时结论**已经是事实**。
+于是删掉多余的一步、把注释改成真的。
+
+> **教训**：反证不只是"证明用例有效"，它也会**证伪你的解释**。
+> 先按机制写断言，再让反证告诉你机制是不是你以为的那样。
+
+### 89.4 MySQL 那一半：卡在 `opensrv`（如实记录，不假装交付）
+
+MySQL 的 warning 计数在**结果集结束包（EOF）**里，而 `opensrv-mysql-0.7.0` 的
+`ResultSetWriter::finish()` 把它**写死为 0**：
+`writers.rs`：`w.write_all(&[0x00, 0x00])?; // no warnings`。
+只有 OK 包（`OkResponse { warnings, .. }`）能带 —— 那是"无结果集"的语句才走的路径。
+
+三条出路（**都还没做**）：① 换/升级 `opensrv`；② 自己写结束包；③ 走 `SHOW WARNINGS` +
+客户端主动查（但客户端拿不到计数，就不会主动查）。
+**在那之前不假装已交付** —— 结论留在 `sqlwire` 的注释里，谁要做谁看得见。
+
+### 89.5 用例（真 gRPC + 真 Flight 客户端）
+
+| # | 场景 | 断言 |
+|---|---|---|
+| ① | 一个来源**读不到** | 结果照常返回（健康来源 3 行都在），**schema 消息** `app_metadata` 含 `"partial":true` + 点名 `inst-b` + 表名 + `connection refused` |
+| ② | 所有来源都读得到 | `app_metadata` **为空**（假警报同样是错：它会让调用方不敢信任何结果） |
+
+### 89.6 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **370 passed / 0 failed（+1 ignored）**
+- clippy 本仓 **0**；规模：46,548 行 / 20 个 crate / 370 测试函数
+
+### 89.7 遗留
+
+- **MySQL 结果集的 warning**（89.4，被 `opensrv` 卡住）；
+- `GetFlightInfo` 阶段还声明不了"完不完整"（那时确实还不知道 —— schema 消息已经是最早的时机）。

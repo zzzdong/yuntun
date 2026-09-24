@@ -659,6 +659,8 @@ fn strings_result(col_names: &[&str], rows: &[Vec<String>]) -> Option<SqlResult>
     Some(SqlResult::Rows {
         schema: batch.schema(),
         batches: vec![batch],
+        // shim 的 canned 结果不读热数据 ⇒ 恒完整（`§89`）
+        partial: yuntun_query::PartialRead::default(),
     })
 }
 

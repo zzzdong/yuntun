@@ -360,26 +360,43 @@ impl QueryEngine {
     }
 
     /// 按 schema 流式执行（多 schema：非限定表名解析到该 schema）。
+    ///
+    /// ⚠️ **流式路径在返回时还不知道结果完不完整**：热读发生在 `scan` 里，而 `scan` 要等流被
+    /// **真正消费**才跑。所以这里不声称完整与否 —— 想要这个事实，用
+    /// [`Self::sql_stream_with_partial`]，在流消费完之后读那个 sink。
+    ///
+    /// （`§89` 之前这里有一句 `if partial.is_partial()` 的告警：它在流还没被消费时读 sink，
+    /// 因而**永远不成立** —— 一句恒假的日志比没有日志更糟：它让人以为"流式路径从没缺过来源"。）
     pub async fn sql_stream_with_schema(
         &self,
         query: &str,
         schema: &str,
     ) -> Result<SendableRecordBatchStream, DataFusionError> {
+        Ok(self.sql_stream_with_partial(query, schema).await?.0)
+    }
+
+    /// 按 schema 流式执行，并交出记录"读不到哪些来源"的 sink（`§89`）。
+    ///
+    /// 与 [`Self::sql_with_partial`] 的差别只有一个：那边结果已经收集完，**此刻**就能给你
+    /// 一个结论；这边的结论要等**流读完**才成形 —— 所以给的是 sink 而不是 `PartialRead`。
+    pub async fn sql_stream_with_partial(
+        &self,
+        query: &str,
+        schema: &str,
+    ) -> Result<
+        (SendableRecordBatchStream, std::sync::Arc<PartialSink>),
+        DataFusionError,
+    > {
         // 同上：`scan` 在物理计划期被调用（热读就在那里），所以 STALE 会在 `execute_stream`
         // 这一步冒出来 —— 此时流还没被消费，重试是干净的。
-        let (stream, partial) = self
-            .with_stale_retry("sql_stream", || async {
-                // 与 `sql_with_partial` 同理：每尝试一个 sink，免得把完整结果误标为部分
-                let partial = std::sync::Arc::new(PartialSink::new(self.partial_policy));
-                let ctx = self.session_with_partial(schema, partial.clone()).await?;
-                let df = ctx.sql(query).await?;
-                Ok((df.execute_stream().await?, partial.read()))
-            })
-            .await?;
-        if partial.is_partial() {
-            tracing::warn!(detail = %partial.describe(), "sql_stream returned a PARTIAL result");
-        }
-        Ok(stream)
+        self.with_stale_retry("sql_stream", || async {
+            // 与 `sql_with_partial` 同理：每尝试一个 sink，免得把完整结果误标为部分
+            let partial = std::sync::Arc::new(PartialSink::new(self.partial_policy));
+            let ctx = self.session_with_partial(schema, partial.clone()).await?;
+            let df = ctx.sql(query).await?;
+            Ok((df.execute_stream().await?, partial))
+        })
+        .await
     }
 
     /// 已收集批次 → 流：非 DataFusion 产出（方言 shim 的 canned 结果、SHOW TABLES

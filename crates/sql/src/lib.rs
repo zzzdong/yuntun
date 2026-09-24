@@ -29,7 +29,7 @@ use yuntun_model::meta::serialize_schema;
 use yuntun_model::ops::CreateTableRequest;
 use yuntun_model::wal_record::{ddl_op, DdlPayload};
 pub use params::SqlValue;
-use yuntun_query::QueryEngine;
+use yuntun_query::{PartialRead, PartialSink, QueryEngine};
 
 /// SQL 执行错误（协议适配层负责映射到各自的回执：
 /// MySQL ERROR 码 / Flight Status / 未来 PG SQLSTATE）。
@@ -90,18 +90,52 @@ impl SqlError {
 /// 一次 SQL 执行的结果（协议适配层据此编码行 / 回执）。
 pub enum SqlResult {
     /// 结果集：schema 恒有值（空结果集也返回查询 schema，S1.5 一致性语义）
-    Rows { schema: SchemaRef, batches: Vec<RecordBatch> },
+    Rows {
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+        /// **结果完不完整**（`§89`）：eager 路径在返回前就把批次收齐了，
+        /// 所以这里给的是**结论**（缺了谁、为什么）。协议层负责把它交给用户。
+        partial: PartialRead,
+    },
     /// 受影响行数（INSERT / DDL / shim no-op）
     Affected(i64),
 }
 
 /// 流式执行结果（S1.10）：`Rows` 的主体为 DataFusion 流（边算边发），
 /// 供 `do_get` 等大结果集路径使用；MySQL wire 走 [`SqlResult`] 的 eager 路径。
+/// 流式结果里"完不完整"这件事的载体（`§89`）。
+///
+/// 两条路拿到的**时机**不同，所以不能共用一个类型：
+///
+/// - **eager 路径**（MySQL wire / shim / 小结果集）：批次已经收齐 ⇒ 直接给结论 [`PartialRead`]；
+/// - **流式路径**（Flight `do_get`）：热读发生在**流被消费时** ⇒ 只能给一个**句柄**，
+///   等流读完再读它。**流没跑之前读它一定会得到"完整"** —— 那是"还不知道"，不是"没问题"。
+#[derive(Debug, Clone)]
+pub enum PartialWatch {
+    /// 已是结论（eager 路径）。
+    Known(PartialRead),
+    /// 还没成形：读它之前必须先把流消费掉（流式路径）。
+    Pending(std::sync::Arc<PartialSink>),
+}
+
+impl PartialWatch {
+    /// 现在能给出的结论。`Pending` 且流未读完时它会**偏"完整"** —— 调用方须自己保证
+    /// "先消费流、再读它"（`§89` 的 Flight 路径正是先 `peek` 一步再读）。
+    pub fn read(&self) -> PartialRead {
+        match self {
+            PartialWatch::Known(r) => r.clone(),
+            PartialWatch::Pending(s) => s.read(),
+        }
+    }
+}
+
 pub enum SqlStreamResult {
     /// 结果集：schema 恒有值；空结果集时流不产出批次但 schema 可用
     Rows {
         schema: SchemaRef,
         stream: yuntun_query::SendableRecordBatchStream,
+        /// 完不完整的载体（见 [`PartialWatch`]）
+        partial: PartialWatch,
     },
     /// 受影响行数（INSERT / DDL / shim no-op）
     Affected(i64),
@@ -282,23 +316,29 @@ impl SqlEngine {
         // 只读查询 → DataFusion 物理计划流（真正的流式；非限定表名按会话 schema 解析）
         if let sqlparser::ast::Statement::Query(q) = &stmt {
             let text = q.to_string();
-            let stream = self
+            let (stream, partial) = self
                 .query
-                .sql_stream_with_schema(&text, session.schema())
+                .sql_stream_with_partial(&text, session.schema())
                 .await
                 .map_err(query_error)?;
             let schema = stream.schema();
-            return Ok(SqlStreamResult::Rows { schema, stream });
+            return Ok(SqlStreamResult::Rows {
+                schema,
+                stream,
+                // 句柄：**流读完**之后它才是结论（调用方负责时机）
+                partial: PartialWatch::Pending(partial),
+            });
         }
         // INSERT / DDL / SHOW TABLES：走既有 eager 分流（结果集小）
         let key = idempotency::extract(sql);
         match self.dispatch(stmt, session, key).await? {
-            RawOutcome::Rows(b) => Ok(eager_to_stream(SqlResult::Rows {
-                schema: b
+            RawOutcome::Rows { batches, partial } => Ok(eager_to_stream(SqlResult::Rows {
+                schema: batches
                     .first()
                     .map(|b| b.schema())
                     .unwrap_or_else(|| Arc::new(Schema::empty())),
-                batches: b,
+                batches,
+                partial,
             })),
             RawOutcome::Affected(n) => Ok(SqlStreamResult::Affected(n)),
         }
@@ -381,16 +421,18 @@ impl SqlEngine {
     /// 结果集收尾：空批次时回填查询 schema（G7 兼容：与 GetFlightInfo 一致）。
     async fn finish(&self, outcome: RawOutcome, sql: &str, schema: &str) -> SqlResult {
         match outcome {
-            RawOutcome::Rows(b) if !b.is_empty() => SqlResult::Rows {
-                schema: b[0].schema(),
-                batches: b,
+            RawOutcome::Rows { batches, partial } if !batches.is_empty() => SqlResult::Rows {
+                schema: batches[0].schema(),
+                batches,
+                partial,
             },
-            RawOutcome::Rows(_) => SqlResult::Rows {
+            RawOutcome::Rows { partial, .. } => SqlResult::Rows {
                 schema: self
                     .schema_of_in(sql, schema)
                     .await
                     .unwrap_or_else(|| Arc::new(Schema::empty())),
                 batches: Vec::new(),
+                partial,
             },
             RawOutcome::Affected(n) => SqlResult::Affected(n),
         }
@@ -478,19 +520,25 @@ impl SqlEngine {
             Statement::Query(q) => {
                 // 只读查询 → DataFusion（非限定表名按会话 schema 解析，G2 + 多 schema）
                 let text = q.to_string();
-                let batches = self
+                // 【§89】用**带 partial 的版本**：`sql_with_schema` 会把"缺了来源"这件事
+                // 只写进日志，协议层就永远拿不到它（这正是本刀要修的那条断路）。
+                let out = self
                     .query
-                    .sql_with_schema(&text, session.schema())
+                    .sql_with_partial(&text, session.schema())
                     .await
                     .map_err(query_error)?;
-                Ok(RawOutcome::Rows(batches))
+                Ok(RawOutcome::Rows {
+                    batches: out.batches,
+                    partial: out.partial,
+                })
             }
             Statement::ShowTables { .. } => {
                 let names = self.list_tables_in(session.schema()).await?;
-                Ok(RawOutcome::Rows(vec![sql::show_tables_batch(
-                    session.schema(),
-                    &names,
-                )]))
+                Ok(RawOutcome::Rows {
+                    batches: vec![sql::show_tables_batch(session.schema(), &names)],
+                    // 元数据类结果不读热数据 ⇒ 恒完整
+                    partial: PartialRead::default(),
+                })
             }
             Statement::ShowDatabases { .. } => {
                 let rows: Vec<Vec<String>> = self
@@ -499,10 +547,10 @@ impl SqlEngine {
                     .into_iter()
                     .map(|s| vec![s])
                     .collect();
-                Ok(RawOutcome::Rows(vec![sql::strings_batch(
-                    &["Database"],
-                    &rows,
-                )]))
+                Ok(RawOutcome::Rows {
+                    batches: vec![sql::strings_batch(&["Database"], &rows)],
+                    partial: PartialRead::default(),
+                })
             }
             // CREATE DATABASE / CREATE SCHEMA（多 schema）
             Statement::CreateDatabase {
@@ -740,9 +788,15 @@ fn query_error(e: impl std::fmt::Display) -> SqlError {
 /// eager 结果 → 流式结果（shim canned / SHOW TABLES / 小结果集的统一出口）。
 fn eager_to_stream(res: SqlResult) -> SqlStreamResult {
     match res {
-        SqlResult::Rows { schema, batches } => SqlStreamResult::Rows {
+        SqlResult::Rows {
+            schema,
+            batches,
+            partial,
+        } => SqlStreamResult::Rows {
             stream: QueryEngine::stream_from_batches(schema.clone(), batches),
             schema,
+            // eager 路径已经有结论 ⇒ 直接给结论（不必等流跑完）
+            partial: PartialWatch::Known(partial),
         },
         SqlResult::Affected(n) => SqlStreamResult::Affected(n),
     }
@@ -750,7 +804,11 @@ fn eager_to_stream(res: SqlResult) -> SqlStreamResult {
 
 /// dispatch 的原始产出（execute 负责补 schema / 包成 SqlResult）。
 pub(crate) enum RawOutcome {
-    Rows(Vec<RecordBatch>),
+    Rows {
+        batches: Vec<RecordBatch>,
+        /// 结果完不完整（`§89`）：非查询类产出恒完整
+        partial: PartialRead,
+    },
     Affected(i64),
 }
 
