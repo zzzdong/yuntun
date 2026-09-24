@@ -6341,3 +6341,76 @@ manifest"**只有调用方知道** —— 让它把集合带过来最省也最�
 
 - 纯文档 + 文档注释：全量 `cargo test --workspace --no-fail-fast -j 4` → 377 passed / 0 failed；
   `cargo clippy --workspace --all-targets` 本仓告警 0。
+
+---
+
+## 101. 真实对象存储（S3）验证：本地 SeaweedFS 上的**网络读写**（2026-09-24）
+
+### 101.1 为什么要做
+
+`§37` 的多节点基线是**本机多进程共享目录**（`--cold-root`）——它恰好绕过了对象存储真实存在的
+那部分：HTTP PUT/GET、寻址/鉴权、重试、以及"flush 的持久化上界"里的真实延迟。
+`status.md §6` 因此把「真实 S3/MinIO + 跨机」列为里程碑门槛之外的**第一项**。
+本刀先把其中**"真实 S3 的读写"这一半**做掉（跨机仍留）。
+
+### 101.2 形态：本机 SeaweedFS（S3 兼容），**代码零改动**
+
+```text
+weed server -s3 -s3.autoCreateBucket -dir=/tmp/yuntun-seaweedfs \
+     -ip=127.0.0.1 -ip.bind=127.0.0.1      # 8333=S3 / 9333=master / 8080=volume / 8888=filer
+yuntun --config <[store] type="s3" endpoint="http://127.0.0.1:8333" …>
+```
+
+`StoreConfig::S3` 早已支持自定义 `endpoint`，`create_store` 用的是 **path-style**
+（`with_virtual_hosted_style_request(false)`）+ `allow_http` —— 正是 SeaweedFS/MinIO 需要的形态；
+`object_store` 的 region 缺省 `us-east-1`（builder 实测），无需配置。
+
+### 101.3 踩到的坑：`-ip` 与 `-ip.bind` 必须一致（**运维向，不是本仓 bug**）
+
+第一次 PUT **全部 500**。SeaweedFS 日志给出真因：
+
+```text
+chunked upload failed: upload 517 bytes to http://192.168.3.55:8080/8,8d28a91a7d:
+  dial tcp 192.168.3.55:8080: connect: connection refused
+```
+
+只给 `-ip.bind=127.0.0.1`、**没给 `-ip`** ⇒ volume server **绑 127.0.0.1、却向 master 广播
+`<机器IP>:8080`**，S3 网关按广播地址传 chunk → 拒连。**修法：两者一致**（本机测试都给 `127.0.0.1`）。
+
+顺带两条观察，都是**正确行为**（留档，免得下次误判成缺陷）：
+- S3 持续 500 时 yuntun 的行为：`flush failed (batch left non-terminal…)`，**批次保持非终态**
+  （WAL 是权威），带退避重试（10 次 / ~5.4s）——**没有静默丢或重**；
+- 残留实例会占住 `[meta] dir` 的 fjall 锁 ⇒ 第二个实例**响亮失败**（`FjallError: Locked`）。
+
+### 101.4 结果：写与读**都走网络**
+
+| 方向 | 证据 |
+|---|---|
+| **写（HTTP PUT）** | `INSERT 3 行` → flush 后桶里**新增** `yuntun/public/s3smoke/dt=…/shard=default/<uuid>.parquet`（517 bytes），直接列举桶可见 |
+| **热读** | 写后 ≤1 个 scan 周期（本配置 50ms）查得 3 行（立刻查会看到空——文档承诺的可见性上界，不是缺陷） |
+| **冷读（HTTP GET）** | **删掉 WAL + spill**、保留 meta 后重启（chunk store 全空）⇒ 仍查得 **3 行** —— 只可能来自 S3 |
+
+### 101.5 沉淀：`scripts/s3_smoke.sh`
+
+上面四步固化成脚本（`S3_ENDPOINT` / `S3_BUCKET` 可配；跑完自动清理进程）：
+
+```bash
+S3_ENDPOINT=http://127.0.0.1:8333 S3_BUCKET=yuntun-lake scripts/s3_smoke.sh
+```
+
+**脚本自身踩过一个坑（留档）**：`( cd … && nohup … & echo $! )` 里的 `$!` 可能拿到**中途退出的
+子 shell** 的 PID ⇒ `cleanup` 杀不掉真进程 ⇒ 残留实例占住 fjall 锁、下一次启动失败（上一条现象）。
+改成直接后台起 + 按"配置路径" `pkill` 兜底。
+
+### 101.6 覆盖到哪、没覆盖到哪（如实说）
+
+- ✅ **覆盖**：path-style 寻址、HTTP 明文、`PUT` / `GET` / `ListObjectsV2`、单节点「写入 → 冷读」闭环；
+  「flush 真的走网络」与「冷读真的走网络」各有独立证据；
+- ⚠️ **未覆盖**：**真云 S3**（TLS / 签名 / 区域 endpoint / 503 退避语义）、**跨机**（本刀同机）、
+  Multipart（本仓仍是单段 PUT，`§7.4` 遗留）、大对象与 S3 PUT 的**绝对延迟/P99**（本刀 517 B）、
+  S3 侧限流的长期行为（只观察到一次持续 500 的正确降级）。
+
+### 101.7 验证
+
+- `scripts/s3_smoke.sh` 连跑 2 次：写 / 热读 / 冷读三段全 PASS，退出后无残留进程；
+- 纯脚本 + 文档，无 Rust 代码改动 ⇒ 全量 `cargo test` 不受影响（377 passed / 0 failed 未变）。

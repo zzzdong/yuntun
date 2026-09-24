@@ -232,6 +232,7 @@ scripts/.venv/bin/pip install -r scripts/requirements.txt -i https://mirrors.ali
 | `scripts/pymysql_smoke.py <mysql地址>` | MySQL wire：T1 文本协议（DDL/INSERT/SELECT/SHOW/错误码 1146）+ T2 预编译 |
 | `scripts/flight_stream_smoke.py <flight地址> <表> [批数 行数]` | Flight `do_get` 流式（S1.10）：灌数 + ADBC 流式读取 + 服务端 RSS 采样（`0 0` = 只读模式） |
 | `scripts/dbeaver_jdbc_probe.java` | DBeaver / JDBC：T3 元数据与预览（需 `javac` + Connector/J） |
+| `scripts/s3_smoke.sh` | 真实 S3（SeaweedFS / MinIO）**网络读写**：flush → HTTP PUT 可见于桶；**删 WAL** 重启后冷读 → HTTP GET。`S3_ENDPOINT` / `S3_BUCKET` 可配（见 `docs/operation-log.md` §101） |
 
 ---
 
