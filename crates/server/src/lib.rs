@@ -649,13 +649,25 @@ pub async fn serve_flight(
     let addr = listen
         .parse::<std::net::SocketAddr>()
         .map_err(|e| format!("invalid listen addr {listen}: {e}"))?;
-    tracing::info!(%addr, "flight server listening (do_put ingest + do_get sql)");
+    // **先自己 bind**，理由有两层：
+    //
+    // 1. **接口行**：`LISTEN <addr>` 是编排/测试读的**契约**（与数据进程 `LISTEN`、metanode 同形），
+    //    —— 它必须是**真实绑定地址**：配置里写 `:0` 时那个 "0" 对调用方毫无用处；
+    // 2. 因此不能用 `serve_with_shutdown(addr, ..)`（它自己 bind、只在日志里回显配置值）：
+    //    日志是给人看的，**接口是给机器读的**，两者不能互相替代。
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let bound = listener.local_addr()?;
+    println!("LISTEN {bound}");
+    tracing::info!(%bound, "flight server listening (do_put ingest + do_get sql)");
     tonic::transport::Server::builder()
         .add_service(svc)
-        .serve_with_shutdown(addr, {
-            let token = lakehouse.shutdown.clone();
-            async move { token.cancelled().await }
-        })
+        .serve_with_incoming_shutdown(
+            tokio_stream::wrappers::TcpListenerStream::new(listener),
+            {
+                let token = lakehouse.shutdown.clone();
+                async move { token.cancelled().await }
+            },
+        )
         .await?;
     Ok(())
 }

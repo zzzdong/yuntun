@@ -15,14 +15,14 @@
 - **Standalone**：**可交付的本地时序/可观测数据库**（单二进制 + 一份 TOML 即可用，两个 SQL 协议端口）。
 - **分布式**：**数据平面地基已打完**（拆进程零返工的部分）；**控制平面为 0 起步**
   （不是"把本地调用换成 gRPC"，而是新增语义：成员/租约/快照/水位传播）。
-- **质量网**：371 用例全绿（+1 ignored） / clippy 0 警告（**全仓**，非热缓存读数）/ chaos **11/11** / T8 基线已入库 / 五个真缺陷已抓出（4 修 1 待）。
+- **质量网**：372 用例全绿（+1 ignored） / clippy 0 警告（**全仓**，非热缓存读数）/ chaos **11/11** / T8 基线已入库 / 五个真缺陷已抓出（4 修 1 待）。
 - **对外口径**：单机可实际使用；**多节点只能算实验性部署**（必须单写者 + 不开后台作业竞争）。
 
 ---
 
 ## 2. 能力矩阵（standalone 今天能做到什么）
 
-规模：**46,698 行 Rust / 20 个 crate / 371 个测试函数 / 371 个用例通过（+1 ignored） / clippy 0 警告**
+规模：**46,875 行 Rust / 20 个 crate / 372 个测试函数 / 372 个用例通过（+1 ignored） / clippy 0 警告**
 工具链：**rustc 1.98.1 + edition 2024**（20 个 crate 全走 `edition.workspace = true`；见 `operation-log §59`）；
 **MSRV 声明 `1.94`**（下界由依赖 `datafusion 55` 决定，**不是** policy 想取的 1.92；**尚未经真·1.94 编译验证**，见 `§60`）。
 全仓仅余 1 条**外部依赖**告警（`proc-macro-error2 v2.0.1`，来自 `opensrv-mysql`，非本仓代码）。
@@ -87,7 +87,7 @@ MySQL 端口 **trust 无鉴权**（按网络隔离部署）；MySQL 轨结果集
 
 | 层 | 证据 | 位置 |
 |---|---|---|
-| 单元 / 集成 | **371 passed / 0 failed**；371 个测试函数；`clippy --workspace --all-targets` 0 警告（本仓） | `cargo test --workspace` |
+| 单元 / 集成 | **372 passed / 0 failed**；372 个测试函数；`clippy --workspace --all-targets` 0 警告（本仓） | `cargo test --workspace` |
 | chaos（真实磁盘 + 跨重启 + 并发） | **11/11** 场景；进程中抓出**五个真缺陷** | `crates/chaos` 模块文档 + `operation-log §27–§31` |
 | 性能基线 | 提交时刻分布 / 峰值提交数 / `seal→committed` / 文件数·天 / 单文件行数 | `operation-log §32`（`bench_baseline`） |
 | 阈值与背压基线 | 账本口径 B/行 / 内存水位峰值 / 背压档 / RowGroup 数 / 单文件字节 | `operation-log §33`（同程序，`pad`/`bytes_threshold`/读者开关） |

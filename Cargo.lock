@@ -5665,11 +5665,15 @@ dependencies = [
 name = "yuntun-standalone"
 version = "0.1.0"
 dependencies = [
+ "arrow",
+ "arrow-flight",
  "clap",
+ "futures",
  "serde",
  "tokio",
  "tokio-util",
  "toml",
+ "tonic",
  "tracing",
  "tracing-subscriber",
  "yuntun-server",
