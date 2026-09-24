@@ -39,6 +39,7 @@
 //! cache_ttl_secs = 30
 //! partial = "allow"                  # 读不到某个来源时：allow（默认，返回部分结果 + 标记）
 //!                                    # 或 reject（当场失败并点名缺了谁）
+//! hot_read_budget_secs = 10          # 整段热读的总预算（超时即按"拿不到"降级；0 = 非法）
 //!
 //! [sql.mysql]
 //! enabled = true
@@ -288,6 +289,11 @@ pub struct QuerySection {
     /// `reject` = 当场失败并点名缺了谁。
     /// 用字符串而不是枚举：配置面保持窄（解析失败会在启动时**报错退出**，见装配层）。
     pub partial: String,
+    /// **整段热读的总预算**（秒，`§88`）：一次查询在热数据上最多等多久。
+    ///
+    /// 与 `partial` 同一条纪律：**写错（0）启动即报错** —— 预算为 0 等于"所有热读都超时"，
+    /// 那不是一个配置，是一个把 partial 恒真的开关，静默接受它会让用户以为"我配的是完整的"。
+    pub hot_read_budget_secs: u64,
 }
 
 impl Default for QuerySection {
@@ -295,6 +301,7 @@ impl Default for QuerySection {
         Self {
             cache_ttl_secs: 30,
             partial: "allow".into(),
+            hot_read_budget_secs: 10,
         }
     }
 }

@@ -420,6 +420,16 @@ async fn build_embedded_catalog(
                 cfg.query.partial
             ))
         })?;
+        // 热读总预算（`§88`）：0 是非法值（等于把所有热读都判成超时，partial 恒真）。
+        if cfg.query.hot_read_budget_secs == 0 {
+            return Err(yuntun_model::error::LakeError::Other(
+                "invalid [query] hot_read_budget_secs = 0: 它等于\"所有热读都超时\"，\
+                 请给正整数（默认 10）"
+                    .into(),
+            ));
+        }
+        let hot_read_budget =
+            std::time::Duration::from_secs(cfg.query.hot_read_budget_secs);
         // query 执行区内存池 = 另一块独立预算，超限直接报错而不抢 chunk 内存（架构 §2.8）
         let query = Arc::new(
             QueryEngine::with_query_memory_limit(
@@ -430,7 +440,8 @@ async fn build_embedded_catalog(
             .map_err(|e| {
                 yuntun_model::error::LakeError::Other(format!("query memory partition: {e}"))
             })?
-            .with_partial_policy(partial),
+            .with_partial_policy(partial)
+            .with_hot_read_budget(hot_read_budget),
         );
 
         // ⑦ SqlEngine（SQL 语义唯一实现；MySQL wire / Flight 共用同一份能力句柄）

@@ -9,6 +9,14 @@
 //! | ③ | 所有来源都读得到 | **不许**误标 partial（假警报也是错） |
 //! | ④ | 某个来源**永远 STALE** | **仍然刷新重试 → 响亮失败**，**绝不**降级成 partial |
 //!
+//! `§88` 又加了三条（扇出的形状本身）：
+//!
+//! | # | 场景 | 期望 |
+//! |---|---|---|
+//! | ⑤ | 多个来源都**慢** | 等待是 `max(各来源)` 而不是**相加**（并发扇出） |
+//! | ⑥ | 来源慢过**总预算** | 按"拿不到"降级 + 点名"超出热读预算"（预算是查询说了算的上界） |
+//! | ⑦ | 多个来源同时 STALE | 报错**顺序确定**（取 `BTreeMap` 键序里的第一个）—— 并发不许改语义 |
+//!
 //! ④ 是这四条的护栏：把"拿不到"降级为可标记的部分结果**是**设计要的（`architecture §4.2`），
 //! 但**顺手把 STALE 也降级**就等于把"可修复的落后"当成永久缺失 —— 静默少数据，正是
 //! `§63.3` / `§67` 反复抓到的那个错误形状。STALE 与失败在代码里**本来就分处两个通道**
@@ -97,6 +105,43 @@ impl ShardReader for AlwaysStale {
     }
 }
 
+/// **慢但会答**的来源：`delay` 之后返回 `rows` 行。
+///
+/// 覆写 `read_table`（trait 的默认实现是"枚举 + 逐分片 + 取水位"）：这里要的是一个
+/// **可控的等待**，用来观察"多个来源的等待是**相加**还是**取最大**"。
+#[derive(Debug)]
+struct SlowButAnswers {
+    delay: Duration,
+    rows: Vec<i64>,
+}
+
+#[async_trait]
+impl ShardReader for SlowButAnswers {
+    fn tier(&self) -> ShardTier {
+        ShardTier::Memory
+    }
+    fn version(&self) -> u64 {
+        0
+    }
+    async fn shards_of(&self, _table: &str) -> Result<Vec<ShardId>, LakeError> {
+        Ok(vec![shard_id()])
+    }
+    async fn read_shard(&self, _id: &ShardId, known: u64) -> Result<ShardRead, LakeError> {
+        Ok(ShardRead::empty(known, known))
+    }
+    async fn watermark(&self, known: u64) -> Result<ShardRead, LakeError> {
+        Ok(ShardRead::empty(known, known))
+    }
+    async fn read_table(&self, _table: &str, known: u64) -> Result<ShardRead, LakeError> {
+        tokio::time::sleep(self.delay).await;
+        Ok(ShardRead {
+            batches: vec![batch(&self.rows)],
+            flushed_watermark: known,
+            stale: false,
+        })
+    }
+}
+
 // ---------------------------------------------------------------- 夹具
 
 /// 造一个"实例"的 chunk store（宽松策略：数据**留在热副本里**，被测的是读侧）。
@@ -144,6 +189,15 @@ async fn engine_with(
     policy: PartialPolicy,
     sources: Vec<(&str, Arc<dyn ShardReader>)>,
 ) -> QueryEngine {
+    engine_with_budget(policy, sources, yuntun_query::DEFAULT_HOT_READ_BUDGET).await
+}
+
+/// 同 [`engine_with`]，但显式给**整段热读的总预算**（`§88`）。
+async fn engine_with_budget(
+    policy: PartialPolicy,
+    sources: Vec<(&str, Arc<dyn ShardReader>)>,
+    budget: Duration,
+) -> QueryEngine {
     let catalog: Arc<dyn CatalogOps> = Arc::new(MemoryCatalog::new());
     create_table(&catalog).await;
 
@@ -163,7 +217,9 @@ async fn engine_with(
     }
     cache.refresh(&catalog).await.unwrap();
 
-    QueryEngine::new(create_store(&StoreConfig::Memory).unwrap(), cache).with_partial_policy(policy)
+    QueryEngine::new(create_store(&StoreConfig::Memory).unwrap(), cache)
+        .with_partial_policy(policy)
+        .with_hot_read_budget(budget)
 }
 
 fn values(batches: &[RecordBatch]) -> Vec<i64> {
@@ -305,5 +361,118 @@ async fn stale_is_retried_then_fails_loudly_never_downgraded_to_partial() {
     assert!(
         !msg.contains("拒绝部分结果"),
         "STALE 被当成了 partial（两条通道被混为一谈）：{msg}"
+    );
+}
+
+// ---------------------------------------------------------------- ⑤ 并发扇出
+
+/// **多个慢来源的等待必须取最大，而不是相加**（`§88`）。
+///
+/// 串行 `for` 的时代，3 个各 200ms 的来源要让查询等 600ms —— 而它们之间**毫无依赖**。
+/// 这条用例直接把"扇出的形状"钉在时间上：串行版本必然失败（3×200ms > 400ms 阈值）。
+///
+/// 阈值取得宽（200ms 的并行实现 vs 400ms 的界）：它要的是**区分相加与取最大**，
+/// 不是测某台机器的快。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_sources_wait_in_parallel_not_in_sequence() {
+    let slow = |rows: Vec<i64>| -> Arc<dyn ShardReader> {
+        Arc::new(SlowButAnswers {
+            delay: Duration::from_millis(200),
+            rows,
+        })
+    };
+
+    let engine = engine_with_budget(
+        PartialPolicy::Allow,
+        vec![
+            ("inst-a", slow(vec![1])),
+            ("inst-b", slow(vec![2])),
+            ("inst-c", slow(vec![3])),
+        ],
+        Duration::from_secs(5), // 预算不参与：这条只测"并行 vs 串行"
+    )
+    .await;
+
+    let t0 = std::time::Instant::now();
+    let out = engine.sql_partial(QUERY).await.expect("三个来源最终都会答");
+    let elapsed = t0.elapsed();
+
+    assert_eq!(values(&out.batches), vec![1, 2, 3], "并发不许改变结果");
+    assert!(!out.is_partial(), "都答上来了，不该标 partial");
+    assert!(
+        elapsed < Duration::from_millis(400),
+        "等待应当是 max(各来源) 而不是相加：3 × 200ms 串行会到 600ms，实测 {elapsed:?}"
+    );
+}
+
+// ---------------------------------------------------------------- ⑥ 总预算
+
+/// **来源慢过总预算** ⇒ 按"拿不到"降级 + 点名"超出热读预算"（`§88`）。
+///
+/// 并发只把 `N ×` 变成 `max(·)`；**单个**来源仍可能慢到自己的传输超时。预算就是
+/// `max(·)` 之上的硬上界 —— 由**查询**说了算，而不是由传输层或对端决定。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn budget_above_which_sources_degrade_to_partial() {
+    let slow = |rows: Vec<i64>| -> Arc<dyn ShardReader> {
+        Arc::new(SlowButAnswers {
+            delay: Duration::from_secs(2), // 远慢于预算
+            rows,
+        })
+    };
+
+    let engine = engine_with_budget(
+        PartialPolicy::Allow,
+        vec![
+            ("inst-a", slow(vec![1])),
+            ("inst-b", slow(vec![2])),
+        ],
+        Duration::from_millis(150),
+    )
+    .await;
+
+    let t0 = std::time::Instant::now();
+    let out = engine
+        .sql_partial(QUERY)
+        .await
+        .expect("预算耗尽 ⇒ 降级（Allow），不是整体失败");
+    let elapsed = t0.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "预算必须真的截断等待（来源要 2s，预算 150ms）：实测 {elapsed:?}"
+    );
+    assert!(out.is_partial(), "超预算的来源是“拿不到” ⇒ 必须标记");
+    let missing = out.partial.missing();
+    assert_eq!(missing.len(), 2, "两个来源都超预算：{missing:?}");
+    assert!(
+        missing.iter().all(|m| m.reason.contains("热读预算")),
+        "原因要说清是预算截断，而不是“连接失败”：{missing:?}"
+    );
+}
+
+// ---------------------------------------------------------------- ⑦ 并发下的语义不变
+
+/// **并发不许改语义**：多个来源同时 STALE 时，报错取 `BTreeMap` 键序里的**第一个**
+/// （与串行时代逐字一致）—— 否则同一个查询在两次运行里会报出不同的来源名。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_error_is_deterministic_under_concurrency() {
+    let engine = engine_with(
+        PartialPolicy::Allow,
+        vec![
+            ("inst-a", Arc::new(AlwaysStale) as Arc<dyn ShardReader>),
+            ("inst-b", Arc::new(AlwaysStale) as Arc<dyn ShardReader>),
+        ],
+    )
+    .await;
+
+    let e = engine
+        .sql_partial(QUERY)
+        .await
+        .expect_err("永久 STALE ⇒ 失败");
+    let msg = e.to_string();
+    assert!(msg.contains("STALE"), "{msg}");
+    assert!(
+        msg.contains("inst-a") && !msg.contains("inst-b"),
+        "两个来源同时 STALE 时，错误必须**确定地**取键序第一个（inst-a）：{msg}"
     );
 }

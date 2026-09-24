@@ -115,6 +115,13 @@ struct Args {
     /// 数据面 RPC 超时（秒）：超过它即视为"无响应"，该来源按 `§4.3` 降级
     #[arg(long, default_value_t = 5)]
     hot_read_timeout_secs: u64,
+    /// **整段热读的总预算**（秒，`§88`）：一次查询在热数据上最多等多久（0 = 非法）。
+    ///
+    /// 与 `--hot-read-timeout-secs` 是两层：那个是"**一个 RPC** 最多等多久"，
+    /// 这个是"**这次查询**愿意为热数据等多久"。扇出已并发（等待取最大而非相加），
+    /// 预算就是这个最大之上的硬上界。
+    #[arg(long, default_value_t = 10)]
+    hot_read_budget_secs: u64,
     /// 额外承担**压缩 + 孤儿 GC**（仅 ingest 形态；默认关）。
     ///
     /// ⚠️ 多数据节点时**只应有一个**打开它：合并的"读 → 合并 → 提交"窗口没有租约，
@@ -402,6 +409,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             )
         })?;
         let hot_read_timeout = Duration::from_secs(args.hot_read_timeout_secs);
+        // 0 = 非法（等于把所有热读都判成超时）⇒ 启动即报错，不静默取默认
+        if args.hot_read_budget_secs == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid --hot-read-budget-secs 0: 它等于\"所有热读都超时\"，请给正整数（默认 10）",
+            )
+            .into());
+        }
+        let hot_read_budget = Duration::from_secs(args.hot_read_budget_secs);
 
         let cache = Arc::new(LocalCatalog::new());
         cache.set_catalog_ops(catalog.clone());
@@ -420,7 +436,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
 
         let engine = Arc::new(
-            QueryEngine::new(store.clone(), cache).with_partial_policy(partial),
+            QueryEngine::new(store.clone(), cache)
+                .with_partial_policy(partial)
+                .with_hot_read_budget(hot_read_budget),
         );
         let listener = TcpListener::bind(sql_listen).await?;
         let addr = listener.local_addr()?;

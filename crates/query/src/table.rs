@@ -66,6 +66,21 @@ use datafusion_datasource_parquet::source::ParquetSource;
 use std::sync::Arc;
 use crate::cache::HotShards;
 use crate::partial::{MissingSource, PartialSink};
+use std::time::Duration;
+
+/// 单个来源的热读结果 —— **够用就好**的三态。
+///
+/// 三态刻意分开，因为处置完全不同（`§77`/`§88` 的全部）：
+/// - [`SourceOutcome::Read`] = 拿到了；
+/// - [`SourceOutcome::Missing`] = **拿不到**（连不上 / 出错 / 超预算）⇒ 降级为部分结果并点名；
+/// - [`SourceOutcome::Stale`] = **还没拿到**（答的是"我的水位超前"）⇒ 刷新重试，**不可降级**。
+enum SourceOutcome {
+    Read(Vec<arrow::record_batch::RecordBatch>),
+    Missing(String),
+    Stale(HotReadStale),
+}
+
+
 
 /// 一张 yuntun 表的 DataFusion 视图（**绑定在某个不可变 Catalog 快照上**）。
 #[derive(Debug)]
@@ -82,6 +97,11 @@ pub struct YuntunTableProvider {
     /// 读不到的来源往这里记（**每查询一个**）：`Allow` ⇒ 降级为部分结果并标记，
     /// `Reject` ⇒ 当场失败点名（`crate::partial`）。
     partial: Arc<PartialSink>,
+    /// **整段热读的总预算**（`§88`）：超过它还没答的来源按"拿不到"处理（降级 + 点名）。
+    ///
+    /// 与 `§78` 的**传输层超时**不是一回事：那个是"**一个 RPC** 最多等多久"，
+    /// 这个是"**这次查询**愿意为热数据等多久"。
+    hot_read_budget: Duration,
 }
 
 impl YuntunTableProvider {
@@ -91,6 +111,7 @@ impl YuntunTableProvider {
         schema: arrow::datatypes::SchemaRef,
         hot: HotShards,
         partial: Arc<PartialSink>,
+        hot_read_budget: Duration,
     ) -> Self {
         Self {
             snapshot,
@@ -100,6 +121,7 @@ impl YuntunTableProvider {
                 .unwrap_or_else(|_| ObjectStoreUrl::local_filesystem()),
             hot,
             partial,
+            hot_read_budget,
         }
     }
 }
@@ -132,52 +154,80 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
         //
         // **按实例逐个拉**（`architecture §4.4`：冷热边界按实例二维切分）：每个实例有**自己的**
         // "已放弃本地副本的水位"，都用查询的快照版本去问，各自回答自己是否 STALE。
-        // 键有序（`BTreeMap`）⇒ 批次拼接顺序确定 ⇒ 结果可复现。
-        for (instance, reader) in &self.hot {
-            // 【T13.4】热读**失败**（连接拒绝 / 超时 / 内部错误）= "**拿不到**"：
-            // 按 `architecture §4.2/§4.3` 降级为**部分结果**并把来源记下来，
-            // `Reject` 策略下 `record` 会当场返回错误（点名缺了谁）。
-            //
-            // ⚠️ 这**不是** STALE 那条路，两者绝不可混同：STALE 是成员**答上来了**、
-            // 且答的是"我的水位超前于你的 manifest"（走下面 `read.stale`）—— 那是
-            // "**还没拿到**"（刷新 manifest 就拿到了），必须重试，**降级它等于静默少数据**。
-            let read = match reader.read_table(&self.ident, self.snapshot.snapshot).await {
-                Ok(r) => r,
-                Err(e) => {
+        //
+        // 【`§88`：并发 + 预算 —— 两件事必须一起做】
+        //
+        // - **并发**：以前是串行 `for` ⇒ N 个慢来源的等待**相加**（`N × 单次超时`）。
+        //   并发之后，热读阶段的等待是 `max(各来源)`，**与实例数无关** —— 这才是扇出该有的形状。
+        // - **预算**：并发只把 `N ×` 变成 `max(·)`；**单个**来源仍可能慢到它自己的传输超时
+        //   （`§78`：每个 RPC 5s，一个来源最坏数个 RPC）。预算是**整段热读**的上界，
+        //   由**查询**说了算 —— 别让传输层越权代替"这次查询愿意等多久"。
+        //
+        // ⚠️ **并发不改变结果**：装配严格按 `self.hot` 的键序（`BTreeMap`）进行 ——
+        // 谁先返回只影响"什么时候"，不影响"拼成什么样"；STALE 也取**顺序上的第一个**
+        // （与串行时代的语义逐字一致）。这是本仓的确定性纪律。
+        //
+        // ⚠️ 与 STALE 的边界一个字没动：预算耗尽 / 读失败都是"**拿不到**"（降级 + 标记），
+        // 而 STALE 是"**还没拿到**"（必须刷新重试）—— 它照样让整次尝试失败。
+        let budget = self.hot_read_budget;
+        let deadline = tokio::time::Instant::now() + budget;
+        let outcomes = futures::future::join_all(self.hot.iter().map(|(instance, reader)| {
+            let instance = instance.clone();
+            let reader = reader.clone();
+            let ident = self.ident.clone();
+            let snapshot = self.snapshot.snapshot;
+            async move {
+                let outcome = match tokio::time::timeout_at(
+                    deadline,
+                    reader.read_table(&ident, snapshot),
+                )
+                .await
+                {
+                    // STALE：成员**答上来了**，答的是"我的水位超前于你的 manifest"
+                    // （`architecture-with-chunk §4.5` 的"两头都没有"窗口）⇒ 整次尝试失败，
+                    // 由 `QueryEngine` 刷新后重试（`§61.4` 第 2 条：**绝不能当答案**）。
+                    Ok(Ok(read)) if read.stale => SourceOutcome::Stale(HotReadStale {
+                        instance: instance.clone(),
+                        table: ident,
+                        known_manifest_ver: snapshot,
+                        flushed_watermark: read.flushed_watermark,
+                    }),
+                    Ok(Ok(read)) => SourceOutcome::Read(read.batches),
+                    Ok(Err(e)) => SourceOutcome::Missing(e.to_string()),
+                    Err(_elapsed) => SourceOutcome::Missing(format!(
+                        "超出热读预算（{} ms 内未答复）",
+                        budget.as_millis()
+                    )),
+                };
+                (instance, outcome)
+            }
+        }))
+        .await;
+
+        // 装配：**严格按键序**，与"谁先答完"无关（并发只改时间，不改结果）
+        for (instance, outcome) in outcomes {
+            let raw = match outcome {
+                SourceOutcome::Read(batches) => batches,
+                SourceOutcome::Missing(reason) => {
                     let source = MissingSource {
                         table: self.ident.to_string(),
-                        instance: instance.clone(),
-                        reason: e.to_string(),
+                        instance,
+                        reason,
                     };
                     tracing::warn!(
                         table = %source.table,
                         instance = %source.instance,
                         error = %source.reason,
                         policy = self.partial.policy().as_str(),
-                        "hot shard read failed; this source degrades to a PARTIAL result"
+                        "hot shard read unavailable; this source degrades to a PARTIAL result"
                     );
                     self.partial.record(source)?;
                     continue;
                 }
+                SourceOutcome::Stale(e) => {
+                    return Err(datafusion::error::DataFusionError::External(Box::new(e)));
+                }
             };
-            // `stale` ⇒ 本实例已放弃 (本次快照, 水位] 之间数据的本地副本，而本次快照的 manifest
-            // 里还没有那些文件（`architecture-with-chunk §4.5` 的"两头都没有"窗口）。
-            //
-            // **必须重试，绝不能当答案**（`operation-log §61.4` 第 2 条）：这里报一个**可识别**
-            // 的错误，由 `QueryEngine` 刷新 manifest 后用新版本重试（`§64`）。
-            // 用**类型**而不是字符串传达"该重试"：字符串匹配认不出来，而这种错误一旦被当成
-            // 普通失败上报，用户就会看到莫名失败。
-            if read.stale {
-                return Err(datafusion::error::DataFusionError::External(Box::new(
-                    HotReadStale {
-                        instance: instance.clone(),
-                        table: self.ident.to_string(),
-                        known_manifest_ver: self.snapshot.snapshot,
-                        flushed_watermark: read.flushed_watermark,
-                    },
-                )));
-            }
-            let raw = read.batches;
             if raw.is_empty() {
                 continue;
             }

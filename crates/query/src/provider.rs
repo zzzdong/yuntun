@@ -10,6 +10,7 @@ use crate::cache::{CatalogSnapshot, HotShards};
 use crate::partial::PartialSink;
 use crate::table::YuntunTableProvider;
 use async_trait::async_trait;
+use std::time::Duration;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::TableType;
@@ -28,6 +29,8 @@ pub struct YuntunSchemaProvider {
     hot: HotShards,
     /// 读不到的来源往这里记（每查询一个 sink）
     partial: Arc<PartialSink>,
+    /// 整段热读的总预算（`§88`，与 sink 同源注入）
+    hot_read_budget: Duration,
 }
 
 impl YuntunSchemaProvider {
@@ -36,12 +39,14 @@ impl YuntunSchemaProvider {
         namespace: impl Into<String>,
         hot: HotShards,
         partial: Arc<PartialSink>,
+        hot_read_budget: Duration,
     ) -> Self {
         Self {
             snapshot,
             namespace: namespace.into(),
             hot,
             partial,
+            hot_read_budget,
         }
     }
 }
@@ -61,6 +66,7 @@ impl SchemaProvider for YuntunSchemaProvider {
                 t.schema.clone(),
                 self.hot.clone(),
                 self.partial.clone(),
+                self.hot_read_budget,
             )))),
             None => Ok(None),
         }
@@ -105,6 +111,8 @@ pub struct YuntunCatalogProvider {
     hot: HotShards,
     /// 读不到的来源往这里记（每查询一个 sink）
     partial: Arc<PartialSink>,
+    /// 整段热读的总预算（`§88`，与 sink 同源注入）
+    hot_read_budget: Duration,
 }
 
 impl YuntunCatalogProvider {
@@ -112,11 +120,13 @@ impl YuntunCatalogProvider {
         snapshot: Arc<CatalogSnapshot>,
         hot: HotShards,
         partial: Arc<PartialSink>,
+        hot_read_budget: Duration,
     ) -> Self {
         Self {
             snapshot,
             hot,
             partial,
+            hot_read_budget,
         }
     }
 }
@@ -133,6 +143,7 @@ impl CatalogProvider for YuntunCatalogProvider {
                 name.to_string(),
                 self.hot.clone(),
                 self.partial.clone(),
+                self.hot_read_budget,
             )))
         } else {
             None

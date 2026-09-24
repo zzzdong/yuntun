@@ -56,6 +56,13 @@ pub const SCHEMA_NAME: &str = "public";
 /// `runtime` 持有 **query 执行区**的内存池：与 chunk 区（读写热缓冲）是两块**独立账本**，
 /// 互不借用。本块超限时 DataFusion 返回 `ResourcesExhausted`，
 /// **绝不抢占 chunk 区**（否则一个大基数 `GROUP BY` 就能把写入压垮）。
+/// **热读总预算的默认值**（`§88`）：一次查询在热数据上最多等多久。
+///
+/// 为什么默认是 10s：它要**大于**单个来源的传输超时（`§78` 默认 5s）—— 否则一个"慢但活着"
+/// 的来源会被预算直接砍掉，等于把传输层的判断抢过来；又要**小于**"一个来源把它的每个 RPC
+/// 都等满"的乘积（一个来源最坏数个 RPC），才能真的收住最坏情况。
+pub const DEFAULT_HOT_READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub struct QueryEngine {
     store: std::sync::Arc<dyn object_store::ObjectStore>,
     catalog: std::sync::Arc<LocalCatalog>,
@@ -63,6 +70,8 @@ pub struct QueryEngine {
     /// partial 策略（`crate::partial`）：**默认 `Allow`** —— `architecture §4.2` 第三条
     /// "节点失败时返回可用结果 + 明确标记"；装配层可设为 `Reject`。
     partial_policy: PartialPolicy,
+    /// 整段热读的总预算（`§88`）：默认 [`DEFAULT_HOT_READ_BUDGET`]，装配层可覆盖。
+    hot_read_budget: std::time::Duration,
 }
 
 /// 一次查询的结果：批次 + **完整性标记**（`crate::partial`）。
@@ -94,6 +103,7 @@ impl QueryEngine {
             catalog,
             runtime: None,
             partial_policy: PartialPolicy::default(),
+            hot_read_budget: DEFAULT_HOT_READ_BUDGET,
         }
     }
 
@@ -116,6 +126,7 @@ impl QueryEngine {
             catalog,
             runtime: Some(std::sync::Arc::new(runtime)),
             partial_policy: PartialPolicy::default(),
+            hot_read_budget: DEFAULT_HOT_READ_BUDGET,
         })
     }
 
@@ -145,6 +156,22 @@ impl QueryEngine {
     /// 当前 partial 策略。
     pub fn partial_policy(&self) -> PartialPolicy {
         self.partial_policy
+    }
+
+    /// 设**整段热读的总预算**（`§88`；装配层从配置来，默认 [`DEFAULT_HOT_READ_BUDGET`]）。
+    ///
+    /// 它管的是"**这次查询**愿意为热数据等多久"，与数据面 RPC 的传输超时（"一个 RPC
+    /// 最多等多久"，`§78`）是两层：并发把 N 个来源的等待从相加变成取最大，预算是这个最大
+    /// 之上的**硬上界**。超过它还没答的来源按"拿不到"处理 ⇒ 降级 + 点名（`Allow`）
+    /// 或当场失败（`Reject`）—— 与 `§77` 同一条路。
+    pub fn with_hot_read_budget(mut self, budget: std::time::Duration) -> Self {
+        self.hot_read_budget = budget;
+        self
+    }
+
+    /// 当前热读总预算。
+    pub fn hot_read_budget(&self) -> std::time::Duration {
+        self.hot_read_budget
     }
 
     /// 本地 Catalog（物化视图：刷新由后台任务驱动）。
@@ -208,7 +235,12 @@ impl QueryEngine {
         let hot = self.catalog.hot_shards();
         ctx.register_catalog(
             CATALOG_NAME,
-            std::sync::Arc::new(YuntunCatalogProvider::new(snapshot, hot, partial)),
+            std::sync::Arc::new(YuntunCatalogProvider::new(
+                snapshot,
+                hot,
+                partial,
+                self.hot_read_budget,
+            )),
         );
         Ok(ctx)
     }
