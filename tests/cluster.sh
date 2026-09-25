@@ -68,7 +68,8 @@ wait_ready() {
 }
 
 up() {
-  [ -x "$ROOT/target/release/metanode" ] || build
+  # 探针也要一起就绪：否则场景跑到一半才触发 release 编译，输出交错、后续步骤可能拿到空值（`§117.4`）
+  { [ -x "$ROOT/target/release/metanode" ] && [ -x "$PROBE" ]; } || build
   say "① 起集群（podman-compose）"
   # 每次都是**干净的一份**：`--init` 对已有数据的目录会被拒（那是防"误把重启当新建"的闸门）
   podman-compose -f "$COMPOSE" down -v >/dev/null 2>&1 || true

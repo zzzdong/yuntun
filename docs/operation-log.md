@@ -7537,3 +7537,41 @@ cargo run -q --release -p yuntun-chaos --example bench_baseline -- \
 - 五组各产出一行 `RESULT {...}`（`§116.3` 直接抄它）；`netem` 注入/清除后 `smoke` 仍通过；
 - 本刀只改 rig 用法与文档（无代码改动）⇒ 全量 `cargo test --workspace`
   **382 passed / 0 failed / 0 ignored**；`clippy --workspace --all-targets` 本仓告警 **0**。
+
+---
+
+## 117. `netem` 做满：抖动 / 丢包 / 乱序的**组合**（+ 一条 `T13.2` 的接缝结论）（2026-09-25）
+
+### 117.1 补什么
+
+`§113` 只试了单一维度（`loss 20%` / `delay 800ms` / `delay 2500ms`）。这里把 `netem` 的组合能力
+用上：`delay 10ms 5ms 25%`（延迟 + 抖动 + 相关丢包）与 `delay 10ms reorder 25%`（乱序）。
+
+### 117.2 实测
+
+| spec | 结果 |
+|---|---|
+| `delay 10ms 5ms 25%` | 8/8 拿到 `accepted` ✓，清掉后收敛（`last=9`）✓，8/8 重放命中 ✓ |
+| `delay 10ms reorder 25%` | 6/6 拿到 `accepted` ✓，收敛（`last=7`）✓，6/6 命中 ✓ |
+
+⇒ 与 `§113.2` 一致：**这些都在 TCP 层被吸收掉了**（重传 / 重排恢复 ⇒ raft 层面看不见）⇒
+它们适合验"**慢而不坏**"，**不适合**造"raft 级消息丢失"（那要靠 `partition` / `freeze`）。
+
+### 117.3 顺带：一条 **`T13.2` 的接缝结论**（已写进 plan，免得下次重走）
+
+`T13.2`（块级剪枝）今天勘察下来**接缝不干净**：`chunk::ColumnStats` / ZoneMap 只在**内存 chunk 层**
+算（`crates/chunk/src/{stats.rs,chunk.rs}`），**落盘不带它**、查询侧（`query/src/table.rs` 的 `scan`）
+**也不消费**。⇒ 要真省 IO，得**先把 per-file 统计落进 manifest**（`FileManifest` 目前只有行数等），
+再让 scan 用它剪枝 —— 是"先补数据模型、再接一根线"的活，不是小改。
+
+### 117.4 一处脚本硬化（本轮踩到的）
+
+场景里的 `probe` 会在**探针不存在时现场 build** ⇒ 首次跑会在场景**中途**触发一次 release 编译：
+输出交错、且后续步骤可能拿到空值（本刀第一次就因此让 `podman exec yuntun-mn tc …` 以 125 失败）。
+修法：`up()` 现在**连探针一起检查**（缺就一起编）⇒ 场景中途不会再编译。
+
+### 117.5 验证
+
+- 两个 spec 都通过（见 `§117.2`）；`smoke` / `soak` / `lossy` / `netem-run` 等仍通过；
+- 本刀只改脚本与文档（无 Rust 改动）⇒ 全量 `cargo test --workspace`
+  **382 passed / 0 failed / 0 ignored**；`clippy --workspace --all-targets` 本仓告警 **0**。
