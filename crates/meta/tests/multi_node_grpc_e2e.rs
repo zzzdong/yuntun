@@ -866,3 +866,121 @@ fn snapshot_trigger_compacts_the_log_by_policy() {
     );
 }
 
+/// **探针**（`operation-log §106`）：小压缩阈值 + 有 follower 落后 ⇒ 集群**写不进去**。
+///
+/// ⚠️ **已知缺陷的复现，修好前它必须变绿**（先例：`§28.1` 的
+/// `chaos::commit_to_mark_window_must_not_double_count`）。所以先 `#[ignore]`，
+/// 手动跑：`cargo test -p yuntun-meta --test multi_node_grpc_e2e -- --ignored`。
+///
+/// # 症状（已复现，稳定，与"是否隔离"无关）
+///
+/// k=0..4 全绿，**k=5 起 30s 拿不到被接受的响应**。同一时刻：
+/// - leader：`role=Leader`，`last` 前进而 `commit` 卡住；`prs` 里目标 peer 的
+///   `next` **远超** `matched`（如 `next=12, matched=9`），且**只发空 append**（`ents=0`）；
+/// - follower：`last`/`commit` 卡住不动，对每条 append 都回 `MsgAppendResponse`
+///   **`reject=false`**（窗口内 306 条响应、**0 条 reject**）；
+/// - 传输层：`failed=0 / rejected=0`（不是网络问题）；**没有** raft 线程 panic；
+///   raft 侧日志**没有** "Skipping sending ... it's paused"、**没有**任何 snapshot 尝试。
+///
+/// # 复现/观察配方（本刀的副产物，值得留着）
+///
+/// ```text
+/// YUNTUN_META_TRACE=1 RUST_LOG=raft=debug cargo test -p yuntun-meta \
+///     --test multi_node_grpc_e2e -- --ignored --nocapture
+/// ```
+///
+/// - `RUST_LOG=raft=debug`：raft-rs 的 `default_logger()` 是 **`slog_envlogger`**，
+///   所以它**一直**可用，只是此前没人设过环境变量（见 `§106`）；
+/// - `YUNTUN_META_TRACE=1`：存储层的 env-gated 轨迹（`append`/`compact`/`recv_snapshot`）。
+///
+/// # 未钉死的那一环（下一刀从这里接）
+///
+/// 症状里有条**互相矛盾**的：leader 反复发 `MsgAppend index=11`（prev=11），而 follower 的
+/// `last=9` —— 它**应该**回 `reject=true`，实际却回 `reject=false`。也就是说
+/// **follower 很可能根本没收到那些 prev=11 的 append**（它一直在回更旧的、它确实能接受的那条）。
+/// 所以下一步该查**传输**而不是 raft：
+/// 给每个 peer 的 `send_loop` 加上"发出去的 (msg_type, index, entries) → 对端回的
+/// (index, reject)"逐条配对计数，先确认"leader 发的东西有没有到"。
+#[ignore = "§106：已复现的写停摆；修好前必须变绿"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compaction_with_lagging_follower_should_keep_committing() {
+    const THRESHOLD: usize = 4;
+    let root = TempDir::new("meta-repro105");
+    let dir = |id: u64| -> PathBuf { Path::new(&root.0).join(format!("node{id}")) };
+    let opts = MetaOptions {
+        compact_log_entries: THRESHOLD,
+    };
+
+    let mut listeners = Vec::new();
+    for _ in IDS {
+        listeners.push(Some(
+            tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind"),
+        ));
+    }
+    let addrs: HashMap<u64, SocketAddr> = IDS
+        .iter()
+        .zip(&listeners)
+        .map(|(id, l)| (*id, l.as_ref().unwrap().local_addr().unwrap()))
+        .collect();
+    let links = Links::start(&addrs).await;
+    let peers_of = |id: u64| -> HashMap<u64, String> {
+        IDS.iter()
+            .filter(|o| **o != id)
+            .map(|o| (*o, links.addr(id, *o).to_string()))
+            .collect()
+    };
+    let mut nodes: Vec<NodeProc> = Vec::new();
+    for (i, id) in IDS.iter().enumerate() {
+        let listener = listeners[i].take().expect("只取一次");
+        nodes.push(spawn_node(*id, dir(*id), peers_of(*id), listener, opts).await);
+    }
+    let clients: HashMap<u64, Client> = {
+        let mut m = HashMap::new();
+        for id in IDS {
+            m.insert(id, connect(addrs[&id]).await);
+        }
+        m
+    };
+
+    let leader = wait_some_leader(&clients, &IDS).await;
+    wait_leader_agreement(&clients, &IDS, leader).await;
+    assert!(
+        propose_following_leader(&clients, &IDS, create_schema_op("analytics", 1_000))
+            .await
+            .accepted
+    );
+    assert!(
+        propose_following_leader(&clients, &IDS, create_table_op("cpu", 1_001))
+            .await
+            .accepted
+    );
+    wait_converged(&clients, &IDS).await;
+
+    // 隔离一个 follower（不是 leader）
+    let victim = IDS.iter().copied().find(|i| *i != leader).expect("有 follower");
+    links.isolate(victim);
+    let majority: Vec<u64> = IDS.iter().copied().filter(|i| *i != victim).collect();
+    let live: HashMap<u64, Client> = majority
+        .iter()
+        .map(|id| (*id, clients[id].clone()))
+        .collect();
+    eprintln!("复现：隔离 follower {victim}；leader={leader}；阈值={THRESHOLD}");
+
+    for k in 0..12u64 {
+        let r = propose_following_leader(
+            &live,
+            &majority,
+            commit_op(&format!("s{k}"), &format!("key-s{k}"), 2_000 + k),
+        )
+        .await;
+        assert!(r.accepted, "第 {k} 条必须被接受");
+        eprintln!("  ④ k={k} ok");
+    }
+
+    for n in nodes {
+        drop(n);
+    }
+}
+

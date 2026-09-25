@@ -6731,3 +6731,74 @@ follower 长期不在线会把日志拖大，而"落后 → 走快照"恰恰是�
 - 新用例连跑 3 次均绿（约 0.2s）；反证（阈值 0）实测失败 ✓；
 - `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
 - 规模：48,827 行 / 20 个 crate / 380 个测试函数。
+
+---
+
+## 106. 压缩 + 落后 follower ⇒ 集群写停摆：**复现 + 收窄**（探针留下，根因未钉死）（2026-09-25）
+
+### 106.0 这一刀做了什么、没做什么
+
+`§105.3` 记了一个"尚未根因"的写停摆。本刀把它变成**可稳定复现的最小用例**、拿到了 **raft 自己的
+一手日志**（关键技术发现见 106.1），并把症状收窄到**一条互相矛盾的事实**（106.4）——
+**但根因仍未钉死**。所以：用 `#[ignore]` 探针把复现留在仓库里（先例 `§28.1` 的
+`commit_to_mark_window_must_not_double_count`），**不假装它已解决**。
+
+### 106.1 关键技术发现：raft-rs 的日志**一直可用**，只是没人设环境变量
+
+`§105` 我以为"`raft::default_logger()` 不输出"。事实：它是 `slog_term::CompactFormat`
++ **`slog_envlogger`**，而 `slog_envlogger` 读 **`RUST_LOG`** ✓。所以
+
+```text
+RUST_LOG=raft=debug cargo test -p yuntun-meta --test multi_node_grpc_e2e -- --ignored --nocapture
+```
+
+就能拿到 raft 的完整内部独白（选主、每条收发的消息、暂停判定、快照判定）—— **不用改一行代码**。
+配上存储层的 `YUNTUN_META_TRACE=1`（`append`/`compact`/`recv_snapshot` 轨迹），两条 env 就是
+metanode 的全部诊断开关。这条配方值钱，已写进探针的文档注释。
+
+### 106.2 复现（`compaction_with_lagging_follower_should_keep_committing`，`#[ignore]`）
+
+3 节点真 gRPC + 小压缩阈值（4）+ 隔离一个 follower ⇒ `k=0..4` 写成功，**`k=5` 起 30s 拿不到
+被接受的响应**。稳定复现（多次一致），且**与"是否隔离"无关**（三方全通时同样复现）。
+
+### 106.3 症状（一手证据，逐条）
+
+| 观察 | 证据 |
+|---|---|
+| leader 仍是 Leader，`last` 前进而 `commit` 卡住 | `role=Leader first=9 last=11 commit=9 applied=9` |
+| leader 对目标 peer 的 `next` **远超** `matched` | `peer3(next=12, matched=9)`（正常应 `next == matched+1`） |
+| leader 只发**空** append | 窗口内 `Sending from 2, msg_type: MsgAppend` 里**带 entries 的 0 条** |
+| follower 对每条 append 都回**接受** | 窗口内 306 条 `MsgAppendResponse`，其中 `reject: true` **0 条** |
+| 传输层"不报错" | `failed=0 / rejected=0`；`active=true`（leader 收得到 follower 的消息） |
+| **没有**被暂停、**没有**快照尝试 | raft 日志里无 `Skipping sending ... it's paused`、无 snapshot 相关行 |
+| **没有** raft 线程 panic | 输出里除测试自身外无 panic |
+
+### 106.4 矛盾点 —— 这就是下一刀的入口
+
+leader 反复发 `MsgAppend log_term: 1 index: 11`（`prev=11`），而 follower 的 `last=9`
+—— 按 raft 它**必须**回 `reject: true`（`match_term(11, 1)` 不可能成立），实际却回
+`reject=false, index=9`。**唯一自洽的解释**：follower **根本没收到那些 `prev=11` 的 append**，
+它一直在回**更旧的、它确实能接受的那条**。
+
+⇒ **下一步查传输层，不是 raft**：给每个 peer 的 `send_loop` 加"发出去的
+`(msg_type, index, entries)` ↔ 对端回的 `(index, reject)`"**逐条配对计数**，先回答
+"leader 发的东西到底有没有到对端"。⚠️ 注意 `GrpcTransport::send` 是 `try_send` + 满了就丢，
+`dropped` 此前一直是 0 —— 但那只是**入队时**的丢弃统计，**不覆盖**"发出去了但对端看不见"。
+
+### 106.5 已排除
+
+① 网络/传输"报错"（`failed/rejected` 全 0）；② "没选主"（leader 在位、`active=true`）；
+③ raft 线程 fatal；④ leader 被暂停（inflights 满）或走了快照；⑤ **测试自己缓存 leader**
+（`§105.3` 记的误诊；本刀的探针已改成跟随 leader）。
+
+### 106.6 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **381 passed / 0 failed / 1 ignored**
+  （基线 381；新增的探针**按设计 ignore**）；单跑探针：
+  `cargo test -p yuntun-meta --test multi_node_grpc_e2e -- --ignored`；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 另记一条**负载敏感抖动**：本轮全量在"机器刚重启 + 连跑多轮"的负载下，
+  `compaction` 的 `concurrent_writers_compaction_and_gc_converge` 与 `query` 的
+  `slow_sources_wait_in_parallel_not_in_sequence` **各失败过一次**（都是**带 deadline 的时序用例**），
+  **单跑全绿**、负载降下来后重跑全量 381/0 ⇒ 登记为负载敏感抖动（与 `§105.4` 那条同类），本刀未修；
+- 规模：48,945 行 / 20 个 crate / 381 个测试函数（含 1 个 `#[ignore]` 探针）。
