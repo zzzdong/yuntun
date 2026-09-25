@@ -167,6 +167,11 @@ impl FjallStorage {
     ///
     /// 启动时必须与实际配置**比对**：不一致（典型：曾按 3 节点跑过，现在按单节点起）
     /// 会让本节点在一个"永远凑不齐成员"的组里静默空转 —— 宁可拒绝启动。
+    /// 当前成员表（`ConfState`：voters / learners）。`§118` 起 `Join` 要用它回答成员查询。
+    pub fn conf_state(&self) -> ConfState {
+        self.cache.lock().unwrap().conf_state.clone()
+    }
+
     pub fn voters(&self) -> Vec<u64> {
         let mut v = self.cache.lock().unwrap().conf_state.voters.clone();
         v.sort_unstable();

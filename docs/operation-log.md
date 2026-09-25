@@ -7575,3 +7575,64 @@ cargo run -q --release -p yuntun-chaos --example bench_baseline -- \
 - 两个 spec 都通过（见 `§117.2`）；`smoke` / `soak` / `lossy` / `netem-run` 等仍通过；
 - 本刀只改脚本与文档（无 Rust 改动）⇒ 全量 `cargo test --workspace`
   **382 passed / 0 failed / 0 ignored**；`clippy --workspace --all-targets` 本仓告警 **0**。
+
+---
+
+## 118. `Join` 地基（**上半刀**）：集群能在线加一个 learner，**地址随 conf change 复制**（2026-09-25）
+
+### 118.1 为什么切两半
+
+`Join` 要一整套，但其中有两处不是"写代码"那么简单：① proto 的 `JoinResponse` 现在只有**计数**
+（`voters`/`learners` 都是 `uint64`）⇒ 要给新节点"成员表 + 各自地址"必须**扩 proto**；
+② 进程内测试没法给"还不存在的那个新节点"接线 ⇒ "真加入并追平"的验收只能是**进程级用例**。
+所以先落地**能独立验的那半**：**集群能在线接纳一个 learner，并把它的地址复制给每个成员**。
+learner **不参与多数派** ⇒ 这件事**不需要那个节点真的存在** ⇒ 进程内就能验干净 ✓。
+
+### 118.2 改了什么
+
+- `PeerTransport::add_peer(id, addr)`（默认 `Err`）+ `GrpcTransport` 实现：两张出站表改成 `RwLock`，
+  运行期起发送任务 ⇒ **peer 表不再是"构造时固定"**（这是"在线加节点"的前提）；
+- `Command::AddLearner` / `Command::Members` + `NodeHandle::add_learner` / `members`；
+- leader 提议 `ConfChangeType::AddLearnerNode`，**地址放在 `ConfChange.context` 里**；
+- 应用 conf change 时（`apply_committed`）记下地址 + `transport.add_peer` ⇒ **地址随日志复制**；
+- `FjallStorage::conf_state()`（回答成员查询要读它）；
+- `spawn_node` 多收一份"初始 `id→地址`"（来自 `--peer`）⇒ 成员表从一开始就是全的。
+
+### 118.3 用例（进程内，`multi_node_grpc_e2e.rs`）
+
+`adding_a_learner_is_replicated_with_its_address`：
+
+```text
+leader = 1
+节点1: voters=[1, 2, 3] learners=[9] addrs[9]=Some("127.0.0.1:19999")
+节点2: voters=[1, 2, 3] learners=[9] addrs[9]=Some("127.0.0.1:19999")
+节点3: voters=[1, 2, 3] learners=[9] addrs[9]=Some("127.0.0.1:19999")
+```
+
+"**三方都有地址**"是**故意**断言的：地址随 `context` 复制 ⇒ **换主之后新 leader 也知道怎么连它**；
+如果只让"当初那个 leader"记着，换主就会出现"配置里有它、但没人连得上"的静默空洞。
+同时断言 **voter 集合一个都不变**（learner 不参与多数派）。
+
+### 118.4 踩到的两个坑（都写进了代码注释）
+
+1. **`tokio::spawn` 不能在驱动线程里用**：`add_peer` 是被 **raft 驱动线程**（`std::thread`）调的，
+   那里没有 tokio 上下文 ⇒ 直接 **panic、把驱动线程带走**（用例当场红，而且报错指向传输层）。
+   修法：把 `Handle` 存进 `GrpcTransport`（它本来就在 `new` 里收到一个），加 peer 时手动 spawn。
+2. **`ConfChange.context` 是 `Bytes`**（不是 `Vec<u8>`）—— 小事，但 `String::from_utf8(...)` 那行会直接
+   编译不过。
+
+### 118.5 覆盖到哪、没覆盖到哪（如实说）
+
+- ✅ **覆盖**：在线加 learner、**地址随 conf change 复制到每个成员**、voter 集合不变；
+- ⚠️ **下一刀（`§119`）**：`Meta.Join` RPC（要扩 `JoinResponse` 带成员表与地址）、`--join` CLI、
+  **新节点真的起来并追平**（进程级用例）、提升 learner→voter、成员**移除**；
+- ❗ **一个现在就存在的缺口**：地址表**只在内存**。重启后 `applied` 之下的 conf change **不会重放**
+  ⇒ 从日志里补不回来；启动配置 `--peer` 只列 **voter** ⇒ **learner 的地址重启后会丢**。
+  这条必须在 `§119` 一并解决（把地址表落盘）—— 记在这里，别让它悄悄留着。
+
+### 118.6 验证
+
+- 新用例连跑 **3/3** 绿（约 0.2s）；
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **383 passed / 0 failed / 0 ignored**；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**（`apply_committed` 参数变多，按本仓
+  先例加了 `#[allow(too_many_arguments)]` 与理由）。

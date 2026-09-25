@@ -25,6 +25,7 @@ use prost::Message as _;
 use yuntun_meta::{MetaNode, MetaOptions};
 use yuntun_proto::meta as pb;
 use yuntun_proto::meta::meta_client::MetaClient;
+use yuntun_meta::NodeHandle;
 
 const IDS: [u64; 3] = [1, 2, 3];
 
@@ -1002,3 +1003,128 @@ async fn compaction_with_lagging_follower_should_keep_committing() {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// 成员变更（`§118`）：在线加一个 learner
+// ---------------------------------------------------------------------------
+
+/// **集群能在线加一个 learner，且它的地址随 conf change 复制到每个成员。**
+///
+/// 为什么这几条断言就够了：learner **不参与多数派** ⇒ "加它"这件事**不需要那个节点真的存在**
+/// （它还不存在 —— 这正是"在线加节点"的起点：集群先接纳它，它再来追平，见 `§119`）。
+/// 所以这一刀能在**进程内**验：
+///
+/// 1. leader 把 9 号加为 learner（提议一条 `ConfChange`，地址放在它的 `context` 里）；
+/// 2. 那条 conf change 提交后，**三方**的成员表都要认它（`voters` 不变、`learners = [9]`）；
+/// 3. 而且三方的**地址表**里都有它的地址 —— 地址是随 `context` **复制**过去的，
+///    不是"只有当初那个 leader 知道"（换主之后新 leader 也得连得上它，所以这一条必须测）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adding_a_learner_is_replicated_with_its_address() {
+    const LEARNER: u64 = 9;
+    const LEARNER_ADDR: &str = "127.0.0.1:19999";
+
+    let root = TempDir::new("meta-add-learner");
+    let dir = |id: u64| -> PathBuf { Path::new(&root.0).join(format!("node{id}")) };
+
+    // ---- ① 先 bind（拿到端口且不释放：`§37` 那个 TOCTOU）----
+    let mut listeners = Vec::new();
+    for _ in IDS {
+        listeners.push(Some(
+            tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind 127.0.0.1:0"),
+        ));
+    }
+    let addrs: HashMap<u64, SocketAddr> = IDS
+        .iter()
+        .zip(&listeners)
+        .map(|(id, l)| (*id, l.as_ref().expect("已 bind").local_addr().expect("addr")))
+        .collect();
+
+    // ---- ② 起三个节点 ----
+    let mut nodes: Vec<NodeProc> = Vec::new();
+    for (i, id) in IDS.iter().enumerate() {
+        let peers: HashMap<u64, String> = IDS
+            .iter()
+            .filter(|o| *o != id)
+            .map(|o| (*o, addrs[o].to_string()))
+            .collect();
+        let listener = listeners[i].take().expect("监听器只取一次");
+        nodes.push(spawn_node(*id, dir(*id), peers, listener, MetaOptions::default()).await);
+    }
+
+    // ---- ③ 等出 leader（**读句柄的 status**，不猜）----
+    let leader = {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let found = nodes.iter().find(|n| {
+                n.node
+                    .as_ref()
+                    .map(|m| m.handle().status().role == "Leader")
+                    .unwrap_or(false)
+            });
+            if let Some(n) = found {
+                break n.id;
+            }
+            assert!(Instant::now() < deadline, "10s 内没有 leader");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    eprintln!("  leader = {leader}");
+
+    // ---- ④ leader 提议：把 9 号加为 learner ----
+    let handle_of = |id: u64| -> NodeHandle {
+        nodes
+            .iter()
+            .find(|n| n.id == id)
+            .expect("节点在")
+            .node
+            .as_ref()
+            .expect("节点活着")
+            .handle()
+    };
+    handle_of(leader)
+        .add_learner(LEARNER, LEARNER_ADDR, Duration::from_secs(5))
+        .expect("提议加 learner 应当成功");
+
+    // ---- ⑤ 等**三方**成员表都认下它（含地址）----
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut not_yet: Vec<u64> = Vec::new();
+        for n in &nodes {
+            let mv = handle_of(n.id)
+                .members(Duration::from_secs(2))
+                .expect("members 命令");
+            let has_addr = mv
+                .addrs
+                .get(&LEARNER)
+                .map(|a| a == LEARNER_ADDR)
+                .unwrap_or(false);
+            if mv.learners != vec![LEARNER] || !has_addr {
+                not_yet.push(n.id);
+            }
+        }
+        if not_yet.is_empty() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("10s 内这些节点的成员表还没认下 learner {LEARNER}：{not_yet:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // ---- ⑥ 顺带：voter 集合**一个都不该变**（learner 不参与多数派）----
+    for n in &nodes {
+        let mv = handle_of(n.id)
+            .members(Duration::from_secs(2))
+            .expect("members 命令");
+        assert_eq!(mv.voters, vec![1, 2, 3], "加 learner 不该动 voter 集合");
+        eprintln!(
+            "  节点{}: voters={:?} learners={:?} addrs[9]={:?}",
+            n.id,
+            mv.voters,
+            mv.learners,
+            mv.addrs.get(&LEARNER)
+        );
+    }
+}

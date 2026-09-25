@@ -130,6 +130,18 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 pub trait PeerTransport: Send + Sync + 'static {
     /// 把消息交给 `to`。**允许丢**（见模块文档）。
     fn send(&self, to: u64, msg: Message);
+
+    /// **运行期加一个 peer**（成员变更用，`§118`）。
+    ///
+    /// 为什么需要它：多节点集群的 peer 表过去是**构造时固定**的（`--peer` 列全才能起），
+    /// 而"在线加节点"要求它可变。地址由 conf change 的 `context` 带过来（**随日志复制** ⇒
+    /// 换主之后新 leader 也知道怎么连它 —— 这一点比"leader 自己记着"重要得多）。
+    ///
+    /// 默认返回 `Err`：`NoTransport`（无对端）与测试里的 `MpscTransport`（**按邮箱接线**、
+    /// 没有地址可加）都不支持。
+    fn add_peer(&self, id: u64, addr: &str) -> Result<(), String> {
+        Err(format!("该传输不支持运行期加 peer（id={id} addr={addr}）"))
+    }
 }
 
 /// 传输计数（诊断用）。
@@ -206,7 +218,9 @@ impl PeerTransport for NoTransport {
 /// 经 `Meta.Raft`（gRPC）把消息送给对端。
 pub struct GrpcTransport {
     /// **携带条目的**消息（重要）：优先发，容量正常。
-    important: HashMap<u64, tokio::sync::mpsc::Sender<Message>>,
+    /// ⚠️ `§118`：两张表在 `RwLock` 里 —— 成员变更要**运行期加 peer**，而发消息只读
+    /// （无竞争的读锁在 raft 线程上足够便宜）。
+    important: std::sync::RwLock<HashMap<u64, tokio::sync::mpsc::Sender<Message>>>,
     /// **可取代的**消息（心跳 / 空追加）：容量只有 1 —— 下个 tick 就会有更新的那条。
     ///
     /// 为什么要分成两条（`§111`，`§110` 实测出来的）：一条 FIFO 队列时，**过时的心跳/空追加会堵在
@@ -214,7 +228,10 @@ pub struct GrpcTransport {
     /// 只出队 298 条，那条救场的 append **一次都没出去**（因为队头是要等满 2s 超时的失败发送）。
     /// 分开之后：可取代的那条最多留一条（满就丢新来的，反正下个 tick 还有更新的），
     /// **重要队列永远不被它们堵住**。
-    best_effort: HashMap<u64, tokio::sync::mpsc::Sender<Message>>,
+    best_effort: std::sync::RwLock<HashMap<u64, tokio::sync::mpsc::Sender<Message>>>,
+    /// 运行时的兜底句柄（`§118`）：加 peer 是在 **raft 驱动线程**（`std::thread`）里被调的，
+    /// 那里没有 tokio 上下文 ⇒ `tokio::spawn` 会 panic。存下来手动 `spawn`。
+    handle: tokio::runtime::Handle,
     stats: Arc<TransportStats>,
 }
 
@@ -262,8 +279,9 @@ impl GrpcTransport {
             best_effort.insert(id, be_tx);
         }
         Ok(Self {
-            important,
-            best_effort,
+            important: std::sync::RwLock::new(important),
+            best_effort: std::sync::RwLock::new(best_effort),
+            handle: handle.clone(),
             stats,
         })
     }
@@ -274,6 +292,26 @@ impl GrpcTransport {
 }
 
 impl PeerTransport for GrpcTransport {
+    /// 运行期加一个 peer（成员变更）：起发送任务、两张表都登记。**幂等**（conf change 可能被重复应用）。
+    fn add_peer(&self, id: u64, addr: &str) -> Result<(), String> {
+        if self.important.read().unwrap().contains_key(&id) {
+            return Ok(());
+        }
+        // 早失败：地址串非法就别起任务（真端点由 `send_loop` 自己造 —— 见它的注释）
+        tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            .map_err(|e| format!("新 peer {id} 的地址 {addr:?} 非法（期望 host:port）：{e}"))?;
+        let (imp_tx, imp_rx) = tokio::sync::mpsc::channel::<Message>(SEND_QUEUE);
+        let (be_tx, be_rx) = tokio::sync::mpsc::channel::<Message>(BEST_EFFORT_QUEUE);
+        // ⚠️ **不能 `tokio::spawn`**：调用方是 raft 驱动线程（`std::thread`），那里没有运行时上下文
+        // ⇒ 用存下来的 `Handle`（`§118` 实测：`tokio::spawn` 在这里直接 panic，把驱动线程带走）
+        self.handle
+            .spawn(send_loop(id, addr.to_string(), imp_rx, be_rx, self.stats.clone()));
+        self.important.write().unwrap().insert(id, imp_tx);
+        self.best_effort.write().unwrap().insert(id, be_tx);
+        eprintln!("[meta:transport] 已加入 peer {id}（{addr}）");
+        Ok(())
+    }
+
     fn send(&self, to: u64, msg: Message) {
         // 轨迹（`YUNTUN_META_TRACE=1`）：**raft 刚交给传输的那一刻**（`§107`）。
         // 与 `send_loop` 里出队时的 `[meta:transport] →` 配对，就能把「raft 根本没生成」与
@@ -293,7 +331,9 @@ impl PeerTransport for GrpcTransport {
         } else {
             &self.important
         };
-        let Some(tx) = q.get(&to) else {
+        // 读锁只在取 sender 时持有（无竞争 ⇒ 便宜），**不跨 IO**
+        let tx = q.read().unwrap().get(&to).cloned();
+        let Some(tx) = tx else {
             // 目标不是本节点认识的 peer：丢 + 计数（不是 panic —— 成员表变化时会短暂出现）
             self.stats.dropped.fetch_add(1, Ordering::Relaxed);
             return;

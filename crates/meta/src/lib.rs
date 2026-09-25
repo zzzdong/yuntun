@@ -108,8 +108,32 @@ enum Command {
         op: yuntun_proto::meta::Op,
         reply: SyncSender<Result<yuntun_proto::meta::ProposeResponse, MetaError>>,
     },
+    /// 把一个节点作为 **learner** 加进集群（成员变更，`§118`）。
+    ///
+    /// 回复 = **提议到的 raft index**（不是"已应用"）：成员变更要等那条 conf change 提交并应用
+    /// 才生效，调用方随后用 [`NodeHandle::members`] 看结果（learner 不参与多数派 ⇒ 加入本身
+    /// 不改 quorum，所以"集群里已经有 3 个 voter"时它照样能提交）。
+    AddLearner {
+        id: u64,
+        addr: String,
+        reply: SyncSender<Result<(), MetaError>>,
+    },
+    /// 当前成员表快照（[`MembersView`]）。
+    Members {
+        reply: SyncSender<MembersView>,
+    },
     /// 停止该节点（模拟崩溃：线程退出、消息不再收发）。
     Stop,
+}
+
+/// 成员表快照（`Members` 命令的回复，`§118`）。
+#[derive(Debug, Clone, Default)]
+pub struct MembersView {
+    pub voters: Vec<u64>,
+    pub learners: Vec<u64>,
+    /// **已知的** `id → 地址`：来自启动配置（`--peer`）**以及**后来每一次 conf change 带过来的地址。
+    /// 可能不全（没配过地址的成员不在这里）—— 别当权威成员表用，权威是 `voters`/`learners`。
+    pub addrs: HashMap<u64, String>,
 }
 
 /// 节点运行时的可观测句柄（测试用）。
@@ -255,6 +279,38 @@ impl NodeHandle {
             .map_err(|e| MetaError::Storage(format!("命令通道断开：{e}")))?;
         match reply_rx.recv_timeout(timeout) {
             Ok(r) => r,
+            Err(_) => Err(MetaError::NoQuorum),
+        }
+    }
+
+    /// 把一个节点作为 **learner** 加进集群（成员变更，`§118`）。**提议成功**即返回。
+    ///
+    /// 要等那条 conf change 提交并应用才生效 —— 用 [`Self::members`] 看结果。
+    /// ⚠️ 同一时刻**只允许一条未提交的 conf change** 在途（raft 的纪律）：本接口不排队，
+    /// 由调用方（`Meta.Join` 是低频人工操作、测试亦然）自己保证串行。
+    pub fn add_learner(&self, id: u64, addr: &str, timeout: Duration) -> Result<(), MetaError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.cmd_tx
+            .send(Command::AddLearner {
+                id,
+                addr: addr.to_string(),
+                reply: reply_tx,
+            })
+            .map_err(|e| MetaError::Storage(format!("命令通道断开：{e}")))?;
+        match reply_rx.recv_timeout(timeout) {
+            Ok(r) => r,
+            Err(_) => Err(MetaError::NoQuorum),
+        }
+    }
+
+    /// 当前成员表快照（`§118`）：voters / learners / **已知地址**。
+    pub fn members(&self, timeout: Duration) -> Result<MembersView, MetaError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.cmd_tx
+            .send(Command::Members { reply: reply_tx })
+            .map_err(|e| MetaError::Storage(format!("命令通道断开：{e}")))?;
+        match reply_rx.recv_timeout(timeout) {
+            Ok(v) => Ok(v),
             Err(_) => Err(MetaError::NoQuorum),
         }
     }
@@ -497,6 +553,11 @@ impl Cluster {
                 debug.clone(),
                 status.clone(),
                 cmd_rx,
+                // 进程内簇没有地址（`MpscTransport` 按邮箱接线）⇒ 成员表里先只放 id、地址留空
+                self.mailboxes
+                    .keys()
+                    .map(|id| (*id, String::new()))
+                    .collect(),
                 // 进程内测试簇**不自动压缩**：它的用例靠手动 `Cluster::compact` 精确控制
                 // "压到哪一条"，自动触发会让那些用例的确定性变差（且它们写的条目远少于阈值）。
                 MetaOptions {
@@ -910,6 +971,8 @@ impl MetaNode {
         //    所以宁可拒绝启动，并把**缺哪个**列出来。
         let mut peers = peers;
         peers.remove(&id); // 列了自己也无妨（常见的复制粘贴写法），忽略即可
+        // 成员表的**初始地址**：`peers` 后来会被搬进传输，这里先留一份（`§118`）
+        let members_init = peers.clone();
         let missing: Vec<u64> = stored
             .iter()
             .copied()
@@ -955,7 +1018,8 @@ impl MetaNode {
             raft_inbox: inbox_tx,
         };
         let thread = spawn_node(
-            id, rx, transport, sm, storage, role, applied, debug, status, cmd_rx, opts,
+            id, rx, transport, sm, storage, role, applied, debug, status, cmd_rx, members_init,
+            opts,
         );
         Ok(Self {
             id,
@@ -1055,8 +1119,11 @@ fn spawn_node(
     debug: Arc<Mutex<String>>,
     status: Arc<Mutex<NodeStatus>>,
     cmd_rx: Receiver<Command>,
+    // 初始 `id → 地址`（来自 `--peer` / 进程内簇；`§118` 起成员变更会在运行期往里加）
+    members_init: HashMap<u64, String>,
     opts: MetaOptions,
 ) -> thread::JoinHandle<Receiver<Message>> {
+    let mut members = members_init;
     thread::spawn(move || {
         let logger = raft::default_logger();
         let cfg = Config {
@@ -1102,6 +1169,39 @@ fn spawn_node(
             loop {
                 match cmd_rx.try_recv() {
                     Ok(Command::Stop) => break 'node,
+                    Ok(Command::AddLearner { id: nid, addr, reply }) => {
+                        if raw.raft.state == StateRole::Leader {
+                            let cc = raft::eraftpb::ConfChange {
+                                change_type: raft::eraftpb::ConfChangeType::AddLearnerNode,
+                                node_id: nid,
+                                // **地址随条目复制**：每个节点应用这条 conf change 时都学到它
+                                context: addr.clone().into_bytes().into(),
+                                ..Default::default()
+                            };
+                            match raw.propose_conf_change(vec![], cc) {
+                                Ok(()) => {
+                                    let _ = reply.send(Ok(()));
+                                }
+                                Err(e) => {
+                                    let _ = reply.send(Err(MetaError::Storage(format!(
+                                        "conf change 提议失败：{e}"
+                                    ))));
+                                }
+                            }
+                        } else {
+                            let _ = reply.send(Err(MetaError::NotLeader {
+                                leader_hint: raw.raft.leader_id,
+                            }));
+                        }
+                    }
+                    Ok(Command::Members { reply }) => {
+                        let cs = storage.conf_state();
+                        let _ = reply.send(MembersView {
+                            voters: cs.voters.clone(),
+                            learners: cs.learners.clone(),
+                            addrs: members.clone(),
+                        });
+                    }
                     Ok(Command::Propose { op, reply }) => {
                         if raw.raft.state == StateRole::Leader {
                             // 顺序很重要：**先提议成功再入队**，否则队列与日志条目会错位
@@ -1222,6 +1322,8 @@ fn spawn_node(
                     &storage,
                     &applied,
                     &mut pending,
+                    &transport,
+                    &mut members,
                 );
                 // 持久化后的消息（follower 的 append 响应等）—— 同样走后端传输、
                 // 同样**不阻塞**（这几条必须在落盘后才发，晚一点没关系，卡住才致命）
@@ -1250,6 +1352,8 @@ fn spawn_node(
                     &storage,
                     &applied,
                     &mut pending,
+                    &transport,
+                    &mut members,
                 );
                 raw.advance_apply();
 
@@ -1337,6 +1441,10 @@ fn temp_root() -> std::path::PathBuf {
     root
 }
 
+/// 参数多是**有意**的（与 `spawn_node` / `Cluster::spawn_with` 同款处理）：这里就是把本次要应用的
+/// 那一批条目所需的全部运行期句柄显式交出去 —— 收进结构体反而会掩盖"谁共享了什么"。
+/// `§118` 又多了两个（`transport` 用来登记新 peer、`members` 用来记地址表）。
+#[allow(clippy::too_many_arguments)]
 fn apply_committed(
     id: u64,
     raw: &mut RawNode<FjallStorage>,
@@ -1347,6 +1455,8 @@ fn apply_committed(
     pending: &mut VecDeque<
         SyncSender<Result<yuntun_proto::meta::ProposeResponse, MetaError>>,
     >,
+    transport: &Arc<dyn PeerTransport>,
+    members: &mut HashMap<u64, String>,
 ) {
     for entry in entries {
         // **先按 raft 索引报告已应用位置**（含 no-op / ConfChange —— 它们也占索引，
@@ -1368,6 +1478,17 @@ fn apply_committed(
                 storage
                     .set_conf_state(cs)
                     .unwrap_or_else(|e| fatal(id, "成员表落盘", e));
+            }
+            // **地址随 conf change 复制**（`§118`）：每个节点都从 `context` 里学到新成员的地址
+            // ⇒ 换主之后新 leader 也知道怎么连它（否则只有"当初那个 leader"知道）。
+            if let Ok(addr) = String::from_utf8(cc.context.to_vec())
+                && !addr.is_empty()
+            {
+                members.insert(cc.node_id, addr.clone());
+                if let Err(e) = transport.add_peer(cc.node_id, &addr) {
+                    // 不致命（进程内传输就不支持），但必须**响亮**：加不进来 = 复制不到它
+                    eprintln!("[meta:{id}] 加 peer {}（{addr}）失败：{e}", cc.node_id);
+                }
             }
             continue;
         }
