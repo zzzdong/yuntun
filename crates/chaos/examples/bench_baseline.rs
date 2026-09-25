@@ -242,11 +242,17 @@ async fn main() {
     // 元数据后端：`--meta` 给了就打到 raft 承载的 metanode（`RemoteCatalog`），否则内存目录。
     // ⚠️ 两次跑必须**同一台机器**，差值才能归因到"多了一次网络 + raft 往返"。
     let catalog: Arc<dyn CatalogOps> = match &args.meta {
-        Some(addr) => {
-            println!("元数据后端          : **raft**（RemoteCatalog → {addr}）");
+        Some(addrs) => {
+            // 支持逗号分隔的**多点接触点**（多节点集群就该这么给：客户端自己找 leader）
+            let list: Vec<String> = addrs
+                .split(',')
+                .map(|a| a.trim().to_string())
+                .filter(|a| !a.is_empty())
+                .collect();
+            println!("元数据后端          : **raft**（RemoteCatalog → {list:?}）");
             Arc::new(
-                yuntun_meta::RemoteCatalog::connect(vec![addr.clone()])
-                    .unwrap_or_else(|e| panic!("连 metanode {addr} 失败：{e}")),
+                yuntun_meta::RemoteCatalog::connect(list)
+                    .unwrap_or_else(|e| panic!("连 metanode {addrs} 失败：{e}")),
             )
         }
         None => {

@@ -27,6 +27,9 @@ services:
       - NET_ADMIN
       - NET_RAW
     container_name: yuntun-mn1
+    # 发布给**宿主**上的 bench 用（容器内仍是 9311）
+    ports:
+      - "19311:9311"
     command:
       - /usr/local/bin/metanode
       - --id=1
@@ -43,7 +46,7 @@ services:
       - YUNTUN_META_TRACE=${YUNTUN_META_TRACE:-}
       - RUST_LOG=${RUST_LOG:-}
     volumes:
-      - ../target/debug/metanode:/usr/local/bin/metanode:ro
+      - ../target/release/metanode:/usr/local/bin/metanode:ro
       - mn1-data:/data
 
   mn2:
@@ -53,6 +56,9 @@ services:
       - NET_ADMIN
       - NET_RAW
     container_name: yuntun-mn2
+    # 发布给**宿主**上的 bench 用（容器内仍是 9311）
+    ports:
+      - "19312:9311"
     command:
       - /usr/local/bin/metanode
       - --id=2
@@ -69,7 +75,7 @@ services:
       - YUNTUN_META_TRACE=${YUNTUN_META_TRACE:-}
       - RUST_LOG=${RUST_LOG:-}
     volumes:
-      - ../target/debug/metanode:/usr/local/bin/metanode:ro
+      - ../target/release/metanode:/usr/local/bin/metanode:ro
       - mn2-data:/data
 
   mn3:
@@ -79,6 +85,9 @@ services:
       - NET_ADMIN
       - NET_RAW
     container_name: yuntun-mn3
+    # 发布给**宿主**上的 bench 用（容器内仍是 9311）
+    ports:
+      - "19313:9311"
     command:
       - /usr/local/bin/metanode
       - --id=3
@@ -95,7 +104,7 @@ services:
       - YUNTUN_META_TRACE=${YUNTUN_META_TRACE:-}
       - RUST_LOG=${RUST_LOG:-}
     volumes:
-      - ../target/debug/metanode:/usr/local/bin/metanode:ro
+      - ../target/release/metanode:/usr/local/bin/metanode:ro
       - mn3-data:/data
 
 volumes:

@@ -20,7 +20,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 COMPOSE="$HERE/compose.yaml"
 IMAGE=docker.io/library/debian:trixie-slim
-PROBE="$ROOT/target/debug/examples/meta_probe"
+PROBE="$ROOT/target/release/examples/meta_probe"
 ADDRS=(mn1:9311 mn2:9311 mn3:9311)
 CONTAINERS=(yuntun-mn1 yuntun-mn2 yuntun-mn3)
 
@@ -43,7 +43,8 @@ trap on_fail EXIT
 
 build() {
   say "① 编 metanode + meta_probe（宿主 cargo）"
-  (cd "$ROOT" && cargo build -p yuntun-meta --bin metanode --example meta_probe)
+  # **release**：容器里跑的是 release 版（debug 会把任何性能对比放大成假的），宿主侧一致
+  (cd "$ROOT" && cargo build --release -p yuntun-meta --bin metanode --example meta_probe)
 }
 
 # 等三个容器**各自**打印接口行。这一条同时证明了：集群起得来、且**已经选出 leader**
@@ -67,7 +68,7 @@ wait_ready() {
 }
 
 up() {
-  [ -x "$ROOT/target/debug/metanode" ] || build
+  [ -x "$ROOT/target/release/metanode" ] || build
   say "① 起集群（podman-compose）"
   # 每次都是**干净的一份**：`--init` 对已有数据的目录会被拒（那是防"误把重启当新建"的闸门）
   podman-compose -f "$COMPOSE" down -v >/dev/null 2>&1 || true
