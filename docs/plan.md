@@ -490,7 +490,7 @@ SQL `INSERT` 返回成功时数据仅落 WAL（与 Flight DoPut 语义一致）�
 | T6.14 | **chunk 压力与恢复专项**（v2.1 新增） | 触发 spill 的写入压力；spill 读回失败降级；大基数 `GROUP BY` 挤压 chunk 区（验证硬分区）；崩溃后 spill 清理 | S1 的"真实压力曲线"缺口 |
 | T6.15 | TTL 分片移除 + segment 清理闸门（R21） | 阶段 0 遗留 | 影响 WAL 磁盘占用（与 §2.2 的 P2 联动） |
 | T7.x | SQL 写入路径专项 Chaos | Flight SQL / INSERT × 崩溃点组合 | 验证与 DoPut 同等持久性 |
-| T8.x | 压测与基线入库 | 吞吐 / P99 / 内存曲线 / **CommitFiles 瞬时并发** / 文件数·天 | P0 的证据来源。**✅ 已入库**：`bench_baseline`（提交时刻分布 + 峰值并发 + 文件数·天 + seal→committed）→ `operation-log §32`；**遗留**：**R3 后打同一 Meta 的真并发**（本轮已给本机多进程上界，§37）、真实 S3/MinIO（**本机 SeaweedFS 上：单机读写两向 + 多节点并发写对拍/冷读均已验**，`§101` / `§102` / `scripts/s3_*_smoke.sh`）、跨机、组级剪枝收益、内存曲线时序 |
+| T8.x | 压测与基线入库 | 吞吐 / P99 / 内存曲线 / **CommitFiles 瞬时并发** / 文件数·天 | P0 的证据来源。**✅ 已入库**：`bench_baseline`（提交时刻分布 + 峰值并发 + 文件数·天 + seal→committed）→ `operation-log §32`；**遗留**：~~**R3 后打同一 Meta**~~ ✅ **已量**（`§114`：同机 A/B，内存目录 vs 单节点 raft 元数据；p50 +0.9% 而 **p99 +14.5%**、峰值提交 −32% ⇒ **raft 把突发串行化**）；**剩余**：多节点 raft 与跨机 RTT；原记：**R3 后打同一 Meta 的真并发**（本轮已给本机多进程上界，§37）、真实 S3/MinIO（**本机 SeaweedFS 上：单机读写两向 + 多节点并发写对拍/冷读均已验**，`§101` / `§102` / `scripts/s3_*_smoke.sh`）、跨机、组级剪枝收益、内存曲线时序 |
 | T9.x | Vortex：锁 commit + feature 打开 + Parquet 对比 | ADR-1 | 遗留清偿大头 |
 
 **准出（阶段 3 的准入）**

@@ -7350,3 +7350,71 @@ disconnect`（全断）与 `podman pause`（冻进程）都造不出"**只丢一
   三条都通过（每条都含"事后逐 key 重放命中"）；`smoke` / `stall` / `gap` / `soak` 仍通过；
 - 本刀只动脚本 + 新增 `tests/Containerfile`（无 Rust 行为改动）⇒ 全量 `cargo test --workspace`
   **382 passed / 0 failed / 0 ignored**；`clippy --workspace --all-targets` 本仓告警 **0**。
+
+---
+
+## 114. `T8.x` 遗留「**R3 后打同一 Meta**」：raft 承载元数据的代价，量出来了（2026-09-25）
+
+### 114.1 动机
+
+`plan T8.x` 的遗留一条写得很直白：T8 基线（`§32`）是拿**本地内存目录**打的，而生产形态的元数据是
+**raft 承载**的 —— 那条往返的代价必须量出来，否则"基线"只是空转的数字。这一刀还顺带是**回归**：
+`§111` 刚把出站队列改成两条（元数据路径正在这条写路径上）。
+
+### 114.2 做法
+
+`crates/chaos/examples/bench_baseline.rs` 加了 `--meta <addr>`：给了就用
+`RemoteCatalog::connect(...)`（打到 raft 承载的 metanode），不给仍是内存目录（T8 基线口径）。
+（chaos crate 加了 `yuntun-meta` 到 **dev-dependencies**：只有 example 用得到。）
+
+```bash
+# 同机 A/B，参数全用默认（= §32 那套：secs=130 shards=100 batch_rows=50 batches/s=10 …）
+cargo run -q --release -p yuntun-chaos --example bench_baseline                      # A：内存目录
+cargo run -q --release -p yuntun-meta --bin metanode -- \
+    --id 1 --dir /tmp/bm --listen 127.0.0.1:9311 --init &                            # 单节点 raft
+cargo run -q --release -p yuntun-chaos --example bench_baseline -- --meta 127.0.0.1:9311   # B：raft
+```
+
+⚠️ 两次必须**同机**（差值才能归因到"多了一次网络 + raft 往返"），且 metanode 与 bench **都用
+release**（debug 版 metanode 会把差异放大成假的）。
+
+### 114.3 数字
+
+| 指标 | A 内存目录 | B raft 元数据 | 差 |
+|---|---|---|---|
+| 文件数 | 301 | 300 | ~同 |
+| 文件数/天 | 199,774 | 199,107 | ~同 |
+| 提交偏移 p50 | 32,841 ms | 33,144 ms | **+303 ms（+0.9%）** |
+| 提交偏移 **p99** | 35,212 ms | **40,171 ms** | **+4,959 ms（+14%）** |
+| 提交偏移 max | 93,399 ms | 40,364 ms | −53,035 ms（A 那次是 `§32.4` 记过的**离群**，噪声，别看它） |
+| 峰值提交（1s / 100ms） | 34 / 8 | **23 / 4** | **−32% / −50%** |
+| **seal → committed p99** | 35,047 ms | **40,133 ms** | **+5,086 ms（+14.5%）** |
+| seal → committed max | 35,176 ms | 40,326 ms | +5,150 ms |
+| 进程峰值 RSS | 39 MiB | 57 MiB | +18 MiB |
+
+### 114.4 怎么读
+
+- **吞吐与文件数不变**：500 行/秒这个量级上，元数据**不是**瓶颈（写入侧还是窗口驱动的 seal ✓）；
+- **中位数几乎不动（+0.9%），但 p99 尾部 +14.5%（35.0s → 40.1s）**，同时**峰值提交从 34/s 掉到
+  23/s** —— 这两条是同一件事：**raft 把突发串行化了**。每次 `CommitFiles` 现在是一条 raft 往返
+  + 一条 apply；平时（理论均值 2.3 次/秒）看不出来，但**关窗瞬间几十个 shard 一起提交**时，它们
+  在 raft 里排队 ⇒ 尾部被拉长、峰值被压低。
+- ⇒ **生产含义**：元数据路径的"突发吸收"得靠**批量化**（一次 op 提交多个 shard 的产物 / 客户端
+  合并），而不是调 raft 参数。这也与 `§32` 的结论呼应：文件数与"shard × 窗口"绑定，而**提交那一刻
+  是挤在一起的**。
+- ⚠️ 绝对量级别看错：这里的 p99 = 35–40 **秒**，是因为默认口径 `max_flush_delay=30s + spread=5s`
+  （关窗后本来就要等）—— 差值（+5s）才是我要报的东西。
+
+### 114.5 覆盖到哪、没覆盖到哪（如实说）
+
+- ✅ **覆盖**：单节点 raft 承载元数据的 A/B（同机、同参数、同 release）；
+- ⚠️ **未覆盖**：**多节点 raft**（1 次多数派往返 + 可能的选主抖动都没量 —— 本刀是单 voter ✓）；
+  **跨机 RTT**（loopback 的网络代价≈0 ⇒ 真实部署还要加上 RTT × 往返次数）；
+  `§111` 的**前后对比**（A/B 都是**改后**的代码 ⇒ 本刀量的是"raft 元数据的代价"，不是"队列改动的
+  影响"；后者由 `§111` 的功能回归守着）。
+
+### 114.6 验证
+
+- 两条命令都能跑通，各自产出 `RESULT {...}` 一行 JSON（`§114.3` 的表就是它两位小数直接抄的）；
+- 本刀改了 **bench 示例 + chaos 的 dev-dep**（无生产路径改动）⇒ 全量 `cargo test --workspace`
+  **382 passed / 0 failed / 0 ignored**；`clippy --workspace --all-targets` 本仓告警 **0**。

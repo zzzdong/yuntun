@@ -211,6 +211,13 @@ struct Args {
     /// `bytes_threshold`（MB）
     #[arg(default_value_t = 128)]
     bytes_threshold_mb: usize,
+    /// **元数据走 raft**：给一个 metanode 地址（如 `127.0.0.1:9311`）⇒ 用 `RemoteCatalog`，
+    /// 每次 `CommitFiles` 都多一次网络 + **raft 往返**；不给则用内存目录（T8 基线口径）。
+    ///
+    /// 为什么要它（`plan T8.x` 遗留「**R3 后打同一 Meta**」）：T8 基线是拿**本地内存目录**打的，
+    /// 而生产形态的元数据是 raft 承载的 —— 那条往返的代价必须量出来，否则"基线"只是空转的数字。
+    #[arg(long)]
+    meta: Option<String>,
     /// 关掉「读者」：没有读者时 chunk 内存永不归还，测到的是背压而非阈值
     /// （等价于旧环境变量 `YUNTUN_BENCH_NO_READER`，两种写法都仍然生效）
     #[arg(long)]
@@ -232,7 +239,21 @@ async fn main() {
     let wal_dir = dir.join("wal").to_string_lossy().to_string();
     let store_root = dir.join("store").to_string_lossy().to_string();
 
-    let catalog = Arc::new(MemoryCatalog::new());
+    // 元数据后端：`--meta` 给了就打到 raft 承载的 metanode（`RemoteCatalog`），否则内存目录。
+    // ⚠️ 两次跑必须**同一台机器**，差值才能归因到"多了一次网络 + raft 往返"。
+    let catalog: Arc<dyn CatalogOps> = match &args.meta {
+        Some(addr) => {
+            println!("元数据后端          : **raft**（RemoteCatalog → {addr}）");
+            Arc::new(
+                yuntun_meta::RemoteCatalog::connect(vec![addr.clone()])
+                    .unwrap_or_else(|e| panic!("连 metanode {addr} 失败：{e}")),
+            )
+        }
+        None => {
+            println!("元数据后端          : 内存目录（MemoryCatalog，T8 基线口径）");
+            Arc::new(MemoryCatalog::new())
+        }
+    };
     catalog
         .create_table(CreateTableRequest {
             name: "base".into(),

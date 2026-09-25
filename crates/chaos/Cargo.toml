@@ -25,6 +25,8 @@ bytes = { workspace = true }
 parquet = { workspace = true }
 
 [dev-dependencies]
+# 压测示例要能打到 **raft 承载的元数据**（`RemoteCatalog`）；只 example 用得到，故放 dev。
+yuntun-meta = { path = "../meta" }
 # 示例（bench/bench_baseline）的参数解析
 clap = { workspace = true }
 yuntun-testkit = { path = "../testkit" }
