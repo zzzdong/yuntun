@@ -866,52 +866,41 @@ fn snapshot_trigger_compacts_the_log_by_policy() {
     );
 }
 
-/// **探针**（`operation-log §106`）：小压缩阈值 + 有 follower 落后 ⇒ 集群**写不进去**。
+/// **回归用例**（原是 `§106` 的复现探针；`§111` 修好后按纪律转正、拿掉 `#[ignore]`）：
+/// 小压缩阈值 + 有 follower 落后 ⇒ 小批量提交必须**一直**能被接受。
 ///
-/// ⚠️ **已知缺陷的复现，修好前它必须变绿**（先例：`§28.1` 的
-/// `chaos::commit_to_mark_window_must_not_double_count`）。所以先 `#[ignore]`，
-/// 手动跑：`cargo test -p yuntun-meta --test multi_node_grpc_e2e -- --ignored`。
+/// # 它当初复现的是什么（留档）
 ///
-/// # 症状（已复现，稳定，与"是否隔离"无关）
+/// k=0..4 全绿，**k=5 起 30s 拿不到被接受的响应**：leader `last` 前进而 `commit` 卡住，
+/// 目标 peer 的 `next` **远超** `matched`，且**只发空 append**；follower 对每条 append 都回
+/// `MsgAppendResponse reject=false`（窗口内 306 条响应、**0 条 reject**）；传输层
+/// `failed=0/rejected=0`；没有 panic，也没有任何 snapshot 尝试。
 ///
-/// k=0..4 全绿，**k=5 起 30s 拿不到被接受的响应**。同一时刻：
-/// - leader：`role=Leader`，`last` 前进而 `commit` 卡住；`prs` 里目标 peer 的
-///   `next` **远超** `matched`（如 `next=12, matched=9`），且**只发空 append**（`ents=0`）；
-/// - follower：`last`/`commit` 卡住不动，对每条 append 都回 `MsgAppendResponse`
-///   **`reject=false`**（窗口内 306 条响应、**0 条 reject**）；
-/// - 传输层：`failed=0 / rejected=0`（不是网络问题）；**没有** raft 线程 panic；
-///   raft 侧日志**没有** "Skipping sending ... it's paused"、**没有**任何 snapshot 尝试。
+/// # 真凶与修法（`§110` 定位、`§111` 修）
 ///
-/// # 复现/观察配方（本刀的副产物，值得留着）
+/// 真凶**不是** raft，而是**传输层出站队列的队头阻塞**：一条 FIFO 队列里，
+/// **过时的心跳/空追加堵在队头**（队头那条还要等满 2s 的 RPC 超时），于是**唯一携带条目的那条
+/// append 一次都没出去**（实测：raft 交出 537 条、`send_loop` 只出队 298 条，那条救场的 append
+/// 到达次数 = **0**）。`§107` 讲的"乐观推进的 `next_idx` 再也补不上"是**后果**：那条 append 一旦
+/// 出不去，follower 就永远缺它，而 leader 只会发空 append、follower 恰好能接受 ⇒ 停摆。
+///
+/// 修法：出站分**两条队列**（携带条目的 = 重要；心跳/空追加 = 可取代，容量 1），
+/// `send_loop` 用 `biased` **优先发重要的** —— 见 `transport.rs` 的模块文档"两条队列"。
+///
+/// # 出问题时的观察配方
 ///
 /// ```text
 /// YUNTUN_META_TRACE=1 RUST_LOG=raft=debug cargo test -p yuntun-meta \
-///     --test multi_node_grpc_e2e -- --ignored --nocapture
+///     --test multi_node_grpc_e2e -- --nocapture
 /// ```
 ///
-/// - `RUST_LOG=raft=debug`：raft-rs 的 `default_logger()` 是 **`slog_envlogger`**，
-///   所以它**一直**可用，只是此前没人设过环境变量（见 `§106`）；
-/// - `YUNTUN_META_TRACE=1`：存储层的 env-gated 轨迹（`append`/`compact`/`recv_snapshot`）。
-///
-/// # 机制（`§107` 已钉死，但**未修好**）
-///
-/// **传输丢一条携带条目的 append ⇒ leader 的 `next_idx` 已乐观推进在前、`matched` 留在原地
-/// ⇒ 它此后只发空 append，而 follower 恰好能接受（`prev` 就在它日志里）⇒ 永久停摆，无任何错误。**
-///
-/// 证据是**同一瞬间**的两组东西（`§107.2`）：
-/// * 视图快照：`peers 3:m8/n9` —— `matched=8` 而 `next=9`，leader 自己 `last=8`；
-/// * `[meta:send]`（raft 交出）160 条 `index=9 entries=0` ＋ 1 条 `index=8 entries=1`（**携带
-///   entry 9 的那条**），而 `[meta:transport]`（真正出队）99 条全是旧形状 ⇒ 那条只发过一次。
-///
-/// 三种修法都被实测否掉并撤回（无界队列 / 送达为止重试 / 每次丢包 `report_unreachable`，`§107.3`）。
-/// **下一刀**：限流的 `report_unreachable`（≤1 次/秒/peer，它是 raft 为此留的入口）；若仍无效则查
-/// **inflight 释放**（`Progress::maybe_update` 只在 `index > matched` 时释放，而停摆时
-/// follower 回的 `index == matched` ⇒ 那条"乐观发出"留下的 inflight 永不释放）。
-#[ignore = "§106：已复现的写停摆；修好前必须变绿"]
+/// - `RUST_LOG=raft=debug`：raft-rs 的 `default_logger()` 是 `slog_envlogger`，一直可用；
+/// - `YUNTUN_META_TRACE=1`：`[meta:send]`（raft 交出什么）/ `[meta:transport]`（真正出队什么）/
+///   入站 / `entries()` / 每秒一行的 `Progress` 视图快照（含 `paused` 与 inflight）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn compaction_with_lagging_follower_should_keep_committing() {
     const THRESHOLD: usize = 4;
-    let root = TempDir::new("meta-repro105");
+    let root = TempDir::new("meta-stall-regression");
     let dir = |id: u64| -> PathBuf { Path::new(&root.0).join(format!("node{id}")) };
     let opts = MetaOptions {
         compact_log_entries: THRESHOLD,

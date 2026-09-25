@@ -11,6 +11,19 @@
 //! | 性质 | raft 是否要求 | 本实现 |
 //! |---|---|---|
 //! | 不丢 | **不要求**（⚠️ 但这条假设在本仓被证伪，见下） | 队列满 → **丢**（计数），绝不阻塞 raft 线程 |
+//!
+//! # 两条队列：可取代的 vs 重要的（`§111`）
+//!
+//! 一条 FIFO 队列时，**过时的心跳 / 空追加会堵在队头**，而它们后面恰恰是**唯一携带条目的那条**：
+//! `§110` 实测 raft 交出 537 条 append、`send_loop` 只出队 298 条，那条救场的 append **一次都没出去**。
+//! 所以出站分成两条（[`GrpcTransport`]）：
+//!
+//! | 队列 | 装什么 | 容量 | 满了怎么办 |
+//! |---|---|---|---|
+//! | `important` | **携带条目**的追加、选举/投票消息、各种响应 | [`SEND_QUEUE`] | 丢新来的（计数） |
+//! | `best_effort` | 心跳、**不携带条目**的追加 | [`BEST_EFFORT_QUEUE`] = 1 | 丢新来的**没关系**（下个 tick 有更新的） |
+//!
+//! `send_loop` 用 `select!{ biased; … }` **优先发重要的** ⇒ 队头再也不会被过时的心跳占住。
 //! | 保序 | **不要求**：靠 term/index 自愈乱序 | 不保证（多连接 + 并发） |
 //! | 不重 | 要求：重复消息会让 raft 反复 `step` | gRPC 不重复；且**我们不做重发** |
 //!
@@ -75,6 +88,12 @@ use crate::trace_on;
 /// leader 永久停摆（见模块文档"已知缺陷"）。本刀**没有**动这个策略：无界队列与"送达为止重试"
 /// 都试过，副作用（长期分区下内存无界 / 队头阻塞把新 append 也堵住）都被实测证实。
 const SEND_QUEUE: usize = 1024;
+
+/// **可取代的**消息（心跳 / 空追加）的队列深度：**1 就够**。
+///
+/// 它们的唯一作用是"告诉对端我还活着 / commit 到哪了"，而**更新的那条完全覆盖**旧的
+/// （commit 单调不降）⇒ 队列里留一条正在发的、再来一条更新的就够；再来的直接丢（`§111`）。
+const BEST_EFFORT_QUEUE: usize = 1;
 
 /// 单次 `Meta.Raft` 调用的超时。对端卡住时不能把发送任务永久占住
 /// （否则这个 peer 的消息会一直堆积 → 一直丢，等价于断链但**没有信号**）。
@@ -186,8 +205,29 @@ impl PeerTransport for NoTransport {
 
 /// 经 `Meta.Raft`（gRPC）把消息送给对端。
 pub struct GrpcTransport {
-    peers: HashMap<u64, tokio::sync::mpsc::Sender<Message>>,
+    /// **携带条目的**消息（重要）：优先发，容量正常。
+    important: HashMap<u64, tokio::sync::mpsc::Sender<Message>>,
+    /// **可取代的**消息（心跳 / 空追加）：容量只有 1 —— 下个 tick 就会有更新的那条。
+    ///
+    /// 为什么要分成两条（`§111`，`§110` 实测出来的）：一条 FIFO 队列时，**过时的心跳/空追加会堵在
+    /// 队头**，而它们后面恰恰是**唯一携带条目的那条** —— 实测 raft 交出 537 条 append、`send_loop`
+    /// 只出队 298 条，那条救场的 append **一次都没出去**（因为队头是要等满 2s 超时的失败发送）。
+    /// 分开之后：可取代的那条最多留一条（满就丢新来的，反正下个 tick 还有更新的），
+    /// **重要队列永远不被它们堵住**。
+    best_effort: HashMap<u64, tokio::sync::mpsc::Sender<Message>>,
     stats: Arc<TransportStats>,
+}
+
+/// 这条消息是否**可被后来的同类取代**（= 丢了也不会让对端少任何东西）。
+///
+/// 判据是"raft 每个心跳 tick 都会重新生成"的那些：**心跳**与**不携带条目的追加**。它们的作用只是
+/// "告诉对端我还活着 / 我的 commit 到哪了"，**更新的那条完全覆盖**它们（commit 单调 ✓）。
+///
+/// **携带条目的追加绝不可取代**：丢一条就可能让 follower 永远缺那一条（`§106`/`§107`）。
+fn is_supersedable(m: &Message) -> bool {
+    use raft::eraftpb::MessageType as T;
+    let t = m.get_msg_type();
+    (t == T::MsgHeartbeat || t == T::MsgAppend) && m.entries.is_empty()
 }
 
 impl GrpcTransport {
@@ -201,19 +241,29 @@ impl GrpcTransport {
         peers: HashMap<u64, String>,
         stats: Arc<TransportStats>,
     ) -> Result<Self, String> {
-        let mut tx_map = HashMap::with_capacity(peers.len());
+        let mut important = HashMap::with_capacity(peers.len());
+        let mut best_effort = HashMap::with_capacity(peers.len());
         for (id, addr) in peers {
             // 早失败：端点串非法就报错（`connect_lazy` 会推迟到首次发送，
             // 那时错误只能变成计数 —— 启动期报出来更有用）。
             // 真正的端点由 `send_loop` 自己造（它要能**重建**，见那里的注释）。
             tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
                 .map_err(|e| format!("节点 {id} 的地址 {addr:?} 非法（期望 host:port）：{e}"))?;
-            let (tx, rx) = tokio::sync::mpsc::channel::<Message>(SEND_QUEUE);
-            handle.spawn(send_loop(id, addr, rx, stats.clone()));
-            tx_map.insert(id, tx);
+            let (imp_tx, imp_rx) = tokio::sync::mpsc::channel::<Message>(SEND_QUEUE);
+            let (be_tx, be_rx) = tokio::sync::mpsc::channel::<Message>(BEST_EFFORT_QUEUE);
+            handle.spawn(send_loop(
+                id,
+                addr,
+                imp_rx,
+                be_rx,
+                stats.clone(),
+            ));
+            important.insert(id, imp_tx);
+            best_effort.insert(id, be_tx);
         }
         Ok(Self {
-            peers: tx_map,
+            important,
+            best_effort,
             stats,
         })
     }
@@ -237,14 +287,22 @@ impl PeerTransport for GrpcTransport {
                 msg.commit
             );
         }
-        let Some(tx) = self.peers.get(&to) else {
+        let supersedable = is_supersedable(&msg);
+        let q = if supersedable {
+            &self.best_effort
+        } else {
+            &self.important
+        };
+        let Some(tx) = q.get(&to) else {
             // 目标不是本节点认识的 peer：丢 + 计数（不是 panic —— 成员表变化时会短暂出现）
             self.stats.dropped.fetch_add(1, Ordering::Relaxed);
             return;
         };
         // `try_send`：满就丢。**绝不阻塞 raft 线程**（它还要 tick）。
-        // ⚠️ `§107`：这里"丢"是**有代价**的（见模块文档"已知缺陷"），但改成无界队列被实测否掉了
-        // （长期分区下积压无界），所以保持原样、把问题记在文档里。
+        //
+        // 两条队列的取舍不一样（`§111`）：**可取代的**那条容量只有 1，满了丢新来的没关系
+        // （下个 tick 就有更新的）；**重要的**（携带条目）满才是真的麻烦 —— 但实测里它离满很远，
+        // 真正的问题是它**排在被堵住的队头后面**，那已经由"两条队列 + 优先发重要的"解决了。
         if tx.try_send(msg).is_err() {
             self.stats.dropped.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -260,13 +318,22 @@ impl PeerTransport for GrpcTransport {
 async fn send_loop(
     to: u64,
     addr: String,
-    mut rx: tokio::sync::mpsc::Receiver<Message>,
+    mut important: tokio::sync::mpsc::Receiver<Message>,
+    mut best_effort: tokio::sync::mpsc::Receiver<Message>,
     stats: Arc<TransportStats>,
 ) {
     let mut client = make_client(&addr);
     // 连续投递失败计数：到 `REBUILD_AFTER` 就**重建通道**（见下面 `Err` 分支）。
     let mut fail_streak: u32 = 0;
-    while let Some(msg) = rx.recv().await {
+    loop {
+        // **优先发重要的**（`biased` 保证分支按书写顺序轮询）：心跳/空追加再新，也不该挡在
+        // **携带条目的**那条前面 —— `§110` 实测到的正是"队头被过时的空追加堵住、救场的 append 出不去"。
+        let msg = tokio::select! {
+            biased;
+            m = important.recv() => m,
+            m = best_effort.recv() => m,
+        };
+        let Some(msg) = msg else { break }; // 两个通道都关了 = 该 peer 的发送任务收工
         let payload = match msg.write_to_bytes() {
             Ok(b) => b,
             Err(e) => {
