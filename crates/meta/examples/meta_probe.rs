@@ -52,11 +52,17 @@ async fn connect_all(addrs: &[String]) -> Vec<Client> {
 }
 
 async fn status(c: &Client) -> Option<pb::StatusResponse> {
-    c.clone()
-        .status(pb::StatusRequest {})
-        .await
-        .ok()
-        .map(|r| r.into_inner())
+    // **必须带超时**：对端被冻住（`podman pause`）时它不会回，没有超时会把探测整个挂死 ——
+    // `tests/cluster.sh soak` 会在冻结期间探状态，这条是它能不能跑的前提。
+    match tokio::time::timeout(
+        Duration::from_secs(3),
+        c.clone().status(pb::StatusRequest {}),
+    )
+    .await
+    {
+        Ok(Ok(r)) => Some(r.into_inner()),
+        _ => None,
+    }
 }
 
 /// 等出 leader（**读各节点的 Status**，不是客户端猜），返回 (下标, leader_id)。

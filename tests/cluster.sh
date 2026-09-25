@@ -237,6 +237,45 @@ stall() {
   say "✅ 三方收敛——容器里**没能**复现 §106 的停摆"
 }
 
+# **反复**"冻结 → 写入 → 解冻"，**每一轮**都断言真收敛；最后再来一次真断网 + 接回。
+#
+# 为什么需要它（`§111` 之后）：那个写停摆的根因是"队头被**过时**消息堵住"，属于**只有在持续故障
+# 下才暴露**的一类 —— 一轮 `smoke`/`gap` 绿只说明"没坏"，反复来才是回归该有的样子。
+soak() {
+  local rounds="${1:-3}"
+  local writes="${2:-5}"
+  say "① 起集群（压缩阈值 = ${YUNTUN_SNAPSHOT_LOG_ENTRIES:-100000}）"
+  up
+  local r l victim n i
+  local alive=()
+  for r in $(seq 1 "$rounds"); do
+    l="$(probe leader "${ADDRS[@]}")"
+    victim=$([ "$l" = "1" ] && echo 2 || echo 1)
+    say "第 $r/$rounds 轮：leader=$l，冻住 mn$victim 期间写 $writes 条"
+    freeze "$victim"
+    alive=()
+    for n in 1 2 3; do [ "$n" = "$victim" ] || alive+=("mn$n:9311"); done
+    for i in $(seq 1 "$writes"); do
+      printf '  r%ss%s: ' "$r" "$i"
+      probe write "r${r}s${i}" "${alive[@]}" || die "第 $r 轮第 $i 条写不进去（多数派）"
+    done
+    unfreeze "$victim"
+    await_convergence 60
+  done
+
+  say "② 换一种故障形态：真断网 + 接回"
+  l="$(probe leader "${ADDRS[@]}")"
+  victim=$([ "$l" = "1" ] && echo 3 || echo 1)
+  partition "$victim"
+  sleep 2
+  alive=()
+  for n in 1 2 3; do [ "$n" = "$victim" ] || alive+=("mn$n:9311"); done
+  probe write "soak-final" "${alive[@]}" || die "真断网下多数派写不进去"
+  heal "$victim"
+  await_convergence 60
+  say "✅ soak 通过（$rounds 轮冻结 + 1 次真断网，全部收敛）"
+}
+
 case "${1:-}" in
   build) build ;;
   up) up ;;
@@ -249,6 +288,7 @@ case "${1:-}" in
   freeze) shift; freeze "$@" ;;
   unfreeze) shift; unfreeze "$@" ;;
   gap) shift; gap "$@" ;;
+  soak) shift; soak "$@" ;;
   logs)
     if [ $# -ge 2 ]; then podman logs "yuntun-mn$2" 2>&1 | tail -40
     else for c in "${CONTAINERS[@]}"; do printf '\n--- %s ---\n' "$c"; podman logs "$c" 2>&1 | tail -8; done; fi

@@ -7229,3 +7229,43 @@ peer 3: matched=8, next_idx=10, state=Replicate, paused=false,
 - `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
 - 容器真环境：`tests/cluster.sh smoke`（真断网 + 接回收敛）与 `gap 10 12`（进程冻结）均通过；
 - 规模：49,419 行 / 20 个 crate / 381 个测试函数（**0 ignored**）。
+
+---
+
+## 112. **反复故障的回归**：`tests/cluster.sh soak`（`§111` 那种 bug 的回归形态）（2026-09-25）
+
+### 112.1 动机
+
+`§111` 修的写停摆，根因是"**队头被过时的消息堵住**"—— 这类问题**只有在持续故障下才暴露**：
+一轮 `smoke`/`gap` 绿只说明"没坏"，不能说明"不会坏"。所以要有**反复来**的回归。
+
+### 112.2 它做什么
+
+```bash
+bash tests/cluster.sh soak [轮数] [每轮条数]     # 默认 3 轮 × 5 条
+```
+
+每轮：**冻住一个 follower**（`podman pause`，即"对端还活着但长时间不响应"）→ 在**多数派**上写
+N 条 → 解冻 → **硬断言三方真收敛**（同一个 leader 且 `last` 全等）。最后一轮换成**真断网**
+（`podman network disconnect`）+ 接回，换一种故障形态。
+
+### 112.3 实测
+
+```text
+第 1 轮：冻 mn2，写 5 条 → 解冻 → ✅ 收敛（last=6）
+第 2 轮：冻 mn2，写 5 条 → 解冻 → ✅ 收敛（last=11）
+第 3 轮：冻 mn2，写 5 条 → 解冻 → ✅ 收敛（last=16）
+② 真断网 mn3 + 接回        → ✅ 收敛（last=17，2 次轮询内）
+=== ✅ soak 通过（3 轮冻结 + 1 次真断网，全部收敛）
+```
+
+### 112.4 顺带一处硬化
+
+`meta_probe` 的 `Status` 调用加了 **3s 超时**：对端被冻住时它不会回，没超时会把整个探测**挂死**
+（`soak` 会在冻结期间探状态，这是它能跑的前提）。冻结期间探到的就是"这一拍没有它"，符合预期。
+
+### 112.5 验证
+
+- `tests/cluster.sh soak 3 5` 通过（见 `§112.3`）；`smoke` / `gap` / `stall` 仍通过；
+- 本刀只动脚本 + `meta_probe` 的超时（无存储/raft 行为改动）⇒ 全量 `cargo test --workspace`
+  **382 passed / 0 failed / 0 ignored**；`clippy --workspace --all-targets` 本仓告警 **0**。
