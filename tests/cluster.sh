@@ -157,6 +157,53 @@ smoke() {
   say "✅ smoke 通过"
 }
 
+# **冻住 / 解冻**一个节点（`podman pause` = cgroup freezer 真实冻结进程）。
+#
+# 为什么用冻结而不是 `tc netem` / `iptables`：本机是 **rootless podman**，网络走 pasta/slirp，
+# 宿主侧**没有可切的 veth**，容器里也没装 iproute2；而冻结是 podman 自带的能力，且它模拟的是
+# 一种很真实的故障形态：**长 GC / 长 IO 停顿 / 宿主压力** —— 对端进程活着、TCP 连接也在，
+# 但请求一律**超时**（不是"连接被拒"）。这正是造出"**leader 以为发出去了、follower 没应用**"
+# （`§106`/`§107` 的 `next > matched+1`）最直接的办法。
+freeze() {
+  local n="${1:?usage: freeze <1|2|3> [secs]}"
+  say "🧊 冻住 mn$n（podman pause）"
+  podman pause "yuntun-mn$n" >/dev/null
+}
+
+unfreeze() {
+  local n="${1:?usage: unfreeze <1|2|3>}"
+  say "🔥 解冻 mn$n（podman unpause）"
+  podman unpause "yuntun-mn$n" >/dev/null
+}
+
+# 刻意造 "**稳定的 follower 丢一条 append**"：冻住一个 follower 几秒，期间在多数派上写几条
+# （leader 会照发、照乐观推进），再解冻 —— 然后看它到底能不能补上（`§109.4` 的第 1 步）。
+gap() {
+  local secs="${1:-3}"
+  local writes="${2:-3}"
+  say "① 起集群（压缩阈值 = ${YUNTUN_SNAPSHOT_LOG_ENTRIES:-100000}）"
+  up
+  local l frozen
+  l="$(probe leader "${ADDRS[@]}")"
+  frozen=$([ "$l" = "1" ] && echo 2 || echo 1)
+  printf '  leader = %s，要冻的是 mn%s\n' "$l" "$frozen"
+
+  say "② 冻住 mn$frozen ${secs}s，期间在多数派上写 $writes 条"
+  freeze "$frozen"
+  local alive=() n i
+  for n in 1 2 3; do [ "$n" = "$frozen" ] || alive+=("mn$n:9311"); done
+  for i in $(seq 1 "$writes"); do
+    printf '  g%s: ' "$i"
+    probe write "g$i" "${alive[@]}" || die "多数派写不进去（第 $i 条）—— 先查环境"
+  done
+  sleep "$secs"
+
+  say "③ 解冻 mn$frozen，等三方收敛（**判据**：`§106` 那个 gap 会让它一直红）"
+  unfreeze "$frozen"
+  await_convergence 60
+  say "✅ 三方收敛——这一形态下也没复现 §106 的停摆"
+}
+
 # 复现 `§106`/`§107` 的**写停摆**：小压缩阈值 + 一个有 follower 落后（**断的是 follower，不是 leader**
 # —— 那样多数派还能提交，落后的那个才需要靠 leader 补日志）。
 #
@@ -199,6 +246,9 @@ case "${1:-}" in
   heal) shift; heal "$@" ;;
   smoke) smoke ;;
   stall) stall ;;
+  freeze) shift; freeze "$@" ;;
+  unfreeze) shift; unfreeze "$@" ;;
+  gap) shift; gap "$@" ;;
   logs)
     if [ $# -ge 2 ]; then podman logs "yuntun-mn$2" 2>&1 | tail -40
     else for c in "${CONTAINERS[@]}"; do printf '\n--- %s ---\n' "$c"; podman logs "$c" 2>&1 | tail -8; done; fi

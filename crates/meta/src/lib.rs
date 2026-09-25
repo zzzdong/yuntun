@@ -1285,13 +1285,15 @@ fn spawn_node(
                     && last_snap.is_none_or(|t: Instant| t.elapsed() >= Duration::from_secs(1))
                 {
                     last_snap = Some(Instant::now());
+                    // 打**整个 `Progress`**（Debug）：`matched/next_idx/state` 之外，`§107.6` 怀疑的
+                    // 两处（`paused` 与 inflight `ins`）只有整打才看得见 —— 「leader 不再发」要么是
+                    // `Probe+paused` 卡住，要么是 `ins` 满了（而 `matched` 不前进时 `ins.free_to`
+                    // 不会被调用 ⇒ 那条"乐观发出"留下的 inflight 永远占着）。
                     let prs = raw
                         .raft
                         .prs()
                         .iter()
-                        .map(|(p, pr)| {
-                            format!("{p}:m{}/n{}/{:?}", pr.matched, pr.next_idx, pr.state)
-                        })
+                        .map(|(p, pr)| format!("{p}:{pr:?}"))
                         .collect::<Vec<_>>()
                         .join(" ");
                     eprintln!(

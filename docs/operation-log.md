@@ -7070,3 +7070,94 @@ leader 的日志早就压到它需要的那段之前了）。
 - `tests/cluster.sh smoke` 仍通过（真断网下多数派照常提交 + 接回收敛）；
 - 全量 `cargo test --workspace` → **381 passed / 0 failed / 1 ignored**（本刀只加脚本，无 Rust 行为改动）；
 - `clippy --workspace --all-targets` 本仓告警 **0**。
+
+---
+
+## 110. 续查 `§106`：瓶颈在**传输队列的队头阻塞**，不在 raft 的乐观推进（仍未修）（2026-09-25）
+
+### 110.1 从哪接
+
+`§109` 用真环境三条路径（真分区 / 加压缩 / 进程冻结）都没能复现 `§106` 的停摆。回头把
+**raft-rs 的拒绝规则真读一遍**（此前一直在凭记忆复述），结论是硬的：
+
+```rust
+// tracker/progress.rs
+if self.state == ProgressState::Replicate {
+    // 陈旧：rejected < matched，或 (rejected == matched 且不是请求快照)
+    if rejected < self.matched || (rejected == self.matched && request_snapshot == INVALID_INDEX) {
+        return false;                 // 当陈旧，忽略
+    }
+    self.next_idx = self.matched + 1; // ← 否则一律回退到 matched+1
+```
+
+⇒ **在 Replicate 态下，只要收到"真拒绝"，`next_idx` 必然被拉回 `matched + 1`** ⇒ 也就必然重发那条
+缺的 ⇒ **"收到拒绝"这件事本身就能自愈**。所以停摆只可能是：**leader 压根没把该发的发出去**。
+
+### 110.2 仪器升级
+
+把每秒一次的"视图快照"从只打 `matched/next/state` 改成打**整个 `Progress`**（Debug）——
+`§107.6` 怀疑的两处（`Probe+paused` 卡住、或 inflight `ins` 满）只有整打才看得见。
+
+### 110.3 实测：停摆时的三组数
+
+**同一瞬间的 Progress**（leader=2，停摆中）：
+
+```text
+peer 3: matched=8, next_idx=10, state=Replicate, paused=false,
+        ins: Inflights { start: 7, count: 1, buffer: [2,3,4,5,6,7,8,9], cap: 256 }
+```
+
+**三条轨迹配对**（全窗口）：
+
+| 轨迹 | 计数 |
+|---|---|
+| raft **交给传输**的 →3 append | **537** |
+| `send_loop` **真正出队**的 | **298**（**239 条卡在队列里**） |
+| →3 **投递失败**（超时） | **118** |
+| node 3 **收到**的 | 297 |
+| 其中 **`index=9` 的**（= 唯一能救场的那条） | **0** |
+| 全集群 `reject=true` 的响应 | **0** |
+
+### 110.4 怎么读
+
+**瓶颈是 per-peer FIFO 队列的队头阻塞**：队头是那些**要等满 2s RPC 超时**的失败发送 ⇒ 队列
+排不动 ⇒ 那条唯一携带条目的 append **一直出不去** ⇒ 于是才有 `§107` 的"乐观推进补不上"。
+**`§107` 的机制是对的，但它是后果，不是首因。**
+
+两条附注：
+
+- `ins` 里那条**悬空的 inflight**（`count: 1`，index 9）证实了 `§107.6` 的猜测 —— 它是"乐观发出"
+  留下的，而 follower 回的 `index` 不前进 ⇒ `maybe_update` 返 false ⇒ `ins.free_to` 压根不调用 ⇒
+  **永不释放**；但 `paused=false`（`ins` 远没满）⇒ **它不是"停发"的原因**，只是一条旁证。
+- `reject=true` **一条都没有** ⇒ follower 侧完全正常（它只是从没收到那条 append）。
+
+### 110.5 为什么真环境复现不了（这次的解释是自洽的）
+
+| | 进程内夹具（会红） | 容器真环境（绿） |
+|---|---|---|
+| 失败长什么样 | **挂住**，等满 2s 超时 | **快速报错**（连接被拒 / 网络不可达） |
+| 失败持续多久 | 受害者**全程**被隔离（风暴不停） | 断网/冻结结束后**立刻恢复** |
+| 解冻/接回之后 | 队列还楔着 | **积压瞬间排空**（实测：15s 冻结 + 20 条写，解冻后仍收敛） |
+
+⇒ 停摆需要"**同一个 peer 连续多次发送都挂住**"这个条件；真环境里它要么不来、要么一来就走，
+所以那三条路径复现不了。这不等于 `§106` 是假的：**"对端还活着但长时间不响应"是真实故障形态**
+（长 GC / 长 IO 停顿 / 宿主压力 ⇒ `tests/cluster.sh freeze` 就是它），只是要把量做够。
+
+### 110.6 下一刀（明确到可执行）
+
+**改队列策略**（不是改 raft）：
+
+1. 现在 `GrpcTransport::send` 是 `try_send`，**满了就丢"新来的"** —— 而新来的往往正是**携带条目**
+   的那条，等于**优先丢掉最该发的东西**。应该反过来：**积压时优先丢空的/过时的**
+   （心跳、被后来者取代的空 append）；
+2. 更简单的一版：同 peer 的空 append 在队列里可以**被后来的取代**（只保留最新的那条）；
+3. 落地后拿 `tests/cluster.sh` 验收：加一个"**长冻结 + 足量写**"的场景（真环境下把队列楔住），
+   并把 `§106` 的探针从进程内**搬到容器 rig** 上跑 —— 那样它就同时是回归用例。
+
+### 110.7 验证
+
+- 容器真环境：`tests/cluster.sh gap 15 20`（15s 进程冻结 + 20 条写）→ **收敛**（`last=1 → 21`）；
+  `stall` / `smoke` 仍通过；
+- 进程内探针（`§106`）**仍 `#[ignore]`**：本刀**没有**修好它，只是把首因换成队列；
+- 本刀只改了一处**诊断输出**（视图快照打整个 `Progress`，默认关）⇒ 全量 `cargo test --workspace`
+  **381 passed / 0 failed / 1 ignored**；`clippy --workspace --all-targets` 本仓告警 **0**。
