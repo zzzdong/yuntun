@@ -465,6 +465,12 @@ impl Storage for FjallStorage {
                     .map_err(|_| RaftError::Store(StorageError::Unavailable))?,
             );
         }
+        // 轨迹：`entries` 是"leader 该发哪些条目"的唯一来源，返回空 = 它会发**空** append，
+        // 而空 append 会让 follower 误以为"没事"（`§106`/`§107` 的停摆就卡在这里）。
+        self.trace(
+            "entries",
+            format!("[{low},{high}) first={first} last={last} → {} 条", out.len()),
+        );
         Ok(out)
     }
 

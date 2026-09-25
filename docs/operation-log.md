@@ -6802,3 +6802,80 @@ leader 反复发 `MsgAppend log_term: 1 index: 11`（`prev=11`），而 follower
   `slow_sources_wait_in_parallel_not_in_sequence` **各失败过一次**（都是**带 deadline 的时序用例**），
   **单跑全绿**、负载降下来后重跑全量 381/0 ⇒ 登记为负载敏感抖动（与 `§105.4` 那条同类），本刀未修；
 - 规模：48,945 行 / 20 个 crate / 381 个测试函数（含 1 个 `#[ignore]` 探针）。
+
+---
+
+## 107. 顺着 `§106` 查下去：**传输会静默丢 raft 消息**（已修）+ 停摆根因再收窄（2026-09-25）
+
+### 107.0 先说清结果
+
+- ✅ **修掉一个真问题**：传输层**不再静默丢** raft 消息（107.2，有证据）；
+- 🔁 **停摆本身仍未修好**，但根因又收窄一层（107.4），且**诊断能力留在了代码里**（107.1）；
+- ❌ 一个试过并**撤掉**的修法（搁浅看门狗，107.5）—— 不留没被证实有效、而且有副作用的东西。
+
+### 107.1 诊断能力（本刀副产物，值钱）
+
+| 轨迹 | 开关 | 回答什么 |
+|---|---|---|
+| 出站逐条（`transport.rs`） | `YUNTUN_META_TRACE=1` | 我**发了什么**：`msg_type` / `index` / `entries` / `commit` / `reject` / `hint` |
+| 入站逐条（`service.rs`） | 同上 | 对端**收到了什么**（含 `delivered`） |
+| 存储 `entries()`（`fjall_storage.rs`） | 同上 | leader **该发哪些条目**、有没有被问过 |
+| raft 内部 | `RUST_LOG=raft=debug` | 选主 / 收发 / 暂停 / 快照的判定（`§106.1`） |
+
+四条一起用，能把"集群不动"拆成「没发出去 / 发了没到 / 到了被拒 / 发了但内容不对」四类。
+
+### 107.2 已修：传输**不再静默丢** raft 消息
+
+**证据**：一次停摆窗口里，leader 对健康 follower 发了 **381** 条 append、对端收到 **380** 条 ——
+**恰好丢 1 条**，而丢的那条正是**唯一携带新条目**的那条。丢点既不是队列满（`try_send`），
+也不是 `delivered=false`（窗口内 0 条"拒收"），而是 `client.raft()` 报错那条**被静默计数**的分支。
+
+**为什么丢一条就致命**（本刀最重要的一条）：模块文档原先写着"丢了没关系，raft 会按 tick 重发"
+—— **这条假设是假的**。raft-rs 在把消息**交给传输**时就**乐观推进** `Progress.next_idx`
+（`prepare_send_entries` → `update_state`），且**不会**因"这条没送到"而回退。丢掉那条 append 之后：
+
+1. leader 的 `next_idx` 已在前面，follower 的 `matched` 还在原地；
+2. leader 没有更新的条目要发 ⇒ 反复发**空** append（`prev_index = next_idx - 1`）；
+3. follower 的日志里**正好有**那个 prev ⇒ 它**接受**并回 `index = 自己的 last`；
+4. `matched` 只能单调前进 ⇒ **leader 永远不会再发那条丢掉的条目** ⇒ **写入停摆，且没有任何错误**。
+
+**修法**：`transport.rs` 改为"**入队无界**（不再 `try_send` 满就丢）+ RPC 失败**重试到送达为止**
+（退避 5ms→500ms）"。代价如实记：对端长期不可达时队列会积压（积压量 ∝ 来不及送的日志），
+"对端永久不在"的正路是成员变更把它摘掉（`Join` / S3-6）。
+
+### 107.3 回归（传输是共享路径，必须全验）
+
+全量 **381 passed / 0 failed / 1 ignored**；`clippy` 本仓 **0**；重点回归：3 节点真 gRPC（`§50`）、
+**网络分区**（`§104`）、**3 个真 metanode 进程**（`§103`）、`raft_poc` —— 全绿。
+
+### 107.4 停摆根因再收窄（仍未修好）
+
+有了 `entries()` 轨迹后这条很清楚：**停摆期间 leader 一直在为 `[9,10)` 调 `entries`（153 次），
+但从来没有为 `[10,11)` 调过** —— 即 raft 认为"该发的都发了"，而 follower 的 `last` 停在 9。
+这与 107.2 是**同一条机制**：那条携带 entry 10 的 append 只发过一次，之后再没被发。
+
+**仍未钉死的一处**：leader 的 `Status` 报 `last_index=10`，而同一时刻 `entries` 调用里是
+`[9,10) first=9 last=9`（`last=9`）—— **"自己日志的末尾"这个值在 `RaftLog` 视图与 `Storage`
+视图之间有偏差**。下一刀从这里接：在 `append` / `set_applied` / `compact_applied` 三处打出
+`last_index / compacted_index / applied` 的成对轨迹，看偏差是哪一步引入的。
+
+### 107.5 试过并**撤掉**的修法（如实记）
+
+**搁浅看门狗**：在驱动循环里，peer 的 `matched < last` 持续超过 1s 就调
+`Progress::become_probe()`（公开 API，语义恰是 `next_idx = matched + 1`）让它重探。撤掉的两个理由：
+
+1. **救不了这个停摆**：实测它确实在重发（`entries [9,10)` 被调 153 次），但真正的缺口是
+   `[10,11)` 从没被问过 —— 看门狗改的是 `next_idx`，而那里 `next_idx` 本来就等于 `matched + 1`，
+   **改动是 no-op**；
+2. **可能有害**：Probe 状态每次只发一条、等回执 ⇒ 等于把落后 peer 的复制**限流到 ~1 条/秒**。
+
+不留"没被证实有效、且有副作用"的改动 —— 与 `§105.3` 撤掉"安全水位"同一个纪律。
+
+### 107.6 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **381 passed / 0 failed / 1 ignored**
+  （ignored 即 `§106` 的探针，本刀**未**让它转绿，故仍 ignore）；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 重点回归：`multi_node_grpc_e2e`（3 节点 / 分区 / 压缩策略）3 绿 1 ignored、
+  `metanode_cluster_process_e2e`（真进程组）1 绿、`raft_poc` 4 绿；
+- 规模：49,071 行 / 20 个 crate / 381 个测试函数（含 1 个 `#[ignore]` 探针）。

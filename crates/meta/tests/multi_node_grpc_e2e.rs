@@ -895,12 +895,15 @@ fn snapshot_trigger_compacts_the_log_by_policy() {
 ///
 /// # 未钉死的那一环（下一刀从这里接）
 ///
-/// 症状里有条**互相矛盾**的：leader 反复发 `MsgAppend index=11`（prev=11），而 follower 的
-/// `last=9` —— 它**应该**回 `reject=true`，实际却回 `reject=false`。也就是说
-/// **follower 很可能根本没收到那些 prev=11 的 append**（它一直在回更旧的、它确实能接受的那条）。
-/// 所以下一步该查**传输**而不是 raft：
-/// 给每个 peer 的 `send_loop` 加上"发出去的 (msg_type, index, entries) → 对端回的
-/// (index, reject)"逐条配对计数，先确认"leader 发的东西有没有到"。
+/// `§107` 用逐条轨迹把范围收窄到一层：**传输层会静默丢 raft 消息**（已修：入队无界 + 送达为止
+/// 重试），而"丢一条就致命"是因为 raft-rs 在把消息交给传输时就**乐观推进** `Progress.next_idx`
+/// 且不会回退 ⇒ leader 只会反复发**空** append，follower 恰好能接受它 ⇒ `matched` 永久钉住。
+///
+/// **仍未钉死的一处**：停摆期间 leader 一直为 `[9,10)` 调 `entries`（153 次），却**从未**为
+/// `[10,11)` 调过 —— 也就是 raft 认为"该发的都发了"。而 leader 的 `Status` 同时报
+/// `last_index=10`、`entries` 调用里却是 `last=9`：**"自己日志的末尾"这个值在 `RaftLog` 视图
+/// 与 `Storage` 视图之间有偏差**。下一刀：在 `append`/`set_applied`/`compact_applied` 三处打出
+/// `last_index / compacted_index / applied` 的成对轨迹，看偏差是哪一步引入的。
 #[ignore = "§106：已复现的写停摆；修好前必须变绿"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn compaction_with_lagging_follower_should_keep_committing() {
@@ -969,14 +972,37 @@ async fn compaction_with_lagging_follower_should_keep_committing() {
     eprintln!("复现：隔离 follower {victim}；leader={leader}；阈值={THRESHOLD}");
 
     for k in 0..12u64 {
-        let r = propose_following_leader(
-            &live,
-            &majority,
-            commit_op(&format!("s{k}"), &format!("key-s{k}"), 2_000 + k),
-        )
-        .await;
-        assert!(r.accepted, "第 {k} 条必须被接受");
-        eprintln!("  ④ k={k} ok");
+        let op = commit_op(&format!("s{k}"), &format!("key-s{k}"), 2_000 + k);
+        let cur = wait_some_leader(&live, &majority).await;
+        let mut c = live[&cur].clone();
+        let call = c.propose(pb::ProposeRequest {
+            op: Some(op),
+            request_id: b"rid".to_vec(),
+            schema_ver: 0,
+        });
+        let accepted = match tokio::time::timeout(Duration::from_secs(12), call).await {
+            Ok(Ok(r)) => r.into_inner().accepted,
+            _ => false,
+        };
+        if !accepted {
+            for id in IDS {
+                eprintln!("  节点 {id}: {:?}", status(&clients[&id], id).await);
+            }
+            for n in &nodes {
+                let s = n.node.as_ref().unwrap().transport_stats();
+                eprintln!(
+                    "  节点 {} 传输: delivered={} failed={} rejected={} dropped={} queued={}",
+                    n.id, s.delivered, s.failed, s.rejected, s.dropped, s.queued
+                );
+            }
+            panic!("④ 第 {k} 条提交失败（12s 内没被接受）");
+        }
+        let st = status(&clients[&cur], cur).await;
+        eprintln!(
+            "  ④ k={k} ok：leader={cur} first={} last={} applied={} commit={}",
+            st.first_index, st.last_index, st.applied_index, st.commit_index
+        );
+        let _ = cur;
     }
 
     for n in nodes {

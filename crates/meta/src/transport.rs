@@ -10,9 +10,25 @@
 //!
 //! | 性质 | raft 是否要求 | 本实现 |
 //! |---|---|---|
-//! | 不丢 | **不要求**：心跳/选举/追加按 tick 重发，丢失只是慢一点 | 队列满 → **丢**（计数），绝不阻塞 raft 线程 |
+//! | 不丢 | **不要求**……但见下方"为什么不能丢" | **入队不丢 + 送达为止重试**（`§107`） |
 //! | 保序 | **不要求**：靠 term/index 自愈乱序 | 不保证（多连接 + 并发） |
-//! | 不重 | 要求：重复消息会让 raft 反复 `step` | gRPC 不重复；且**我们不做重发** |
+//! | 不重 | 不要求：raft 对重复消息是幂等的（重复的追加只会再走一次一致性检查） | 会重发（送达为止），这是**有意**的 |
+//!
+//! # 为什么不能丢（`§107`，一个真缺陷的结论）
+//!
+//! 上面那句"raft 不要求不丢、丢了它自己会重发"**是假的**：raft-rs 在把消息交给传输时就
+//! **乐观推进** `Progress.next_idx`（`prepare_send_entries` → `update_state`），而它
+//! **不会**因为"这条 append 没送达"而回退。丢掉一条携带条目的 append 之后：
+//!
+//! 1. leader 的 `next_idx` 已经在前面（它认为发出去了），follower 的 `matched` 还在原地；
+//! 2. leader 没有更新的条目要发，于是一遍遍发**空** append（`prev_index = next_idx - 1`）；
+//! 3. follower 的日志里**正好有**那个 prev ⇒ 它**接受**并回 `index = 自己的 last`；
+//! 4. leader 的 `matched` 只能单调前进 ⇒ **它永远不会再发那条丢掉的条目** ⇒ 写入永久停摆
+//!    （`§106` 复现、`§107` 定位）。
+//!
+//! 所以传输必须自己保证送达：**入队无界（不丢）+ RPC 失败重试到送达为止**。
+//! 代价是诚实记下来的：对端长期不可达时队列会积压（积压量 ∝ 来不及送的日志），
+//! 而"对端永久不在"的正路是成员变更把它摘掉（`Join` / S3-6）。
 //!
 //! 结论：`send()` 必须**非阻塞**（调用方是 raft 线程，它还要 tick 别人的选举）。
 //! 这就是把发送放进后台任务（每 peer 一个）而不是"在 raft 线程里 await"的原因。
@@ -40,7 +56,9 @@ use yuntun_proto::meta as pb;
 
 /// 每个 peer 的出站队列深度。满了就丢（raft 会重发）——
 /// 这个值是"能吸收多少瞬时突发"的旋钮：追赶大日志时会打满，但**丢的是可重发的消息**。
-const SEND_QUEUE: usize = 1024;
+/// 送达重试的退避上下限（`§107`）：RPC 失败后重试，间隔从 5ms 涨到 500ms。
+const RETRY_MIN_BACKOFF: Duration = Duration::from_millis(5);
+const RETRY_MAX_BACKOFF: Duration = Duration::from_millis(500);
 
 /// 单次 `Meta.Raft` 调用的超时。对端卡住时不能把发送任务永久占住
 /// （否则这个 peer 的消息会一直堆积 → 一直丢，等价于断链但**没有信号**）。
@@ -130,7 +148,8 @@ impl PeerTransport for NoTransport {
 
 /// 经 `Meta.Raft`（gRPC）把消息送给对端。
 pub struct GrpcTransport {
-    peers: HashMap<u64, tokio::sync::mpsc::Sender<Message>>,
+    /// **无界**：入队绝不丢（`§107` 的"为什么不能丢"）。
+    peers: HashMap<u64, tokio::sync::mpsc::UnboundedSender<Message>>,
     stats: Arc<TransportStats>,
 }
 
@@ -154,7 +173,7 @@ impl GrpcTransport {
             let endpoint = endpoint
                 .connect_timeout(CONNECT_TIMEOUT)
                 .timeout(RPC_TIMEOUT);
-            let (tx, rx) = tokio::sync::mpsc::channel::<Message>(SEND_QUEUE);
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
             handle.spawn(send_loop(id, addr, endpoint, rx, stats.clone()));
             tx_map.insert(id, tx);
         }
@@ -176,13 +195,23 @@ impl PeerTransport for GrpcTransport {
             self.stats.dropped.fetch_add(1, Ordering::Relaxed);
             return;
         };
-        // `try_send`：满就丢。**绝不阻塞 raft 线程**（它还要 tick）。
-        if tx.try_send(msg).is_err() {
+        // **不丢**：无界入队（`§107`）。`send` 只在接收端已销毁时失败（该 peer 的发送任务没了
+        // = 节点已停），这时才算丢并计数。**绝不阻塞 raft 线程**（它还要 tick）—— 无界入队天然满足。
+        if tx.send(msg).is_err() {
             self.stats.dropped.fetch_add(1, Ordering::Relaxed);
         } else {
             self.stats.queued.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+/// 逐条消息轨迹开关（`YUNTUN_META_TRACE=1`）—— 与存储层 `storage.rs` 的 `trace` 同一个开关。
+///
+/// 为什么需要它：`§106` 那个写停摆的卡点是"leader 说它发了、follower 那边却说没收到"，
+/// 只有把**出站**与**入站**逐条配对才能区分「没发出去 / 发了没到 / 到了被拒 / 根本没到」。
+/// ⚠️ 它逐条 `eprintln!`，**只在排查时开**（默认关，正常路径零影响）。
+fn trace_on() -> bool {
+    std::env::var("YUNTUN_META_TRACE").is_ok()
 }
 
 /// 每个 peer 一个发送任务：出队 → 编码 → `Meta.Raft`。
@@ -193,7 +222,7 @@ async fn send_loop(
     to: u64,
     addr: String,
     endpoint: tonic::transport::Endpoint,
-    mut rx: tokio::sync::mpsc::Receiver<Message>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<Message>,
     stats: Arc<TransportStats>,
 ) {
     let mut client = pb::meta_client::MetaClient::new(endpoint.connect_lazy());
@@ -211,20 +240,59 @@ async fn send_loop(
             from: msg.from,
             message: payload,
         };
-        match client.raft(req).await {
-            Ok(resp) => {
-                let r = resp.into_inner();
-                if r.delivered {
-                    stats.delivered.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    stats.rejected.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("[meta:transport] {to}({addr}) 拒收：{}", r.reason);
+        // 逐条出站轨迹（`YUNTUN_META_TRACE=1`）：与 `service.rs` 的入站轨迹配对，
+        // 用来回答"**发出去的东西到底有没有到对端**" —— 这是 `§106` 那个写停摆的卡点。
+        if trace_on() {
+            eprintln!(
+                "[meta:transport] →{to} {:?} from={} index={} log_term={} entries={} commit={} \
+                 reject={} hint={}",
+                msg.get_msg_type(),
+                msg.from,
+                msg.index,
+                msg.log_term,
+                msg.entries.len(),
+                msg.commit,
+                msg.reject,
+                msg.reject_hint
+            );
+        }
+        // **送达为止**（`§107`）：RPC 失败（对端没起 / 超时 / 连接被断）**不丢这条消息**，退避后重试。
+        //
+        // 为什么不能丢（见模块文档"为什么不能丢"）：raft-rs 在把消息交给传输时就**乐观推进**
+        // `Progress.next_idx`，且**不会**因"这条 append 没送达"而回退 —— 丢掉一条携带条目的
+        // append 之后，leader 只会一遍遍发空 append，而 follower 恰好能接受它（prev 在它日志里）
+        // ⇒ `matched` 钉死 ⇒ **写永久停摆**（`§106` 复现、`§107` 定位）。
+        let mut backoff = RETRY_MIN_BACKOFF;
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            match client.raft(req.clone()).await {
+                Ok(resp) => {
+                    let r = resp.into_inner();
+                    if r.delivered {
+                        stats.delivered.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        // 对端**明确**说"没收"（它已停 / 自己不是成员）：重试无意义，记账退出。
+                        // 这与"RPC 失败"是两回事 —— 后者我们**不知道**对端收到没有，必须重试。
+                        stats.rejected.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("[meta:transport] {to}({addr}) 拒收：{}", r.reason);
+                    }
+                    break;
                 }
-            }
-            Err(_) => {
-                // 对端不可达/重启中/超时：**不是错误路径**（raft 会重发），只计数。
-                // 不打日志：心跳 30ms 一次，对端挂掉会刷屏（要看就看计数）。
-                stats.failed.fetch_add(1, Ordering::Relaxed);
+                Err(e) => {
+                    // 一次失败记一次账（`failed` 的原意 = **投递尝试**失败次数），
+                    // 但这条消息仍留在手里重试。默认不打日志（对端长期不可达会刷屏），
+                    // `YUNTUN_META_TRACE=1` 时打开。
+                    stats.failed.fetch_add(1, Ordering::Relaxed);
+                    if trace_on() {
+                        eprintln!(
+                            "[meta:transport] →{to} 第 {attempt} 次投递失败（{e}），{}ms 后重试",
+                            backoff.as_millis()
+                        );
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(RETRY_MAX_BACKOFF);
+                }
             }
         }
     }
