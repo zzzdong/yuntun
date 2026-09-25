@@ -893,17 +893,20 @@ fn snapshot_trigger_compacts_the_log_by_policy() {
 ///   所以它**一直**可用，只是此前没人设过环境变量（见 `§106`）；
 /// - `YUNTUN_META_TRACE=1`：存储层的 env-gated 轨迹（`append`/`compact`/`recv_snapshot`）。
 ///
-/// # 未钉死的那一环（下一刀从这里接）
+/// # 机制（`§107` 已钉死，但**未修好**）
 ///
-/// `§107` 用逐条轨迹把范围收窄到一层：**传输层会静默丢 raft 消息**（已修：入队无界 + 送达为止
-/// 重试），而"丢一条就致命"是因为 raft-rs 在把消息交给传输时就**乐观推进** `Progress.next_idx`
-/// 且不会回退 ⇒ leader 只会反复发**空** append，follower 恰好能接受它 ⇒ `matched` 永久钉住。
+/// **传输丢一条携带条目的 append ⇒ leader 的 `next_idx` 已乐观推进在前、`matched` 留在原地
+/// ⇒ 它此后只发空 append，而 follower 恰好能接受（`prev` 就在它日志里）⇒ 永久停摆，无任何错误。**
 ///
-/// **仍未钉死的一处**：停摆期间 leader 一直为 `[9,10)` 调 `entries`（153 次），却**从未**为
-/// `[10,11)` 调过 —— 也就是 raft 认为"该发的都发了"。而 leader 的 `Status` 同时报
-/// `last_index=10`、`entries` 调用里却是 `last=9`：**"自己日志的末尾"这个值在 `RaftLog` 视图
-/// 与 `Storage` 视图之间有偏差**。下一刀：在 `append`/`set_applied`/`compact_applied` 三处打出
-/// `last_index / compacted_index / applied` 的成对轨迹，看偏差是哪一步引入的。
+/// 证据是**同一瞬间**的两组东西（`§107.2`）：
+/// * 视图快照：`peers 3:m8/n9` —— `matched=8` 而 `next=9`，leader 自己 `last=8`；
+/// * `[meta:send]`（raft 交出）160 条 `index=9 entries=0` ＋ 1 条 `index=8 entries=1`（**携带
+///   entry 9 的那条**），而 `[meta:transport]`（真正出队）99 条全是旧形状 ⇒ 那条只发过一次。
+///
+/// 三种修法都被实测否掉并撤回（无界队列 / 送达为止重试 / 每次丢包 `report_unreachable`，`§107.3`）。
+/// **下一刀**：限流的 `report_unreachable`（≤1 次/秒/peer，它是 raft 为此留的入口）；若仍无效则查
+/// **inflight 释放**（`Progress::maybe_update` 只在 `index > matched` 时释放，而停摆时
+/// follower 回的 `index == matched` ⇒ 那条"乐观发出"留下的 inflight 永不释放）。
 #[ignore = "§106：已复现的写停摆；修好前必须变绿"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn compaction_with_lagging_follower_should_keep_committing() {

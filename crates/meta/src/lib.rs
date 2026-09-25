@@ -1072,6 +1072,8 @@ fn spawn_node(
         let mut last_tick = Instant::now();
         let tick_every = Duration::from_millis(10);
 
+        // 【视图快照】上次打印的时刻（见循环末尾；`YUNTUN_META_TRACE=1` 时每秒一行）
+        let mut last_snap: Option<Instant> = None;
         'node: loop {
             // ① 收消息
             loop {
@@ -1258,6 +1260,39 @@ fn spawn_node(
                     storage
                         .compact_applied()
                         .unwrap_or_else(|e| fatal(id, "压缩日志", e));
+                }
+            }
+            // 【视图快照】每秒一行，把**两个视图并排**打出来（`YUNTUN_META_TRACE=1`，默认关）。
+            //
+            // `§107.4` 要回答的问题正是"**leader 自己日志的末尾**"为何会在 `RaftLog` 视图与
+            // `Storage` 视图之间不一致（一个说 10、一个说 9）。**必须同一瞬间并排**才有意义 ——
+            // 跨两次 run 各看一个数得出的"矛盾"是假的（`§107.4` 的初版结论就犯了这个错）。
+            {
+                if std::env::var("YUNTUN_META_TRACE").is_ok()
+                    && last_snap.is_none_or(|t: Instant| t.elapsed() >= Duration::from_secs(1))
+                {
+                    last_snap = Some(Instant::now());
+                    let prs = raw
+                        .raft
+                        .prs()
+                        .iter()
+                        .map(|(p, pr)| {
+                            format!("{p}:m{}/n{}/{:?}", pr.matched, pr.next_idx, pr.state)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    eprintln!(
+                        "[meta:{id}] 视图 raft[first={} last={} committed={} applied={}] \
+                         store[first={} last={} compact={} applied={}] peers {prs}",
+                        raw.raft.raft_log.first_index(),
+                        raw.raft.raft_log.last_index(),
+                        raw.raft.raft_log.committed,
+                        raw.raft.raft_log.applied,
+                        storage.first_index().unwrap_or(1),
+                        storage.last_index().unwrap_or(0),
+                        storage.compacted_index(),
+                        storage.applied_index(),
+                    );
                 }
             }
             thread::sleep(Duration::from_millis(2));
