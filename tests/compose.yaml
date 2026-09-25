@@ -30,6 +30,7 @@ services:
       - --listen=0.0.0.0:9311
       - --voters=1,2,3
       - --peer=2@mn2:9311,3@mn3:9311
+      - --snapshot-log-entries=${YUNTUN_SNAPSHOT_LOG_ENTRIES:-100000}
       - --init
     environment:
       # **按需打开**（默认关）：`YUNTUN_META_TRACE=1 RUST_LOG=raft=debug bash tests/cluster.sh up`
@@ -51,6 +52,7 @@ services:
       - --listen=0.0.0.0:9311
       - --voters=1,2,3
       - --peer=1@mn1:9311,3@mn3:9311
+      - --snapshot-log-entries=${YUNTUN_SNAPSHOT_LOG_ENTRIES:-100000}
       - --init
     environment:
       # **按需打开**（默认关）：`YUNTUN_META_TRACE=1 RUST_LOG=raft=debug bash tests/cluster.sh up`
@@ -72,6 +74,7 @@ services:
       - --listen=0.0.0.0:9311
       - --voters=1,2,3
       - --peer=1@mn1:9311,2@mn2:9311
+      - --snapshot-log-entries=${YUNTUN_SNAPSHOT_LOG_ENTRIES:-100000}
       - --init
     environment:
       # **按需打开**（默认关）：`YUNTUN_META_TRACE=1 RUST_LOG=raft=debug bash tests/cluster.sh up`

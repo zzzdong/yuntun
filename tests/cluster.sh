@@ -157,6 +157,39 @@ smoke() {
   say "✅ smoke 通过"
 }
 
+# 复现 `§106`/`§107` 的**写停摆**：小压缩阈值 + 一个有 follower 落后（**断的是 follower，不是 leader**
+# —— 那样多数派还能提交，落后的那个才需要靠 leader 补日志）。
+#
+# 在容器里跑它的意义：一次回答"那个进程内探针**是不是夹具造出来的**"。红了 = 真 bug 有真环境的
+# 复现（可以在真环境里改、真环境里验）；绿了 = 进程内那套夹具的产物，得回头改夹具。
+stall() {
+  export YUNTUN_SNAPSHOT_LOG_ENTRIES="${YUNTUN_SNAPSHOT_LOG_ENTRIES:-4}"
+  say "① 起集群（压缩阈值 = ${YUNTUN_SNAPSHOT_LOG_ENTRIES} 条）"
+  up
+
+  say "② 看清谁是 leader，然后断掉**另一个** follower"
+  local l victim
+  l="$(probe leader "${ADDRS[@]}")"
+  victim=$([ "$l" = "1" ] && echo 2 || echo 1)
+  printf '  leader = %s，要断的是 mn%s\n' "$l" "$victim"
+  partition "$victim"
+  sleep 2
+
+  say "③ 在多数派上连写 10 条（阈值小 ⇒ 一路触发压缩）"
+  local alive=() n i
+  for n in 1 2 3; do [ "$n" = "$victim" ] || alive+=("mn$n:9311"); done
+  for i in $(seq 1 10); do
+    printf '  s%s: ' "$i"
+    probe write "s$i" "${alive[@]}" ||
+      die "多数派写不进去（第 $i 条）—— 先查环境，这还不是本场景要测的东西"
+  done
+
+  say "④ 接回 mn$victim，等三方收敛（**这里就是判据**：`§106` 的停摆会让它一直红）"
+  heal "$victim"
+  await_convergence 60
+  say "✅ 三方收敛——容器里**没能**复现 §106 的停摆"
+}
+
 case "${1:-}" in
   build) build ;;
   up) up ;;
@@ -165,6 +198,7 @@ case "${1:-}" in
   partition) shift; partition "$@" ;;
   heal) shift; heal "$@" ;;
   smoke) smoke ;;
+  stall) stall ;;
   logs)
     if [ $# -ge 2 ]; then podman logs "yuntun-mn$2" 2>&1 | tail -40
     else for c in "${CONTAINERS[@]}"; do printf '\n--- %s ---\n' "$c"; podman logs "$c" 2>&1 | tail -8; done; fi

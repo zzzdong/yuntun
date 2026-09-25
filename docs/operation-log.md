@@ -6996,3 +6996,77 @@ leader 反复发 `MsgAppend log_term: 1 index: 11`（`prev=11`），而 follower
 - `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
 - `tests/cluster.sh smoke` 通过（其中"接回后必须收敛"是**硬断言**，修前它会红）；
 - 规模：49361 行 / 20 个 crate / 381 个测试函数（含 1 个 `#[ignore]` 探针）。
+
+---
+
+## 109. 用容器真集群检验 `§106` 那个停摆：**这一形态下没复现**（但拿到快照安装的正面证据）（2026-09-25）
+
+### 109.1 要验什么
+
+`§106`/`§107` 的写停摆一直有个没被排除的怀疑：**它是不是 `§104` 那套进程内链路夹具造出来的**
+（夹具断链是"拒绝连接 + 被 abort 的 `copy_bidirectional`"，与真断网不等价；`§107.4` 量到它还会
+产生 43/s 的连接失败风暴）。`§108` 的容器 rig 就是为此准备的，这里给它加一个场景：
+`tests/cluster.sh stall` —— **复现 `§106` 的全部条件**，但把网络换成真的。
+
+### 109.2 场景与结果
+
+```text
+① 起集群（压缩阈值 = 4 条，生产默认是 10 万）
+② 看清 leader（=1），**断掉另一个 follower**（mn2）—— 断 follower 而不是 leader，
+   这样多数派还能提交，落后的那个才需要靠 leader 补日志
+③ 在多数派上连写 10 条：s1…s10 全部 `accepted=true manifest_ver=1…10`
+④ 接回 mn2，等收敛（硬断言 60s）
+```
+
+结果：
+
+```text
+=== ⏳ 等三方收敛 ===
+  ⋯ 还没收敛：last=1 last=11  / role=Follower role=Leader
+  ✅ 三方已收敛（last=11）
+=== ✅ 三方收敛——容器里**没能**复现 §106 的停摆
+```
+
+**收敛了**：被断的 follower 从 `last=1` 一路追平到 `last=11`（它落后了 10 条，而阈值只有 4 ⇒
+leader 的日志早就压到它需要的那段之前了）。
+
+### 109.3 怎么读这个结果（**不能说"§106 是假的"**）
+
+两次跑的**状态**不是同一个，差别恰好是本刀最值钱的一条：
+
+| | 进程内探针（`§106`，会红） | 容器真集群（本刀，绿） |
+|---|---|---|
+| 分区怎么断 | 夹具：拒绝新连接 + abort 转发任务（**有风暴**） | 内核拔网线：`podman network disconnect` |
+| 落后的量 | 落后 **1 条**（`last=8` vs `9`） | 落后 **10 条**（远超阈值 4） |
+| leader 走哪条路补 | **增量 append**（`next_idx` 恰好在那个危险位置） | **快照**（落后太多，`entries()` 直接 `Compacted` ⇒ 走快照） |
+| 结果 | 停摆（`next > matched+1`，永不回退） | 收敛 |
+
+**关键**：快照安装会把该 peer 的 Progress **重置**（`become_snapshot` ⇒ `matched`/`next` 重新对齐），
+所以走快照路径时**根本进不到** `§106` 那个状态。而 `§106` 的卡点要的是更刁钻的一种：
+**稳定的 follower 恰好丢了一条携带条目的 append** ⇒ `next = matched + 2` ⇒ leader 只发空 append
+⇒ follower 恰好能接受 ⇒ `matched` 钉住。
+
+⇒ 本刀**没有**证明 `§106` 是假的，只证明"**在真环境的这个场景里它不出现**"；而且两次跑的差别
+（走快照 vs 走增量）本身就是 `§107.2` 那条机制的旁证。
+
+**反过来还有一条正面收获**：这次是**快照安装**把落后的 follower 追平的 ⇒ **`T11.5` 的第三项
+（"snapshot 重建"）在这一形态下拿到了真实证据**（`§42.4b` 当年"集成层稳定触发未拿到"的那一格，
+在真集群 + 小阈值下稳定出现了）。
+
+### 109.4 下一步（明确到可执行）
+
+要判 `§106` 到底是不是生产问题，得**刻意**造出"稳定的 follower 丢一条 append"这个状态。
+容器 rig 上加一格就能做到，而且都是**真环境**：
+
+1. **不对称 / 有损链路**：在**一侧**的 veth 上注入丢包或短时黑hole（`tc netem` / `iptables DROP`
+   只加在 leader→follower 一个方向）⇒ 制造"一条 append 丢了、但心跳还在" ⇒ 正好是那个 gap；
+2. 有了它就能在真环境里验 `§107.6` 的**限流 `report_unreachable`**（≤1 次/秒/peer）；
+3. 若仍无效，再查 **inflight 释放**（`Progress::maybe_update` 只在 `index > matched` 时
+   `ins.free_to`，而停摆时 follower 回的 `index == matched`）。
+
+### 109.5 验证
+
+- `tests/cluster.sh stall`（容器真集群，压缩阈值 4 + 真断网 + 接回）→ **收敛**（见 `§109.2`）；
+- `tests/cluster.sh smoke` 仍通过（真断网下多数派照常提交 + 接回收敛）；
+- 全量 `cargo test --workspace` → **381 passed / 0 failed / 1 ignored**（本刀只加脚本，无 Rust 行为改动）；
+- `clippy --workspace --all-targets` 本仓告警 **0**。
