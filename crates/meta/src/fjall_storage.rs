@@ -237,7 +237,7 @@ impl FjallStorage {
     }
 
     fn trace(&self, what: &str, detail: String) {
-        if std::env::var("YUNTUN_META_TRACE").is_ok() {
+        if crate::trace_on() {
             eprintln!("[meta:{}] {what} {detail}", self.id);
         }
     }

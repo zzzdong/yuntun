@@ -233,6 +233,7 @@ scripts/.venv/bin/pip install -r scripts/requirements.txt -i https://mirrors.ali
 | `scripts/flight_stream_smoke.py <flight地址> <表> [批数 行数]` | Flight `do_get` 流式（S1.10）：灌数 + ADBC 流式读取 + 服务端 RSS 采样（`0 0` = 只读模式） |
 | `scripts/dbeaver_jdbc_probe.java` | DBeaver / JDBC：T3 元数据与预览（需 `javac` + Connector/J） |
 | `scripts/s3_smoke.sh` | 真实 S3（SeaweedFS / MinIO）**网络读写**：flush → HTTP PUT 可见于桶；**删 WAL** 重启后冷读 → HTTP GET。`S3_ENDPOINT` / `S3_BUCKET` 可配（见 `docs/operation-log.md` §101） |
+| `tests/cluster.sh` | **容器化三节点真集群**（podman-compose + `debian:trixie-slim`）：真网络命名空间 / 真断网（`podman network disconnect`）/ 接回后**收敛硬断言**；配套极小 Meta 客户端 `cargo run -p yuntun-meta --example meta_probe`（见 `docs/operation-log.md` §108） |
 | `scripts/s3_multinode_smoke.sh` | **多节点 + 真实 S3**：起 metanode + 两个可写数据进程（各私有 `--dir`、**同一个桶**），并发真写各自的 SQL 面 ⇒ 两边查询对拍都 `[1..6]`；再删 WAL 重启验冷读（见 §102） |
 
 ---

@@ -6910,3 +6910,89 @@ leader 反复发 `MsgAppend log_term: 1 index: 11`（`prev=11`），而 follower
   `metanode_cluster_process_e2e`（真进程组）1 绿、`raft_poc` 4 绿；
 - **行为回到原状**：传输层仍是"队列满丢 + RPC 失败丢"（三处实验改动全部撤回），只新增默认关闭的轨迹；
 - 规模：49104 行 / 20 个 crate / 381 个测试函数（含 1 个 `#[ignore]` 探针）。
+
+---
+
+## 108. **容器化三节点真集群**：一跑就抓到一个真 bug（对端换 IP 后 leader 再也送不到）已修（2026-09-25）
+
+### 108.1 动机：把"环境"这个变量拿掉
+
+`§104` 的"网络分区"是**进程内夹具**（可切断的 TCP 转发）做的，`§106`/`§107` 那个写停摆一直卡在
+"**是不是夹具造出来的**"上：夹具断链后会拒绝新连接、`copy_bidirectional` 被 abort，行为与真断网
+并不等价。本刀用容器（真网络命名空间、真 TCP、`podman network disconnect` = 真断网）把那个变量
+拿掉 —— 顺带补上 `§103` 记过的缺口：**全仓没有 Meta gRPC 客户端**，所以容器里的集群没法断言。
+
+### 108.2 rig 是什么
+
+| 文件 | 作用 |
+|---|---|
+| `tests/compose.yaml` | 三个 `metanode` 容器（`--voters 1,2,3` + `--peer 2@mn2:9311,…`）。**用容器名当地址**：名字在编排时就固定，顺手满足 `§103` 的"对端地址必须先知道" |
+| `tests/cluster.sh` | `up / wait / probe / partition <N> / heal <N> / smoke / logs / ps / down`；`partition` = `podman network disconnect`，`heal` = `network connect --alias` |
+| `crates/meta/examples/meta_probe.rs` | 极小 Meta 客户端：`status / leader / write <key> / verify <key>`。**`verify` 是重放同一个幂等键、必须被拒** —— 命中幂等记录 = 那条提交真的在状态机里（同 `§50`/`§103` 的判据） |
+
+**不在容器里编译**：镜像就用本机已有的 `debian:trixie-slim`，二进制由宿主 cargo 编好挂进去 ——
+实测宿主 glibc（2.44）编出的二进制在这个 2.41 的镜像里**能直接跑**（无缺失符号）。20 个 crate 在
+容器里编一遍又慢又要拉 crates.io，而这里要验的是**运行期**行为。
+
+### 108.3 它一跑就抓到一个**真 bug**（已修）
+
+`smoke` 第一版是：healthy 写 → 断 mn3 → 多数派写 → 接回 → 等收敛。前两段就过了，**第三段红**：
+
+```text
+⛔ 断掉 mn3：多数派（1+2）accepted=true manifest_ver=2   ← 真断网下多数派照常提交 ✓
+   （重放 k2 被拒 ✓ ⇒ 那条真的进了状态机）
+🔌 接回 mn3：
+   mn1: Leader  term=1 commit=4 last=4
+   mn2: Follower term=1 commit=4 last=4
+   mn3: PreCandidate term=1 commit=2 last=2      ← 30s 都不动
+```
+
+轨迹（`YUNTUN_META_TRACE=1` + `RUST_LOG=raft=debug`）把根因指出来了：
+
+* leader 侧对 mn3 **一直 `Timeout expired`**（12 次），而**同一时刻新起的**探针容器连 mn3 完全正常；
+* mn3 自己 → mn2 是通的（它在广播 pre-vote、收到 mn2 的响应，但被**拒** ⇒ 永远选不上）；
+* mn3 因为收不到 append，就一直当 **PreCandidate**；leader 因为以为它在，就不再补日志。
+
+**根因**：容器/pod **重新接入网络会换 IP**（实测 `10.89.0.2` → `10.89.0.10`，旧 IP 还可能被别的
+容器复用），而 tonic 的通道把地址 **pin 在建通道那一刻**解析出的结果上 ⇒ leader 一直在往旧地址发。
+这正是"多节点真部署"必然踩的一格，**`§104` 的进程内夹具测不到它**（夹具里 IP 从不变化）。
+
+**修法**（`transport.rs`）：`send_loop` 连续投递失败 `REBUILD_AFTER = 3` 次就**重建通道**
+（`make_client(addr)` 造一个全新通道 ⇒ 名字重新解析一遍），成功一次即清零；重建**无条件打一行**
+（这是该被运维看见的事件）。**对照**：
+
+| | 接回后 |
+|---|---|
+| 修前 | 30s 不收敛（mn3 停在 `last=2`，一直 PreCandidate） |
+| 修后 | **2s 内收敛到 `last=4`**（`⋯ 还没收敛` ×2 → `✅ 三方已收敛`），随后写 k3 再收敛到 `last=6` |
+
+顺手把 `smoke` 的**收敛断言**做成硬失败（`await_convergence`）——脚本第一版只是"打印三方 Status
+就宣布应当收敛"，而那次 mn3 其实还落后 2 条：**嘴上说收敛、实际没验**。
+
+### 108.4 两条踩坑（都写进了 rig 的注释）
+
+1. **`podman network connect` 必须带 `--alias`**：不带的话，容器在这张网络的 DNS 里只剩容器哈希,
+   别的节点**再也解析不到** `mn3` 这个名字（它们连的是名字）。第一版没带 ⇒ "接回来自愈"整段连不上。
+2. **轨迹别在真实集群里默认打开**：`YUNTUN_META_TRACE=1` 是"每条消息一行 `eprintln!`"，实测把它
+   默认打开后三个容器**根本起不来** —— stdout 管道被塞满 ⇒ **进程被写阻塞**。于是
+   `trace_on()` 收紧为"**非空且不是 `0`**"（编排里常见的 `- VAR=${VAR:-}` 会给出"已设置但为空"，
+   用 `is_ok()` 判会被误当成要打轨迹），compose 里改成**按需注入**：
+   `YUNTUN_META_TRACE=1 bash tests/cluster.sh up`。
+
+### 108.5 覆盖到哪、没覆盖到哪（如实说）
+
+- ✅ **覆盖**：三节点真集群（真网络命名空间 / 真进程 / 真容器）；**真断网**下的"多数派照常提交"、
+  "少数派写不进"；接回后的**收敛**（带硬断言）；**对端换 IP** 这一格；
+- ⚠️ **未覆盖**：**跨机**（本刀仍是同机多容器；跨机差的是网络与时钟）；**非对称分区 / 丢包 / 延迟**
+  （容器上可加 `tc netem`，本刀没做）；`Join`（动态成员）仍是 UNIMPLEMENTED ⇒ 地址仍要**先知道**；
+- ❗ **两回事要说清**：本刀修的是"**对端换了地址、leader 再也送不到**"。`§106`/`§107` 那个
+  "**一条携带条目的 append 丢了、乐观推进的 `next_idx` 再也补不上**"是**另一个**机制，
+  **仍未修**（`§107.6` 的下一刀不变：限流的 `report_unreachable`，再不行查 inflight 释放）。
+
+### 108.6 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **381 passed / 0 failed / 1 ignored**
+  （`ignored` 仍是 `§106` 的进程内探针 —— 它测的是上面那个"另一回事"，本刀**没有**让它转绿）；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- `tests/cluster.sh smoke` 通过（其中"接回后必须收敛"是**硬断言**，修前它会红）；
+- 规模：49361 行 / 20 个 crate / 381 个测试函数（含 1 个 `#[ignore]` 探针）。

@@ -17,22 +17,13 @@ use tonic::{Request, Response, Status};
 
 use raft::eraftpb::Message;
 
-use crate::{MetaError, NodeHandle};
+use crate::{trace_on, MetaError, NodeHandle};
 use yuntun_proto::meta as pb;
 
 /// 等一个提案被 raft 应用的上限。
 ///
 /// 超时返回 `UNAVAILABLE`（**可重试**）而不是让客户端裸等：客户端换节点重试比挂死好。
 const PROPOSE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// 逐条消息轨迹开关（`YUNTUN_META_TRACE=1`）—— 与 `transport.rs` 的出站轨迹配对使用。
-///
-/// 它回答的是"**发出去的东西到底有没有到本节点**"：与对端 `transport` 的 `→` 行按
-/// `(from, msg_type, index)` 配对，就能把「没发出去 / 发了没到 / 到了但 `delivered=false`」
-/// 三种情况分开 —— 这三者在现象上都是"集群不动"（`§106`）。
-fn trace_on() -> bool {
-    std::env::var("YUNTUN_META_TRACE").is_ok()
-}
 
 /// gRPC 服务实现。
 pub struct MetaService {

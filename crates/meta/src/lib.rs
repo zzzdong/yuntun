@@ -74,6 +74,19 @@ use prost::Message as _;
 /// 三节点的固定成员表（PoC 用常量；生产由 `--init` / `Join` 决定）。
 pub const PEERS: [u64; 3] = [1, 2, 3];
 
+/// 逐条轨迹的总开关（`YUNTUN_META_TRACE`）。**全局只在**这里定义一次，各模块都用它。
+///
+/// ⚠️ **空值 / `0` 都算关**：编排（podman-compose / k8s）常写成 `- YUNTUN_META_TRACE=${VAR:-}`
+/// —— 那种写法会给出"**已设置但为空**"的变量，用 `is_ok()` 判就会被当成"要打轨迹"，
+/// 于是容器里每条消息一行 `eprintln!`，真实集群的 stdout 管道很快塞满 ⇒ **进程被写阻塞**、
+/// 集群根本起不来（`§108` 实测踩过）。所以判据是"非空且不是 0"。
+///
+/// ⚠️ 也**别在真实集群里默认打开**：它的量级是"每条消息一行"，只适合在需要时临时开
+/// （`tests/cluster.sh` 里用 `YUNTUN_META_TRACE=1` 按需注入）。
+pub(crate) fn trace_on() -> bool {
+    matches!(std::env::var("YUNTUN_META_TRACE").as_deref(), Ok(v) if !v.is_empty() && v != "0")
+}
+
 // op 的**编码与应用**已迁到生产路径：见 [`crate::op`]（proto `Op` → `StateOp` → 状态机）。
 //
 // 这里原本是 PoC 的文本编码（`PocOp` + `apply_op`）。S3-0/S3-3 之后它被真正的协议取代，
@@ -1268,7 +1281,7 @@ fn spawn_node(
             // `Storage` 视图之间不一致（一个说 10、一个说 9）。**必须同一瞬间并排**才有意义 ——
             // 跨两次 run 各看一个数得出的"矛盾"是假的（`§107.4` 的初版结论就犯了这个错）。
             {
-                if std::env::var("YUNTUN_META_TRACE").is_ok()
+                if trace_on()
                     && last_snap.is_none_or(|t: Instant| t.elapsed() >= Duration::from_secs(1))
                 {
                     last_snap = Some(Instant::now());

@@ -1,0 +1,94 @@
+# 三节点 metanode **真集群**（容器 = 真网络命名空间 / 真 TCP；"断网" = `podman network disconnect`）。
+#
+# # 为什么要容器（`tests/cluster.sh` 的动机）
+#
+# * `§104` 的"网络分区"是用**进程内夹具**（可切断的 TCP 转发）做的 —— 语义终究是仿的；
+#   容器给的是内核级真隔离，`podman network disconnect` 就是**真断网**。
+#   `§106`/`§107` 那个写停摆一直卡在"是不是夹具造出来的"，这一层正是为了把那个变量拿掉。
+# * 容器名在**编排时就固定**，顺带满足 `§103` 定下的部署约束的一半：`--peer` 要求对端地址在
+#   启动前就知道（另一半是"所有节点要在 10s 窗口内起齐"，compose 起得很近，差得远）。
+#
+# # 为什么不在容器里编译
+#
+# 镜像用本机已有的 `debian:trixie-slim`，**二进制由宿主 cargo 编好挂进来** —— 实测宿主 glibc（2.44）
+# 编出的二进制在这个 2.41 的镜像里**能直接跑**（无缺失符号）。在容器里编 20 个 crate 又慢又要拉
+# crates.io，而这里要验的是**运行期**的多节点行为。
+#
+# # 诊断开关（`§107` 的两条轨迹本来就是为此留的）
+#
+# `YUNTUN_META_TRACE=1` 打开逐条消息轨迹（`[meta:send]` / `[meta:transport]` / `[meta:service]` /
+# `entries()`），`RUST_LOG=raft=debug` 打开 raft 内部判定 —— 日志走容器 stdout，`podman logs` 就能看。
+# 默认开着（这个 rig 就是用来查多节点疑难杂症的，日志比安静值钱）；要安静就删掉这两个 `environment`。
+services:
+  mn1:
+    image: docker.io/library/debian:trixie-slim
+    container_name: yuntun-mn1
+    command:
+      - /usr/local/bin/metanode
+      - --id=1
+      - --dir=/data
+      - --listen=0.0.0.0:9311
+      - --voters=1,2,3
+      - --peer=2@mn2:9311,3@mn3:9311
+      - --init
+    environment:
+      # **按需打开**（默认关）：`YUNTUN_META_TRACE=1 RUST_LOG=raft=debug bash tests/cluster.sh up`
+      # 就能注入（空值 / 0 一律当关 —— 见 `crate::trace_on` 的注释：真实集群里默认打开会把
+      # stdout 管道塞满、进程被写阻塞，集群反而起不来）。
+      - YUNTUN_META_TRACE=${YUNTUN_META_TRACE:-}
+      - RUST_LOG=${RUST_LOG:-}
+    volumes:
+      - ../target/debug/metanode:/usr/local/bin/metanode:ro
+      - mn1-data:/data
+
+  mn2:
+    image: docker.io/library/debian:trixie-slim
+    container_name: yuntun-mn2
+    command:
+      - /usr/local/bin/metanode
+      - --id=2
+      - --dir=/data
+      - --listen=0.0.0.0:9311
+      - --voters=1,2,3
+      - --peer=1@mn1:9311,3@mn3:9311
+      - --init
+    environment:
+      # **按需打开**（默认关）：`YUNTUN_META_TRACE=1 RUST_LOG=raft=debug bash tests/cluster.sh up`
+      # 就能注入（空值 / 0 一律当关 —— 见 `crate::trace_on` 的注释：真实集群里默认打开会把
+      # stdout 管道塞满、进程被写阻塞，集群反而起不来）。
+      - YUNTUN_META_TRACE=${YUNTUN_META_TRACE:-}
+      - RUST_LOG=${RUST_LOG:-}
+    volumes:
+      - ../target/debug/metanode:/usr/local/bin/metanode:ro
+      - mn2-data:/data
+
+  mn3:
+    image: docker.io/library/debian:trixie-slim
+    container_name: yuntun-mn3
+    command:
+      - /usr/local/bin/metanode
+      - --id=3
+      - --dir=/data
+      - --listen=0.0.0.0:9311
+      - --voters=1,2,3
+      - --peer=1@mn1:9311,2@mn2:9311
+      - --init
+    environment:
+      # **按需打开**（默认关）：`YUNTUN_META_TRACE=1 RUST_LOG=raft=debug bash tests/cluster.sh up`
+      # 就能注入（空值 / 0 一律当关 —— 见 `crate::trace_on` 的注释：真实集群里默认打开会把
+      # stdout 管道塞满、进程被写阻塞，集群反而起不来）。
+      - YUNTUN_META_TRACE=${YUNTUN_META_TRACE:-}
+      - RUST_LOG=${RUST_LOG:-}
+    volumes:
+      - ../target/debug/metanode:/usr/local/bin/metanode:ro
+      - mn3-data:/data
+
+volumes:
+  mn1-data:
+  mn2-data:
+  mn3-data:
+
+networks:
+  default:
+    # 具名网络：`podman network disconnect yuntun-cluster yuntun-mn3` 就是"把 3 号真断网"
+    name: yuntun-cluster

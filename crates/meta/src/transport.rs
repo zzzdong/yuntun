@@ -34,6 +34,14 @@
 //! 但必须**限流**（每次丢包都报会把复制限流在 Probe 节奏上），并且要先有一个能证明
 //! "它真能救回来"的用例。
 //!
+//! # 对端换地址（`§108`：容器 / pod 重启会换 IP）—— 这条**已修**
+//!
+//! 通道把地址 pin 在**建通道那一刻**解析出的结果上；对端换 IP（容器 / pod 重启、重新接入网络、
+//! k8s 重建 pod）之后，leader 侧对它**一直超时**，而那个落后的节点因此永远收不到 append ⇒
+//! **永久停摆**（`tests/cluster.sh smoke` 的收敛断言在容器里稳定复现）。
+//! 所以 `send_loop` 连续失败 [`REBUILD_AFTER`] 次就**重建通道**（名字重新解析一遍）——
+//! 地址一旦回到可达就自愈。这是"多节点真部署"必须处理的一格，`§104` 的进程内链路夹具测不到它。
+//!
 //! 结论：`send()` 必须**非阻塞**（调用方是 raft 线程，它还要 tick 别人的选举）。
 //! 这就是把发送放进后台任务（每 peer 一个）而不是"在 raft 线程里 await"的原因。
 //!
@@ -58,6 +66,8 @@ use raft::eraftpb::Message;
 
 use yuntun_proto::meta as pb;
 
+use crate::trace_on;
+
 /// 每个 peer 的出站队列深度。满了就丢（raft 会重发）——
 /// 这个值是"能吸收多少瞬时突发"的旋钮：追赶大日志时会打满，但**丢的是可重发的消息**。
 ///
@@ -69,6 +79,28 @@ const SEND_QUEUE: usize = 1024;
 /// 单次 `Meta.Raft` 调用的超时。对端卡住时不能把发送任务永久占住
 /// （否则这个 peer 的消息会一直堆积 → 一直丢，等价于断链但**没有信号**）。
 const RPC_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 连续投递失败多少次就**重建**到该 peer 的通道（= 把它的名字重新解析一遍）。
+///
+/// 为什么需要（`§108`，**容器化集群里实测出来的**）：容器 / pod 重启、或重新接入网络会**换 IP**，
+/// 而通道把地址 pin 在**建通道那一刻**解析出来的结果上。实测：把三节点里的一台
+/// `podman network disconnect` 再 `connect`（IP 从 `10.89.0.2` 变成 `10.89.0.10`）之后，
+/// leader 对它就**一直 `Timeout expired`**（12 次），而**同一时刻新起的**客户端连它完全正常 ——
+/// 那个落后的节点因此永远收不到 append，**永久停摆**（在容器里稳定复现，`smoke` 的收敛断言会红）。
+/// 重建通道会重新解析名字，对端地址一旦回到可达就自愈。
+const REBUILD_AFTER: u32 = 3;
+
+/// 造一个到 `addr` 的客户端（`connect_lazy`：真正建立连接是第一次发消息的时候）。
+///
+/// 单独抽出来是为了**重建**：`send_loop` 在对端连续失败后会调它拿一个**全新**的通道，
+/// 新通道会把 `addr` 重新解析一遍（见 [`REBUILD_AFTER`]）。
+fn make_client(addr: &str) -> pb::meta_client::MetaClient<tonic::transport::Channel> {
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .expect("地址在 GrpcTransport::new 里已经校验过，这里不会再失败")
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(RPC_TIMEOUT);
+    pb::meta_client::MetaClient::new(endpoint.connect_lazy())
+}
 
 /// 连接超时：对端没起来时快速失败，交给下一 tick 重发。
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
@@ -172,14 +204,12 @@ impl GrpcTransport {
         let mut tx_map = HashMap::with_capacity(peers.len());
         for (id, addr) in peers {
             // 早失败：端点串非法就报错（`connect_lazy` 会推迟到首次发送，
-            // 那时错误只能变成计数 —— 启动期报出来更有用）
-            let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            // 那时错误只能变成计数 —— 启动期报出来更有用）。
+            // 真正的端点由 `send_loop` 自己造（它要能**重建**，见那里的注释）。
+            tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
                 .map_err(|e| format!("节点 {id} 的地址 {addr:?} 非法（期望 host:port）：{e}"))?;
-            let endpoint = endpoint
-                .connect_timeout(CONNECT_TIMEOUT)
-                .timeout(RPC_TIMEOUT);
             let (tx, rx) = tokio::sync::mpsc::channel::<Message>(SEND_QUEUE);
-            handle.spawn(send_loop(id, addr, endpoint, rx, stats.clone()));
+            handle.spawn(send_loop(id, addr, rx, stats.clone()));
             tx_map.insert(id, tx);
         }
         Ok(Self {
@@ -223,15 +253,6 @@ impl PeerTransport for GrpcTransport {
     }
 }
 
-/// 逐条消息轨迹开关（`YUNTUN_META_TRACE=1`）—— 与存储层 `storage.rs` 的 `trace` 同一个开关。
-///
-/// 为什么需要它：`§106` 那个写停摆的卡点是"leader 说它发了、follower 那边却说没收到"，
-/// 只有把**出站**与**入站**逐条配对才能区分「没发出去 / 发了没到 / 到了被拒 / 根本没到」。
-/// ⚠️ 它逐条 `eprintln!`，**只在排查时开**（默认关，正常路径零影响）。
-fn trace_on() -> bool {
-    std::env::var("YUNTUN_META_TRACE").is_ok()
-}
-
 /// 每个 peer 一个发送任务：出队 → 编码 → `Meta.Raft`。
 ///
 /// 用 `connect_lazy` + 端点超时：对端没起来/重启中**不需要**我们写重连逻辑
@@ -239,11 +260,12 @@ fn trace_on() -> bool {
 async fn send_loop(
     to: u64,
     addr: String,
-    endpoint: tonic::transport::Endpoint,
     mut rx: tokio::sync::mpsc::Receiver<Message>,
     stats: Arc<TransportStats>,
 ) {
-    let mut client = pb::meta_client::MetaClient::new(endpoint.connect_lazy());
+    let mut client = make_client(&addr);
+    // 连续投递失败计数：到 `REBUILD_AFTER` 就**重建通道**（见下面 `Err` 分支）。
+    let mut fail_streak: u32 = 0;
     while let Some(msg) = rx.recv().await {
         let payload = match msg.write_to_bytes() {
             Ok(b) => b,
@@ -277,6 +299,7 @@ async fn send_loop(
         match client.raft(req).await {
             Ok(resp) => {
                 let r = resp.into_inner();
+                fail_streak = 0;
                 if r.delivered {
                     stats.delivered.fetch_add(1, Ordering::Relaxed);
                 } else {
@@ -287,9 +310,20 @@ async fn send_loop(
             Err(e) => {
                 // 对端不可达/重启中/超时：只计数（raft 会重发）。
                 // ⚠️ `§107`：这句"raft 会重发"**不成立** —— 丢掉一条**携带条目的** append 会让
-                // leader 永久停摆（模块文档"已知缺陷"）。修复方向见那里，本刀未改行为。
+                // leader 永久停摆（模块文档"已知缺陷"）。
                 stats.failed.fetch_add(1, Ordering::Relaxed);
-                if trace_on() {
+                fail_streak += 1;
+                // 连续失败 ⇒ **重建通道**（`§108`）：对端可能换了 IP（容器/pod 重启、重新接入网络），
+                // 而通道里 pin 的是旧地址 —— 不重建就永远连不上它（实测：leader 一直 `Timeout expired`，
+                // 而新客户端连得上）。这里**无条件打一行**：这是个该被运维看见的事件，不是噪声。
+                if fail_streak >= REBUILD_AFTER {
+                    client = make_client(&addr);
+                    fail_streak = 0;
+                    eprintln!(
+                        "[meta:transport] →{to}({addr}) 连续 {REBUILD_AFTER} 次投递失败：\
+                         已重建通道（重新解析对端地址；最近一次错误：{e}）"
+                    );
+                } else if trace_on() {
                     eprintln!("[meta:transport] →{to} 投递失败（本条丢弃）：{e}");
                 }
             }
