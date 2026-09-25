@@ -7269,3 +7269,84 @@ N 条 → 解冻 → **硬断言三方真收敛**（同一个 leader 且 `last` 
 - `tests/cluster.sh soak 3 5` 通过（见 `§112.3`）；`smoke` / `gap` / `stall` 仍通过；
 - 本刀只动脚本 + `meta_probe` 的超时（无存储/raft 行为改动）⇒ 全量 `cargo test --workspace`
   **382 passed / 0 failed / 0 ignored**；`clippy --workspace --all-targets` 本仓告警 **0**。
+
+---
+
+## 113. 容器 rig 补上**有损 / 延迟链路**（`tc netem`）：三条实测结论（2026-09-25）
+
+### 113.1 为什么加它
+
+`§109.4` / `§111.5` 都把"**不对称 / 有损链路**"列成这套 rig 缺的唯一故障维度：`podman network
+disconnect`（全断）与 `podman pause`（冻进程）都造不出"**只丢一部分 / 只慢一点**"，而那才是真实
+网络的常态。于是加一个**要构建的镜像**（`tests/Containerfile` = `debian:trixie-slim` + `iproute2`，
+`compose.yaml` 给三个节点带 `NET_ADMIN`）与三个子命令：
+
+| 命令 | 作用 |
+|---|---|
+| `netem <1\|2\|3> <netem 参数…>` | 在某个节点的 **egress** 上注入（丢包 / 延迟 / 乱序…） |
+| `netem-clear <1\|2\|3>` | 清掉 |
+| `lossy [丢包%] [条数]` | 预设：在 **leader** 上丢包，然后写 N 条 |
+| `netem-run "<参数>" [条数] [说明]` | 通用版（`loss 20%` / `delay 800ms` / `delay 800ms 200ms 25%`…） |
+
+⚠️ netem 是**出口**整形，做不到"只让 leader→follower 丢"；在 leader 上注入会同时影响它到两个 peer
+的流量 —— 三节点下是可接受的近似（脚本注释里写明了）。
+
+**断言的三条**（`netem-run`）：① 期间**多数派仍写得进去**；② 清掉注入后三方**收敛**；
+③ **每个 key 事后重放都必须命中** —— 第 ③ 条是必需的：丢包会吃掉**回复**，
+"客户端没收到 accepted"**不等于**"没提交"，只有幂等键重放能分清这两件事。
+
+### 113.2 实测结论一：**丢包会被 TCP 兜住，造不出 raft 级的消息丢失**
+
+`lossy 20 8`：8/8 都拿到 `accepted=true` ✓，清掉后收敛 ✓，8/8 重放命中 ✓。
+20% 的包丢率对 TCP 只是**重传**（慢一点），raft 层面**根本感知不到**。
+
+⇒ 这条很重要：**要造"raft 少一条 append / 少一个 ack"，得靠 TCP 级断**（`partition` 全断、
+`freeze` 冻进程 —— 它们会让连接挂住或拒绝），**不是丢包**。rig 里两套都有，各司其职。
+
+### 113.3 实测结论二：**单向延迟超过 RPC 超时也照样能干**
+
+- `netem-run "delay 800ms" 5`：5/5 accepted ✓、收敛 ✓、5/5 命中 ✓；
+- `netem-run "delay 2500ms" 3`（**超过 `RPC_TIMEOUT = 2s`**）：3/3 accepted ✓、收敛 ✓、3/3 命中 ✓。
+
+为什么"超过超时"还能干活：netem 只延迟**出口** ⇒ leader→follower 的请求慢 2.5s（leader 侧 RPC
+超时、记一条 `failed` ✗），但 follower→leader 的**回执是快的** ✓ ⇒ `matched` 照样推进 ✓。
+换句话说：**raft 的提交推进靠的是回执，不是请求本身是否在超时内到达**。
+
+### 113.4 实测结论三：**对称延迟 1.5s 就崩** —— 部署包线是被三个超时决定的
+
+手动把**三个节点都**注入 `delay 1500ms`（往返 ≈ 3s）之后：
+
+```text
+[meta:transport] →2(mn2:9311) 连续 3 次投递失败：已重建通道（最近一次错误：
+                 tcp connect error, 10.89.0.3:9311, kind: TimedOut）
+后：term=6（从 1 涨上来的）、三方 commit=2 / applied=0
+```
+
+两件事一起发生：**TCP `connect_timeout`（500ms）都超时了**（`§108` 的"连续失败重建通道"按设计触发 ✓，
+它挡的是"通道钉在旧地址"而不是"网络太慢" ✗），以及**选举风暴** —— `term` 从 1 涨到 **6**
+（节点在选举超时内收不到心跳 ⇒ 反复重新选举）。
+
+⇒ **部署包线**（这一格以前只是"没测"，现在是量过的）：
+
+| 旋钮 | 现值 | 含义 |
+|---|---|---|
+| `connect_timeout` | 500ms | 建连超过它就失败 ⇒ 对称延迟 >0.5s 开始伤 |
+| `RPC_TIMEOUT` | 2s | 单次 `Meta.Raft` 的上限（单向延迟 >2s 时 leader 侧记失败，但只要反向快就不影响提交 ✓） |
+| raft 选举超时 | ~1s 量级 | 对称延迟把它顶穿 ⇒ **反复选举**（term 涨） |
+
+⇒ **跨可用区 / 跨机部署前，这三个都得按 RTT 重新定**（现在的值是按本机/同机房定的）。
+
+### 113.5 覆盖到哪、没覆盖到哪
+
+- ✅ **覆盖**：丢包、单向延迟（含越过 RPC 超时）、对称延迟下的**包线**；
+- ⚠️ **未覆盖 / 未做成场景**：**乱序**（`netem reorder` 没试）、**抖动**（`delay X Y` 的组合没试）、
+  对称延迟**没有做成脚本场景**（本刀是手工量的 —— 做成场景要先想清楚"这时候该断言什么"：
+  断言"能写"是错的，断言"term 会涨"才是它真正测的东西）；
+- ⚠️ 依然是**同机多容器**（跨机没做）。
+
+### 113.6 验证
+
+- `tests/cluster.sh lossy 20 8` / `netem-run "delay 800ms" 5` / `netem-run "delay 2500ms" 3`
+  三条都通过（每条都含"事后逐 key 重放命中"）；`smoke` / `stall` / `gap` / `soak` 仍通过；
+- 本刀只动脚本 + 新增 `tests/Containerfile`（无 Rust 行为改动）⇒ 全量 `cargo test --workspace`
+  **382 passed / 0 failed / 0 ignored**；`clippy --workspace --all-targets` 本仓告警 **0**。

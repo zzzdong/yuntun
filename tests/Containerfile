@@ -1,0 +1,17 @@
+# 容器化多节点测试用的镜像：`debian:trixie-slim` + **`iproute2`（`tc netem`）**。
+#
+# 为什么需要它：`§109.4` / `§111.5` 把"**不对称 / 有损链路**"列为这套 rig 缺的唯一故障维度 ——
+# 复制/心跳**丢包、延迟、乱序**是真实网络的常态，而 `podman network disconnect`（全断）与
+# `podman pause`（冻住进程）都造不出"**只丢一部分**"。`tc netem` 才能。
+#
+# 为什么是"要构建的镜像"而不是像别的场景那样直接挂宿主的二进制：`tc` 是个系统包，
+# 得装进镜像；其余一切照旧（metanode / meta_probe 仍然是宿主 cargo 编好挂进来）。
+FROM docker.io/library/debian:trixie-slim
+
+# `iproute2` = `tc`（netem）；`iputils-ping` 只是方便手工排查（`podman exec` 里试连通性）
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends iproute2 iputils-ping ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# 说明：`tc qdisc` 需要 `NET_ADMIN` —— compose 里给三个节点都带上（rootless podman 里该能力
+# 只作用在容器自己的网络命名空间内，够用）。

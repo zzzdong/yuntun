@@ -276,6 +276,78 @@ soak() {
   say "✅ soak 通过（$rounds 轮冻结 + 1 次真断网，全部收敛）"
 }
 
+# 在 mn$n 的 **egress** 上注入 `tc netem`（丢包 / 延迟 / 乱序…）。
+#
+# ⚠️ netem 是**出口**整形，做不到"只让 leader→follower 这一个方向丢" —— 在 leader 上注入会同时
+# 影响它到两个 peer 的流量。三节点下这仍是有效的近似（`§113` 用的就是它）。
+netem() {
+  local n="${1:?usage: netem <1|2|3> <netem 参数…>}"
+  shift
+  say "🌐 在 mn$n 的 egress 注入：netem $*"
+  podman exec "yuntun-mn$n" tc qdisc add dev eth0 root netem "$@"
+}
+
+netem_clear() {
+  local n="${1:?usage: netem-clear <1|2|3>}"
+  say "🌐 清掉 mn$n 的 egress 注入"
+  podman exec "yuntun-mn$n" tc qdisc del dev eth0 root 2>/dev/null || true
+}
+
+# **有损链路**下还能不能干活：在 leader 的 egress 上丢一部分包（追加 / 心跳 / **给客户端的回复**
+# 都会丢），断言三件事：
+#   ① 多数派仍然写得进去（丢包只该让它变慢，不该写不进）；
+#   ② 清掉丢包后三方**收敛**；
+#   ③ 每个 key 都**真的进了状态机**（重放必须被拒）。
+#
+# ⚠️ 第 ③ 条为什么必需：丢包会**吃掉回复** ⇒ "客户端没收到 accepted" **不等于** "没提交"。
+# 所以期间允许写失败，但事后必须用**幂等键重放**去证实 —— 这是唯一能分清"没提交"与"回复丢了"的办法。
+lossy() {
+  local loss="${1:-20}"
+  local writes="${2:-8}"
+  netem_run "loss ${loss}%" "$writes" "丢包 ${loss}%"
+}
+
+# 通用版：`netem-run "<netem 参数>" [写入条数] [说明]` —— 断言同上（能写 / 收敛 / 每个 key 事后都命中）。
+# 参数任意：`loss 20%`、`delay 800ms`、`delay 800ms 200ms 25%`（延迟+抖动+丢包）…
+netem_run() {
+  local spec="${1:?usage: netem-run \"<netem 参数>\" [写入条数] [说明]}"
+  local writes="${2:-8}"
+  local label="${3:-$spec}"
+  say "① 起集群（压缩阈值 = ${YUNTUN_SNAPSHOT_LOG_ENTRIES:-100000}）"
+  up
+  local l i ok=0
+  l="$(probe leader "${ADDRS[@]}")"
+  printf '  leader = %s\n' "$l"
+  # shellcheck disable=SC2086  # spec 要按空格拆成多个参数
+  netem "$l" $spec
+
+  say "② 在丢包下连写 $writes 条（**允许**失败：回复本身可能被丢）"
+  for i in $(seq 1 "$writes"); do
+    printf '  l%s: ' "$i"
+    if probe write "l$i" "${ADDRS[@]}" >/dev/null 2>&1; then
+      printf '拿到 accepted ✓\n'
+      ok=$((ok + 1))
+    else
+      printf '没拿到答复（丢包 —— 是"没提交"还是"回复丢了"？留给下一步判定）\n'
+    fi
+  done
+
+  netem_clear "$l"
+  say "③ 清掉丢包，等三方收敛"
+  await_convergence 60
+
+  say "④ 逐个 key 重放：**必须全部命中**（命中 = 那条真的在状态机里）"
+  for i in $(seq 1 "$writes"); do
+    printf '  重放 l%s: ' "$i"
+    if probe verify "l$i" "${ADDRS[@]}" >/dev/null 2>&1; then
+      printf '命中 ✓\n'
+    else
+      die "l$i 重放**没**命中 —— 这条确实没提交（丢包被吃掉的不是回复）"
+    fi
+  done
+  say "✅ netem 通过（${label}：${ok}/${writes} 直接拿到答复，但 ${writes}/${writes} 事后都命中）"
+}
+
 case "${1:-}" in
   build) build ;;
   up) up ;;
@@ -289,6 +361,10 @@ case "${1:-}" in
   unfreeze) shift; unfreeze "$@" ;;
   gap) shift; gap "$@" ;;
   soak) shift; soak "$@" ;;
+  netem) shift; netem "$@" ;;
+  netem-clear) shift; netem_clear "$@" ;;
+  lossy) shift; lossy "$@" ;;
+  netem-run) shift; netem_run "$@" ;;
   logs)
     if [ $# -ge 2 ]; then podman logs "yuntun-mn$2" 2>&1 | tail -40
     else for c in "${CONTAINERS[@]}"; do printf '\n--- %s ---\n' "$c"; podman logs "$c" 2>&1 | tail -8; done; fi

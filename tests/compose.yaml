@@ -21,7 +21,11 @@
 # 默认开着（这个 rig 就是用来查多节点疑难杂症的，日志比安静值钱）；要安静就删掉这两个 `environment`。
 services:
   mn1:
-    image: docker.io/library/debian:trixie-slim
+    image: localhost/yuntun-test:latest
+    # `NET_ADMIN` 只作用在容器自己的网络命名空间里：`tc netem`（丢包/延迟/乱序）要用它
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
     container_name: yuntun-mn1
     command:
       - /usr/local/bin/metanode
@@ -43,7 +47,11 @@ services:
       - mn1-data:/data
 
   mn2:
-    image: docker.io/library/debian:trixie-slim
+    image: localhost/yuntun-test:latest
+    # `NET_ADMIN` 只作用在容器自己的网络命名空间里：`tc netem`（丢包/延迟/乱序）要用它
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
     container_name: yuntun-mn2
     command:
       - /usr/local/bin/metanode
@@ -65,7 +73,11 @@ services:
       - mn2-data:/data
 
   mn3:
-    image: docker.io/library/debian:trixie-slim
+    image: localhost/yuntun-test:latest
+    # `NET_ADMIN` 只作用在容器自己的网络命名空间里：`tc netem`（丢包/延迟/乱序）要用它
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
     container_name: yuntun-mn3
     command:
       - /usr/local/bin/metanode
