@@ -134,6 +134,13 @@ enum Command {
         id: u64,
         reply: SyncSender<Result<(), MetaError>>,
     },
+    /// 把一个成员**从集群移除**（`§121`）。
+    ///
+    /// 走的是同一条 conf change 通路。回复 = 提议成功与否；生效要等应用。
+    Remove {
+        id: u64,
+        reply: SyncSender<Result<(), MetaError>>,
+    },
     /// 当前成员表快照（[`MembersView`]）。
     Members {
         reply: SyncSender<MembersView>,
@@ -340,6 +347,21 @@ impl NodeHandle {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.cmd_tx
             .send(Command::Promote { id, reply: reply_tx })
+            .map_err(|e| MetaError::Storage(format!("命令通道断开：{e}")))?;
+        match reply_rx.recv_timeout(timeout) {
+            Ok(r) => r,
+            Err(_) => Err(MetaError::NoQuorum),
+        }
+    }
+
+    /// 把一个成员**从集群移除**（`§121`）。**提议成功**即返回，生效要等应用
+    /// （用 [`Self::members`] 看结果）。已经不在成员表里 ⇒ **幂等成功**。
+    ///
+    /// ⚠️ 与 `add_learner` / `promote` 同一条纪律：同一时刻只允许一条未提交的 conf change 在途。
+    pub fn remove(&self, id: u64, timeout: Duration) -> Result<(), MetaError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.cmd_tx
+            .send(Command::Remove { id, reply: reply_tx })
             .map_err(|e| MetaError::Storage(format!("命令通道断开：{e}")))?;
         match reply_rx.recv_timeout(timeout) {
             Ok(r) => r,
@@ -1266,6 +1288,16 @@ fn spawn_node(
                         };
                         let _ = reply.send(r);
                     }
+                    Ok(Command::Remove { id: nid, reply }) => {
+                        let r = if raw.raft.state != StateRole::Leader {
+                            Err(MetaError::NotLeader {
+                                leader_hint: raw.raft.leader_id,
+                            })
+                        } else {
+                            remove_checked(&mut raw, &storage, nid)
+                        };
+                        let _ = reply.send(r);
+                    }
                     Ok(Command::Members { reply }) => {
                         let cs = storage.conf_state();
                         let _ = reply.send(MembersView {
@@ -1530,6 +1562,44 @@ fn sorted_ids(mut v: Vec<u64>) -> Vec<u64> {
     v
 }
 
+/// **成员移除的唯一硬门槛**（`§121`）：不能把**最后一个 voter** 摘掉。
+///
+/// 为什么这条要单独拦：没有 voter 的集群**再也提交不了任何东西** —— 连"把它加回来"这个
+/// 补救动作都提交不了 ⇒ **不可逆**。其余情形一律允许，包括"摘一个本来就不在表里的 id"
+/// （那是**幂等**：移除的目的就是"让它不在表里"）。
+///
+/// 单独抽成纯函数是为了能直接测：它只依赖 voters 这一个入参，不需要起 raft。
+fn remove_gate(voters: &[u64], id: u64) -> Result<(), MetaError> {
+    if voters.contains(&id) && voters.len() == 1 {
+        return Err(MetaError::BadRequest(format!(
+            "{id} 是集群里**最后一个 voter**：摘掉它之后这个集群再也提交不了任何东西\
+             （连把它加回来都做不到）—— 不可逆，拒绝"
+        )));
+    }
+    Ok(())
+}
+
+/// 移除的检查：过 [`remove_gate`]，不在册就**幂等返回**，否则提议那条 conf change。
+fn remove_checked(
+    raw: &mut RawNode<FjallStorage>,
+    storage: &FjallStorage,
+    id: u64,
+) -> Result<(), MetaError> {
+    let cs = storage.conf_state();
+    remove_gate(&cs.voters, id)?;
+    if !cs.voters.contains(&id) && !cs.learners.contains(&id) {
+        // 幂等：本来就不在成员表里 = 目的已达成（客户端超时重发是常见形态）
+        return Ok(());
+    }
+    let cc = ConfChange {
+        change_type: raft::eraftpb::ConfChangeType::RemoveNode,
+        node_id: id,
+        ..Default::default()
+    };
+    raw.propose_conf_change(vec![], cc)
+        .map_err(|e| MetaError::Storage(format!("conf change 提议失败：{e}")))
+}
+
 /// **提升 learner → voter 的两道门槛**（`§120`），检查过了才提议那条 conf change。
 ///
 /// 两道都对应"提升错人"的**真实**代价：
@@ -1641,6 +1711,20 @@ fn apply_committed(
                     .set_conf_state(cs)
                     .unwrap_or_else(|e| fatal(id, "成员表落盘", e));
             }
+            // **成员移除**（`§121`）：地址表与传输**一起收**。
+            //
+            // 两个理由：① 留着它 = 留一条永远发不出去的出站队列与两个发送任务（它不会再回来）；
+            // ② 更要紧的是"**配置里没有它、peer 表里还有它**"会让排障时无从判断哪份才是权威 ——
+            //    而"移除"这件事的两半（raft 的 `ProgressTracker` + 传输的 peer 表）必须同时动。
+            if cc.change_type == raft::eraftpb::ConfChangeType::RemoveNode {
+                if members.remove(&cc.node_id).is_some() {
+                    storage
+                        .set_peer_addrs(members)
+                        .unwrap_or_else(|e| fatal(id, "地址表落盘", e));
+                }
+                transport.remove_peer(cc.node_id);
+                continue;
+            }
             // **地址随 conf change 复制**（`§118`）：每个节点都从 `context` 里学到新成员的地址
             // ⇒ 换主之后新 leader 也知道怎么连它（否则只有"当初那个 leader"知道）。
             if let Ok(addr) = String::from_utf8(cc.context.to_vec())
@@ -1708,5 +1792,28 @@ fn apply_committed(
         if let Some(reply) = pending.pop_front() {
             let _ = reply.send(resp);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 移除的**硬门槛**（`§121`）：最后一个 voter 不能被摘掉。
+    ///
+    /// 这条用纯函数测（不起 raft、不起进程）—— 它只依赖 `voters` 一个入参，
+    /// 而它拦下的后果是**不可逆**的（没有 voter 的集群再也提交不了任何东西）。
+    #[test]
+    fn removing_the_last_voter_is_refused() {
+        let e = remove_gate(&[1], 1).expect_err("唯一 voter 不能摘");
+        assert!(
+            format!("{e:?}").contains("最后一个 voter"),
+            "拒绝理由要说清后果：{e:?}"
+        );
+        // 还有别的 voter ⇒ 允许（4 个 voter 摘到剩 3 个是常规操作）
+        remove_gate(&[1, 2, 3], 2).expect("还有别的 voter ⇒ 可以摘");
+        remove_gate(&[1, 2, 3, 4], 4).expect("4 voter ⇒ 摘一个没问题");
+        // 摘一个**不在表里**的 id 由调用方当幂等处理（本函数不管这层）
+        remove_gate(&[1, 2], 77).expect("不在册（幂等那条路）不该被这里拦");
     }
 }

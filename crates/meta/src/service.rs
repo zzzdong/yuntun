@@ -252,6 +252,65 @@ impl pb::meta_server::Meta for MetaService {
         }
     }
 
+    /// 成员变更（`§121`）：把一个成员**从集群移除** —— "对端永久不在"的**正路**。
+    ///
+    /// # 为什么"永久不在"必须移除
+    ///
+    /// 一个节点真的没了（机器报废 / 换网段 / 长期下线）时，把它留在成员表里有**两个**代价：
+    ///
+    /// 1. **quorum 里永远含着一个不会回话的成员** ⇒ 可用性被它绑住：4 个 voter 掉两个就
+    ///    停摆，而其中一个是永远回不来的话，那 3 个活着的节点本来是可以继续干活的；
+    /// 2. 排障时"它到底还是不是成员"无从判断（配置里一份、现状一份）。
+    ///
+    /// ⚠️ **但要趁还能提交的时候摘**：成员变更本身也要过 quorum，已经掉到不足多数派时就
+    /// 摘不动了（那时只能先把某个节点拉回来）。这条纪律写在 `§121` 的进程级用例里。
+    ///
+    /// # 约定
+    ///
+    /// 只 leader 受理；**幂等**（本来就不在成员表里 ⇒ 直接成功，那就是移除的目的）；
+    /// **等生效才回包**。唯一硬门槛见 `remove_gate`（不能摘掉最后一个 voter）。
+    async fn remove(
+        &self,
+        req: Request<pb::RemoveRequest>,
+    ) -> Result<Response<pb::RemoveResponse>, Status> {
+        let id = req.into_inner().node_id;
+        if id == 0 {
+            return Err(Status::invalid_argument("node_id 必填"));
+        }
+        let st = self.node.status();
+        if st.role != "Leader" {
+            return Err(MetaError::NotLeader {
+                leader_hint: st.leader_id,
+            }
+            .into());
+        }
+
+        let mv = members_of(&self.node).await?;
+        if mv.voters.contains(&id) || mv.learners.contains(&id) {
+            let node = self.node.clone();
+            tokio::task::spawn_blocking(move || node.remove(id, PROPOSE_TIMEOUT))
+                .await
+                .map_err(|e| Status::internal(format!("阻塞任务失败（remove）：{e}")))??;
+        }
+
+        let deadline = tokio::time::Instant::now() + CONF_CHANGE_TIMEOUT;
+        loop {
+            let mv = members_of(&self.node).await?;
+            if !mv.voters.contains(&id) && !mv.learners.contains(&id) {
+                return Ok(Response::new(pb::RemoveResponse {
+                    voter_ids: mv.voters,
+                    learner_ids: mv.learners,
+                }));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Status::deadline_exceeded(format!(
+                    "移除未在 {CONF_CHANGE_TIMEOUT:?} 内生效（看 Status 的 voter_ids）"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// 节点间：一条 raft 消息（`Meta.Raft`）。**不是客户端接口**。
     ///
     /// 这一层刻意只做"解码 + 入箱"，**不做**：去重、排序、鉴权、地址校验 ——

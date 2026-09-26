@@ -142,6 +142,17 @@ pub trait PeerTransport: Send + Sync + 'static {
     fn add_peer(&self, id: u64, addr: &str) -> Result<(), String> {
         Err(format!("该传输不支持运行期加 peer（id={id} addr={addr}）"))
     }
+
+    /// **运行期摘掉一个 peer**（成员移除用，`§121`）。
+    ///
+    /// 为什么必须真的摘掉：留着它 = 留着一条**永远发不出去的出站队列**与两个发送任务
+    /// （那个节点已经被移出集群、不会再回来）。更要紧的是"**配置里没有它、peer 表里还有它**"
+    /// 会让排障时无从判断哪份才是权威。
+    ///
+    /// 默认空实现：`NoTransport` 没有 peer 表；测试里的 `MpscTransport` 按邮箱接线。
+    fn remove_peer(&self, id: u64) {
+        let _ = id;
+    }
 }
 
 /// 传输计数（诊断用）。
@@ -310,6 +321,20 @@ impl PeerTransport for GrpcTransport {
         self.best_effort.write().unwrap().insert(id, be_tx);
         eprintln!("[meta:transport] 已加入 peer {id}（{addr}）");
         Ok(())
+    }
+
+    /// 运行期摘掉一个 peer（成员移除，`§121`）：**两张表都删** ⇒ 两个 `Sender` 随之 drop ⇒
+    /// 那条 `send_loop` 的出队端全部关闭、任务自然结束（不用显式 abort）。
+    ///
+    /// ⚠️ 只动传输、不动 raft：`ProgressTracker` 里的那一条由 `apply_conf_change` 负责。
+    /// 两者是同一件事的两半（见 `apply_committed` 的移除分支），缺一边就会出现
+    /// "配置里没有它、却还在给它发消息"或反过来。
+    fn remove_peer(&self, id: u64) {
+        let a = self.important.write().unwrap().remove(&id).is_some();
+        let b = self.best_effort.write().unwrap().remove(&id).is_some();
+        if a || b {
+            eprintln!("[meta:transport] 已移除 peer {id}（它不再是集群成员）");
+        }
     }
 
     fn send(&self, to: u64, msg: Message) {

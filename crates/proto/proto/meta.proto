@@ -45,6 +45,8 @@ service Meta {
   rpc Join     (JoinRequest)     returns (JoinResponse);
   // 成员变更：把 learner **提升为 voter**（`§120`）—— `Join` 的"下半场"
   rpc Promote  (PromoteRequest)  returns (PromoteResponse);
+  // 成员变更：把一个成员**移除**（`§121`）—— "对端永久不在"的正路
+  rpc Remove   (RemoveRequest)   returns (RemoveResponse);
   // **心跳**（T12.3）：数据节点保活用。只更新 metanode 的**内存**存活表，
   // **绝不写 raft** —— 秒级心跳会把写路径压垮（`architecture-with-chunk §3.2`）。
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
@@ -423,6 +425,16 @@ message PromoteRequest {
 }
 
 message PromoteResponse {
+  repeated uint64 voter_ids   = 1;
+  repeated uint64 learner_ids = 2;
+}
+
+// 把一个成员**从集群移除**（`§121`）。只 leader 受理；**幂等**（它本来就不在成员表里 ⇒ 直接成功）。
+message RemoveRequest {
+  uint64 node_id = 1;
+}
+
+message RemoveResponse {
   repeated uint64 voter_ids   = 1;
   repeated uint64 learner_ids = 2;
 }

@@ -148,6 +148,19 @@ fn start(
     peers: &HashMap<u64, SocketAddr>,
     init: bool,
 ) -> Proc {
+    start_with_voters(id, dir, listen, peers, &IDS, init)
+}
+
+/// 起一个进程，**成员表可指定**（`§121`：4 个 voter 的集群要它才能组起来 —— 默认三个的用例
+/// 证不出"移除改变了容错度"这件事，见那条用例的注释）。
+fn start_with_voters(
+    id: u64,
+    dir: &Path,
+    listen: SocketAddr,
+    peers: &HashMap<u64, SocketAddr>,
+    voters: &[u64],
+    init: bool,
+) -> Proc {
     // 只列**别的**节点（列了自己会被忽略，见 `cli::normalize`）
     let peer_csv = peers
         .iter()
@@ -165,7 +178,8 @@ fn start(
         .arg(listen.to_string())
         .arg("--voters")
         .arg(
-            IDS.iter()
+            voters
+                .iter()
                 .map(|i| i.to_string())
                 .collect::<Vec<_>>()
                 .join(","),
@@ -236,25 +250,30 @@ struct Cluster {
 
 /// 起三个真进程；某个节点没打印接口行就退出 ⇒ **整组重试**（换新端口 + 新目录）。
 fn start_cluster(root: &Path) -> Cluster {
+    start_cluster_of(root, &IDS)
+}
+
+/// 同上，但**成员表可指定**（`§121` 要 4 个 voter）。
+fn start_cluster_of(root: &Path, ids: &[u64]) -> Cluster {
     for attempt in 1..=5 {
         let run = root.join(format!("run{attempt}"));
         let addrs: HashMap<u64, SocketAddr> =
-            IDS.iter().copied().zip(free_ports(IDS.len())).collect();
+            ids.iter().copied().zip(free_ports(ids.len())).collect();
         // **先把三个都起起来，再等接口行** —— 不能"起一个等一个"：成员表是 [1,2,3]，
         // 而每个节点都要等「集群里有 leader」才打印接口行，leader 又需要**多数派投票**
         // ⇒ 串行起会僵住（第一个节点的票永远凑不齐，因为后面的还没起）。
         // 这也是部署约束：**所有节点要在 10s 窗口内起来**（`§103`）。
         let mut procs: HashMap<u64, Proc> = HashMap::new();
-        for id in IDS {
+        for id in ids {
             let dir = run.join(format!("node{id}"));
-            procs.insert(id, start(id, &dir, addrs[&id], &addrs, true));
+            procs.insert(*id, start_with_voters(*id, &dir, addrs[id], &addrs, ids, true));
         }
         let mut ok = true;
-        for id in IDS {
-            if procs[&id].wait_listening().is_none() {
+        for id in ids {
+            if procs[id].wait_listening().is_none() {
                 eprintln!(
                     "第 {attempt} 次尝试：节点 {id} 没在 20s 内就绪 —— 整组重试。stderr:\n{}",
-                    procs[&id].stderr.lock().unwrap()
+                    procs[id].stderr.lock().unwrap()
                 );
                 ok = false;
                 break;
@@ -265,7 +284,7 @@ fn start_cluster(root: &Path) -> Cluster {
         }
         // 已经起来的那些随 `procs` 一起 drop ⇒ 被杀掉，不留孤儿
     }
-    panic!("5 次尝试都没能把三个真 metanode 进程组起来");
+    panic!("5 次尝试都没能把 {} 个真 metanode 进程组起来", ids.len());
 }
 
 // ---------------------------------------------------------------- op 构造
@@ -952,4 +971,145 @@ fn promoting_a_learner_makes_it_count_for_the_quorum() {
         "4 个 voter 只活 2 个（{{1,3}}）⇒ 不到 quorum，**不该**被接受：{res:?}"
     );
     eprintln!("  ④ 提升后：同一批存活 voter {{1,3}} 已不构成多数派 ⇒ 写入**停住**（4s 内未被接受）");
+}
+
+// ---------------------------------------------------------------------------
+// 成员变更的收尾：把"永久不在"的成员**移除**（`§121`）
+// ---------------------------------------------------------------------------
+
+/// **移除一个永久不在的成员，集群重新变得能容错**（`§121`）。
+///
+/// # 为什么非要用 4 个 voter
+///
+/// 3 个 voter（quorum 2）掉一个照样提交 —— "移除"这件事在那套配置里**看不出效果**。
+/// 4 个 voter（quorum 3）才有那对可对照的实验：
+///
+/// | 阶段 | voters | 活着 | quorum | 写入 |
+/// |---|---|---|---|---|
+/// | ③ | `[1,2,3,4]` | 2 个 | 3 | ❌ **停住** |
+/// | ⑥ | 三个（那个永久不在的已移除） | 同样 2 个 | 2 | ✅ **成功** |
+///
+/// ③→⑥ 之间只做了两件事：**先把一个节点拉回来**（成员变更本身也要过 quorum —— 这是这条
+/// 纪律的核心：**移除必须趁还能提交的时候做**），然后趁能提交把那个永久不在的成员摘掉。
+#[test]
+fn removing_a_permanently_gone_member_makes_the_cluster_tolerant_again() {
+    const IDS4: [u64; 4] = [1, 2, 3, 4];
+    let root = TempDir::new("meta-remove");
+    let mut cluster = start_cluster_of(std::path::Path::new(&root.0), &IDS4);
+    let rt = tokio::runtime::Runtime::new().expect("运行时");
+    let clients = rt.block_on(connect_all(&cluster.addrs, &IDS4));
+
+    let leader = rt.block_on(wait_some_leader(&clients, &IDS4));
+    // ② 杀掉、⑤ 移除的那个 —— 本用例里它就是"**永久不在**"的成员
+    let gone = *IDS4
+        .iter()
+        .find(|id| **id != leader)
+        .expect("4 个 voter 里总有别的");
+    eprintln!("  ① 4 个 voter 起齐（quorum 3）：leader={leader}；永久不在的是 {gone}");
+
+    // ---- ② 掉一个：3 个活着 = quorum ⇒ 照样提交 ----
+    cluster.procs.get_mut(&gone).expect("进程在").kill9();
+    let alive3: Vec<u64> = IDS4.iter().copied().filter(|id| *id != gone).collect();
+    let r = rt.block_on(propose_following_leader(
+        &clients,
+        &alive3,
+        commit_op("t1", "k-t1", 8_000),
+    ));
+    assert!(r.accepted, "掉一个（剩 3 = quorum）⇒ 写入应当成功");
+    eprintln!("  ② 杀掉 {gone}：存活 3 个 = quorum ⇒ 写入**成功**");
+
+    // ---- ③ 再掉一个：2 个活着 < quorum ⇒ 停住（**有界**等待：不能无限等）----
+    let second = *alive3.iter().find(|id| **id != leader).expect("还有别的");
+    cluster.procs.get_mut(&second).expect("进程在").kill9();
+    let res = rt.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(4),
+            clients[&leader].clone().propose(pb::ProposeRequest {
+                op: Some(commit_op("t2", "k-t2", 8_100)),
+                request_id: b"rid".to_vec(),
+                schema_ver: 0,
+            }),
+        )
+        .await
+    });
+    assert!(
+        res.is_err(),
+        "4 个 voter 只剩 2 个（< quorum 3）⇒ **不该**被接受：{res:?}"
+    );
+    eprintln!("  ③ 再杀掉 {second}：存活 2 个 < quorum ⇒ 写入**停住**");
+
+    // ---- ④ **先把一个拉回来**：成员变更本身也要过 quorum，没有这一步 ⑤ 提交不了 ----
+    let dir = cluster.run.join(format!("node{second}"));
+    cluster.procs.insert(
+        second,
+        start_with_voters(
+            second,
+            &dir,
+            cluster.addrs[&second],
+            &cluster.addrs,
+            &IDS4,
+            false,
+        ),
+    );
+    assert!(
+        cluster.procs[&second].wait_listening().is_some(),
+        "拉回来的节点 {second} 没在 20s 内就绪。stderr:\n{}",
+        cluster.procs[&second].stderr.lock().unwrap()
+    );
+    let r = rt.block_on(propose_following_leader(
+        &clients,
+        &alive3,
+        commit_op("t3", "k-t3", 8_200),
+    ));
+    assert!(r.accepted, "拉回一个 ⇒ 3 个活着 = quorum ⇒ 写入恢复");
+    eprintln!("  ④ 把 {second} 拉回来：3 个活着 ⇒ 写入**恢复**（自救；没它 ⑤ 提交不了）");
+
+    // ---- ⑤ **趁能提交**把那个永久不在的成员摘掉 ----
+    let leader = rt.block_on(wait_some_leader(&clients, &alive3));
+    let after: Vec<u64> = IDS4.iter().copied().filter(|id| *id != gone).collect();
+    let resp = rt.block_on(async {
+        clients[&leader]
+            .clone()
+            .remove(pb::RemoveRequest { node_id: gone })
+            .await
+            .expect("移除应当成功（§121）")
+            .into_inner()
+    });
+    assert_eq!(resp.voter_ids, after, "移除后只剩三个 voter：{resp:?}");
+    assert!(
+        !resp.voter_ids.contains(&gone),
+        "被移除的那个不能在 voter_ids 里：{resp:?}"
+    );
+    // 成员变更走 raft ⇒ 从**别的**节点读一遍也必须一致（只在一个节点可见 = 没复制到）
+    let other = *after.iter().find(|id| **id != leader).expect("还有别的");
+    let st_other = rt.block_on(status(&clients[&other], other));
+    assert_eq!(st_other.voter_ids, after, "成员变更必须复制到每个成员");
+    // **幂等**：同样的请求再来一次必须成功（客户端超时重发的常见形态）；
+    // 它此时已经不在成员表里 ⇒ 连 conf change 都不该提议（所以也不需要 quorum）
+    let again = rt.block_on(async {
+        clients[&leader]
+            .clone()
+            .remove(pb::RemoveRequest { node_id: gone })
+            .await
+            .expect("重复移除必须幂等成功（§121）")
+            .into_inner()
+    });
+    assert_eq!(again.voter_ids, after, "重复移除不该改动成员表：{again:?}");
+    eprintln!("  ⑤ 已移除 {gone}：voters={after:?}（quorum 从 3 降到 2）；重复请求幂等 OK");
+
+    // ---- ⑥ 对照：**同样只活两个**，现在又够 quorum 了 ----
+    let third = *after.iter().find(|id| **id != leader).expect("还有别的");
+    cluster.procs.get_mut(&third).expect("进程在").kill9();
+    let alive_after: Vec<u64> = after.iter().copied().filter(|id| *id != third).collect();
+    assert_eq!(alive_after.len(), 2, "同样是只活两个");
+    let r = rt.block_on(propose_following_leader(
+        &clients,
+        &alive_after,
+        commit_op("t4", "k-t4", 8_300),
+    ));
+    assert!(
+        r.accepted,
+        "移除之后 quorum 是 2 ⇒ 同样只活两个也能提交（与 ③ 同一个存活数，结果相反）"
+    );
+    eprintln!("  ⑥ 再杀掉 {third}：存活 2 个 = quorum(3) ⇒ 写入**成功**（与 ③ 对照）");
 }
