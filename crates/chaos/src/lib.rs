@@ -52,9 +52,9 @@
 //! 2. **已知缺陷标 `#[ignore]` + 保留确定性探针**：不把缺陷固化成规格，也不静默删用例；
 //!    修好后取消 `#[ignore]`。`§28.1` 正是这条规矩的样板：探针先留着（一键复现），
 //!    读侧栅栏落地后转绿（见 [`commit_to_mark_window_must_not_double_count`]）。
-//!    **本 crate 当前已无 `#[ignore]` 用例**；全仓另有一条 —— `crates/meta` 里 `§106` 的写停摆
-//!    探针（`compaction_with_lagging_follower_should_keep_committing`），修好后同样要取消它的
-//!    `#[ignore]`，别让它悄悄常驻。
+//!    **全仓当前已无 `#[ignore]` 用例**：`crates/meta` 里 `§106` 那条写停摆探针
+//!    （`compaction_with_lagging_follower_should_keep_committing`）已在 `§111` 修好后按纪律
+//!    转正（`§122` 复核连跑 5/5）。
 
 // 本 crate 当前只含验收测试（E2/E3/T6.4/T6.8）与压测示例；以下导入均为测试专用。
 #[cfg(test)]

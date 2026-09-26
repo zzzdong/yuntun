@@ -993,9 +993,11 @@ async fn compaction_with_lagging_follower_should_keep_committing() {
             panic!("④ 第 {k} 条提交失败（12s 内没被接受）");
         }
         let st = status(&clients[&cur], cur).await;
+        // 顺带打 `snapshot_index`（= 压缩位）：这条用例要能一眼看出"**压缩真的在发生**"
+        // （`first_index` 跟着它走）—— `§122` 核对"这一格到底被覆盖到没有"时就靠它。
         eprintln!(
-            "  ④ k={k} ok：leader={cur} first={} last={} applied={} commit={}",
-            st.first_index, st.last_index, st.applied_index, st.commit_index
+            "  ④ k={k} ok：leader={cur} first={} snapshot={} last={} applied={} commit={}",
+            st.first_index, st.snapshot_index, st.last_index, st.applied_index, st.commit_index
         );
         let _ = cur;
     }
