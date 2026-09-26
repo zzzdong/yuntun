@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§124，2026-09-26**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§125，2026-09-26**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -8091,3 +8091,76 @@ C 类的 4 条里没有一条说明"**目标态本身错了**" —— 全是"没
 - 文档一致性判据（`§123`）**5/5 绿**（规模行随本刀改动同步）；
 - compaction 专项：`cargo test -p yuntun-datanode --test compaction_e2e` → **2/2 绿**（带观测配方跑过）；
 - 规模：51,547 行 / 20 个 crate / 394 个测试函数。
+
+---
+
+## 125. `D-1` → ①：**`durable` 档落地**（WAL 归档 + 丢盘拉回 + 有对照组的验收）（2026-09-26）
+
+按决策**做 ①**（补实现），而不是 ②（撤回 ADR）。
+
+### 125.0 动手前先钉死：**要保护的那个窗口真的存在**
+
+ADR-9 说 `best_effort` = "节点磁盘故障 ⇒ **未提交**数据丢失"。这句话指向一个具体窗口，先把它量出来：
+
+* 客户端 ack **只等 WAL 组提交 fsync**（`crates/server/src/flight.rs:637-646` ← `Ingestor::ingest`
+  内部到 ack 之间**只做了 WAL fsync**，`crates/ingest/src/pipeline.rs:343-353`）；
+* 而 seal → 上传对象存储 → `commit_files`（raft）**全在后台攒批循环里**（`pipeline.rs:415-491`）；
+* ⇒ 窗口 = `time_threshold(5s) + 相位铺开(30s) + PUT + raft 往返`，文档给的上界 **~31.4s**。
+
+**窗口里丢的是什么**：`(i)` ack → PUT 之前 ⇒ 数据**只在本机 WAL 里**（共享存储没有任何副本）；
+`(ii)` PUT 之后 → commit 之前 ⇒ 对象已是孤儿（字节还在 S3，但没有任何 manifest 引用它）。
+今天**没有任何东西**能恢复 `(i)`：恢复只读**本地** WAL（`resume_recovered` → `full_recovery`），
+盘没了 ⇒ `recovery::recover` 见到目录不存在直接返回空。
+
+⇒ 窗口是真的，ADR-9 有实东西可做。**没有**先造一套机制去保护一个不存在的窗口。
+
+### 125.1 设计（三处关键的"为什么这么选"）
+
+新模块 `crates/ingest/src/wal_archive.rs`（`ArchiveConfig` / `archive_once` / `spawn_archiver` / `restore`）：
+
+| 选择 | 理由 |
+|---|---|
+| **归档连"正在写的段"一起传**（不是只传已轮转的） | 段要 64MB / 1h 才轮转 ⇒ 只传轮转过的等于 **RPO 是小时级**。传"活的"文件不会搞坏归档：撕裂的尾巴由 WAL 自己的 **CRC + `repair_torn_tails`** 兜住（崩溃时正在写的段本来就要走这套） |
+| **恢复 = 把归档段拉回本地 WAL 目录，再走既有通路** | WAL 的读面（`WalReader` / `recover` / `segment.rs`）**全部绑本地 FS**；拉回来之后 DDL 重放 / `resume_recovered` 的 `Pending` 分支 / accumulator 重吸收**一行都不用改** —— `durable` 的重建**恰好就是**今天 `best_effort` 那条恢复通路，只是 WAL 的来源换了 |
+| **键里带 `instance_id`**（`{prefix}/instance={id}/shard={s}/seg={seq:020}.wal`） | WAL 路径**没有**实例维度（固定 `shard=0`）⇒ 多节点归档到同一前缀会**互相覆盖** |
+
+装配（`crates/server/src/lib.rs`）：**拉回必须钩在 `WalWriter::open` 之前**（它会挑本地最大的 seq
+续写，归档段得先躺在那儿）；归档循环随其它后台任务一起起、共用 shutdown token。
+
+**RPO 的界（写清楚，不吹）**：**≤ 归档间隔 + 一次上传时延**（默认间隔 1s）。
+要"真正的 0"必须**同步归档**（ack 之前等 S3 PUT）—— 那是拿写入时延换 RPO，本实现**不选**。
+
+### 125.2 验收（**有对照组**，机制级）
+
+`crates/ingest/tests/wal_archive_durable.rs`：同一场景跑两遍，**只差归档这一个开关** ——
+
+* **有归档**：写 8 条（每条一次 fsync ack）→ 归档一轮 → **把私有目录整个删掉**（整盘丢失）→ 拉回 →
+  `WalReader::scan_from(0)` **逐条**读回 **8/8**；
+* **没归档**：一模一样 → 读回 **0** 条（目录不存在 ⇒ 一条都没有）。
+
+⇒ 两次只有归档之别，所以"数据活下来"**不可能是别的原因**。而且读回走的是**既有**读取面
+（`WalReader` + CRC）⇒ 顺带证明拉回的字节**能被既有通路解析**。
+
+**这条用例第一次跑就抓到一个真 bug**：归档键是 `seg={seq}.wal`，而 `restore` 按 `{seq}.wal`
+解析 ⇒ 每个对象都解析失败、**静默跳过**（`list_all` 有对象、一个没拉回）。修法是让 `seq_of`
+两种命名都认 —— 这正是"**静默跳过**"这类错的典型形态，用例值回票价。
+
+### 125.3 覆盖到哪、没覆盖到哪（新开两条台账）
+
+* ✅ **覆盖**：归档（含"正在写的段"）→ 整盘丢失 → 拉回 → **可重放**；对照组反证；
+  standalone 侧的**真实接入口**（`[wal] archive_prefix` 配置 → 装配 → 后台循环）；
+* ⚠️ **`D-5`（新）**：**datanode 侧没接**（它缺 `resume_recovered` / `spawn_timeout_monitor` 接线，
+  与 standalone 不一致）⇒ ① 目前**只在 standalone 生效**；
+* ⚠️ **`D-6`（新）**：**端到端**（拉回后走 `resume_recovered` 重新提交成**可见数据**）尚未断言；
+  另有"整盘"的边界问题（若连 meta 目录一起丢，manifest 也没了 —— 那不是 WAL 归档能解决的）。
+
+### 125.4 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **394 passed / 0 failed / 0 ignored**；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 本刀用例：`cargo test -p yuntun-ingest --test wal_archive_durable` → 1/1 绿；
+- 文档一致性判据（`§123`）**5/5 绿**；
+- **记一条负载敏感的抖动**（**不是**本刀引入）：全量 `-j 4` 下 `ingest` 的
+  `disk_watermark_aborts_oldest_batch_then_releases_segments`（单跑 ~48s，靠磁盘水位触发）
+  失败过**一次**，单独复跑即绿 —— 与 `§122` 记 `query::partial_fanout` 那条同类，留在案上；
+- 规模：51,964 行 / 20 个 crate / 395 个测试函数。

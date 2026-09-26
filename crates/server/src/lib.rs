@@ -350,6 +350,20 @@ async fn build_embedded_catalog(
 
         // ③ WAL（MVP 单 shard 0）
         let wal_cfg = cfg.wal_config();
+
+        // ③.1 **`durable`：先把归档里的段拉回来**（ADR-9 / `§125`）。顺序是硬要求 ——
+        //     必须在 `WalWriter::open` **之前**：它会挑本地"最大的 seq"续写，所以归档段得先
+        //     躺在那儿，否则 `replay_wal_ddl` / `resume_recovered` 根本看不到它们。
+        if let Some(ac) = cfg.archive_config() {
+            match yuntun_ingest::restore(&ac, &wal_cfg.dir, 0, store.as_ref()).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(segments = n, "WAL 归档已拉回（durable）"),
+                // 拉不回来不是致命错误（本地 WAL 可能本来就完整）—— 但必须响亮：
+                // 这正是"这段窗口的数据这次救不回来"
+                Err(e) => tracing::error!(error = %e, "WAL 归档拉回失败（durable）"),
+            }
+        }
+
         let wal = WalWriter::open(wal_cfg.clone(), 0).await?;
 
         // ③.5 WAL DDL 重放（S1.7）：先重建表清单，再分流数据批次恢复（§5.6）。
@@ -502,6 +516,23 @@ async fn build_embedded_catalog(
             segments_info,
             self.shutdown.clone(),
         ));
+
+        // **`durable`：WAL 归档循环**（ADR-9 / `§125`）—— 与其它后台任务同款：拿 shutdown token，
+        // 随进程退出而停。归档间隔决定 RPO 的界（间隔 + 一次上传时延）。
+        if let Some(ac) = cfg.archive_config() {
+            tracing::info!(
+                prefix = %ac.prefix,
+                interval_secs = ac.interval.as_secs(),
+                "WAL 归档已启用（durable）：RPO ≤ 间隔 + 一次上传"
+            );
+            handles.push(yuntun_ingest::spawn_archiver(
+                ac,
+                wal_cfg.dir.clone(),
+                0,
+                self.store.clone(),
+                self.shutdown.clone(),
+            ));
+        }
 
         // Compaction
         let compactor = Arc::new(yuntun_compaction::Compactor {

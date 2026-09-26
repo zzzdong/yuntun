@@ -19,6 +19,7 @@ pub mod ddl;
 pub use ddl::replay_wal_ddl;
 pub mod flush;
 pub mod pipeline;
+pub mod wal_archive;
 pub mod schema_cache;
 pub mod source;
 pub mod timeutil;
@@ -29,6 +30,7 @@ pub use flush::{
     FlushDeps, FlushOutcome, LiveBatchTracker,
 };
 pub use pipeline::{Ingestor, IngestorConfig};
+pub use wal_archive::{archive_once, restore, spawn_archiver, ArchiveConfig};
 pub use schema_cache::SchemaCache;
 pub use source::{IngestSource, Receipt};
 

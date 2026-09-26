@@ -25,7 +25,7 @@
 
 | # | 偏差 | 现状（证据） | 决定 | 闭环证据 |
 |---|---|---|---|---|
-| **D-1** | **ADR-9 的 `durable` 持久性 SLA 从未实现**（架构要求表级分 `best_effort` / `durable`＝本地 WAL **+ S3 归档**，RPO≈0） | `Durability` 枚举**全仓零引用**（`crates/model/src/lib.rs:69-78`）；`IngestConfig.durability` 恒 0、从不被读 | ⏳ **等决策**（两个选项的成本与影响见 **§6 决策备忘**） | — |
+| **D-1** | **ADR-9 的 `durable` 持久性 SLA 从未实现**（架构要求表级分 `best_effort` / `durable`＝本地 WAL **+ S3 归档**，RPO≈0） | `Durability` 枚举**全仓零引用**（`crates/model/src/lib.rs:69-78`）；`IngestConfig.durability` 恒 0、从不被读 | ✅ **已落地（v1）**：按 **①** 做了 —— WAL 段持续归档到共享存储（含"正在写的段"）+ 丢盘后**拉回本地再走既有恢复通路**；RPO 的界 = **归档间隔 + 一次上传时延**（默认 1s 间隔；"真正的 0"要同步归档，不选） | `§125`；`crates/ingest/tests/wal_archive_durable.rs`（**有对照组**：同场景开关一开一关 ⇒ 8/8 vs 0/0）；接入口 `[wal] archive_prefix`（standalone） |
 | **D-2** | compaction 的"**独立 blocking pool** 资源隔离"未落地（设计明确要求"避免挤占 ingest 与 query"） | `docs/design.md:1208` 的要求 vs 实现用普通 `tokio::spawn`（`crates/compaction/src/lib.rs:430-487`）；全仓 `spawn_blocking` 只在 meta 服务层 | ✅ **已落地**：编解码（`format::{read_batch,write_batch}`，两者都是 `async fn` ⇒ 必在运行时里 ⇒ `spawn_blocking` 安全）与 compaction 的 `concat` 全部走**阻塞池** | `§124`；观测配方 `YUNTUN_FORMAT_TRACE=1`（实测 `encode` 的**执行线程**与提交方不同 ⇒ 活真的搬走了） |
 | **D-3** | `ProposeRequest.request_id` / `schema_ver` 是**死字段**（设计 §5 规定它们是幂等／OCC 载体） | 客户端恒置空/0（`crates/meta/src/remote_catalog.rs:154-158`），服务端只读 `op`（`crates/meta/src/service.rs:57-74`）；实际由 op 层 `IdempotencyOp` / `EvolveSchemaOp.expected_version` 承担 | ✅ **已决定**：语义由 **op 层**承担（那两处才是权威），proto 保留字段号但**标注为历史字段**（删字段会让老客户端读出 0 而看不出区别） | `§124`：`meta.proto` 的 `ProposeRequest` 上那段注释 |
 | **D-4** | R5 的"**partial aggregate 下推** + 冷数据按 datanode 分配"未兑现，**但 M5 已标 ✅** | 数据面回传的是**原始行**（`crates/proto/proto/shard.proto:67-70`）；协调者只 fanout 热数据 | ✅ **已决定**：**把 M5 降级为"部分"**（承诺不该比现实漂亮），两条欠账留在本表（不假装它们是 T13.1/T13.2 的进度） | `§124`：`status.md` 的 M5 行已标"✅（**部分**）"并列明两条欠账 |
@@ -86,6 +86,9 @@
 3. 只登记**偏差**：`status.md` 记现状、`operation-log` 记证据与过程、`plan.md` 记任务与门槛 ——
    台账不重复它们，否则它自己也会变成第三个会漂移的地方。
 
+| **D-5** | **datanode 侧没接** `durable`：它缺 `resume_recovered` / `spawn_timeout_monitor` 接线（与 standalone 不一致） | `crates/datanode/src/main.rs` 只 `replay_wal_ddl` + `spawn_accumulator`；对照 `crates/server/src/lib.rs:389`/`498-504` | **待定**：先确认 datanode 的恢复路径（accumulator 重吸收 + 重 flush）与这两条的关系，再决定是补接线还是把 accumulator 那条路写清 | — |
+| **D-6** | `durable` 的**端到端**验收缺：现在是**机制级**（拉回 → 可重放），没断言"重建之后重新提交成可见数据"；另"整盘"的边界未定（若连 meta 目录一起丢，manifest 也没了 —— 不是 WAL 归档能解决的） | `crates/ingest/tests/wal_archive_durable.rs` 的边界注释 | **待定**：补一条"拉回 → Ingestor 恢复 → `commit_files` → 数据可见"的端到端用例；并把"整盘"的验收范围写进用例名/注释 | — |
+
 ---
 
 ## 6. 决策备忘：`D-1` ADR-9 的 `durable` SLA（**唯一需要设计决策的一条**）
@@ -115,4 +118,9 @@
 纪律，与"宁可少写"是同一条 —— 而 `durable` 现在的状态是**最坏的那种**：文档说有两档、
 类型也在，但选它与选 `best_effort` **行为完全一样**，且**没人会收到任何提示**。
 
-> 决定之后，把本节的结论填回 §1 的 D-1 行（"决定" + "闭环证据"），并划掉台账里的这条。
+### 6.4 结论（2026-09-26）：**已按 ① 落地 v1**
+
+`D-1` 的 D-1 行已闭环：走 ①，v1 = **机制 + standalone 接入 + 机制级验收**（`§125`）。
+本节保留作为**取舍记录** —— 特别是"为什么没选同步归档"（那会拿写入时延换 RPO；
+真正的 RPO=0 需要 ack 之前等 S3 PUT，是另一个取舍）。剩余两格见 `D-5`（datanode 接线）
+与 `D-6`（端到端验收 + "整盘"边界）。

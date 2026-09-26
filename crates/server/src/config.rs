@@ -98,6 +98,12 @@ pub struct WalSection {
     pub batch_timeout_secs: u64,
     /// 磁盘水位
     pub disk_high_watermark: f64,
+    /// **WAL 归档前缀**（ADR-9 的 `durable` 档，`§125`）：给了它就把 WAL 段持续归档到这里
+    /// （共享存储上的一级目录，键里会带 `instance_id`），于是"整盘丢失"后还能把数据捞回来。
+    /// `None` = 不归档（`best_effort`：ack 过的数据在落盘提交之前只活在本机磁盘上）。
+    pub archive_prefix: Option<String>,
+    /// 归档间隔（秒，默认 1）。**它直接决定 RPO 的界**（连同一次上传时延）。
+    pub archive_interval_secs: u64,
 }
 
 impl Default for WalSection {
@@ -107,6 +113,8 @@ impl Default for WalSection {
             segment_max_mb: 64,
             batch_timeout_secs: 1800,
             disk_high_watermark: 0.80,
+            archive_prefix: None,
+            archive_interval_secs: 1,
         }
     }
 }
@@ -459,6 +467,21 @@ impl Config {
             disk_high_watermark: self.wal.disk_high_watermark,
             ..Default::default()
         }
+    }
+}
+
+
+impl Config {
+    /// **WAL 归档配置**（ADR-9 的 `durable` 档，`§125`）：`[wal] archive_prefix` 没给就是 `None`。
+    ///
+    /// 实例维度取 `[chunk] instance_id` —— WAL 路径本身**没有**实例维度（`shard=0` 固定），
+    /// 多节点归档到同一前缀会互相覆盖，所以键里必须带上它。
+    pub fn archive_config(&self) -> Option<yuntun_ingest::ArchiveConfig> {
+        self.wal.archive_prefix.as_ref().map(|p| yuntun_ingest::ArchiveConfig {
+            prefix: p.clone(),
+            instance_id: self.chunk.instance_id.clone(),
+            interval: std::time::Duration::from_secs(self.wal.archive_interval_secs.max(1)),
+        })
     }
 }
 
