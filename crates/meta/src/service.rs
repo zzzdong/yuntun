@@ -25,6 +25,9 @@ use yuntun_proto::meta as pb;
 /// 超时返回 `UNAVAILABLE`（**可重试**）而不是让客户端裸等：客户端换节点重试比挂死好。
 const PROPOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// `Join` 等"成员变更真的生效"的上限（`§119`）：提议 + 提交 + 应用（同一机房通常是毫秒级）。
+const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// gRPC 服务实现。
 pub struct MetaService {
     node: NodeHandle,
@@ -94,13 +97,97 @@ impl pb::meta_server::Meta for MetaService {
         Ok(Response::new(pb::HeartbeatResponse { known }))
     }
 
+    /// 成员变更（`§119`）：把一个节点作为 **learner** 加进集群，并把**起步配置**回给它。
+    ///
+    /// # 两半合起来才是"在线加节点"
+    ///
+    /// * **集群不用预先知道新节点**：它的地址由本请求带进来，随 conf change 复制给每个成员
+    ///   （`§118` 用 `ConfChange.context` 带地址）；
+    /// * **新节点不用预先知道所有地址**：本回包把成员表与各自地址给它（**含 leader 自己**）——
+    ///   它据此起自己的 raft，并知道该把 `AppendResponse` 发回哪。
+    ///
+    /// 于是它替掉了"改 `--voters`/`--peer` 再全量重启"那套；`cli` 的启动闸门也据此开了
+    /// `--join` 这个正门（`§119`）。
+    ///
+    /// # 幂等
+    ///
+    /// 已经是成员（voter 或 learner）就**不再提议**、直接回当前配置 —— 客户端超时重发不该被罚。
+    ///
+    /// # 只 leader 受理
+    ///
+    /// 非 leader 回 `NotLeader` + hint（与 `Propose` 同一约定）。⚠️ hint 是个 **id**，
+    /// 而调用方（新节点）手里只有地址 —— 所以 `--join` 支持逗号分隔的多个接触点，
+    /// 逐个试到 leader 为止（与 `bench --meta`、`RemoteCatalog` 同一套做法）。
+    ///
+    /// # 为什么等生效才回包
+    ///
+    /// 回包里给的是**新节点的起步配置**：如果 conf change 还没提交就回，新节点会拿一份
+    /// "集群不认"的配置去起步（它不在任何人的成员表里，没人会给它发日志）。等它进成员表
+    /// 才算"接纳完成"。
     async fn join(
         &self,
-        _req: Request<pb::JoinRequest>,
+        req: Request<pb::JoinRequest>,
     ) -> Result<Response<pb::JoinResponse>, Status> {
-        Err(Status::unimplemented(
-            "成员变更（learner → voter）属 S3-6；现在加节点必须改初始成员表并全量重启",
-        ))
+        let r = req.into_inner();
+        if r.node_id == 0 || r.address.is_empty() {
+            return Err(Status::invalid_argument(
+                "node_id 与 address 都必填；address 要填**别的节点能连到它**的地址\
+                 （不是 --listen 的 0.0.0.0，见 --advertise）",
+            ));
+        }
+        let st = self.node.status();
+        if st.role != "Leader" {
+            return Err(MetaError::NotLeader {
+                leader_hint: st.leader_id,
+            }
+            .into());
+        }
+
+        // ⚠️ `add_learner` / `members` 都是**阻塞**的（内部 `recv_timeout` 等 raft 线程回话）。
+        // 直接在 async 函数里调会占住 tokio 工作线程 —— 与 `propose` 同一条纪律，走阻塞池。
+        let blocking = |node: NodeHandle, what: &'static str| async move {
+            let r = tokio::task::spawn_blocking(move || node.members(Duration::from_secs(2)))
+                .await
+                .map_err(|e| Status::internal(format!("阻塞任务失败（{what}）：{e}")))?;
+            r.map_err(Status::from)
+        };
+
+        let mv = blocking(self.node.clone(), "members").await?;
+        let already = mv.voters.contains(&r.node_id) || mv.learners.contains(&r.node_id);
+        if !already {
+            let node = self.node.clone();
+            let (id, addr) = (r.node_id, r.address.clone());
+            tokio::task::spawn_blocking(move || node.add_learner(id, &addr, PROPOSE_TIMEOUT))
+                .await
+                .map_err(|e| Status::internal(format!("阻塞任务失败（add_learner）：{e}")))??;
+        }
+
+        let deadline = tokio::time::Instant::now() + JOIN_TIMEOUT;
+        loop {
+            let mv = blocking(self.node.clone(), "members").await?;
+            if mv.voters.contains(&r.node_id) || mv.learners.contains(&r.node_id) {
+                return Ok(Response::new(pb::JoinResponse {
+                    voters: mv.voters.len() as u64,
+                    learners: mv.learners.len() as u64,
+                    voter_ids: mv.voters.clone(),
+                    learner_ids: mv.learners.clone(),
+                    members: mv
+                        .addrs
+                        .iter()
+                        .map(|(id, a)| pb::NodeAddr {
+                            node_id: *id,
+                            address: a.clone(),
+                        })
+                        .collect(),
+                }));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Status::deadline_exceeded(format!(
+                    "成员变更未在 {JOIN_TIMEOUT:?} 内生效（raft 选不出 leader？看 Status）"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// 节点间：一条 raft 消息（`Meta.Raft`）。**不是客户端接口**。

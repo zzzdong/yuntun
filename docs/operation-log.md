@@ -7636,3 +7636,83 @@ leader = 1
 - 全量 `cargo test --workspace --no-fail-fast -j 4` → **383 passed / 0 failed / 0 ignored**；
 - `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**（`apply_committed` 参数变多，按本仓
   先例加了 `#[allow(too_many_arguments)]` 与理由）。
+
+---
+
+## 119. `Join` 下半刀：**新节点在线加入并追平**（含地址表落盘 + 一处自我更正）（2026-09-26）
+
+### 119.1 交付了什么
+
+`§118` 交的是地基（集群能在线加 learner、地址随 conf change 复制到每个成员），这一刀补上**入口**：
+
+| 层 | 改了什么 |
+|---|---|
+| `proto` | `JoinResponse` 增 `voter_ids` / `learner_ids` / `members`（**含 leader 自己**）+ 新 `NodeAddr`；原来那两个**计数**保留 —— 加字段向后兼容，删字段会让老客户端读出 0 |
+| `service` | 实现 `Meta.Join`：**只 leader 受理**（非 leader 回 `NotLeader` + hint）、**幂等**（已是成员就直接回当前配置）、**等生效才回包**（回包里是给新节点的**起步配置**，不能是"还没提交"的那份） |
+| `cli` | 新 `--join <接触点列表>` 与 `--advertise <地址>`；`normalize` / `check_bootstrap` 为"加入"这个**意图**开了正门（并**拒绝** `--join` 配 `--voters`/`--peer`、拒绝打到已有数据的目录 —— 两条都是"两个都想说了算"） |
+| `main` | `--join` 时先向集群要起步配置，再起本节点；**先 bind 再 join**（集群一知道我们的地址，socket 就已在 `listen`，它发来的首批 append/快照会排在 accept backlog 里，而不是因为"服务还没起"被丢掉 —— 丢一条快照是致命的，`§107`） |
+| `lib` | 成员**地址表落盘**（应用 conf change 时写）；启动时"**先吃盘上的、再用 `--peer` 覆盖**"（盘上才有"后来加入的成员"） |
+
+### 119.2 两半合起来才是"在线加节点"
+
+* **集群不用预先知道新节点**：它的地址由 `Join` 请求带进去，随 conf change **复制**给每个成员（`§118`）；
+* **新节点不用预先知道所有地址**：`Join` 回包把成员表与各自地址给它（**含 leader 自己** —— 否则它连
+  `AppendResponse` 都发不回去）。
+
+⇒ `metanode --join <接触点…>` 因此替掉了"改 `--voters`/`--peer` 再全量重启"那套；
+`§103` 那条"多节点必须先知道所有地址"的部署约束，现在只剩**初始 3 个 voter** 需要（它们确实在
+`--init` 时就要配好）。新节点以**非成员姿态**起步（`voters=[1,2,3]`、**不含自己**）⇒ 它不会自己
+选主（`§118` 的分析），只在收到那条 conf change 后成为 learner。
+
+### 119.3 验收（进程级，`metanode_cluster_process_e2e`）
+
+新增 `a_fourth_process_joins_a_running_cluster_and_catches_up`（3 个真进程 + 第 4 个 `--join`）：
+
+```text
+集群 leader = 1
+加入前：leader commit=4 last=4
+节点 4 已就绪：127.0.0.1:37825（通过 127.0.0.1:43321,127.0.0.1:33009,127.0.0.1:41333 加入）
+✅ 已追平：节点4 last=5 applied=4（集群 commit=5）
+✅ 新写入也跟上了：节点4 applied=8 集群 commit=8
+集群已整组重启，新 leader = 3（--peer 里没有节点 4）
+✅ 集群整组重启后，节点 4 仍在被复制：applied 8 → 11（集群 commit=11）
+```
+
+四段断言各自对应一件进程内测不出来的事：① `Join` 真的回了起步配置；② 新节点**追平**了历史；
+③ **跟上**了加入之后的写入；④ **整组重启**（`--peer` 里没有它）之后仍被复制。
+
+### 119.4 **自我更正**：`§118.5` 那句"重启后 applied 之下不重放"是**错的**
+
+`§118.5` 写的是"重启后 `applied` 之下的 conf change 不会重放 ⇒ learner 地址重启即失"。
+本刀**实测推翻**：把"地址表落盘"**临时关掉**，`§119.3` 的第 ④ 段**照样绿** ⇒ 地址确实靠**重放**回来了。
+
+真相：raft-rs 的 `RaftLog.applied` 在重启时是从 **快照**恢复的，而 `FjallStorage::set_applied`
+只是**我们自己的**记账（服务于本地压缩）⇒ **已提交但未压缩**的条目会在重启后**重新投递**，
+那条 conf change 被**重放** ⇒ `add_peer` 再来一次 ⇒ 地址就回来了。
+
+⇒ 落盘真正管的是**压缩之后**那一格：conf change 条目一旦被压掉，重放再也给不出地址，只剩盘上那份。
+**这一格目前只有存储层往返用例守着**（`peer_addrs_survive_reopen`：写 → 重开 → 读回），
+**没有端到端覆盖**（那需要"小压缩阈值 + 压缩发生在加入之后"）—— 明确留作后续，**别当它已被证明**。
+
+### 119.5 顺带修正的一处**旧断言**
+
+`meta_service_e2e::propose_status_delta_over_real_grpc` 里有一条"`Join` 必须返回 `UNIMPLEMENTED`"
+（S3-6 时代的断言）。本刀把它换成**正向断言**：回包必须带新节点、**必须含 leader 自己**、
+重复请求必须**幂等**。
+
+### 119.6 覆盖到哪、没覆盖到哪（如实说）
+
+* ✅ **覆盖**：在线加入 + 追平 + 跟上新写入 + 整组重启后仍被复制；`Join` 的幂等与非 leader 拒绝；
+  地址表跨 reopen 存活；
+* ⚠️ **未做**（下一刀）：**提升 learner → voter**（现在只加 learner，它**不参与多数派**）、
+  成员**移除**、"压缩之后地址表"的端到端覆盖；
+* ⚠️ 仍是**同机多进程**（跨机待真机）。
+
+### 119.7 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **385 passed / 0 failed / 0 ignored**；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 新用例连跑 **3/3** 绿（各 ~1.1s）；存储往返用例绿；
+- **记一条既有的计时抖动**（**不是**本刀引入）：`query::partial_fanout::slow_sources_wait_in_parallel_not_in_sequence`
+  阈值 600ms、实测 581ms，全量并行时偶尔擦边失败，单独跑必过 —— 留在案上，免得下次当新问题重查；
+- 规模：50,345 行 / 20 个 crate / 383 个测试函数。

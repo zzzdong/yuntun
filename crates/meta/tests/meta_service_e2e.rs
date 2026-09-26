@@ -195,16 +195,35 @@ async fn propose_status_delta_over_real_grpc() {
         "schema 版本落后时必须要求全量重建（否则会**静默丢掉结构变更**）：{stale:?}"
     );
 
-    // ---- 未实现的方法必须明确 UNIMPLEMENTED ----
-    let e = client
-        .join(pb::JoinRequest {
-            node_id: 9,
-            address: "127.0.0.1:1".into(),
-            learner_only: true,
-        })
+    // ---- 成员变更（`§119`）：`Join` 现在**实现了** ----
+    // 它把一个节点作为 **learner** 加进集群，并把**起步配置**回给新节点
+    // （成员表 + 各自地址，**含 leader 自己** —— 新节点要靠它把 AppendResponse 发回来）。
+    let req = pb::JoinRequest {
+        node_id: 9,
+        address: "127.0.0.1:1".into(),
+        learner_only: true,
+    };
+    let j = client
+        .join(req.clone())
         .await
-        .expect_err("Join 尚未实现（属 S3-6）");
-    assert_eq!(e.code(), tonic::Code::Unimplemented);
+        .expect("Join 应当成功（§119）")
+        .into_inner();
+    assert_eq!(
+        j.voter_ids,
+        vec![1, 2, 3],
+        "加 learner 不该动 voter 集合：{j:?}"
+    );
+    assert_eq!(j.learner_ids, vec![9], "新节点应以 learner 进成员表：{j:?}");
+    assert!(
+        j.members.iter().any(|m| m.node_id == 9),
+        "回包必须带新节点自己的地址（各节点据此连它）：{j:?}"
+    );
+    assert!(
+        j.members.iter().any(|m| m.node_id == 1),
+        "回包必须**含 leader 自己**（否则新节点回不了消息）：{j:?}"
+    );
+    // 幂等：同样的请求再来一次不该报错（客户端超时重发的常见形态）
+    client.join(req).await.expect("Join 应当幂等（§119）");
     server.abort();
 }
 

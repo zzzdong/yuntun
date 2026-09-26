@@ -19,6 +19,10 @@
 //! |---|---|
 //! | 空目录 + 没给 `--init` | 你以为在"重启"，其实在**新建一个成员只有自己的集群**（旧集群的节点各自成组，数据永远合不回来） |
 //! | 有数据的目录 + 给了 `--init` | 你以为在"初始化"，其实是在**已存在的成员表上启动**（行为完全不同） |
+//! | **`--join` 打到已有数据的目录**（`§119`） | 你以为在"加入"，其实那个目录**已经是某个集群的一员**（成员表在盘上）⇒ 两份身份打架，直接拒绝 |
+//!
+//! `--join` 是第三条路的**正门**（`§119`）：新节点**不需要** `--voters` / `--peer`
+//! （成员表与各自地址由被加入的集群回包给出），也**不需要** `--init`（那是"新建集群"）。
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -62,6 +66,21 @@ pub struct Args {
     /// 首次启动：显式声明「这个目录是新集群」
     #[arg(long)]
     pub init: bool,
+
+    /// **加入一个已有集群**：给任一现有节点的地址（`host:port`，`§119`）。
+    ///
+    /// 给了它就**不要**再给 `--voters` / `--peer` —— 成员表与各节点地址由被加入的集群回包给出
+    /// （见 `Meta.Join`）。也不需要 `--init`：那是"新建集群"的开关，而这里是"加入"。
+    #[arg(long)]
+    pub join: Option<String>,
+
+    /// **对外通告的地址**（别的节点用它连本节点）。默认取 `--listen`。
+    ///
+    /// 为什么需要它（`§119`）：`--listen 0.0.0.0:9311` 是**监听**语义，不是一个可连的地址 ——
+    /// 把 `0.0.0.0:9311` 当通告地址发给集群，别的节点会去连 `0.0.0.0`（必然失败，而且是静默的）。
+    /// 容器 / 多网卡部署**必须**显式给一个可达地址（容器里通常就是容器名 + 端口）。
+    #[arg(long)]
+    pub advertise: Option<String>,
 
     /// 日志条数超过它就**压缩**（生成快照 + 丢弃老日志）；`0` = 关。
     ///
@@ -121,6 +140,22 @@ impl Args {
     pub fn normalize(mut self) -> Result<Self, String> {
         self.voters.sort_unstable();
         self.voters.dedup();
+        if self.join.is_some() {
+            // **加入模式**（`§119`）：成员表与各节点地址都从集群回包来 ⇒ 本地既不需要、也不该猜。
+            // 这里刻意**拒绝**而不是忽略：`--join` 配 `--voters` 是"两个都想说了算"，那正是
+            // 最容易把节点加进错误成员表的情形（与 `--peer` 重复 id 同一条纪律）。
+            if !self.voters.is_empty() {
+                return Err(
+                    "--join 不能与 --voters 同时给：成员表由被加入的集群回包给出（§119）".into(),
+                );
+            }
+            if !self.peer.is_empty() {
+                return Err(
+                    "--join 不能与 --peer 同时给：各节点地址由被加入的集群回包给出（§119）".into(),
+                );
+            }
+            return Ok(self);
+        }
         if self.voters.is_empty() {
             // 单节点是默认形态（多节点成员表要网络传输，见 MetaNode::open）
             self.voters = vec![self.id];
@@ -165,11 +200,32 @@ impl Args {
         self.peer.iter().map(|p| (p.id, p.addr.clone())).collect()
     }
 
+    /// **对外通告的地址**（`§119`）：显式给了 `--advertise` 就用它，否则退回 `--listen`。
+    pub fn advertise_addr(&self) -> String {
+        self.advertise
+            .clone()
+            .unwrap_or_else(|| self.listen.to_string())
+    }
+
     /// **启动安全闸门**：把"参数合法"提升到"意图合法"。
     ///
     /// 返回 `Err` 时应当**拒绝启动**（而不是打个警告继续跑）：这两条搞错，
     /// 数据是**静默**对不上的（各自成组 / 意外加入），事后极难查。
     pub fn check_bootstrap(&self) -> Result<(), String> {
+        if self.join.is_some() {
+            // 加入模式（`§119`）：**新节点** ⇒ 空目录 + 不给 `--init` 才是对的（上面第一条闸门
+            // 恰好会把这种组合判成"忘了 --init"，所以在这里先行放行）；反过来，目录里已有数据
+            // 说明这个目录已经是某个集群的一员，再 `--join` 就是两份身份打架 ⇒ 拒绝。
+            if dir_has_data(&self.dir) {
+                return Err(format!(
+                    "目录 {} 已有数据，但给了 --join。\n\
+                     已有数据的节点**重启**时不该再 --join（成员表在盘上，直接重启即可）；\n\
+                     确实要以新身份重新加入，请先清空目录（那等于**弃掉**这份元数据）。",
+                    self.dir.display()
+                ));
+            }
+            return Ok(());
+        }
         match (dir_has_data(&self.dir), self.init) {
             (true, true) => Err(format!(
                 "目录 {} 已有数据，但给了 --init。\n\

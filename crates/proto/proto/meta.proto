@@ -394,6 +394,21 @@ message JoinRequest {
 message JoinResponse {
   uint64 voters   = 1;
   uint64 learners = 2;
+
+  // `§119`：给**新节点的起步配置** —— 它要据此起自己的 raft（集群里都有谁、各自在哪）。
+  //
+  // 为什么不复用上面两个计数：计数答不了"我的对端在哪"这个问题，而新节点**必须**知道
+  // （它至少要能把 `AppendResponse` 发回给 leader）。老字段 1/2 保留不动：protobuf 加字段
+  // 向后兼容，删字段会让老客户端读出 0。
+  repeated uint64   voter_ids   = 3;
+  repeated uint64   learner_ids = 4;
+  repeated NodeAddr members     = 5;  // **含 leader 自己**（它就是新节点要回消息的那个）
+}
+
+// 一个节点的对外地址（`§119`）。
+message NodeAddr {
+  uint64 node_id = 1;
+  string address = 2;
 }
 
 // ---------------------------------------------------------------- 节点间（raft 传输）

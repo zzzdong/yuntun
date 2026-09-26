@@ -54,6 +54,7 @@
 //! "S" + idx(u64 BE)   快照产物（**只保留最新一份**）
 //! ```
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -74,6 +75,13 @@ const K_COMPACT_TERM: &[u8] = b"ct";
 const K_LAST_IDX: &[u8] = b"li";
 const K_ENTRY: u8 = b'L';
 const K_ARTIFACT: u8 = b'S';
+/// 成员**地址表**（`§119`）。
+///
+/// 为什么必须落盘：地址有**两个**来源 —— 启动配置（`--peer`，只有初始 voter 在里头）和
+/// **每次 conf change 带过来的**（`§118` 把新节点地址放在 `ConfChange.context` 里）。
+/// 而重启后 `applied` 之下的条目**不会重放** ⇒ 光靠日志补不回来；不落盘的话，
+/// **learner 的地址重启即失**，leader 再也复制不到它（而且是静默的）。
+const K_PEERS: &[u8] = b"pe";
 
 /// fjall 落盘的 raft 存储。
 #[derive(Clone)]
@@ -99,6 +107,8 @@ struct Cache {
     last_index: u64,
     /// 是否已有与 `compacted_index` 对应的产物（内容不进缓存：可能很大，按需从 fjall 取）
     has_artifact: bool,
+    /// 成员地址表（`§119`）：`id → host:port`。启动配置 + 历次 conf change 带过来的。
+    peer_addrs: HashMap<u64, String>,
 }
 
 impl FjallStorage {
@@ -124,6 +134,7 @@ impl FjallStorage {
             last_index: read_u64(&ks, K_LAST_IDX)?.unwrap_or(0),
             ..Default::default()
         };
+        cache.peer_addrs = read_peer_addrs(&ks)?;
         cache.conf_state = match read_msg(&ks, K_CONF_STATE)? {
             Some(cs) => cs,
             None => {
@@ -294,6 +305,23 @@ impl FjallStorage {
         write_msg(&self.ks, K_HARD_STATE, &hs)?;
         c.hard_state = hs;
         Ok(())
+    }
+
+    /// 写入成员**地址表**（`§119`）。调用点：应用 conf change 时（raft 线程，成员变更很稀少）。
+    ///
+    /// 用 `SyncAll` 落盘：它和成员表是**同一条性命**的 —— 丢了地址表，那个成员的地址就再也
+    /// 补不回来（日志不重放），集群会"配置里有它、却没人连得上"。
+    pub fn set_peer_addrs(&self, m: &HashMap<u64, String>) -> fjall::Result<()> {
+        // 文本编码（见 `encode_peer_addrs`）⇒ 不走 `write_msg`（那个要求 protobuf 消息）
+        self.ks.insert(K_PEERS, encode_peer_addrs(m).into_bytes())?;
+        self.db.persist(PersistMode::SyncAll)?;
+        self.cache.lock().unwrap().peer_addrs = m.clone();
+        Ok(())
+    }
+
+    /// 读成员地址表（`§119`）。空表 = 还没写过（首次启动，地址全来自 `--peer`）。
+    pub fn peer_addrs(&self) -> HashMap<u64, String> {
+        self.cache.lock().unwrap().peer_addrs.clone()
     }
 
     /// 更新成员表。
@@ -578,6 +606,40 @@ fn write_msg<T: PbMessage>(ks: &Keyspace, key: &[u8], msg: &T) -> fjall::Result<
     ks.insert(key, msg.write_to_bytes().unwrap())
 }
 
+
+/// 成员地址表的**内部**编码（`§119`）：每行 `id\t地址`。
+///
+/// 刻意不用 protobuf：这不是**线上**格式（只在本地盘上），用文本是为了出问题时
+/// `fjall` 里能直接看懂；而"节点数"是个人数量级，不必为它引入一个消息定义。
+fn encode_peer_addrs(m: &HashMap<u64, String>) -> String {
+    let mut ids: Vec<&u64> = m.keys().collect();
+    ids.sort_unstable(); // 定序：落盘内容对同一张表是**确定的**（便于比对/排查）
+    let mut s = String::new();
+    for id in ids {
+        s.push_str(&format!("{id}\t{}\n", m[id]));
+    }
+    s
+}
+
+/// 解 [`encode_peer_addrs`] 的编码；坏行**跳过**（地址表是可重建的辅助信息，
+/// 不值得为一行坏数据拒绝启动 —— 与"成员表必须一致"那种硬闸门不同）。
+fn read_peer_addrs(ks: &Keyspace) -> fjall::Result<HashMap<u64, String>> {
+    let Some(v) = ks.get(K_PEERS)? else {
+        return Ok(HashMap::new());
+    };
+    let text = String::from_utf8_lossy(&v);
+    let mut m = HashMap::new();
+    for line in text.lines() {
+        if let Some((id, addr)) = line.split_once('\t')
+            && let Ok(id) = id.trim().parse::<u64>()
+            && !addr.trim().is_empty()
+        {
+            m.insert(id, addr.trim().to_string());
+        }
+    }
+    Ok(m)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,6 +717,37 @@ mod tests {
             term,
             ..Default::default()
         }
+    }
+
+    /// **成员地址表要跨 reopen 存活**（`§119`）。
+    ///
+    /// 为什么它值得单独一条用例：地址有**两个**来源 —— 启动配置（`--peer`，只有初始 voter）和
+    /// 历次 conf change 带过来的（后来加入的成员）。而当那条 conf change **被压缩掉**之后，
+    /// 日志重放也给不出地址（`§119.6` 说清了它的边界），盘上这份就是唯一的来源；
+    /// 丢了它，集群会"配置里有这个成员、却没人连得上"，而且是静默的。
+    #[test]
+    fn peer_addrs_survive_reopen() {
+        let dir = TempDir::new("peer-addrs");
+        {
+            let sm = new_sm();
+            let st = FjallStorage::open(dir.path(), 1, sm, vec![1, 2, 3]).unwrap();
+            assert!(st.peer_addrs().is_empty(), "首次打开应当是空表");
+            let mut m = HashMap::new();
+            m.insert(2u64, "10.0.0.2:9311".to_string());
+            m.insert(3u64, "10.0.0.3:9311".to_string());
+            m.insert(9u64, "10.0.0.9:9311".to_string()); // 后来加入的 learner
+            st.set_peer_addrs(&m).unwrap();
+        }
+        // 重新打开 = 模拟重启（`§119` 的进程级用例就是从这条路回来的）
+        let sm = new_sm();
+        let st = FjallStorage::open(dir.path(), 1, sm, vec![1, 2, 3]).unwrap();
+        let got = st.peer_addrs();
+        assert_eq!(got.len(), 3, "三个地址都要活下来：{got:?}");
+        assert_eq!(
+            got.get(&9).map(String::as_str),
+            Some("10.0.0.9:9311"),
+            "**learner 的地址**必须跨重启存活（`§119`）"
+        );
     }
 
     /// 日志 / 硬状态 / 已应用索引都要**跨 reopen 存活**（崩溃恢复的基础）。

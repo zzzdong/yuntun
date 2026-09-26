@@ -562,6 +562,8 @@ impl Cluster {
                 // "压到哪一条"，自动触发会让那些用例的确定性变差（且它们写的条目远少于阈值）。
                 MetaOptions {
                     compact_log_entries: 0,
+                    // 进程内簇没有地址（`MpscTransport` 按邮箱接线，`§118`/`§119`）
+                    self_addr: String::new(),
                 },
             ),
         );
@@ -899,7 +901,7 @@ pub struct MetaNode {
 /// `§42.4b` 记的"稳定触发快照安装未拿到"，根因就是驱动层**根本没有触发**
 /// （`compact_applied` 只被测试用的 `Cluster::compact` 调过）—— 于是进程形态的日志只增不减、
 /// "落后节点靠快照追上"这条路径在真实部署里**永远走不到**（`operation-log §105`）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetaOptions {
     /// 日志条数（`last_index - first_index + 1`）超过它就**压缩到已应用位置**
     /// （生成快照产物 + 丢弃老日志）。`0` = 关（测试簇改用手动 `Cluster::compact`）。
@@ -907,11 +909,21 @@ pub struct MetaOptions {
     /// ⚠️ 数的是**日志条数**，不是 op 数：no-op 与 ConfChange 也占索引（`storage.rs` 的坐标纪律）。
     /// 设计 §4.4 的另一个判据（状态 > 256MB）**未实现**，见 `operation-log §105.4`。
     pub compact_log_entries: usize,
+
+    /// **本节点的对外地址**（`§119`）：成员表里"自己"那一项用它。
+    ///
+    /// 为什么需要：新节点从 `Meta.Join` 回包里拿到的成员表**必须包含 leader 自己的地址** ——
+    /// 否则它连"回一条 `AppendResponse`"都发不出去（learner 不发主消息，但要回执）。
+    /// 空串 = 未知（进程内测试簇就是空的：它按邮箱接线，没有地址这回事）。
+    pub self_addr: String,
 }
 
 impl Default for MetaOptions {
     fn default() -> Self {
         Self {
+            // `§119` 之前的调用点没有"自己的地址"这回事（进程内测试簇按邮箱接线）；
+            // 生产由 `metanode` 从 `--advertise` / `--listen` 填进来。
+            self_addr: String::new(),
             // 设计 §4.4 定的上界：日志条数 > 10 万
             compact_log_entries: 100_000,
         }
@@ -1018,8 +1030,7 @@ impl MetaNode {
             raft_inbox: inbox_tx,
         };
         let thread = spawn_node(
-            id, rx, transport, sm, storage, role, applied, debug, status, cmd_rx, members_init,
-            opts,
+            id, rx, transport, sm, storage, role, applied, debug, status, cmd_rx, members_init, opts,
         );
         Ok(Self {
             id,
@@ -1123,7 +1134,14 @@ fn spawn_node(
     members_init: HashMap<u64, String>,
     opts: MetaOptions,
 ) -> thread::JoinHandle<Receiver<Message>> {
-    let mut members = members_init;
+    // 成员表（`§119`）：**先吃盘上的**（历次 conf change 带过来的地址 —— 那里面才有"后来加入的
+    // 成员"），再用启动配置覆盖（`--peer` 只列初始 voter）。冲突时以**运维显式给的**为准。
+    let mut members = storage.peer_addrs();
+    members.extend(members_init);
+    // **把自己也算进成员表**（`§119`）：地址来自 `--advertise`（见 `MetaOptions::self_addr`）。
+    if !opts.self_addr.is_empty() {
+        members.insert(id, opts.self_addr.clone());
+    }
     thread::spawn(move || {
         let logger = raft::default_logger();
         let cfg = Config {
@@ -1485,6 +1503,10 @@ fn apply_committed(
                 && !addr.is_empty()
             {
                 members.insert(cc.node_id, addr.clone());
+                // **落盘**（`§119`）：重启后 `applied` 之下的条目不会重放，光靠日志补不回地址表
+                storage
+                    .set_peer_addrs(members)
+                    .unwrap_or_else(|e| fatal(id, "地址表落盘", e));
                 if let Err(e) = transport.add_peer(cc.node_id, &addr) {
                     // 不致命（进程内传输就不支持），但必须**响亮**：加不进来 = 复制不到它
                     eprintln!("[meta:{id}] 加 peer {}（{addr}）失败：{e}", cc.node_id);

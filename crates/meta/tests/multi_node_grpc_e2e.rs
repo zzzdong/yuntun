@@ -819,6 +819,7 @@ fn snapshot_trigger_compacts_the_log_by_policy() {
     let dir = Path::new(&root.0).join("node1");
     let opts = MetaOptions {
         compact_log_entries: 4,
+        ..MetaOptions::default()
     };
     let node = MetaNode::open_with(&dir, 1, vec![1], HashMap::new(), opts).expect("起单节点");
     // 用 `NodeHandle`（= gRPC 服务层用的那个句柄）：它同时给 Status 与 Propose
@@ -905,6 +906,7 @@ async fn compaction_with_lagging_follower_should_keep_committing() {
     let dir = |id: u64| -> PathBuf { Path::new(&root.0).join(format!("node{id}")) };
     let opts = MetaOptions {
         compact_log_entries: THRESHOLD,
+        ..MetaOptions::default()
     };
 
     let mut listeners = Vec::new();
@@ -930,7 +932,7 @@ async fn compaction_with_lagging_follower_should_keep_committing() {
     let mut nodes: Vec<NodeProc> = Vec::new();
     for (i, id) in IDS.iter().enumerate() {
         let listener = listeners[i].take().expect("只取一次");
-        nodes.push(spawn_node(*id, dir(*id), peers_of(*id), listener, opts).await);
+        nodes.push(spawn_node(*id, dir(*id), peers_of(*id), listener, opts.clone()).await);
     }
     let clients: HashMap<u64, Client> = {
         let mut m = HashMap::new();

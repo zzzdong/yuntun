@@ -14,7 +14,12 @@
 //! `--peer` 要把**对端地址在启动前**交给每个节点，而 `MetaNode::open` 会拒绝"成员表里有节点、
 //! 却没给它地址"（`cli::normalize` 同样会拦）。所以三个节点的端口只能由**部署方指定** ——
 //! `multi_node_grpc_e2e.rs` 正是为了绕开这点才用"进程内节点 + 已 bind 的 listener"。
-//! 正路是**动态成员变更**（`Join`），但 proto 里的 `Join` 目前是 **UNIMPLEMENTED**。
+//!
+//! **`§119` 起这条路有正门了**：`metanode --join <接触点列表>` 让新节点**在线加入** ——
+//! 集群不用预先知道它（地址随 `Join` 请求进去、随 conf change 复制给每个成员），
+//! 它也不用预先知道集群里所有地址（`Join` 回包给，**含 leader 自己**）。
+//! 本文件最后一条用例 `a_fourth_process_joins_a_running_cluster_and_catches_up` 证的就是它；
+//! 上面那段"端口必须先知道"因此只剩**初始 3 个 voter** 需要（它们确实在 `--init` 时就要配好）。
 //!
 //! 于是这里：`bind(127.0.0.1:0)` 取三个端口后**立刻释放**再交给子进程。这是 `§37` 批评过的
 //! TOCTOU（"探测空闲端口再交给别人"），本用例用**整组重试**兜住那个极小窗口，并把这件事写在
@@ -583,5 +588,241 @@ fn three_real_processes_elect_replicate_and_survive_leader_kill_and_restart() {
         if let Some(p) = cluster.procs.get_mut(&id) {
             p.kill9();
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 动态成员变更：`--join`（`§119`）
+// ---------------------------------------------------------------------------
+
+/// 起一个**加入模式**的进程：不给 `--voters` / `--peer` / `--init`，只给 `--join` 与 `--advertise`。
+///
+/// 这正是 `cli` 那两道启动闸门要放行的意图（`check_bootstrap`）：**空目录 + 没给 `--init`
+/// + 给了 `--join`** —— 前两条单独出现时恰恰是被拒绝的组合。
+fn start_join(
+    id: u64,
+    dir: &Path,
+    listen: SocketAddr,
+    contacts: &str,
+    advertise: SocketAddr,
+) -> Proc {
+    let mut cmd = Command::new(BIN);
+    cmd.arg("--id")
+        .arg(id.to_string())
+        .arg("--dir")
+        .arg(dir)
+        .arg("--listen")
+        .arg(listen.to_string())
+        .arg("--advertise")
+        .arg(advertise.to_string())
+        .arg("--join")
+        .arg(contacts)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("启动 metanode 真进程（--join）");
+
+    let stdout = child.stdout.take().expect("stdout");
+    let (tx, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut r = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match r.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if tx.send(line.clone()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    let stderr = Arc::new(Mutex::new(String::new()));
+    let sink = stderr.clone();
+    let mut e = child.stderr.take().expect("stderr");
+    std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = e.read_to_string(&mut s);
+        *sink.lock().unwrap() = s;
+    });
+
+    Proc {
+        id,
+        listen,
+        child,
+        lines,
+        stderr,
+    }
+}
+
+/// **第 4 个进程 `--join` 进一个正在跑的 3 节点集群，并追上（含追上之后的新写入）。**
+///
+/// # 它证的三件事（进程内测不出来 —— 那三个用例的成员表都是写死的）
+///
+/// 1. **集群不用预先知道新节点**：`--voters`/`--peer` 里都没有它。它的地址随 `Meta.Join`
+///    的**请求**进去，再随 conf change **复制**给每个成员（`§118` 的 `ConfChange.context`）；
+/// 2. **新节点不用预先知道所有地址**：成员表与各节点地址全部来自 `Join` **回包**
+///    （含 leader 自己 —— 否则它连 `AppendResponse` 都发不回去）；
+/// 3. **启动闸门对"加入"这个意图放行**：新节点是"空目录 + 没给 `--init` + 给了 `--join`"，
+///    而 `check_bootstrap` 恰好把前两条单独出现判成"忘了 --init"。
+///
+/// # 为什么只用 3 个接触点里任一个都能成
+///
+/// 只有 leader 受理成员变更，非 leader 回 `NotLeader` + hint，而 **hint 是 id 不是地址** ——
+/// 所以 `--join` 收的是**接触点列表**（本用例把三个地址都给它），逐个试到 leader 为止。
+#[test]
+fn a_fourth_process_joins_a_running_cluster_and_catches_up() {
+    let root = TempDir::new("meta-join");
+    let mut cluster = start_cluster(std::path::Path::new(&root.0));
+    let rt = tokio::runtime::Runtime::new().expect("运行时");
+
+    let clients = rt.block_on(connect_all(&cluster.addrs, &IDS));
+    let leader = rt.block_on(wait_some_leader(&clients, &IDS));
+    eprintln!("  集群 leader = {leader}，地址 {:?}", cluster.addrs[&leader]);
+
+    // ---- ① 先写几条：让新节点"有东西可追" ----
+    for k in 0..3u64 {
+        let r = rt.block_on(propose_following_leader(
+            &clients,
+            &IDS,
+            commit_op(&format!("pre{k}"), &format!("k-pre{k}"), 1_000 + k),
+        ));
+        assert!(r.accepted, "预备写入 k={k} 应当被接受");
+    }
+    let st0 = rt.block_on(status(&clients[&leader], leader));
+    eprintln!("  加入前：leader commit={} last={}", st0.commit_index, st0.last_index);
+
+    // ---- ② 起第 4 个进程（**空目录 + 不给 --init**，只给 --join 与 --advertise）----
+    let addr4 = free_ports(1)[0];
+    let dir4 = cluster.run.join("node4");
+    let contacts = IDS
+        .iter()
+        .map(|i| cluster.addrs[i].to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let p4 = start_join(4, &dir4, addr4, &contacts, addr4);
+    assert!(
+        p4.wait_listening().is_some(),
+        "第 4 个进程没在 20s 内就绪（要么 Join 没成，要么它没等到 leader）。stderr:\n{}",
+        p4.stderr.lock().unwrap()
+    );
+    eprintln!("  节点 4 已就绪：{addr4}（通过 {contacts} 加入）");
+
+    // ---- ③ 它必须**追平**（last 追上集群的 commit，applied 也跟上）----
+    let c4 = rt.block_on(connect(addr4));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let s4 = rt.block_on(status(&c4, 4));
+        let sl = rt.block_on(status(&clients[&leader], leader));
+        if s4.last_index >= sl.commit_index && s4.applied_index >= st0.commit_index {
+            eprintln!(
+                "  ✅ 已追平：节点4 last={} applied={}（集群 commit={}）",
+                s4.last_index, s4.applied_index, sl.commit_index
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "30s 内没追平：节点4 last={} applied={}，集群 commit={}",
+            s4.last_index,
+            s4.applied_index,
+            sl.commit_index
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // ---- ④ 加入**之后**的新写入也要到它（说明 leader 真的把它算进复制了）----
+    for k in 10..13u64 {
+        let r = rt.block_on(propose_following_leader(
+            &clients,
+            &IDS,
+            commit_op(&format!("post{k}"), &format!("k-post{k}"), 2_000 + k),
+        ));
+        assert!(r.accepted, "加入后的写入 k={k} 应当被接受");
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let s4 = rt.block_on(status(&c4, 4));
+        let sl = rt.block_on(status(&clients[&leader], leader));
+        if s4.applied_index >= sl.commit_index {
+            eprintln!(
+                "  ✅ 新写入也跟上了：节点4 applied={} 集群 commit={}",
+                s4.applied_index, sl.commit_index
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "30s 内新写入没到节点 4：applied={} commit={}",
+            s4.applied_index,
+            sl.commit_index
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // ---- ⑤ **重启整个集群**：新 leader 必须仍然知道节点 4 的地址（`§119` 的地址表落盘）----
+    //
+    // 这一段证的是"**重启后新 leader 仍能把日志送到 learner**"，而这次的 `--peer` 里
+    // **只有原来那三个 voter**（运维并不知道后来加入的节点 4 —— 那正是 `Join` 要解决的事）：
+    // 新 leader 若不知道 4 的地址，`transport.send(4, …)` 会落进"peer 表里没有它"那条分支被
+    // **静默丢弃**，节点 4 就再也收不到任何东西。
+    //
+    // ⚠️ **但它不能证明"地址表落盘"**（`§119.6` 实测：把落盘关掉它**照样绿**）——
+    // 因为 raft 的 `applied` 是从**快照**恢复的，我们自己的 `applied_index` 只服务于本地压缩；
+    // 于是重启后**已提交未压缩的条目会重新投递**，那条 conf change 被**重放** ⇒ `add_peer` 再来一次
+    // ⇒ 地址就回来了。（`§118.5` 原先写的"重启后 applied 之下不重放"是**错的**，`§119.6` 更正。）
+    //
+    // 落盘真正管的是**压缩之后**那一格：一旦 conf change 条目被压掉，重放就再也给不出地址，
+    // 只剩盘上那份。把这一格端到端盖住需要"小压缩阈值 + 压缩发生在加入之后"，留作后续。
+    for id in IDS {
+        cluster.procs.get_mut(&id).expect("进程在").kill9();
+    }
+    for id in IDS {
+        let dir = cluster.run.join(format!("node{id}"));
+        // 重启：**不带 `--init`**（目录里有数据，闸门会拒绝），`--peer` 仍是原来那三个
+        cluster
+            .procs
+            .insert(id, start(id, &dir, cluster.addrs[&id], &cluster.addrs, false));
+    }
+    for id in IDS {
+        assert!(
+            cluster.procs[&id].wait_listening().is_some(),
+            "重启后的节点 {id} 没在 20s 内就绪。stderr:\n{}",
+            cluster.procs[&id].stderr.lock().unwrap()
+        );
+    }
+    let clients = rt.block_on(connect_all(&cluster.addrs, &IDS));
+    let leader = rt.block_on(wait_some_leader(&clients, &IDS));
+    eprintln!("  集群已整组重启，新 leader = {leader}（--peer 里没有节点 4）");
+
+    let s4_before = rt.block_on(status(&c4, 4));
+    for k in 20..22u64 {
+        let r = rt.block_on(propose_following_leader(
+            &clients,
+            &IDS,
+            commit_op(&format!("after{k}"), &format!("k-after{k}"), 3_000 + k),
+        ));
+        assert!(r.accepted, "重启后的写入 k={k} 应当被接受");
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let s4 = rt.block_on(status(&c4, 4));
+        let sl = rt.block_on(status(&clients[&leader], leader));
+        if s4.applied_index > s4_before.applied_index && s4.applied_index >= sl.commit_index {
+            eprintln!(
+                "  ✅ 集群整组重启后，节点 4 仍在被复制：applied {} → {}（集群 commit={}）",
+                s4_before.applied_index, s4.applied_index, sl.commit_index
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "重启后新 leader 复制不到节点 4（applied 停在 {}，集群 commit={}）—— \
+             多半是**地址表没落盘**：新 leader 手里没有节点 4 的地址（`§119`）",
+            s4.applied_index,
+            sl.commit_index
+        );
+        std::thread::sleep(Duration::from_millis(200));
     }
 }
