@@ -16,7 +16,7 @@ fn help_lists_every_subcommand_and_global_flag() {
     let out = run(&["--help"]);
     assert!(out.status.success(), "--help 必须退 0（它不是错误）");
     let s = String::from_utf8_lossy(&out.stdout);
-    for needle in ["query", "insert", "tables", "schema", "--addr"] {
+    for needle in ["query", "insert", "tables", "schema", "meta", "--addr"] {
         assert!(s.contains(needle), "--help 里应出现 {needle}：\n{s}");
     }
 }
@@ -38,6 +38,9 @@ fn usage_errors_exit_two_and_name_the_offending_argument() {
         (vec!["query", "select 1", "--format", "yaml"], "--format"),
         (vec!["bogus-cmd"], "bogus-cmd"),
         (vec!["insert"], "--table"),
+        // 成员变更（`§128`）：`--node` 与 `--meta` 都必填，缺哪个就该点名哪个
+        (vec!["meta", "promote"], "--node"),
+        (vec!["meta", "remove"], "--node"),
     ] {
         let out = run(&args);
         assert_eq!(out.status.code(), Some(2), "args={args:?} 用法错应退 2");

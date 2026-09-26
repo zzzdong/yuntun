@@ -5400,7 +5400,9 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "yuntun-catalog",
+ "yuntun-meta",
  "yuntun-model",
+ "yuntun-proto",
  "yuntun-server",
  "yuntun-testkit",
 ]

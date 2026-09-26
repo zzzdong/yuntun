@@ -84,6 +84,38 @@ enum Cmd {
         /// 表名
         table: String,
     },
+
+    /// **成员变更（运维面）**：看成员表 / 提升 learner / 移除成员。
+    ///
+    /// 需要**接触点列表**（`--meta`）：只有 leader 受理成员变更，而非 leader 回的 hint 是个
+    /// **id 不是地址** ⇒ 由本命令逐个试到有人受理为止。
+    Meta {
+        #[command(subcommand)]
+        action: MetaCmd,
+
+        /// 接触点（`host:port`，逗号分隔）。给集群里任意几个成员的地址即可。
+        #[arg(long, value_delimiter = ',')]
+        meta: Vec<String>,
+    },
+}
+
+/// `yuntun-cli meta` 的动作。
+#[derive(Subcommand, Debug)]
+enum MetaCmd {
+    /// 打印成员表（任何活着的成员都答得出来，不必是 leader）
+    Members,
+    /// 把 learner **提升为 voter**（服务端有门槛：必须在册且追得够近）
+    Promote {
+        /// 节点 id
+        #[arg(long)]
+        node: u64,
+    },
+    /// 把一个成员**移除**（幂等；服务端不许摘掉最后一个 voter）
+    Remove {
+        /// 节点 id
+        #[arg(long)]
+        node: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -133,6 +165,21 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
 
     match cmd {
+        Cmd::Meta { action, meta } => {
+            use yuntun_client::admin::{self, AdminAction};
+            let (act, verb) = match action {
+                MetaCmd::Members => (AdminAction::Members, "成员表"),
+                MetaCmd::Promote { node } => (AdminAction::Promote(node), "提升"),
+                MetaCmd::Remove { node } => (AdminAction::Remove(node), "移除"),
+            };
+            let (ms, via) = admin::run(act, &meta, std::time::Duration::from_secs(10)).await?;
+            if act == AdminAction::Members {
+                println!("{ms}    （由 {via} 回答）");
+            } else {
+                println!("{verb}成功（经 {via}）：{ms}");
+            }
+            Ok(())
+        }
         Cmd::Query { sql, format } => {
             let client = Client::connect(&addr).await?;
             let batches = client.query(&sql).await?;

@@ -18,6 +18,7 @@
 //! # Ok(()) }
 //! ```
 
+pub mod admin;
 pub mod input;
 
 use std::sync::Arc;

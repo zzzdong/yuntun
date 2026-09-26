@@ -10,6 +10,8 @@ name = "yuntun-cli"
 path = "src/main.rs"
 
 [dependencies]
+# 成员变更的运维面要直接调 metanode 的 gRPC 面（`§128`）
+yuntun-proto = { path = "../proto" }
 # CLI 参数解析（全仓统一）
 clap = { workspace = true }
 # prettyprint = CLI 表格输出；csv/json = 导入解析
@@ -26,6 +28,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# 运维面用例要起一个**真的** metanode 服务（`§128`：验"接触点逐个试"+ 服务端拒绝原样上抛）
+yuntun-meta = { path = "../meta" }
 yuntun-testkit = { path = "../testkit" }
 yuntun-server = { path = "../server" }
 yuntun-catalog = { path = "../catalog" }
