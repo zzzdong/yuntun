@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§130，2026-09-26**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§131，2026-09-26**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -8446,3 +8446,47 @@ vortex-arrow 0.84.0 → ['arrow-array 58.4.0', 'arrow-buffer 58.4.0', 'arrow-sch
 - `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
 - 文档一致性判据（`§123`）**5/5 绿**；
 - 规模：53,233 行 / 20 个 crate / 407 个测试函数（本刀**没动代码** ⇒ 与 `§129` 同）。
+
+---
+
+## 131. `T6.14`（chunk 压力专项）第一刀：**硬分区的两层验证**（2026-09-26）
+
+### 131.0 先核对 plan 里那四件事，哪件其实已做
+
+plan 的 `T6.14` 列了四件：① 触发 spill 的**真实压力曲线**；② spill **读回失败降级**；
+③ 大基数 `GROUP BY` 挤压 chunk 区（**验证硬分区**）；④ **崩溃后 spill 清理**。
+
+核对结果：**④ 已经实现且有用例** —— `ChunkStore::purge_leftover_spills`（`chunk/src/store.rs`）
+在构造时就清理遗留 spill，`server/tests/private_dir_gate.rs` 还专门守着"**被拒的进程不许动盘**"
+（连清理都不能做）。所以这一刀做 **③**（有零件、没验证），并把它与 ①② 的边界写清。
+
+### 131.1 硬分区的**两层**验证（分工写在用例的头注释里）
+
+| 层 | 用例 | 证什么 |
+|---|---|---|
+| **零件级** | `chunk::budget::tests::chunk_and_query_regions_are_hard_partitioned`、`region_limits_are_independent` | 两个账本**各自触顶、各自拒绝、各自释放**：chunk 满载时**再要一个字节被拒**（且被拒的不计入用量、`pressure()` 进第三级"明确拒绝写入"），而 query 区用量**仍是 0**；反过来 query 区满载也不影响 chunk 区；释放只动自己那一区 |
+| **整机级** | `query/tests/hard_partition.rs::a_query_that_blows_its_own_pool_fails_loudly` | 查询引擎的内存上限**真的被强制执行**：1 MiB 的查询池 + 50 万组 `GROUP BY` ⇒ 得到**可诊断的错误**（内存类），不是静默给答案、也不是把进程拖垮；而且**一次撞上限不让引擎失效**（换个小查询照样跑） |
+
+判据刻意用"**真拒绝**"（`try_reserve` 返回 `false`）而不是"水位比例" —— 比例只是算术，
+**拒绝**才是分区在起作用；"两个机制互不抢占"这句话的可执行形式就是这两条。
+
+**没有**在整机级断言"同一次压力下写入侧没被碰"：读写用的是**两个不同的机制**
+（chunk 区 = 我们的 `MemoryLedger`，查询区 = DataFusion 的 `GreedyMemoryPool`），
+"互不抢占"是**结构性**的，由零件级用例守着。这条分工写在用例头注释里，
+免得下次有人把其中一层当成另一层（`§126` 那次也是这么分工的）。
+
+### 131.2 还没做（如实留在 plan 里）
+
+* ① **触发 spill 的真实压力曲线**：仍缺端到端的"真压力"测量（`plan §8.5` 那句"T6.14 的内存曲线
+  不高于基线（**待压测**）"仍然挂在那儿）；
+* ② **spill 读回失败降级**：需要注入点（读本地 spill 失败 ⇒ 该来源降级为 PARTIAL 还是整查询失败），
+  目前没有注入口，也没用例。
+
+### 131.3 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **409 passed / 0 failed / 0 ignored**；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 本刀用例：`cargo test -p yuntun-chunk --lib budget` → **7/7**（含新增 2）；
+  `cargo test -p yuntun-query --test hard_partition` → **1/1**；
+- 文档一致性判据（`§123`）**5/5 绿**（本刀被它拦过一次：改了代码没同步规模行）；
+- 规模：53,332 行 / 20 个 crate / 410 个测试函数。

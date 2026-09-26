@@ -268,4 +268,62 @@ mod tests {
         assert_eq!(p.chunk().pressure(), Pressure::Normal);
         assert!(p.chunk().try_reserve(100), "chunk 区必须保底，不被 query 抢占");
     }
+
+    /// **硬分区**（架构 §2.8，plan `T6.14`）：chunk 区触顶**与** query 区无关，反之亦然。
+    ///
+    /// 判据用"**真拒绝**"（`try_reserve` 返回 `false`）而不是"水位比例"——
+    /// 比例只是算术，**拒绝**才是分区在起作用。
+    #[test]
+    fn chunk_and_query_regions_are_hard_partitioned() {
+        let p = MemoryPartition::new(100, 100);
+
+        // ① chunk 区塞到限额：再要一个字节必须**被拒**，且被拒的那次**不计入**用量
+        assert!(p.chunk().try_reserve(100), "限额内的申请应当成功");
+        assert!(!p.chunk().try_reserve(1), "超出限额必须**被拒**（不是静默超限）");
+        assert_eq!(p.chunk().used(), 100, "被拒的申请不得计入用量");
+        assert!(
+            p.chunk().pressure().rejects_writes(),
+            "满额 ⇒ 第三级背压（明确拒绝写入，而不是静默超限）"
+        );
+
+        // ② **query 区一点都没被碰** —— 这就是"硬分区"那句话的可执行形式
+        assert_eq!(
+            p.query().used(),
+            0,
+            "chunk 区触顶**不得**动用 query 区（硬分区）"
+        );
+        assert!(p.query().try_reserve(100), "query 区仍可正常申请");
+
+        // ③ 反向：query 区触顶时，chunk 区照样能收（只要它还有余额）
+        assert!(!p.query().try_reserve(1), "query 区满额后同样**被拒**");
+        p.chunk().release(100);
+        assert!(
+            p.chunk().try_reserve(50),
+            "chunk 区释放后应能再收 —— 它不受 query 区满额的影响"
+        );
+
+        // ④ 释放是**各自**的：动 chunk 不影响 query 的用量
+        let query_before = p.query().used();
+        p.chunk().release(50);
+        assert_eq!(p.chunk().used(), 0);
+        assert_eq!(
+            p.query().used(),
+            query_before,
+            "释放必须只动自己那一区（否则两个区会通过释放互相串味）"
+        );
+    }
+
+    /// 两个区的**限额互不相干**（同一个 `MemoryPartition` 里各配各的）。
+    #[test]
+    fn region_limits_are_independent() {
+        let p = MemoryPartition::new(10, 1000);
+        assert_eq!(p.chunk().limit(), 10);
+        assert_eq!(p.query().limit(), 1000);
+        assert!(p.chunk().try_reserve(10));
+        assert!(!p.chunk().try_reserve(1), "chunk 区到 10 就满");
+        assert!(
+            p.query().try_reserve(1000),
+            "query 区的限额与 chunk 区无关（1000 照样给）"
+        );
+    }
 }
