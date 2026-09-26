@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§129，2026-09-26**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§130，2026-09-26**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -8390,3 +8390,59 @@ per-file 统计落进 manifest**，再让 scan 剪枝"* —— 这一刀做的�
 - 本刀用例：`cargo test -p yuntun-query --lib prune` → **8/8**；
 - 文档一致性判据（`§123`）**5/5 绿**（本刀被它拦过一次：改了代码没同步规模行）；
 - 规模：53,233 行 / 20 个 crate / 407 个测试函数。
+
+---
+
+## 130. `T9.x` Vortex：**接不进来** —— 被 arrow 版本挡住（核实 + 登记，不假实现）（2026-09-26）
+
+### 130.0 结论先说
+
+**不是"没时间做"，是版本不兼容**：`vortex` 现在用的 arrow 与**本仓被 DataFusion 钉住的那一代**不同代，
+直接接入会引入**两代 arrow**、`RecordBatch` 类型**不互通** ⇒ `encode_vortex(&RecordBatch)` 根本写不出来。
+所以本刀**没有**去动 `crates/format` 的占位实现（那只会造一个假接口），而是把**决策点**核实清楚并登记。
+
+### 130.1 核实过程（可复现）
+
+```text
+$ cargo add vortex --dry-run -p yuntun-format
+warning: ignoring vortex@0.86.1 (which requires rustc 1.95) to maintain yuntun-format's rust-version of 1.94
+      Adding vortex v0.84.0 to dependencies          ← ① 我们都 MSRV 1.94 ⇒ 自动回退到 0.84
+
+$ cargo add vortex -p yuntun-format --no-default-features --features files,zstd && grep arrow Cargo.lock
+name = "arrow"      version = "59.3.0"               ← 本仓（DataFusion 55 钉的）
+arrow-array 58.4.0                                   ← ② vortex 06.84 自己那一代
+vortex-arrow 0.84.0 → ['arrow-array 58.4.0', 'arrow-buffer 58.4.0', 'arrow-schema 58.4.0', …]
+```
+
+⇒ **两代 arrow 并存**（58.4.0 与 59.3.0），`vortex-arrow` 的 `RecordBatch` 与本仓的不是同一个类型。
+（核实完**立即回退**：`crates/format/Cargo.toml` 那一行已删，`Cargo.lock` 里 vortex / arrow 58
+都已消失，工作区干净 —— 这一步也要如实写，免得下次有人以为"已经在用了"。）
+
+### 130.2 三个选项（这是**决策点**，不是"待办"）
+
+| | 做法 | 代价 |
+|---|---|---|
+| ① **等** vortex 迁到 arrow 59 | 什么都不做，跟版本 | 零成本；何时未知（DataFusion 55 ↔ arrow 59 是硬绑定，我们换不了） |
+| ② **走 IPC 边界** | 把我们的 `RecordBatch` 序列化成 Arrow IPC，再用 vortex 那代的 arrow 读回来 | 每次编解码多一趟 IPC（正是"零拷贝列式格式"想省掉的东西）；且要维护两代 arrow 的依赖图 |
+| ③ **放弃 Vortex**（改 ADR-1） | 承认 Parquet 是主格式 | 与 ADR-1 的"Vortex 主 / Parquet 辅"相反，得改架构文档 |
+
+**我的建议：选 ①（等）**，理由：ADR-1 要的是"零拷贝列式 + 好压缩"，而 ② 的 IPC 边界会把它
+打折到接近"另一种列式编码"；而**现在没有非它不可的痛点**（`§33`/`§36` 的压缩与 RowGroup 上界
+已把 Parquet 路径调好，`§129` 刚刚补上文件级剪枝）。等 vortex 与 arrow 同代，接进来才是原来想要的收益。
+
+### 130.3 本刀做了什么
+
+* **核实**（上面那两步，可复现）；**回退**（工作区干净，没留下半接入状态）；
+* **登记为台账 `D-7`**（`docs/closeout.md` §1）—— 那一节本来已经被 `§127` 清空，这一条是
+  **新发现**，按台账纪律"先在 §1 加一行"；
+* `plan.md` 的 `T9.x` 从"未完成"改成"**被依赖版本挡住**（vortex 0.84 ↔ arrow 58，本仓 arrow 59）"，
+  并指向 `D-7`；
+* **没有**去改 `encode_vortex`/`decode_vortex` 的占位实现 —— 造一个"看起来接了、其实每次返回错误"
+  的接口比留个诚实的占位更糟。
+
+### 130.4 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **406 passed / 0 failed / 0 ignored**（代码未变）；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 文档一致性判据（`§123`）**5/5 绿**；
+- 规模：53,233 行 / 20 个 crate / 407 个测试函数（本刀**没动代码** ⇒ 与 `§129` 同）。
