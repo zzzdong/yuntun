@@ -87,7 +87,7 @@
    台账不重复它们，否则它自己也会变成第三个会漂移的地方。
 
 | **D-5** | **datanode 侧没接** `durable`：它缺 `resume_recovered` / `spawn_timeout_monitor` 接线（与 standalone 不一致） | `crates/datanode/src/main.rs` 只 `replay_wal_ddl` + `spawn_accumulator`；对照 `crates/server/src/lib.rs:389`/`498-504` | **待定**：先确认 datanode 的恢复路径（accumulator 重吸收 + 重 flush）与这两条的关系，再决定是补接线还是把 accumulator 那条路写清 | — |
-| **D-6** | `durable` 的**端到端**验收缺：现在是**机制级**（拉回 → 可重放），没断言"重建之后重新提交成可见数据"；另"整盘"的边界未定（若连 meta 目录一起丢，manifest 也没了 —— 不是 WAL 归档能解决的） | `crates/ingest/tests/wal_archive_durable.rs` 的边界注释 | **待定**：补一条"拉回 → Ingestor 恢复 → `commit_files` → 数据可见"的端到端用例；并把"整盘"的验收范围写进用例名/注释 | — |
+| **D-6** | `durable` 的**端到端**验收缺：原先只有**机制级**（拉回 → 可重放） | `crates/ingest/tests/wal_archive_durable.rs` 只证到"能读回" | ✅ **已闭环**：补了端到端用例（拉回 → 既有恢复通路 → **重新提交成可见文件**），**带对照组**；并把"整盘"的边界**写成边界声明**（WAL 归档保护的是节点私有盘；连 meta 一起丢不是它的事，靠 meta 自己的 raft 多副本） | `§126`；`crates/ingest/tests/wal_archive_e2e.rs`（有归档 `redone=1` + 1 个可见文件；无归档 `redone=0` + 空） |
 
 ---
 
