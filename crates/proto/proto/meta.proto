@@ -231,6 +231,11 @@ message ColumnStatLiteMsg {
   uint64 null_count = 4;
 }
 
+// ⚠️ `request_id` / `schema_ver` 是**历史字段**（`§124`，台账 D-3）：
+// 设计 §5 原本让它们承担"幂等"与"OCC"，但实现把这两件事都放进了 **op 层**
+// —— `IdempotencyOp`（幂等认领）与 `EvolveSchemaOp.expected_version`（OCC）。
+// 服务端**只读 `op`**，从不读这两个字段；客户端也恒置空/0。
+// **保留字段号**（删字段会让老客户端读出 0 而看不出区别），但别再指望它们有语义。
 message ProposeRequest {
   Op     op         = 1;
   // 幂等：同 request_id 重复 propose 必须返回同一结果（跨进程去重靠 SM 内的幂等键）

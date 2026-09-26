@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§123，2026-09-26**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§124，2026-09-26**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -8027,3 +8027,67 @@ C 类的 4 条里没有一条说明"**目标态本身错了**" —— 全是"没
 - 全量 `cargo test --workspace --no-fail-fast -j 4` → **393 passed / 0 failed / 0 ignored**；
 - `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
 - 规模：51,488 行 / 20 个 crate / 394 个测试函数。
+
+---
+
+## 124. 偏差台账**逐条闭环**：D-2 落地（CPU 段下阻塞池）+ D-3/D-4 定案 + D-1 决策备忘（2026-09-26）
+
+`§123` 立了台账（`docs/closeout.md`）并把可机核的部分判据化。本刀按纪律**逐条处理**台账 §1 的
+四条未闭环偏差：能决定的定掉、能做的做掉、**需要设计决策的做成备忘**（不替使用者拍板）。
+
+### 124.1 D-2（compaction 资源隔离）：**已落地**
+
+设计要求"Compaction 使用**独立 tokio blocking pool**，避免挤占 Ingestor 攒批与 Query 响应"
+（`design.md §9.3` / `architecture.md §12.1`），而实现是在 async 上下文里直接跑同步 CPU：
+`concat_batches`（把几百 MB 列缓冲搬到一起）+ parquet 解码 + 编码 —— **都会占住 worker 线程**，
+现象是"查询莫名变慢"且**没有任何报错**。
+
+改法（新助手 `yuntun_format::cpu_off_thread`，三处调用）：
+
+| 位置 | 原来 | 现在 |
+|---|---|---|
+| `format::read_batch` | `decode_batch(&bytes, fmt)` 直接跑 | 解码进阻塞池 |
+| `format::write_batch` | `encode_batch(batch, fmt)?` 直接跑 | 编码进阻塞池（`RecordBatch::clone` 是**浅拷贝**，不复制数据） |
+| `compaction::compact_shard` | schema 对齐 + `concat_batches` 直接跑 | 整段进阻塞池 |
+
+**为什么在这里用 `spawn_blocking` 是安全的**（写进了函数文档）：这三个入口都是 **`async fn`**
+⇒ 调用方必然已经把 future 交给某个运行时在驱动 ⇒ 不会触发"没有运行时"的 panic。
+
+**观测（不断言，理由同 `§122`）**：`YUNTUN_FORMAT_TRACE=1` 时打印"提交方线程 + 实际执行线程"。
+实测（`cargo test -p yuntun-datanode --test compaction_e2e`）：
+
+```text
+[format] encode → 阻塞池（提交方 Some("datanode_merges_files_from_shared_storage_and_commits_via_raft")）
+[format] encode：实际执行于 Some("tokio-rt-worker")
+```
+
+**执行线程 ≠ 提交线程** ⇒ 活真的搬走了。**刻意不写时序断言**（"查询没被拖慢"那种断言在本仓的
+机器上必然是抖的）—— 与 `§122` 里 `snapshot_installs` 那条同一个理由：**观测到 ≠ 断言**。
+
+### 124.2 D-3（两个死字段）：**已决定 —— 语义在 op 层**
+
+`ProposeRequest.request_id` / `schema_ver` 按设计 §5 是"幂等"与"OCC"的载体，但实现把这两件事
+都放进了 **op 层**（`IdempotencyOp` / `EvolveSchemaOp.expected_version`），服务端**只读 `op`**。
+决定：**保留字段号**（删字段会让老客户端读出默认值而看不出区别），在 `meta.proto` 上标明它们
+是历史字段 —— 别再指望它们有语义。
+
+### 124.3 D-4（M5 虚高）：**已决定 —— 降级为"部分"**
+
+承诺不该比现实漂亮：`status.md` 的 M5 从 `✅` 改成 `✅（**部分**）`，并列明两条欠账
+（`partial aggregate 下推`、`冷数据按 datanode 分配`）—— 它们仍**没有**任务号，留在台账里比
+塞进 `T13.1`/`T13.2` 更诚实（那两条是别的事）。
+
+### 124.4 D-1（ADR-9 的 `durable` SLA）：**做成决策备忘，不替使用者拍板**
+
+这是唯一一条**需要设计决策**的：补实现（S3 WAL 归档 + "整盘丢失"的验收）还是正式撤回该 ADR。
+两个选项的成本 / 影响 / 风险写在 `closeout.md §6`。我的建议：**先做"选它就直接报错"的显式校验**
+（防**静默降级**这种最坏形态 —— 文档说有两档、类型也在，而选它与选 `best_effort` 行为完全一样
+且没有任何提示），把真正的归档路径当独立任务排期。
+
+### 124.5 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **393 passed / 0 failed / 0 ignored**；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 文档一致性判据（`§123`）**5/5 绿**（规模行随本刀改动同步）；
+- compaction 专项：`cargo test -p yuntun-datanode --test compaction_e2e` → **2/2 绿**（带观测配方跑过）；
+- 规模：51,547 行 / 20 个 crate / 394 个测试函数。

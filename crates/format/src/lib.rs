@@ -82,7 +82,9 @@ pub async fn write_batch(
     fmt: DataFormat,
 ) -> Result<(String, u64, u64), LakeError> {
     let path = file_path(table, shard, time_window, batch_id, fmt);
-    let bytes = encode_batch(batch, fmt)?;
+    // 编码同样是纯 CPU（`§124`）。`RecordBatch::clone` 是**浅拷贝**（列缓冲是 `Arc`）⇒ 不复制数据。
+    let owned = batch.clone();
+    let bytes = cpu_off_thread("encode", move || encode_batch(&owned, fmt)).await?;
     let size = bytes.len() as u64;
     store
         .put(
@@ -108,7 +110,55 @@ pub async fn read_batch(
         .bytes()
         .await
         .map_err(|e| LakeError::S3(e.to_string()))?;
-    decode_batch(&bytes, fmt)
+    // **解码是纯 CPU**（解压 + 列式→Arrow）⇒ 走阻塞池，别占住 async worker（见 [`cpu_off_thread`]）。
+    cpu_off_thread("decode", move || decode_batch(&bytes, fmt)).await
+}
+
+/// 把**纯 CPU** 的活交给 tokio 的**阻塞池**（与 async worker 池分开的那一个），`await` 结果。
+///
+/// # 为什么需要它（`§124`，落地设计 §9.3「Compaction 资源隔离」）
+///
+/// 解码 / 编码 / 合并这类活是**同步 CPU**：直接在 async 上下文里跑会占住 worker 线程，
+/// 把**同一个节点上**的 ingest 攒批与 query 响应一起拖住 —— 现象是"查询莫名变慢"，
+/// 而且**没有任何报错**（`architecture.md §12.1` 正是为这件事要求"独立 tokio blocking pool"）。
+///
+/// # 为什么这里用 `spawn_blocking` 是安全的
+///
+/// 会用到它的入口都是 **`async fn`**（`read_batch` / `write_batch` / `compact_shard`）⇒
+/// 调用方必然已经把 future 交给某个运行时在驱动 ⇒ 不会触发"没有运行时"的 panic。
+///
+/// # 观测
+///
+/// `YUNTUN_FORMAT_TRACE=1` 时逐次打印"交给谁 + 当前线程名" —— 排查"谁在占 worker"用的。
+pub async fn cpu_off_thread<T, F>(what: &'static str, f: F) -> Result<T, LakeError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, LakeError> + Send + 'static,
+{
+    // 两处都打：**提交方**（async worker）与**执行方**（阻塞池）各是谁 —— 一眼看出"活搬走了没有"。
+    if trace_on() {
+        eprintln!(
+            "[format] {what} → 阻塞池（提交方 {:?}）",
+            std::thread::current().name()
+        );
+    }
+    let f = move || {
+        if trace_on() {
+            eprintln!(
+                "[format] {what}：实际执行于 {:?}",
+                std::thread::current().name()
+            );
+        }
+        f()
+    };
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| LakeError::Other(format!("阻塞任务失败（{what}）：{e}")))?
+}
+
+/// 逐次 CPU 轨迹开关（`YUNTUN_FORMAT_TRACE=1`）。
+fn trace_on() -> bool {
+    std::env::var("YUNTUN_FORMAT_TRACE").is_ok()
 }
 
 /// 编码 RecordBatch。

@@ -25,10 +25,10 @@
 
 | # | 偏差 | 现状（证据） | 决定 | 闭环证据 |
 |---|---|---|---|---|
-| **D-1** | **ADR-9 的 `durable` 持久性 SLA 从未实现**（架构要求表级分 `best_effort` / `durable`＝本地 WAL **+ S3 归档**，RPO≈0） | `Durability` 枚举**全仓零引用**（`crates/model/src/lib.rs:69-78`）；`IngestConfig.durability` 恒 0、从不被读 | **待定**：① 设计 S3 WAL 归档路径并补任务；或 ② **正式撤回该 ADR**（字段标 reserved） | — |
-| **D-2** | compaction 的"**独立 blocking pool** 资源隔离"未落地（设计明确要求"避免挤占 ingest 与 query"） | `docs/design.md:1208` 的要求 vs 实现用普通 `tokio::spawn`（`crates/compaction/src/lib.rs:430-487`）；全仓 `spawn_blocking` 只在 meta 服务层 | **待定**：① 落地（改动不大）；或 ② 撤回该承诺 | — |
-| **D-3** | `ProposeRequest.request_id` / `schema_ver` 是**死字段**（设计 §5 规定它们是幂等／OCC 载体） | 客户端恒置空/0（`crates/meta/src/remote_catalog.rs:154-158`），服务端只读 `op`（`crates/meta/src/service.rs:57-74`）；实际由 op 层 `IdempotencyOp` / `EvolveSchemaOp.expected_version` 承担 | **待定**：① 在 proto 里标 `reserved`／写清"已由 op 层承担"；或 ② 接线到服务端 | — |
-| **D-4** | R5 的"**partial aggregate 下推** + 冷数据按 datanode 分配"未兑现，**但 M5 已标 ✅** | 数据面回传的是**原始行**（`crates/proto/proto/shard.proto:67-70`）；协调者只 fanout 热数据 | **待定**：① 写进任务表（T13.1/T13.2）；或 ② 把 M5 的 ✅ 降级为"部分" | — |
+| **D-1** | **ADR-9 的 `durable` 持久性 SLA 从未实现**（架构要求表级分 `best_effort` / `durable`＝本地 WAL **+ S3 归档**，RPO≈0） | `Durability` 枚举**全仓零引用**（`crates/model/src/lib.rs:69-78`）；`IngestConfig.durability` 恒 0、从不被读 | ⏳ **等决策**（两个选项的成本与影响见 **§6 决策备忘**） | — |
+| **D-2** | compaction 的"**独立 blocking pool** 资源隔离"未落地（设计明确要求"避免挤占 ingest 与 query"） | `docs/design.md:1208` 的要求 vs 实现用普通 `tokio::spawn`（`crates/compaction/src/lib.rs:430-487`）；全仓 `spawn_blocking` 只在 meta 服务层 | ✅ **已落地**：编解码（`format::{read_batch,write_batch}`，两者都是 `async fn` ⇒ 必在运行时里 ⇒ `spawn_blocking` 安全）与 compaction 的 `concat` 全部走**阻塞池** | `§124`；观测配方 `YUNTUN_FORMAT_TRACE=1`（实测 `encode` 的**执行线程**与提交方不同 ⇒ 活真的搬走了） |
+| **D-3** | `ProposeRequest.request_id` / `schema_ver` 是**死字段**（设计 §5 规定它们是幂等／OCC 载体） | 客户端恒置空/0（`crates/meta/src/remote_catalog.rs:154-158`），服务端只读 `op`（`crates/meta/src/service.rs:57-74`）；实际由 op 层 `IdempotencyOp` / `EvolveSchemaOp.expected_version` 承担 | ✅ **已决定**：语义由 **op 层**承担（那两处才是权威），proto 保留字段号但**标注为历史字段**（删字段会让老客户端读出 0 而看不出区别） | `§124`：`meta.proto` 的 `ProposeRequest` 上那段注释 |
+| **D-4** | R5 的"**partial aggregate 下推** + 冷数据按 datanode 分配"未兑现，**但 M5 已标 ✅** | 数据面回传的是**原始行**（`crates/proto/proto/shard.proto:67-70`）；协调者只 fanout 热数据 | ✅ **已决定**：**把 M5 降级为"部分"**（承诺不该比现实漂亮），两条欠账留在本表（不假装它们是 T13.1/T13.2 的进度） | `§124`：`status.md` 的 M5 行已标"✅（**部分**）"并列明两条欠账 |
 
 > 判据：`§1` 的每一行**要么有"闭环证据"，要么"决定"列不是"待定"**。这张表空了，偏差才算清完了。
 
@@ -85,3 +85,34 @@
 2. **可机核的**一律写成判据（§4），而不是写"请记得同步"。
 3. 只登记**偏差**：`status.md` 记现状、`operation-log` 记证据与过程、`plan.md` 记任务与门槛 ——
    台账不重复它们，否则它自己也会变成第三个会漂移的地方。
+
+---
+
+## 6. 决策备忘：`D-1` ADR-9 的 `durable` SLA（**唯一需要设计决策的一条**）
+
+### 6.1 事实
+
+- `architecture.md` 的 **ADR-9** 规定表级持久性分两档：`best_effort`（默认，本地 WAL）与
+  `durable`（"本地 WAL **+ S3 WAL 归档** → RPO≈0"）；
+- 代码里 `Durability` 枚举**存在但全仓零引用**（`crates/model/src/lib.rs:69-78`），
+  `IngestConfig.durability` 恒为 `0` 且**从不被读** ⇒ `durable` 这条路径**一行都没实现**；
+- 它**不在** `plan.md` 的任务表里（`T9.x` 是 Vortex，`T12.x` 是数据节点形态，都没有它）；
+- 已登记的只有一句"**RPO 量级表述要同步**"（`operation-log §25`）—— 说的是**措辞**，不是"没实现"。
+
+### 6.2 两个选项
+
+| | ① 补实现（S3 WAL 归档路径） | ② 正式撤回该 ADR |
+|---|---|---|
+| **做什么** | `IngestConfig.durability = durable` 时：WAL 段**异步上传 S3** + 启动时能从 S3 重建 + RPO 判据（"节点整盘丢失后，已 ack 的数据还在"） | 在 `architecture.md` 的 ADR-9 上标注**已撤回**，写明理由（PoC 阶段不做异地持久性）；`Durability` 枚举与字段标 `reserved`／加"当前不接受 `durable`"的显式校验 |
+| **代价** | 大：一条新的数据路径（ingest ↔ store ↔ 启动恢复），且**必须有"整盘丢失"的验收**才敢说 RPO≈0 —— 本仓的纪律不允许"写了就算" | 小：一次文档 + 一处字段校验（选 `durable` 直接报 `BadRequest`，而不是**静默降级成 best_effort** ← 后者才是最危险的形态） |
+| **影响** | 推迟其它收尾项；但把"宣称的持久性"变成真的 | 把 ADR 表从"宣称"拉回"现实"：**架构文档不再比实现漂亮** |
+| **风险** | 半成品（"能上传但不能重建"）比没做更糟 —— 它会让人**以为**有 RPO≈0 | 若将来真要做，ADR 要重新激活（可接受：届时按新事实重写，比留一句假话好） |
+
+### 6.3 我的建议（不替你定）
+
+**先做 ②，把"选 `durable` 就报错"的显式校验加上**（很小的改动，且**防止静默降级**这种最坏形态），
+把 ① 作为**独立的、要排期的数据路径任务**（若确实需要 RPO≈0）。理由：本仓对"承诺 vs 现实"的
+纪律，与"宁可少写"是同一条 —— 而 `durable` 现在的状态是**最坏的那种**：文档说有两档、
+类型也在，但选它与选 `best_effort` **行为完全一样**，且**没人会收到任何提示**。
+
+> 决定之后，把本节的结论填回 §1 的 D-1 行（"决定" + "闭环证据"），并划掉台账里的这条。

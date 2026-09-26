@@ -195,12 +195,22 @@ pub async fn compact_shard(
     if batches.is_empty() {
         return Ok(None);
     }
-    // schema 对齐（多版本文件共存 → 取最大版本 schema，flush::align_batch 同规则）
-    batches.sort_by_key(|b| b.schema().fields().len());
-    let target = batches.last().unwrap().schema();
-    // 简化：concat_batches 要求同 schema；版本差异由 flush 层已对齐，
-    // 这里直接 concat（失败则跳过本轮，不阻塞写入路径）
-    let merged = match arrow::compute::concat_batches(&target, &batches) {
+    // schema 对齐（多版本文件共存 → 取最大版本 schema，flush::align_batch 同规则）+ concat。
+    //
+    // ⚠️ **整段走阻塞池**（`§124`）：`concat_batches` 是纯 CPU，且是"把几百 MB 列缓冲搬到一起"，
+    // 在 async 上下文里跑会占住 worker —— 而它旁边就是要保证不被挤占的**写入攒批与查询响应**
+    // （设计 §9.3 的"资源隔离"）。失败则跳过本轮，不阻塞写入路径。
+    let merged = match yuntun_format::cpu_off_thread("concat", move || {
+        batches.sort_by_key(|b| b.schema().fields().len());
+        let target = batches
+            .last()
+            .ok_or_else(|| LakeError::Other("concat：没有 batch".into()))?
+            .schema();
+        arrow::compute::concat_batches(&target, &batches)
+            .map_err(|e| LakeError::Other(format!("concat：{e}")))
+    })
+    .await
+    {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!(table, shard, error = %e, "compaction concat failed, skip this round");
