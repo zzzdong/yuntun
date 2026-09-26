@@ -23,6 +23,10 @@
 
 ## 1. 未闭环偏差（**要决定的**）
 
+> **本节目前为空（2026-09-26，`§127`）。** `§123` 立台账时的四类差异（`D-1`~`D-4`）加上后续新开的
+> `D-5`/`D-6` **全部闭环** —— 按本节自己的判据（"§1 空了，偏差才算清完了"），到这里算清完。
+> 新发现照 §5 的纪律往这儿加行。
+
 | # | 偏差 | 现状（证据） | 决定 | 闭环证据 |
 |---|---|---|---|---|
 | **D-1** | **ADR-9 的 `durable` 持久性 SLA 从未实现**（架构要求表级分 `best_effort` / `durable`＝本地 WAL **+ S3 归档**，RPO≈0） | `Durability` 枚举**全仓零引用**（`crates/model/src/lib.rs:69-78`）；`IngestConfig.durability` 恒 0、从不被读 | ✅ **已落地（v1）**：按 **①** 做了 —— WAL 段持续归档到共享存储（含"正在写的段"）+ 丢盘后**拉回本地再走既有恢复通路**；RPO 的界 = **归档间隔 + 一次上传时延**（默认 1s 间隔；"真正的 0"要同步归档，不选） | `§125`；`crates/ingest/tests/wal_archive_durable.rs`（**有对照组**：同场景开关一开一关 ⇒ 8/8 vs 0/0）；接入口 `[wal] archive_prefix`（standalone） |
@@ -86,7 +90,7 @@
 3. 只登记**偏差**：`status.md` 记现状、`operation-log` 记证据与过程、`plan.md` 记任务与门槛 ——
    台账不重复它们，否则它自己也会变成第三个会漂移的地方。
 
-| **D-5** | **datanode 侧没接** `durable`：它缺 `resume_recovered` / `spawn_timeout_monitor` 接线（与 standalone 不一致） | `crates/datanode/src/main.rs` 只 `replay_wal_ddl` + `spawn_accumulator`；对照 `crates/server/src/lib.rs:389`/`498-504` | **待定**：先确认 datanode 的恢复路径（accumulator 重吸收 + 重 flush）与这两条的关系，再决定是补接线还是把 accumulator 那条路写清 | — |
+| **D-5** | **datanode 侧没接** `durable`：它缺 `resume_recovered` / `spawn_timeout_monitor` 接线（与 standalone 不一致） | 先查清了代价：**幂等键索引不重建**（重启后重发同一 `client_request_id` 会**再接受一次** ⇒ 数据重复，`§27`）+ `Pending` 批次用新 batch_id 重做（老对象变孤儿）+ **WAL 段永不清理**（磁盘只涨） | ✅ **已闭环**：按 standalone 接线（`resume_recovered` **必须在吸收循环之前** —— 否则 `replay_skip` 被取空等于没建；超时监控；`durable` 的拉回 + 归档循环 + `--wal-archive-prefix` 两个开关） | `§127`；datanode 三条 e2e 全绿；序列本身由 `§125`/`§126` 的 Ingestor 级用例（含对照组）守 |
 | **D-6** | `durable` 的**端到端**验收缺：原先只有**机制级**（拉回 → 可重放） | `crates/ingest/tests/wal_archive_durable.rs` 只证到"能读回" | ✅ **已闭环**：补了端到端用例（拉回 → 既有恢复通路 → **重新提交成可见文件**），**带对照组**；并把"整盘"的边界**写成边界声明**（WAL 归档保护的是节点私有盘；连 meta 一起丢不是它的事，靠 meta 自己的 raft 多副本） | `§126`；`crates/ingest/tests/wal_archive_e2e.rs`（有归档 `redone=1` + 1 个可见文件；无归档 `redone=0` + 空） |
 
 ---

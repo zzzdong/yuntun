@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§126，2026-09-26**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§127，2026-09-26**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -8213,3 +8213,52 @@ WAL **从归档回到本地**，后面的路一步没改。
 - 本刀用例：`cargo test -p yuntun-ingest --test wal_archive_e2e` → **2/2 绿**（含对照组）；
 - 文档一致性判据（`§123`）**5/5 绿**；
 - 规模：52,158 行 / 20 个 crate / 397 个测试函数。
+
+---
+
+## 127. `D-5` 闭环：把 **datanode 与 standalone 的两处装配差异补上**（含 `durable` 接线）（2026-09-26）
+
+### 127.0 先查清（台账里写的就是"先确认再动手"）
+
+`D-5` 记的是"datanode 缺 `resume_recovered` / `spawn_timeout_monitor`，与 standalone 不一致"。
+先量它的**具体代价** —— 不是"少两条代码"，而是两件会真出问题的事：
+
+| 缺的东西 | 具体坏在哪 |
+|---|---|
+| `resume_recovered` | ① **幂等键索引不重建** ⇒ 重启后重发同一个 `client_request_id` 会被**再接受一次** ⇒ **数据重复**（`§27` 那条纪律正是为它立的）；② `S3Written` 未提交的批次不会补提交；③ `Pending` 批次不会被"复用原 batch_id"重做 ⇒ 吸收循环用**新** batch_id 再传一份，老对象变孤儿白占空间 |
+| `spawn_timeout_monitor` | ① 批次超时不会被 abort（非终态批次一直挂着）；② **WAL 段永远不清理** —— 数据进程跑久了**磁盘只涨不降**（可删段的判据是"不与任何非终态 batch 区间相交"，就是这个循环在算） |
+
+⇒ 是真缺口，要接，不是"写清就行"。
+
+### 127.1 接线（三处 + 一条顺序铁律）
+
+* **拉回归档**（`durable`）：钩在 `WalWriter::open` **之前**（同 `§125` 的理由 —— 它会挑本地最大 seq 续写）；
+* **`resume_recovered`**：⚠️ **必须在 `spawn_accumulator` 之前** —— 它建立的 `replay_skip` 会被
+  吸收循环**取走**（`std::mem::take`），顺序反了就等于**没建**（吸收循环会把已认领的 Data 全部重放）；
+* **`spawn_timeout_monitor`**：段清单取自 `full_recovery()`、磁盘水位取自 WAL 配置（与 standalone 同款）；
+* 新增两个 CLI：`--wal-archive-prefix` / `--wal-archive-interval-secs`（形态照 `--s3-*` / `--cold-root`），
+  于是 `durable` 在 datanode 上**有了真实入口**（不再只有 standalone 能用）。
+
+### 127.2 覆盖到哪（说清"什么证明什么"）
+
+* **序列本身**（`replay_wal_ddl` → `resume_recovered` → 吸收循环 → 恢复成可见数据）：`§125`/`§126` 的
+  Ingestor 级用例证过（含对照组）；datanode 现在**逐步照抄**同一条序列；
+* **幂等索引重启后重建**：既有用例 `chaos` 的 `§27` 专项 + `§126` 的端到端都在守；
+* **datanode 自己的装配**：`datanode_forms_e2e`（4 绿）/ `compaction_e2e`（2 绿）/
+  `cross_process_hot_read`（3 绿）本刀全跑过；
+* ⚠️ **仍没做**：datanode 级的"重启后不重复"端到端断言（要起真进程 + 走 DoPut/SQL 面）。
+  这条**不是**新悬案：同一性质由上面那两条既有用例守着，区别只是"经由哪条装配路径"。
+
+### 127.3 台账：`D-5` 闭环 ⇒ **§1 空了**
+
+`docs/closeout.md` 的 §1（未闭环偏差）现在**一条不剩** —— 按那份台账自己的判据
+（"§1 空了，偏差才算清完了"），`§123` 立的那四类差异到此收尾：`D-1`（`durable`）→ `D-6`（端到端）
+→ `D-5`（datanode 接线）全部闭环，`D-2`/`D-3`/`D-4` 在前两轮定案/落地。
+
+### 127.4 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **396 passed / 0 failed / 0 ignored**；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- datanode 侧：`datanode_forms_e2e` 4 绿 / `compaction_e2e` 2 绿 / `cross_process_hot_read` 3 绿；
+- 文档一致性判据（`§123`）**5/5 绿**（本刀中途被它拦过一次 —— 改了代码没同步规模行，正是它的职责）；
+- 规模：52,230 行 / 20 个 crate / 397 个测试函数。

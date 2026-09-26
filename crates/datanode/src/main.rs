@@ -98,6 +98,14 @@ struct Args {
     /// 本机 SeaweedFS / MinIO 的完整配方见 `scripts/s3_multinode_smoke.sh`。
     #[arg(long)]
     s3_bucket: Option<String>,
+    /// **WAL 归档前缀**（ADR-9 的 `durable` 档，`§127`）：给了它就把 WAL 段持续归档到这里
+    /// （共享存储上的一级目录；键里带 `instance_id`，多节点可共用同一前缀）。
+    /// 不给 = `best_effort`：ack 过的数据在落盘提交之前只活在本机磁盘上。
+    #[arg(long)]
+    wal_archive_prefix: Option<String>,
+    /// WAL 归档间隔（秒，默认 1）。**它直接决定 RPO 的界**（连同一次上传时延）。
+    #[arg(long, default_value_t = 1)]
+    wal_archive_interval_secs: u64,
     /// S3 端点，如 `http://127.0.0.1:8333`（MinIO / SeaweedFS）；**与 `--s3-bucket` 必须一起给**
     #[arg(long)]
     s3_endpoint: Option<String>,
@@ -362,6 +370,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     if !args.no_ingest {
         // ---- 数据侧：WAL → DDL 重放 → Ingestor → 数据面服务 + 入册/心跳 ----
+        // 【`durable`，`§127`】先把归档里的 WAL 段拉回来 —— 顺序是硬要求：必须在
+        // `WalWriter::open` **之前**（它会挑本地最大的 seq 续写，归档段得先躺在那儿）。
+        let archive_cfg =
+            args.wal_archive_prefix
+                .as_ref()
+                .map(|p| yuntun_ingest::ArchiveConfig {
+                    prefix: p.clone(),
+                    instance_id: args.instance_id.clone(),
+                    interval: std::time::Duration::from_secs(args.wal_archive_interval_secs.max(1)),
+                });
+        if let Some(ac) = &archive_cfg {
+            match yuntun_ingest::restore(ac, &wal_root, 0, store.as_ref()).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(segments = n, "WAL 归档已拉回（durable）"),
+                // 拉不回来不致命（本地 WAL 可能本来就完整），但必须响亮：这正是"这段窗口救不回"
+                Err(e) => tracing::error!(error = %e, "WAL 归档拉回失败（durable）"),
+            }
+        }
+
         let wal = WalWriter::open(
             WalConfig {
                 dir: wal_root.clone(),
@@ -390,8 +417,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             catalog.clone(),
             store.clone(),
         ));
+        // **批次恢复：与 standalone 对齐**（`§127`）—— 这一条以前只在 standalone 有。
+        //
+        // 它做三件 datanode 也需要的事：① 从 WAL **重建幂等键索引**（少了它，重启后重发同一个
+        // `client_request_id` 会被**再接受一次** ⇒ 数据重复，`§27` 那条纪律）；② 把
+        // `S3Written` 但未提交的批次补提交；③ 把 `Pending` 批次**复用原 batch_id** 重做
+        // （而不是让吸收循环用新 batch_id 再传一份 ⇒ 老对象变孤儿白占空间）。
+        //
+        // ⚠️ **必须在 `spawn_accumulator` 之前**：它建立的 `replay_skip` 会被吸收循环**取走**
+        // （`std::mem::take`）—— 顺序反了就等于没建，吸收循环会把已认领的 Data 全部重放一遍。
+        let (redone, committed) = ingestor.resume_recovered().await?;
+        if redone + committed > 0 {
+            tracing::info!(redone, committed, "启动恢复：批次重做 / 重提交");
+        }
+
         sql_ingestor = Some(ingestor.clone());
         let _accumulator = ingestor.clone().spawn_accumulator(shutdown.clone());
+
+        // **WAL 超时监控：与 standalone 对齐**（`§127`）—— 这一条以前也只在 standalone 有。
+        // 少了它：批次超时不会被 abort（非终态批次一直挂着），而且**WAL 段永远不清理** ——
+        // 数据进程跑久了磁盘只涨不降（可删段必须跨"区间相交的非终态 batch"，这条纪律就是这个循环）。
+        let segments_info = ingestor
+            .wal
+            .full_recovery()
+            .map(|r| r.segments)
+            .unwrap_or_default();
+        let disk = Arc::new(yuntun_wal::cleanup::DirSizeUsage {
+            dir: ingestor.wal.shard_dir(),
+            max_bytes: ingestor.wal.config().segment_max_size * 100,
+        });
+        let _timeout_monitor = yuntun_wal::cleanup::spawn_timeout_monitor(
+            ingestor.wal.clone(),
+            ingestor.tracker.clone(),
+            Some(disk),
+            segments_info,
+            shutdown.clone(),
+        );
+
+        // **`durable`：WAL 归档循环**（`§127`）—— 与其它后台任务同款（共用 shutdown token）。
+        if let Some(ac) = archive_cfg {
+            tracing::info!(
+                prefix = %ac.prefix,
+                interval_secs = ac.interval.as_secs(),
+                "WAL 归档已启用（durable）：RPO ≤ 间隔 + 一次上传"
+            );
+            let _archiver =
+                yuntun_ingest::spawn_archiver(ac, wal_root.clone(), 0, store.clone(), shutdown.clone());
+        }
 
         // **压缩 + 孤儿 GC 角色**（数据进程的第二职能，`--compaction` 打开）。
         // 放在吸收循环之后：本进程已经握着共享冷存储与目录句柄，压缩不需要新输入。
