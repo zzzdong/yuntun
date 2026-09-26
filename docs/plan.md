@@ -599,7 +599,7 @@ standalone 仍可单机运行（同一份装配的裁剪）。
 | ID | 内容 | 说明 |
 |---|---|---|
 | T13.1 | 查询 fanout（按分片归属分发）+ 结果合并 | owner 侧过滤（架构 §4.3） |
-| T13.2 | 块级剪枝接入（`chunk::ColumnStats` + ZoneMap） | **v2.1 新增**：统计已算出但未消费，单节点同样受益。**接缝勘察（`§117.3`）**：统计只在**内存 chunk 层**算，**落盘不带**、查询侧（`query/src/table.rs` 的 `scan`）**不消费** ⇒ **要真省 IO 得先把 per-file 统计落进 manifest**，再让 scan 剪枝（"先补数据模型、再接一根线"） |
+| T13.2 | 块级剪枝接入（`chunk::ColumnStats` + ZoneMap） | **一半已落地**（`§129`）：per-file min/max **真算进 manifest**（`compute_stats_lite` 原来是空实现）+ `scan` 按清单统计做**文件级剪枝**（`query/src/prune.rs`，8 条用例）；**未做**：把谓词下推进 `ParquetSource` 让 **row-group（块级）**统计也参与剪枝。**接缝勘察（`§117.3`）**：统计只在**内存 chunk 层**算，**落盘不带**、查询侧（`query/src/table.rs` 的 `scan`）**不消费** ⇒ **要真省 IO 得先把 per-file 统计落进 manifest**，再让 scan 剪枝（"先补数据模型、再接一根线"） |
 | T13.3 | 对拍测试（硬要求，不可抽样） | 分布式并发结果 == 单节点串行结果 |
 | T13.4 | 查询中节点故障的降级语义 | **第一刀已落地**（`§77`）："拿不到"（`Err` 通道）⇒ **降级为部分结果 + 点名缺失来源**，`[query] partial = "allow"`（默认）/ `"reject"`（当场失败）；而"还没拿到"（STALE）**仍然刷新重试 / 响亮失败**，两者分处两条通道（用例守着边界）。**第二刀已落地**（`§78`）：数据面 RPC 的**客户端超时**（`GrpcShardFetch` 带 timeout、`connect_with_timeout`、`DEFAULT_TIMEOUT=5s`、建连也受限；`yuntun-datanode --hot-read-timeout-secs`）⇒ "无响应"也变成 `Err`，走同一条降级路径（组合用例：真 gRPC 假死节点 ⇒ 查询成功 + 点名"超时" + 耗时 < 3s）。**第三刀已落地**（`§88`）：扇出**并发化**（等待从 `Σ` 变 `max(·)`，与实例数无关）+ **每查询热读预算**（`[query] hot_read_budget_secs`，默认 10s；超预算按"拿不到"降级）；并发**不改语义**（装配按键序、STALE 取键序第一个，有专门用例），反证把并行性**量化**出来（串行化后 3×200ms 实测 765ms ⇒ 用例变红）。**第四刀已落地**（`§89`）：把"结果不完整"**交给用户** —— `SqlResult`/`SqlStreamResult` 带上 partial（`PartialRead` / `PartialWatch` 两种载体，因为时机不同），Flight SQL 把结论挂到 **schema 消息的 `app_metadata`**（完整时为空，不许假警报；真 gRPC 用例两向都钉）。**遗留**：MySQL 的结果集 warning **被 `opensrv` 卡住**（其 `ResultSetWriter::finish()` 把 warning 计数写死为 0，只有 OK 包能带）；预算只覆盖热读，冷 parquet 读不在其中 |
 

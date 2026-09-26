@@ -349,24 +349,233 @@ pub struct ColumnStatLite {
     pub null_count: u64,
 }
 
+/// 一个**统计边界**（`§129`）：`compute_stats_lite` 把每列的 min/max 编成字节，
+/// 这里给它一个**同一套语义**的值类型，让"写"与"读"共用一份编码规则（不许各写一半）。
+///
+/// 比较规则（`PartialOrd`）：
+/// * 同族直接比；`I` 与 `U` 比时按数值（负数必小于任何 `U`）；`I`/`U` 与 `F` 比时都转 `f64`；
+/// * **`B` 只与 `B` 比**；
+/// * 任一侧是 `NaN` ⇒ `None`（"无法确定"）—— 调用方必须把 `None` 当**不可剪**处理。
+#[derive(Debug, Clone, PartialEq)]
+pub enum StatBound {
+    I(i64),
+    U(u64),
+    F(f64),
+    B(Vec<u8>),
+}
+
+impl StatBound {
+    /// 能不能和对方比（不可比 ⇒ 调用方不得据此剪枝）。
+    pub fn comparable(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::B(_), Self::B(_))
+                | (Self::I(_) | Self::U(_) | Self::F(_), Self::I(_) | Self::U(_) | Self::F(_))
+        )
+    }
+}
+
+impl PartialOrd for StatBound {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        use std::cmp::Ordering;
+        match (self, other) {
+            (Self::I(a), Self::I(b)) => a.partial_cmp(b),
+            (Self::U(a), Self::U(b)) => a.partial_cmp(b),
+            (Self::F(a), Self::F(b)) => a.partial_cmp(b),
+            (Self::B(a), Self::B(b)) => a.partial_cmp(b),
+            (Self::I(a), Self::U(b)) => {
+                if *a < 0 {
+                    Some(Ordering::Less)
+                } else {
+                    (*a as u64).partial_cmp(b)
+                }
+            }
+            (Self::U(a), Self::I(b)) => {
+                if *b < 0 {
+                    Some(Ordering::Greater)
+                } else {
+                    a.partial_cmp(&(*b as u64))
+                }
+            }
+            // 与浮点混比：转 `f64`（大整数会损失精度 ⇒ 见 `comparable` 的注释与调用方的保守处理）
+            (Self::F(a), _) => a.partial_cmp(&other.as_f64()?),
+            (_, Self::F(b)) => self.as_f64()?.partial_cmp(b),
+            _ => None,
+        }
+    }
+}
+
+impl StatBound {
+    /// 只能用于"与浮点比较"这条路径；`B` 给 `None`。
+    fn as_f64(&self) -> Option<f64> {
+        Some(match self {
+            Self::I(v) => *v as f64,
+            Self::U(v) => *v as f64,
+            Self::F(v) => *v,
+            Self::B(_) => return None,
+        })
+    }
+}
+
+/// 把 [`StatBound`] 编成字节（**写侧**；读侧用 [`decode_bound`]，两者必须成对改）。
+///
+/// | 类型族 | 编码 |
+/// |---|---|
+/// | `Int8/16/32/64`、`Date32/64`、`Timestamp`、`Time32/64` | **i64 小端 8 字节** |
+/// | `UInt8/16/32/64` | **u64 小端 8 字节** |
+/// | `Float32/64` | **f64 小端 8 字节**（按位） |
+/// | `Utf8` / `LargeUtf8` / `Binary` / `LargeBinary` | **原始字节** |
+/// | 其余 | 空（= 没有边界，**永不剪**） |
+pub fn encode_bound(dt: &arrow::datatypes::DataType, b: &StatBound) -> Vec<u8> {
+    use arrow::datatypes::DataType as D;
+    match (dt, b) {
+        (D::UInt8 | D::UInt16 | D::UInt32 | D::UInt64, StatBound::U(v)) => {
+            v.to_le_bytes().to_vec()
+        }
+        (D::Float32 | D::Float64, StatBound::F(v)) => v.to_le_bytes().to_vec(),
+        (D::Utf8 | D::LargeUtf8 | D::Binary | D::LargeBinary, StatBound::B(v)) => v.clone(),
+        (_, StatBound::I(v)) => v.to_le_bytes().to_vec(),
+        // 类型与值的族对不上（不该发生）⇒ 空 = 没有边界，宁可不剪
+        _ => Vec::new(),
+    }
+}
+
+/// 字节 → [`StatBound`]（**读侧**）。类型不支持 / 字节数不对 ⇒ `None`。
+pub fn decode_bound(dt: &arrow::datatypes::DataType, bytes: &[u8]) -> Option<StatBound> {
+    use arrow::datatypes::DataType as D;
+    macro_rules! i64b {
+        () => {{
+            let a: [u8; 8] = bytes.try_into().ok()?;
+            StatBound::I(i64::from_le_bytes(a))
+        }};
+    }
+    macro_rules! u64b {
+        () => {{
+            let a: [u8; 8] = bytes.try_into().ok()?;
+            StatBound::U(u64::from_le_bytes(a))
+        }};
+    }
+    macro_rules! f64b {
+        () => {{
+            let a: [u8; 8] = bytes.try_into().ok()?;
+            StatBound::F(f64::from_le_bytes(a))
+        }};
+    }
+    let b = match dt {
+        D::Int8 | D::Int16 | D::Int32 | D::Int64 => i64b!(),
+        D::Date32 | D::Date64 => i64b!(),
+        D::Time32(_) | D::Time64(_) | D::Timestamp(_, _) => i64b!(),
+        D::UInt8 | D::UInt16 | D::UInt32 | D::UInt64 => u64b!(),
+        D::Float32 | D::Float64 => f64b!(),
+        D::Utf8 | D::LargeUtf8 | D::Binary | D::LargeBinary => StatBound::B(bytes.to_vec()),
+        _ => return None,
+    };
+    Some(b)
+}
+
 /// 从 RecordBatch 计算精简统计（仅排序列 + 分区列）。
+///
+/// ⚠️ **这里以前是空实现**：`min`/`max` 恒为 `Vec::new()`，注释写着"由文件 footer 提供完整统计"
+/// —— 但**没人读 footer** ⇒ "文件级剪枝"这件事一行都没落地（查询侧连谓词都丢掉了）。
+/// `§129` 把这条链补上：**算出来 → 存下来（下面这套编码）→ 查询侧用起来**。
 pub fn compute_stats_lite(
     batch: &arrow::record_batch::RecordBatch,
     columns: &[String],
 ) -> Result<StatisticsLite, crate::error::LakeError> {
-    use arrow::array::Array;
+    use arrow::array::{Array, ArrayRef};
+    use arrow::datatypes::DataType;
+
+    /// 一列的 `(min, max)`；不支持的类型 / 全 null ⇒ `None`。
+    fn bounds(arr: &ArrayRef) -> Option<(StatBound, StatBound)> {
+        use arrow::array::*;
+        macro_rules! prim {
+            ($t:ty, $to:expr) => {{
+                let a = arr.as_any().downcast_ref::<$t>()?;
+                let mut it = a.iter().flatten();
+                let first = it.next()?;
+                let (mut lo, mut hi) = ($to(first), $to(first));
+                for v in it {
+                    let v = $to(v);
+                    // 先把两个序都算出来，再动边界（`v` 会被移进 lo/hi，不能先用后移）
+                    let lt = matches!(v.partial_cmp(&lo), Some(std::cmp::Ordering::Less));
+                    let gt = matches!(v.partial_cmp(&hi), Some(std::cmp::Ordering::Greater));
+                    // `partial_cmp` 给 `None`（NaN）⇒ 不动边界（保守：宁可不剪）
+                    if lt {
+                        lo = v.clone();
+                    }
+                    if gt {
+                        hi = v;
+                    }
+                }
+                Some((lo, hi))
+            }};
+        }
+        // 字符数组与二进制数组的迭代项类型不同（`&str` vs `&[u8]`）⇒ 用转换器拉齐
+        macro_rules! bytes_ {
+            ($t:ty, $conv:expr) => {{
+                let a = arr.as_any().downcast_ref::<$t>()?;
+                let mut it = a.iter().flatten();
+                let first = it.next()?;
+                let (mut lo, mut hi) = ($conv(first), $conv(first));
+                for v in it {
+                    let v = $conv(v);
+                    // 同 `prim!`：先算再移
+                    let lt = v < lo;
+                    let gt = v > hi;
+                    if lt {
+                        lo = v.clone();
+                    }
+                    if gt {
+                        hi = v;
+                    }
+                }
+                Some((StatBound::B(lo), StatBound::B(hi)))
+            }};
+        }
+        match arr.data_type() {
+            DataType::Int8 => prim!(Int8Array, |v: i8| StatBound::I(v as i64)),
+            DataType::Int16 => prim!(Int16Array, |v: i16| StatBound::I(v as i64)),
+            DataType::Int32 => prim!(Int32Array, |v: i32| StatBound::I(v as i64)),
+            DataType::Int64 => prim!(Int64Array, |v: i64| StatBound::I(v)),
+            DataType::UInt8 => prim!(UInt8Array, |v: u8| StatBound::U(v as u64)),
+            DataType::UInt16 => prim!(UInt16Array, |v: u16| StatBound::U(v as u64)),
+            DataType::UInt32 => prim!(UInt32Array, |v: u32| StatBound::U(v as u64)),
+            DataType::UInt64 => prim!(UInt64Array, |v: u64| StatBound::U(v)),
+            DataType::Float32 => prim!(Float32Array, |v: f32| StatBound::F(v as f64)),
+            DataType::Float64 => prim!(Float64Array, |v: f64| StatBound::F(v)),
+            DataType::Date32 => prim!(Date32Array, |v: i32| StatBound::I(v as i64)),
+            DataType::Date64 => prim!(Date64Array, |v: i64| StatBound::I(v)),
+            DataType::Time32(_) => prim!(Time32SecondArray, |v: i32| StatBound::I(v as i64)),
+            DataType::Time64(_) => prim!(Time64MicrosecondArray, |v: i64| StatBound::I(v)),
+            DataType::Timestamp(_, _) => {
+                prim!(TimestampMicrosecondArray, |v: i64| StatBound::I(v))
+            }
+            DataType::Utf8 => bytes_!(StringArray, |v: &str| v.as_bytes().to_vec()),
+            DataType::LargeUtf8 => bytes_!(LargeStringArray, |v: &str| v.as_bytes().to_vec()),
+            DataType::Binary => bytes_!(BinaryArray, |v: &[u8]| v.to_vec()),
+            DataType::LargeBinary => bytes_!(LargeBinaryArray, |v: &[u8]| v.to_vec()),
+            // 其余类型（嵌套、字典…）：留空 ⇒ 查询侧不剪（**宁可少剪，不可错剪**）
+            _ => None,
+        }
+    }
+
     let mut cols = Vec::new();
     for name in columns {
         let Some((idx, _)) = batch.schema().column_with_name(name) else {
             continue;
         };
         let arr = batch.column(idx);
-        // min/max 计算依赖 arrow-compute；此处仅收集 null_count（精简统计的必要成分），
-        // min/max 由文件 footer（Vortex/Parquet）提供完整统计，Meta 只做文件级剪枝。
+        let (min, max) = match bounds(arr) {
+            Some((lo, hi)) => (
+                encode_bound(arr.data_type(), &lo),
+                encode_bound(arr.data_type(), &hi),
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
         cols.push(ColumnStatLite {
             name: name.clone(),
-            min: Vec::new(),
-            max: Vec::new(),
+            min,
+            max,
             null_count: arr.null_count() as u64,
         });
     }

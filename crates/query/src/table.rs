@@ -59,6 +59,7 @@ use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_groups::FileGroup;
+use crate::prune::prune_visible_files;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::source::DataSourceExec;
@@ -142,7 +143,7 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         let schema = self.schema.clone();
@@ -268,11 +269,28 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
         }
 
         // ② 已提交文件（Manifest 驱动，C7）：文件清单来自**本 provider 的快照**
-        if let Some(t) = table
-            && !t.files.is_empty()
-        {
-            let files: Vec<PartitionedFile> = t
-                .files
+        //
+        // **先按清单统计剪一遍**（`§129`，plan `T13.2`）：`FileManifest.stats` 里的 `[min, max]`
+        // 足以证明"某些文件不可能满足过滤器" ⇒ 那就不必打开它们 —— 这一层**不需要**谓词下推到
+        // Parquet 就能省下 IO 与解码。剪枝只做**确定性**判断，拿不准一律留下
+        // （剪错 = 静默少数据，见 `prune` 模块文档）。
+        let (kept, dropped) = table
+            .map(|t| prune_visible_files(&self.schema, &t.files, filters))
+            .unwrap_or_default();
+        let total = kept.len() + dropped;
+        if kept.len() < total {
+            tracing::debug!(
+                table = %self.ident,
+                kept = kept.len(),
+                total,
+                skipped = total - kept.len(),
+                "文件级剪枝：按清单 min/max 跳过文件（§129，plan T13.2）"
+            );
+        }
+        // ⚠️ **全被剪掉**时不能塞一个空的 `FileGroup`（扫描器会报错）⇒ 直接跳过这一支；
+        // 下面第 ③ 支会给一个空的执行计划，语义正好（没有数据）。
+        if !kept.is_empty() {
+            let files: Vec<PartitionedFile> = kept
                 .iter()
                 .map(|f| PartitionedFile::new(f.file_path.clone(), f.file_size))
                 .collect();
@@ -320,8 +338,16 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
         &self,
         filters: &[&Expr],
     ) -> datafusion::common::Result<Vec<TableProviderFilterPushDown>> {
-        // MVP：谓词交给 Parquet row-group 统计在 scan 内部处理（ParquetSource 默认行为），
-        // 表级先声明 Inexact —— 正确且保守。
+        // 表级一律 `Inexact`：我们**不承诺**把谓词吃干净。
+        //
+        // ⚠️ 这句注释以前是错的 —— 它写着"谓词交给 Parquet row-group 统计在 scan 内部处理
+        // （ParquetSource 默认行为）"，但 `scan` 当时把 `filters` **整个丢掉**、也从不给
+        // `ParquetSource` 传谓词 ⇒ **一行都没剪**。现在是诚实的：我们在 `scan` 里做的是
+        // **文件级剪枝**（按清单 `min`/`max`，`§129`，见 `prune` 模块），**剩下的谓词由上层算子
+        // 过滤**（所以 `Inexact` 是对的）。
+        //
+        // `T13.2` 的另一半 —— 把谓词**下推进 `ParquetSource`**，让 row-group（块级）统计也参与
+        // 剪枝 —— **尚未做**（需要 logical `Expr` → `PhysicalExpr`，`scan` 的 `state` 能给）。
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 

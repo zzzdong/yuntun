@@ -12,6 +12,7 @@
 
 pub mod cache;
 pub mod partial;
+pub mod prune;
 pub mod provider;
 pub mod table;
 
