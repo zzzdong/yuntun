@@ -74,6 +74,14 @@ use prost::Message as _;
 /// 三节点的固定成员表（PoC 用常量；生产由 `--init` / `Join` 决定）。
 pub const PEERS: [u64; 3] = [1, 2, 3];
 
+/// **提升 learner 时"落后多少算太多"**（`§120`）：`matched` 距日志末尾超过它就拒绝提升。
+///
+/// 取值是**工程判断**，不是定理：它不是正确性阈值（哪怕落后 1 条，提升也只是让 quorum 略紧），
+/// 而是"**别把可用性押在一个还没追上的节点上**"的旋钮。取 64 ≈ 一次快照之后正常的追赶量级：
+/// 正常复制（本机 µs、跨机 ms）几乎瞬间就落在范围内，真落后的节点会明显超出。
+/// 生产应当由配置给（与 `--snapshot-log-entries` 同类），PoC 用常量。
+const PROMOTE_MAX_LAG: u64 = 64;
+
 /// 逐条轨迹的总开关（`YUNTUN_META_TRACE`）。**全局只在**这里定义一次，各模块都用它。
 ///
 /// ⚠️ **空值 / `0` 都算关**：编排（podman-compose / k8s）常写成 `- YUNTUN_META_TRACE=${VAR:-}`
@@ -116,6 +124,14 @@ enum Command {
     AddLearner {
         id: u64,
         addr: String,
+        reply: SyncSender<Result<(), MetaError>>,
+    },
+    /// 把一个 **learner 提升为 voter**（`§120`）。
+    ///
+    /// 与 [`Command::AddLearner`] 走**同一条通路**（conf change），区别只在 `ConfChangeType`
+    /// 与**两道门槛**（见 [`promote_checked`]）。回复 = 提议成功与否；生效要等应用。
+    Promote {
+        id: u64,
         reply: SyncSender<Result<(), MetaError>>,
     },
     /// 当前成员表快照（[`MembersView`]）。
@@ -177,6 +193,14 @@ pub struct NodeStatus {
     pub commit_index: u64,
     pub applied_index: u64,
     pub snapshot_index: u64,
+    /// **成员表**（`§120`）：voters / learners（权威来源是 raft 的 `ConfState`）。
+    ///
+    /// 放进 Status 的理由与租约同款：**"谁在集群里"必须可观测** —— 提升/移除这类成员变更
+    /// 没有它只能靠猜（进程级用例也靠它断言）。
+    /// 刻意**不放地址表**：那玩意儿会变、而且对高频快照没意义（要看地址用 `Meta.Join`
+    /// 的回包或 `Members` 命令）。
+    pub voters: Vec<u64>,
+    pub learners: Vec<u64>,
     pub first_index: u64,
     pub last_index: u64,
 }
@@ -261,6 +285,10 @@ impl NodeHandle {
             last_index: s.last_index,
             version: yuntun_proto::PROTO_VERSION.into(),
             leases,
+            // 成员表（`§120`）：取自驱动循环维护的快照，**不在这里现算** ——
+            // Status 是高频只读路径（心跳/排障/客户端落点都在用），不该顺带加锁去读 raft。
+            voter_ids: s.voters.clone(),
+            learner_ids: s.learners.clone(),
         }
     }
 
@@ -296,6 +324,22 @@ impl NodeHandle {
                 addr: addr.to_string(),
                 reply: reply_tx,
             })
+            .map_err(|e| MetaError::Storage(format!("命令通道断开：{e}")))?;
+        match reply_rx.recv_timeout(timeout) {
+            Ok(r) => r,
+            Err(_) => Err(MetaError::NoQuorum),
+        }
+    }
+
+    /// 把一个 **learner 提升为 voter**（`§120`）。**提议成功**即返回，生效要等应用
+    /// （用 [`Self::members`] 看结果）。
+    ///
+    /// ⚠️ 与 [`Self::add_learner`] 同一条纪律：同一时刻**只允许一条未提交的 conf change**
+    /// 在途，本接口不排队。
+    pub fn promote(&self, id: u64, timeout: Duration) -> Result<(), MetaError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.cmd_tx
+            .send(Command::Promote { id, reply: reply_tx })
             .map_err(|e| MetaError::Storage(format!("命令通道断开：{e}")))?;
         match reply_rx.recv_timeout(timeout) {
             Ok(r) => r,
@@ -1212,11 +1256,21 @@ fn spawn_node(
                             }));
                         }
                     }
+                    Ok(Command::Promote { id: nid, reply }) => {
+                        let r = if raw.raft.state != StateRole::Leader {
+                            Err(MetaError::NotLeader {
+                                leader_hint: raw.raft.leader_id,
+                            })
+                        } else {
+                            promote_checked(&mut raw, &storage, &members, nid)
+                        };
+                        let _ = reply.send(r);
+                    }
                     Ok(Command::Members { reply }) => {
                         let cs = storage.conf_state();
                         let _ = reply.send(MembersView {
-                            voters: cs.voters.clone(),
-                            learners: cs.learners.clone(),
+                            voters: sorted_ids(cs.voters.clone()),
+                            learners: sorted_ids(cs.learners.clone()),
                             addrs: members.clone(),
                         });
                     }
@@ -1279,6 +1333,11 @@ fn spawn_node(
                     st.commit_index = raw.raft.raft_log.committed;
                     st.applied_index = *applied.lock().unwrap();
                     st.snapshot_index = storage.compacted_index();
+                    // 成员表（`§120`）：每次刷新都从**权威**的 `ConfState` 取一份（几毫秒一次、
+                    // 几个编号，代价可以忽略；换来的是"提升/移除之后 Status 立刻能看见"）。
+                    let cs = storage.conf_state();
+                    st.voters = sorted_ids(cs.voters.clone());
+                    st.learners = sorted_ids(cs.learners.clone());
                     st.first_index = raw.raft.raft_log.first_index();
                     st.last_index = raw.raft.raft_log.last_index();
                 }
@@ -1459,6 +1518,82 @@ fn temp_root() -> std::path::PathBuf {
     root
 }
 
+/// 成员编号**对外展示**时统一排序（`§120`）。
+///
+/// 为什么必须在**展示层**做，而不是直接改 raft 的状态：`ConfState.voters` 的顺序取决于
+/// 加入/提升的历史（实测：三次 voter + 一次提升之后是 `[2,4,1,3]`），而它**语义上是集合**
+/// —— 顺序没有任何含义。原样透出去只会让每个消费方各自踩一次"看起来不一样但其实是同一批人"。
+/// raft 自己的那份**原样保存**（`set_conf_state`），只在 `Members` / `Status` 这两个视图里排序。
+fn sorted_ids(mut v: Vec<u64>) -> Vec<u64> {
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// **提升 learner → voter 的两道门槛**（`§120`），检查过了才提议那条 conf change。
+///
+/// 两道都对应"提升错人"的**真实**代价：
+///
+/// 1. **必须在册且是 learner**：不在册的 id 走这条路 = 静默把一个陌生节点加进来；
+///    已经在 `voters` 里 = **幂等成功**（客户端超时重发是常见形态）；
+/// 2. **必须追得够近**（`matched` 距日志末尾 ≤ [`PROMOTE_MAX_LAG`]）：把一个几乎没数据的
+///    learner 提成 voter，等于把 quorum 交给它 —— 它一慢/一掉线，集群跟着停，而且
+///    **没有任何报错**（现象只是"写不进去"）。etcd 的 `IsLearnerReady` 就是为这件事存在的。
+fn promote_checked(
+    raw: &mut RawNode<FjallStorage>,
+    storage: &FjallStorage,
+    members: &HashMap<u64, String>,
+    id: u64,
+) -> Result<(), MetaError> {
+    let cs = storage.conf_state();
+    if cs.voters.contains(&id) {
+        return Ok(()); // 幂等：已经是 voter
+    }
+    if !cs.learners.contains(&id) {
+        return Err(MetaError::BadRequest(format!(
+            "节点 {id} 不在成员表里（voters={:?} learners={:?}）—— 先让它 Join 成为 learner 再提升",
+            cs.voters, cs.learners
+        )));
+    }
+    let last = raw.raft.raft_log.last_index();
+    match raw
+        .raft
+        .prs()
+        .get(id)
+        .map(|p| last.saturating_sub(p.matched))
+    {
+        Some(lag) if lag > PROMOTE_MAX_LAG => {
+            return Err(MetaError::BadRequest(format!(
+                "learner {id} 落后太多（差 {lag} 条，上限 {PROMOTE_MAX_LAG}）—— 等它追平再提升；\
+                 否则 quorum 会含进一个几乎没数据的节点，写会随它一起卡住"
+            )));
+        }
+        // 本 leader 手里应当**总有**它的 `Progress`（它刚被 conf change 加进来）。没有 =
+        // 我们对它的进度一无所知（典型是"刚当选、那条 conf change 还没应用"）——
+        // 与"落后太多"是**同一类**风险（把 quorum 交给一个我们不了解的节点），一样拒绝。
+        None => {
+            return Err(MetaError::BadRequest(format!(
+                "本 leader 没有 learner {id} 的复制进度，拒绝提升（等它的 conf change 应用后再试）"
+            )));
+        }
+        Some(_) => {}
+    }
+    let cc = ConfChange {
+        change_type: raft::eraftpb::ConfChangeType::AddNode,
+        node_id: id,
+        // 地址随条目复制（`§118`）：提升不改地址，但带上它能让**还没学到**的成员一并补上
+        context: members
+            .get(&id)
+            .cloned()
+            .unwrap_or_default()
+            .into_bytes()
+            .into(),
+        ..Default::default()
+    };
+    raw.propose_conf_change(vec![], cc)
+        .map_err(|e| MetaError::Storage(format!("conf change 提议失败：{e}")))
+}
+
 /// 参数多是**有意**的（与 `spawn_node` / `Cluster::spawn_with` 同款处理）：这里就是把本次要应用的
 /// 那一批条目所需的全部运行期句柄显式交出去 —— 收进结构体反而会掩盖"谁共享了什么"。
 /// `§118` 又多了两个（`transport` 用来登记新 peer、`members` 用来记地址表）。
@@ -1482,6 +1617,15 @@ fn apply_committed(
         storage
             .set_applied(entry.index)
             .unwrap_or_else(|e| fatal(id, "记录已应用位置", e));
+        // 同步更新**对外报告**的已应用位置（`Status.applied_index` / `NodeHandle::applied`）。
+        //
+        // ⚠️ 这行是补的：原先只有"应用一条 op"那条分支才写它，于是 **no-op 与 conf change
+        // 应用完之后，对外报的 `applied_index` 会停在原地**。后果不是理论上的 —— `§120` 的
+        // 进程级用例拿它判"新节点追平了没有"，实测被它骗过：节点 4 的 `last_index=2`、
+        // `commit_index=2`（**确实追平了**），而 `applied_index` 报 0 ⇒ 判据看走眼、白等 30s。
+        // 按"每条条目都算已应用"记（与 `storage.set_applied` 同一个位置，
+        // 因为它对空条目也记 —— 见上面的注释）。
+        *applied.lock().unwrap() = entry.index;
         // 空条目 = 新 leader 的就位条目（无 op）
         if entry.data.is_empty() {
             continue;

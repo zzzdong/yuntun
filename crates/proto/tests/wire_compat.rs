@@ -375,12 +375,18 @@ fn status_response_exposes_all_operational_fields() {
         last_index: 30,
         version: yuntun_proto::PROTO_VERSION.into(),
                 leases: Vec::new(),
+        voter_ids: vec![1, 2, 3],
+        learner_ids: vec![4],
         };
     let back = roundtrip(&s);
     assert_eq!(back, s);
     // 快照健康度的三个量必须都在（缺任一个都无法判断"该发快照了吗"）
     assert!(back.snapshot_index > 0 && back.first_index == back.snapshot_index + 1);
     assert!(back.last_index >= back.applied_index);
+    // 成员表（`§120`）也**必须过线**：成员变更（提升 learner→voter、移除）没有它对外就是
+    // **不可观测**的 —— 运维只能靠"写入还通不通"倒推，而那条路既慢又不可靠。
+    assert_eq!(back.voter_ids, vec![1, 2, 3]);
+    assert_eq!(back.learner_ids, vec![4]);
 }
 
 /// 生成的**服务面**存在（client + server 两侧），且包名与 `PROTO_VERSION` 一致。

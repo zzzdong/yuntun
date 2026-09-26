@@ -826,3 +826,130 @@ fn a_fourth_process_joins_a_running_cluster_and_catches_up() {
         std::thread::sleep(Duration::from_millis(200));
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// 成员变更的第二半：把 learner **提升为 voter**（`§120`）
+// ---------------------------------------------------------------------------
+
+/// **提升 learner → voter，并证明它真的进了多数派**（`§120`）。
+///
+/// # 为什么必须有"提升前 / 提升后"的对照
+///
+/// "提升成功"本身很容易证（看一眼成员表就行）。难的是证明它**改变了 quorum** ——
+/// 这才是这件事的全部意义，也是它**危险**的地方（多一个 voter，集群就更紧）。
+/// 本用例让**同一批存活 voter**在提升前后得到**相反**的结果：
+///
+/// | 阶段 | 集群成员 | 谁死了 | 存活 voter | quorum | 写入 |
+/// |---|---|---|---|---|---|
+/// | 提升前 | voters `[1,2,3]` + learner `4` | `2`（`4` 活着但**只是个 learner**） | `{1,3}` = 2 | 2（3 个 voter） | ✅ 成功 |
+/// | 提升后 | voters `[1,2,3,4]` | `2`、`4` | `{1,3}` = 2 | 3（4 个 voter） | ❌ **停住** |
+///
+/// 两边**是同一个存活 voter 集合** `{1,3}` ⇒ 结果相反只可能来自那次提升。
+/// （learner 的死活不影响 quorum，这是定义；所以"4 死了"**不是**停住的原因。）
+#[test]
+fn promoting_a_learner_makes_it_count_for_the_quorum() {
+    let root = TempDir::new("meta-promote");
+    let mut cluster = start_cluster(std::path::Path::new(&root.0));
+    let rt = tokio::runtime::Runtime::new().expect("运行时");
+
+    let clients = rt.block_on(connect_all(&cluster.addrs, &IDS));
+    let leader0 = rt.block_on(wait_some_leader(&clients, &IDS));
+
+    // ---- ① 第 4 个节点 Join 并追平（`§119` 的能力，这里当提升的前置）----
+    let addr4 = free_ports(1)[0];
+    let dir4 = cluster.run.join("node4");
+    let contacts = IDS
+        .iter()
+        .map(|i| cluster.addrs[i].to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut p4 = start_join(4, &dir4, addr4, &contacts, addr4);
+    assert!(
+        p4.wait_listening().is_some(),
+        "节点 4 没在 20s 内就绪。stderr:\n{}",
+        p4.stderr.lock().unwrap()
+    );
+    let c4 = rt.block_on(connect(addr4));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let s4 = rt.block_on(status(&c4, 4));
+        let sl = rt.block_on(status(&clients[&leader0], leader0));
+        if sl.commit_index > 0 && s4.applied_index >= sl.commit_index {
+            eprintln!("  ① 节点 4 已追平：applied={}（集群 commit={}）", s4.applied_index, sl.commit_index);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "30s 内节点 4 没追平：applied={} commit={}\n  节点4 全量: {s4:?}\n  集群(leader={leader0}) 全量: {sl:?}",
+            s4.applied_index,
+            sl.commit_index
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // ---- ② 基线：杀一个 voter，**写入照常成功**（learner 不算数）----
+    cluster.procs.get_mut(&2).expect("进程在").kill9();
+    let live: [u64; 2] = [1, 3];
+    let r = rt.block_on(propose_following_leader(
+        &clients,
+        &live,
+        commit_op("before", "k-before", 6_000),
+    ));
+    assert!(
+        r.accepted,
+        "提升前：3 个 voter 里剩 2 个就是多数派（learner 不参与）⇒ 写入应当成功"
+    );
+    eprintln!("  ② 提升前：杀掉 voter 2 后写入**照常成功**（存活 voter {{1,3}} = 2）");
+
+    // ---- ③ 提升：把它从 learner 变成 voter ----
+    let leader = rt.block_on(wait_some_leader(&clients, &live));
+    let resp = rt.block_on(async {
+        clients[&leader]
+            .clone()
+            .promote(pb::PromoteRequest { node_id: 4 })
+            .await
+            .expect("提升应当成功（§120）")
+            .into_inner()
+    });
+    assert_eq!(resp.voter_ids, vec![1, 2, 3, 4], "提升后成员表必须含 4：{resp:?}");
+    assert!(
+        resp.learner_ids.is_empty(),
+        "它已经不再是 learner：{:?}",
+        resp.learner_ids
+    );
+    // 成员变更是**走 raft 的** ⇒ 从**别的**节点读一遍也必须一致（否则就是没复制到）
+    let other = if leader == 1 { 3 } else { 1 };
+    let st_other = rt.block_on(status(&clients[&other], other));
+    assert_eq!(
+        st_other.voter_ids,
+        vec![1, 2, 3, 4],
+        "成员变更必须复制到每个成员（Status 的 voter_ids 可直接观测）"
+    );
+    eprintln!("  ③ 已提升：voters=[1,2,3,4]（leader={leader} 与 节点{other} 都认下了）");
+
+    // ---- ④ 对照：杀 node 4 ⇒ 存活 voter **仍是 {1,3}**，但写入必须**停住** ----
+    p4.kill9();
+    let leader = rt.block_on(wait_some_leader(&clients, &live));
+    assert_eq!(
+        rt.block_on(status(&clients[&leader], leader)).role,
+        "Leader",
+        "先确认我们问的还是一个**活着的 leader** —— 否则下面的超时说明不了任何事"
+    );
+    let res = rt.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(4),
+            clients[&leader].clone().propose(pb::ProposeRequest {
+                op: Some(commit_op("after", "k-after", 7_000)),
+                request_id: b"rid".to_vec(),
+                schema_ver: 0,
+            }),
+        )
+        .await
+    });
+    assert!(
+        res.is_err(),
+        "4 个 voter 只活 2 个（{{1,3}}）⇒ 不到 quorum，**不该**被接受：{res:?}"
+    );
+    eprintln!("  ④ 提升后：同一批存活 voter {{1,3}} 已不构成多数派 ⇒ 写入**停住**（4s 内未被接受）");
+}

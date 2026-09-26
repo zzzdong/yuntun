@@ -17,7 +17,7 @@ use tonic::{Request, Response, Status};
 
 use raft::eraftpb::Message;
 
-use crate::{trace_on, MetaError, NodeHandle};
+use crate::{trace_on, MembersView, MetaError, NodeHandle};
 use yuntun_proto::meta as pb;
 
 /// 等一个提案被 raft 应用的上限。
@@ -25,8 +25,21 @@ use yuntun_proto::meta as pb;
 /// 超时返回 `UNAVAILABLE`（**可重试**）而不是让客户端裸等：客户端换节点重试比挂死好。
 const PROPOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// `Join` 等"成员变更真的生效"的上限（`§119`）：提议 + 提交 + 应用（同一机房通常是毫秒级）。
-const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// 成员变更（`Join` / `Promote`）等"**真的生效**"的上限（`§119`/`§120`）：
+/// 提议 + 提交 + 应用（同一机房通常是毫秒级）。两者共用是因为它们的等待形态完全一样。
+const CONF_CHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 读成员表。**阻塞操作**（`NodeHandle::members` 内部等 raft 线程回话）⇒ 必须走阻塞池，
+/// 否则会占住 tokio 工作线程（与 `propose` 同一条纪律）。
+///
+/// 抽成一处是因为 `Join`（`§119`）与 `Promote`（`§120`）都要读它，而且都要**轮询到生效**。
+async fn members_of(node: &NodeHandle) -> Result<MembersView, Status> {
+    let node = node.clone();
+    tokio::task::spawn_blocking(move || node.members(Duration::from_secs(2)))
+        .await
+        .map_err(|e| Status::internal(format!("阻塞任务失败（members）：{e}")))?
+        .map_err(Status::from)
+}
 
 /// gRPC 服务实现。
 pub struct MetaService {
@@ -143,16 +156,8 @@ impl pb::meta_server::Meta for MetaService {
             .into());
         }
 
-        // ⚠️ `add_learner` / `members` 都是**阻塞**的（内部 `recv_timeout` 等 raft 线程回话）。
-        // 直接在 async 函数里调会占住 tokio 工作线程 —— 与 `propose` 同一条纪律，走阻塞池。
-        let blocking = |node: NodeHandle, what: &'static str| async move {
-            let r = tokio::task::spawn_blocking(move || node.members(Duration::from_secs(2)))
-                .await
-                .map_err(|e| Status::internal(format!("阻塞任务失败（{what}）：{e}")))?;
-            r.map_err(Status::from)
-        };
-
-        let mv = blocking(self.node.clone(), "members").await?;
+        // ⚠️ `add_learner` 是**阻塞**的（内部 `recv_timeout` 等 raft 线程回话）⇒ 走阻塞池。
+        let mv = members_of(&self.node).await?;
         let already = mv.voters.contains(&r.node_id) || mv.learners.contains(&r.node_id);
         if !already {
             let node = self.node.clone();
@@ -162,9 +167,9 @@ impl pb::meta_server::Meta for MetaService {
                 .map_err(|e| Status::internal(format!("阻塞任务失败（add_learner）：{e}")))??;
         }
 
-        let deadline = tokio::time::Instant::now() + JOIN_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + CONF_CHANGE_TIMEOUT;
         loop {
-            let mv = blocking(self.node.clone(), "members").await?;
+            let mv = members_of(&self.node).await?;
             if mv.voters.contains(&r.node_id) || mv.learners.contains(&r.node_id) {
                 return Ok(Response::new(pb::JoinResponse {
                     voters: mv.voters.len() as u64,
@@ -183,7 +188,64 @@ impl pb::meta_server::Meta for MetaService {
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(Status::deadline_exceeded(format!(
-                    "成员变更未在 {JOIN_TIMEOUT:?} 内生效（raft 选不出 leader？看 Status）"
+                    "成员变更未在 {CONF_CHANGE_TIMEOUT:?} 内生效（raft 选不出 leader？看 Status）"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// 成员变更（`§120`）：把一个 **learner 提升为 voter** —— `Join` 的"下半场"。
+    ///
+    /// # 为什么必须分两步
+    ///
+    /// 新节点刚加入时日志是空的。**直接当 voter** 会让 quorum 含进一个几乎没数据的节点：
+    /// 它一慢/一掉线，集群跟着停，而且**没有任何报错**（现象只是"写不进去"）。
+    /// 所以标准姿势是 `Join`（先当 learner、开始收日志）→ 追平 → `Promote`；
+    /// 两道门槛（在册且是 learner / 追得够近）在 `promote_checked` 里。
+    ///
+    /// # 约定
+    ///
+    /// 只 leader 受理（非 leader 回 `NotLeader` + hint）；**幂等**（已经是 voter 就直接回当前
+    /// 成员表）；**等生效才回包**（回包里的成员表必须已经含它）。
+    async fn promote(
+        &self,
+        req: Request<pb::PromoteRequest>,
+    ) -> Result<Response<pb::PromoteResponse>, Status> {
+        let id = req.into_inner().node_id;
+        if id == 0 {
+            return Err(Status::invalid_argument("node_id 必填"));
+        }
+        let st = self.node.status();
+        if st.role != "Leader" {
+            return Err(MetaError::NotLeader {
+                leader_hint: st.leader_id,
+            }
+            .into());
+        }
+
+        let mv = members_of(&self.node).await?;
+        if !mv.voters.contains(&id) {
+            // 门槛（在册/追平）在驱动循环里判，错误经 `MetaError::BadRequest` 传回
+            // ⇒ 这里直接映射成 gRPC 状态码，调用方能看见**具体原因**
+            let node = self.node.clone();
+            tokio::task::spawn_blocking(move || node.promote(id, PROPOSE_TIMEOUT))
+                .await
+                .map_err(|e| Status::internal(format!("阻塞任务失败（promote）：{e}")))??;
+        }
+
+        let deadline = tokio::time::Instant::now() + CONF_CHANGE_TIMEOUT;
+        loop {
+            let mv = members_of(&self.node).await?;
+            if mv.voters.contains(&id) {
+                return Ok(Response::new(pb::PromoteResponse {
+                    voter_ids: mv.voters,
+                    learner_ids: mv.learners,
+                }));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Status::deadline_exceeded(format!(
+                    "提升未在 {CONF_CHANGE_TIMEOUT:?} 内生效（看 Status 的 voter_ids）"
                 )));
             }
             tokio::time::sleep(Duration::from_millis(50)).await;

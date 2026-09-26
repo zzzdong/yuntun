@@ -41,8 +41,10 @@ service Meta {
   rpc Delta    (DeltaRequest)    returns (DeltaResponse);
   // 运维：leader / term / 各索引 / 快照位置
   rpc Status   (StatusRequest)   returns (StatusResponse);
-  // 成员变更（learner → voter）
+  // 成员变更：把一个节点作为 **learner** 加进集群（`§119`）
   rpc Join     (JoinRequest)     returns (JoinResponse);
+  // 成员变更：把 learner **提升为 voter**（`§120`）—— `Join` 的"下半场"
+  rpc Promote  (PromoteRequest)  returns (PromoteResponse);
   // **心跳**（T12.3）：数据节点保活用。只更新 metanode 的**内存**存活表，
   // **绝不写 raft** —— 秒级心跳会把写路径压垮（`architecture-with-chunk §3.2`）。
   rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
@@ -372,6 +374,10 @@ message StatusResponse {
   // 当前租约（T14.1）。放进 Status 是刻意的：**"谁在干全局作业"必须是可观测的** ——
   // 否则"只有一个 compactor"这件事只能靠信任，排障时无从确认。
   repeated LeaseView leases = 11;
+  // `§120`：**成员表**（谁在集群里）。同样的理由 —— 成员变更（提升 learner→voter、移除）
+  // 没有它就是**不可观测**的，运维只能靠猜。
+  repeated uint64 voter_ids   = 12;
+  repeated uint64 learner_ids = 13;
 }
 
 // 租约的运维视图（只读快照，不含任何调度语义）。
@@ -409,6 +415,16 @@ message JoinResponse {
 message NodeAddr {
   uint64 node_id = 1;
   string address = 2;
+}
+
+// 把一个 **learner 提升为 voter**（`§120`）。只 leader 受理；幂等（已经是 voter 就直接回当前成员表）。
+message PromoteRequest {
+  uint64 node_id = 1;
+}
+
+message PromoteResponse {
+  repeated uint64 voter_ids   = 1;
+  repeated uint64 learner_ids = 2;
 }
 
 // ---------------------------------------------------------------- 节点间（raft 传输）

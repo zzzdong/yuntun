@@ -1129,4 +1129,49 @@ async fn adding_a_learner_is_replicated_with_its_address() {
             mv.addrs.get(&LEARNER)
         );
     }
+
+    // ---- ⑦ 提升的三道门槛（`§120`）：逐条试一遍 ----
+    //
+    // 这里能把"落后太多"测出来，靠的是**给 learner 一个永远追不上的处境**：
+    // `LEARNER_ADDR` 指向没人监听的端口 ⇒ 它的 `matched` **永远**是 0（`§118` 刻意用了个假地址）。
+    // 再垫够 > `PROMOTE_MAX_LAG`(64) 条，日志末尾与它拉开距离，门槛就会拦。
+    let leader = {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(id) = IDS
+                .iter()
+                .copied()
+                .find(|id| handle_of(*id).status().role == "Leader")
+            {
+                break id;
+            }
+            assert!(Instant::now() < deadline, "10s 内没有 leader");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    let h = handle_of(leader);
+    for k in 0..80u64 {
+        h.propose(
+            commit_op(&format!("pad{k}"), &format!("k-pad{k}"), 5_000 + k),
+            Duration::from_secs(5),
+        )
+        .unwrap_or_else(|e| panic!("垫高日志的写入 k={k} 应当被接受：{e:?}"));
+    }
+    let e = h
+        .promote(LEARNER, Duration::from_secs(5))
+        .expect_err("落后太多的 learner 不该被提升");
+    assert!(
+        format!("{e:?}").contains("落后"),
+        "拒绝理由要说清**是落后**（不是别的错）：{e:?}"
+    );
+    h.promote(leader, Duration::from_secs(5))
+        .expect("已经是 voter ⇒ 幂等成功");
+    let e = h
+        .promote(77, Duration::from_secs(5))
+        .expect_err("不在成员表里的节点不该被提升");
+    assert!(
+        format!("{e:?}").contains("不在成员表"),
+        "拒绝理由要说清**是不在册**：{e:?}"
+    );
+    eprintln!("  ⑦ 三道门槛都按预期：落后 → 拒；已是 voter → 幂等；不在册 → 拒");
 }
