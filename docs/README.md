@@ -7,15 +7,16 @@
 | 我想…… | 读 |
 |---|---|
 | 知道**今天实际能做到什么 / 还缺什么 / 下一步做什么** | [`status.md`](status.md) ← **现状唯一入口** |
-| 知道**某个结论的证据**、某个实现与原设计的**偏差及原因** | [`operation-log.md`](operation-log.md)（§1–§32，按时间） |
+| 知道**某个结论的证据**、某个实现与原设计的**偏差及原因** | [`operation-log.md`](operation-log.md)（§1–§123，按时间） |
 | 知道**任务怎么排、里程碑与准出门槛** | [`plan.md`](plan.md)（阶段 WBS / M1–M6 / 风险登记） |
 | 知道**架构为什么这样设计**、有哪些 ADR | [`architecture.md`](architecture.md)（12 个 ADR + 域设计） |
 | 知道**模块边界、接口契约、数据结构、状态机、配置项** | [`design.md`](design.md) |
 | 知道**从现状到分布式目标态该怎么改、按什么顺序** | [`refactor.md`](refactor.md)（S0–S6 / R0–R6） |
-| 想知道 **R3（metanode + raft）怎么设计、怎么排期、验收与风险** | [`metanode-design.md`](metanode-design.md)（**R3 设计与计划，待开工**） |
+| 想知道 **R3（metanode + raft）怎么设计、怎么排期、验收与风险** | [`metanode-design.md`](metanode-design.md)（R3 设计与计划；**R3 已完成** —— 现状看 `status.md`） |
 | 知道 **chunk 层（数据平面）的目标态** | [`architecture-with-chunk.md`](architecture-with-chunk.md) |
 | 知道**多协议 SQL 接入**怎么设计 | [`sql-access-design.md`](sql-access-design.md) |
 | 知道 **DELETE/UPDATE（未实现）**怎么设计 | [`delta-dml-design.md`](delta-dml-design.md) |
+| 知道**还存在哪些"实现 vs 文档"的未闭环偏差、各自打算怎么办** | [`closeout.md`](closeout.md)（偏差台账；**可机核的部分由 `crates/testkit/tests/docs_consistency.rs` 守着**） |
 | 想**跑起来用起来** | 仓库根 [`README.md`](../README.md) |
 
 **新读者建议顺序**：根 `README.md`（5 分钟）→ `docs/status.md`（10 分钟）→

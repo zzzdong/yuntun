@@ -16,17 +16,27 @@
 // `yuntun-model` 里的请求结构是**手写普通 Rust 结构**（`ops.rs`，**不是** prost 消息），
 // 所以接口面不能"直接搬字节"，必须**逐字段镜像**。本轮迁移：
 //
+// 下表是**逐 op** 的现状。它有**判据**守着：`crates/testkit/tests/docs_consistency.rs` 的
+// `proto_migration_table_is_honest` 会核对"`oneof kind` 里每个 op 都在表里被点名"、
+// 以及"标 ⏳ 的 op 不得已经存在" —— 表在骗人比没有表更糟（本表实测漂移过一次：
+// `EvolveSchema` 等早已迁移，却还挂在 ⏳ 那行）。
+//
 // | op | 状态 |
 // |---|---|
 // | `CreateSchema` | ✅ |
-// | `DropTable` | ✅ |
+// | `DropSchema` | ✅ |
 // | `CreateTable`（含 `partition_cols` / `ingest_config`） | ✅ |
+// | `DropTable` | ✅ |
+// | `EvolveSchema` | ✅ |
 // | `CommitFiles`（含 `FileManifest` / `StatisticsLite` / `ColumnStatLite`） | ✅（设计 §6 点名的那一项） |
-// | `EvolveSchema` / `DropShard` / `Compaction` / 租约 | ⏳ 后续增量 |
+// | `DropShard` | ✅ |
+// | `Compaction`（含 `lease_epoch` 栅栏） | ✅ |
+// | `Idempotency` | ✅（写入前登记键，见 `pipeline.rs`） |
+// | `RegisterDatanode` / `RemoveDatanode` | ✅（T12.3：名录走 raft，心跳不走） |
+// | `AcquireLease` / `RenewLease` / `ReleaseLease` | ✅（T14.1；结果 `LeaseGrant` 走 `ProposeResponse.result`） |
+// | `RecordInFlight` / `SweepInFlight` | ✅（T14.3：孤儿 GC 唯一能问的权威） |
 //
-// 未迁移的 op 目前**不进**这个 proto（而不是留个没有编解码的 `bytes` 字段 —— 那种占位会
-// 让下一位实现者以为"已经有格式了"）。`wire_compat.rs` 里有一条断言分支数的用例：
-// 加分支必须同时更新它，防止漏覆盖。
+// 纪律的另一半在 `wire_compat.rs`：那里有一条断言分支数的用例，加分支必须同时更新它。
 
 syntax = "proto3";
 
