@@ -32,6 +32,7 @@ use std::time::Duration;
 
 use tonic::transport::Channel;
 use yuntun_catalog::CatalogOps;
+use yuntun_model::dv::DeletionEntry;
 use yuntun_model::error::LakeError;
 use yuntun_model::meta::{FileManifest, IdempotencyRecord, TableMeta};
 use yuntun_model::ops::{
@@ -861,6 +862,41 @@ impl CatalogOps for RemoteCatalog {
         // 与状态机同序（那边是 `BTreeMap` 的键序）：对拍才有意义
         out.sort_by(|a, b| a.batch_id.cmp(&b.batch_id));
         Ok(out)
+    }
+
+    // ---------------------------------------------------------- 删除向量（F.3）
+
+    /// **本刀（`§146`）只落了内存参考实现**：远端形态的 DV 写入尚未接线。
+    ///
+    /// 这里**明确报错**而不是"静默成功"：删除是用户可见的事实，
+    /// 悄悄不生效 = 用户以为删了（比少数据更糟）。
+    async fn apply_deletions(&self, _entries: Vec<DeletionEntry>) -> Result<u64, LakeError> {
+        Err(LakeError::Other(
+            "删除向量的远端写入尚未接线（`plan.md` F.3b）：本刀只落了 MemoryCatalog 参考实现；             远端形态下 DELETE 一律报错，绝不假装成功"
+                .into(),
+        ))
+    }
+
+    /// 远端形态**不可能有 DV**（上面那条 `apply_deletions` 直接拒绝）⇒ 空列表是**事实**，不是猜测。
+    ///
+    /// ⚠️ **`F.3b` 必须把这两个方法一起接上**：一旦远端能写 DV 而这里还返回空，
+    /// 就已经删掉的行就会**复活**（静默错结果）。这条注释是那个前提的显式抵押。
+    async fn list_deletions(
+        &self,
+        _table: &str,
+        _snapshot: u64,
+    ) -> Result<Vec<DeletionEntry>, LakeError> {
+        Ok(Vec::new())
+    }
+
+    async fn revoke_deletions_for_file(
+        &self,
+        _file_path: &str,
+        _at: u64,
+    ) -> Result<usize, LakeError> {
+        Err(LakeError::Other(
+            "删除向量的远端撤销尚未接线（`plan.md` F.3b/F.3c）".into(),
+        ))
     }
 
     async fn drop_shard(&self, table: &str, shard: &str) -> Result<u64, LakeError> {

@@ -7027,6 +7027,7 @@ dependencies = [
  "bytes",
  "crc32fast",
  "prost",
+ "roaring",
  "serde",
  "thiserror 2.0.21",
  "uuid",

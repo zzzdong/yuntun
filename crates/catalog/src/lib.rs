@@ -11,6 +11,7 @@
 use arrow::datatypes::SchemaRef;
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
+use yuntun_model::dv::DeletionEntry;
 use yuntun_model::error::LakeError;
 use yuntun_model::meta::{
     DatanodeMember, LeaseGrant, FileManifest, IdempotencyRecord, TableMeta,
@@ -69,6 +70,30 @@ pub trait CatalogOps: Send + Sync {
         snapshot: u64,
         shard_filter: Option<&str>,
     ) -> Result<Vec<FileManifest>, LakeError>;
+
+    // ---- 删除向量（F.3）----
+    /// **登记一批删除向量**（`delta-dml-design §3.3`）：返回本次分配的**快照号**。
+    ///
+    /// 语义（三条都在 `CatalogState::apply_deletions` 里实现，这里只定接口）：
+    /// 单快照原子（一次 DELETE 的全部 DV 共用一个 `applied_at`）＋ 按 `dv_id` 幂等
+    /// ＋ 触发读缓存**全量重建**（DV 是读快照的新字段，增量通道只搬文件清单）。
+    async fn apply_deletions(&self, entries: Vec<DeletionEntry>) -> Result<u64, LakeError>;
+
+    /// **某表在某快照下生效的删除向量**（读侧唯一入口；快照窗口过滤见 `DeletionEntry::active_at`）。
+    async fn list_deletions(
+        &self,
+        table: &str,
+        snapshot: u64,
+    ) -> Result<Vec<DeletionEntry>, LakeError>;
+
+    /// **撤销**锚定在某文件上的 DV（compaction 把那些行物理重写掉之后调用），返回条数。
+    ///
+    /// 置 `revoked_at` 而不是删行：删了就无法回答"某个历史快照当时看到什么"。
+    async fn revoke_deletions_for_file(
+        &self,
+        file_path: &str,
+        at: u64,
+    ) -> Result<usize, LakeError>;
 
     // ---- 删除 ----
     /// L1 分片移除：整 shard 的文件标记 deleted_at（§6.3）
@@ -317,6 +342,32 @@ impl CatalogOps for MemoryCatalog {
             .read()
             .unwrap()
             .list_visible_files(table, snapshot, shard_filter))
+    }
+
+    // ---------------------------------------------------------- 删除向量（F.3）
+
+    async fn apply_deletions(&self, entries: Vec<DeletionEntry>) -> Result<u64, LakeError> {
+        self.state.write().unwrap().apply_deletions(entries)
+    }
+
+    async fn list_deletions(
+        &self,
+        table: &str,
+        snapshot: u64,
+    ) -> Result<Vec<DeletionEntry>, LakeError> {
+        Ok(self.state.read().unwrap().list_deletions(table, snapshot))
+    }
+
+    async fn revoke_deletions_for_file(
+        &self,
+        file_path: &str,
+        at: u64,
+    ) -> Result<usize, LakeError> {
+        Ok(self
+            .state
+            .write()
+            .unwrap()
+            .revoke_deletions_for_file(file_path, at))
     }
 
     async fn drop_shard(&self, table: &str, shard: &str) -> Result<u64, LakeError> {

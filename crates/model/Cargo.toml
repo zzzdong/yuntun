@@ -11,6 +11,8 @@ arrow = { workspace = true }
 crc32fast = { workspace = true }
 # F.4 行组级索引：XOR filter（零假阴性是硬要求，见 workspace Cargo.toml 的说明）
 xorf = { workspace = true }
+# F.3 删除向量：行号位图（`delta-dml-design.md §3.1`）
+roaring = { workspace = true }
 prost = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }

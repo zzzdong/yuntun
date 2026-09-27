@@ -237,6 +237,26 @@ impl CatalogOps for BrokenCatalog {
     async fn heartbeat(&self, id: &str) -> Result<bool, yuntun_model::LakeError> {
         self.inner.heartbeat(id).await
     }
+    async fn apply_deletions(
+        &self,
+        entries: Vec<yuntun_model::dv::DeletionEntry>,
+    ) -> Result<u64, yuntun_model::LakeError> {
+        self.inner.apply_deletions(entries).await
+    }
+    async fn list_deletions(
+        &self,
+        table: &str,
+        snapshot: u64,
+    ) -> Result<Vec<yuntun_model::dv::DeletionEntry>, yuntun_model::LakeError> {
+        self.inner.list_deletions(table, snapshot).await
+    }
+    async fn revoke_deletions_for_file(
+        &self,
+        file_path: &str,
+        at: u64,
+    ) -> Result<usize, yuntun_model::LakeError> {
+        self.inner.revoke_deletions_for_file(file_path, at).await
+    }
     async fn drop_schema(&self, n: &str) -> Result<(), yuntun_model::LakeError> {
         self.inner.drop_schema(n).await
     }

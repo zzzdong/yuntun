@@ -36,13 +36,15 @@ use yuntun_model::ops::{
     CommitFilesRequest, CommitFilesResponse, CreateTableRequest, EvolveSchemaRequest,
     EvolveSchemaResponse, ManifestDelta, DEFAULT_SCHEMA,
 };
+use yuntun_model::dv::DeletionEntry;
 use yuntun_model::schema::apply_change;
 
 use crate::normalize_table;
 use yuntun_model::error::SnapshotError;
 use yuntun_model::snapshot::{
-    CatalogStateSnapshot, SnapshotFileEntry, SnapshotIdempotencyEntry, SnapshotSchemaEntry,
-    SnapshotInFlightEntry, SnapshotTableEntry, SnapshotTableVerEntry, SNAPSHOT_FORMAT_VERSION,
+    CatalogStateSnapshot, SnapshotDeletionEntry, SnapshotFileEntry, SnapshotIdempotencyEntry,
+    SnapshotInFlightEntry, SnapshotSchemaEntry, SnapshotTableEntry, SnapshotTableVerEntry,
+    SNAPSHOT_FORMAT_VERSION,
 };
 
 /// Catalog 的全部可变状态。
@@ -80,6 +82,14 @@ pub struct CatalogState {
     /// 它存在的唯一理由是让**孤儿 GC 看得见** ——"已上传未提交"的文件不是垃圾，
     /// 删了就是**真丢数据**（`R-9`）。此前这条判断只能靠 grace（时间假设）兜底。
     in_flight: BTreeMap<String, u64>,
+    /// **删除向量事件**（`F.3`）：`dv_id` → 事件。
+    ///
+    /// 为什么是独立事件表而不是 `FileManifest` 上的可变字段（`delta-dml-design §3.2`）：
+    /// manifest 是**文件的事实**（不可变、按批次幂等），而"谁在什么时候被删了"是
+    /// **另一个维度的事实**，有它自己的快照窗口（`applied_at` / `revoked_at`）。
+    /// 混进 manifest 会让"文件"与"删除"互相污染（重提交/幂等按 batch_id 走，
+    /// 而删除按 dv_id 走）。
+    deletions: BTreeMap<String, DeletionEntry>,
     /// 结构变更计数（表 / schema / schema 演进）—— 缓存**全量重建**的触发器（S2-5）
     schema_ver: u64,
     /// 文件清单变更计数 —— 缓存**增量刷新**的触发器（S2-5）
@@ -548,6 +558,94 @@ impl CatalogState {
             .collect()
     }
 
+    // ---------------------------------------------------------------- 删除向量（F.3）
+
+    /// **登记一批删除向量**（`delta-dml-design §3.3` 的 `apply_deletions`）。
+    ///
+    /// 三条语义，每条都对应一个具体的失败形态：
+    ///
+    /// 1. **单快照原子**：一次 DELETE 的**全部** DV 共用同一个 `applied_at`
+    ///    （= 本次分配的快照号）⇒ 要么全生效、要么全不生效 —— 不会出现"删了一半"的可见态；
+    /// 2. **幂等**（按 `dv_id`）：同一条 WAL 记录重放两次不会写两份；**已存在的一律原样保留**
+    ///    （连 `applied_at` 都不改 —— 改了等于把"何时被删"往前挪，**旧快照的可见性会被悄悄改写**）；
+    ///    全部命中重复时**不推快照号**（没有真实变更就不该有版本前进）；
+    /// 3. **触发全量缓存重建**（`schema_ver`）：DV 进的是读快照的**新字段**，
+    ///    而增量通道只搬文件清单 ⇒ 必须走全量（`§5.2` 的"按表增量刷新"是后续项）。
+    pub fn apply_deletions(&mut self, entries: Vec<DeletionEntry>) -> Result<u64, LakeError> {
+        let mut fresh: Vec<DeletionEntry> = Vec::with_capacity(entries.len());
+        for e in entries {
+            if e.dv_id.is_empty() || e.table.is_empty() || e.file_path.is_empty() {
+                return Err(LakeError::Other(format!(
+                    "删除向量缺必填字段（dv_id/table/file_path 都不得为空）：{e:?}"
+                )));
+            }
+            if e.card == 0 {
+                // `card == 0` 不落盘（`§3.1`）—— 也不该进目录：它表达不了任何事实，
+                // 却会让读侧为它去取一个不存在的对象
+                return Err(LakeError::Other(format!(
+                    "删除向量 {} 的 card 为 0：空删除不该进目录（`§3.1`）",
+                    e.dv_id
+                )));
+            }
+            if !self.deletions.contains_key(&e.dv_id) {
+                fresh.push(e);
+            }
+        }
+        if fresh.is_empty() {
+            return Ok(self.snapshot_version);
+        }
+        let next = self.next_snapshot();
+        for mut e in fresh {
+            e.table = normalize_table(&e.table);
+            e.applied_at = next;
+            e.revoked_at = 0;
+            if e.store_path.is_empty() {
+                // 路径是**推导**出来的（`dv_object_path`）：调用方漏填也补上，
+                // 免得读侧拿着空路径去 GET 一个不存在的位置
+                e.store_path = yuntun_model::dv::dv_object_path(&e.file_path, &e.dv_id);
+            }
+            self.deletions.insert(e.dv_id.clone(), e);
+        }
+        self.schema_ver += 1;
+        Ok(next)
+    }
+
+    /// **某表在 `snapshot` 这个快照下生效的删除向量**（读侧唯一入口）。
+    ///
+    /// 过滤是**快照维度**的（`active_at`）：`applied_at <= snapshot < revoked_at`。
+    /// 提交之前开始的查询因此看不到这次删除 —— 这就是快照隔离（`F.3` 验收②）。
+    pub fn list_deletions(&self, table: &str, snapshot: u64) -> Vec<DeletionEntry> {
+        let key = normalize_table(table);
+        self.deletions
+            .values()
+            .filter(|d| d.table == key && d.active_at(snapshot))
+            .cloned()
+            .collect()
+    }
+
+    /// **撤销**锚定在某文件上的删除向量（= compaction 已把那些行物理重写掉）。
+    ///
+    /// 置 `revoked_at` 而**不是删行**：删了就无法回答"某个历史快照当时看到什么"。
+    /// 返回被撤销的条数（0 = 没有悬挂 DV）。
+    pub fn revoke_deletions_for_file(&mut self, file_path: &str, at: u64) -> usize {
+        let mut n = 0usize;
+        for d in self.deletions.values_mut() {
+            if d.file_path == file_path && d.revoked_at == 0 {
+                d.revoked_at = at;
+                n += 1;
+            }
+        }
+        if n > 0 {
+            self.schema_ver += 1;
+        }
+        n
+    }
+
+    /// 目录里全部 DV 事件（诊断 / 对账用；不过快照过滤）。
+    pub fn all_deletions(&self) -> Vec<DeletionEntry> {
+        self.deletions.values().cloned().collect()
+    }
+
     /// L1 分片移除（§6.3）：整 shard 文件 `deleted_at = current_snapshot + 1`。
     pub fn drop_shard(&mut self, table: &str, shard: &str) -> u64 {
         let next = self.next_snapshot();
@@ -575,6 +673,11 @@ impl CatalogState {
         }
         self.schemas.retain(|(t, _), _| *t != key);
         self.files.retain(|_, f| normalize_table(&f.table) != key);
+        // 表没了 ⇒ 它的删除向量也没有意义（留着只会在同名重建后**张冠李戴**：
+        // 新表的文件路径与旧表不同，DV 锚定的是旧文件；而"锚定不到文件"的 DV
+        // 既不会被读侧用到，也会永久占着快照）
+        self.deletions
+            .retain(|_, d| normalize_table(&d.table) != key);
         self.snapshot_version += 1;
         // 结构与清单都变了：schema_ver 让缓存全量重建，manifest_ver 兜一层增量消费者
         self.bump_schema_ver();
@@ -829,6 +932,14 @@ impl CatalogState {
                     manifest_ver: *v,
                 })
                 .collect(),
+            deletions: self
+                .deletions
+                .iter()
+                .map(|(k, v)| SnapshotDeletionEntry {
+                    dv_id: k.clone(),
+                    entry: Some(v.clone()),
+                })
+                .collect(),
         }
     }
 
@@ -953,6 +1064,24 @@ impl CatalogState {
                 )));
             }
         }
+        let mut deletions: BTreeMap<String, DeletionEntry> = BTreeMap::new();
+        for e in &msg.deletions {
+            let v = e.entry.clone().ok_or_else(|| {
+                SnapshotError::InvalidState(format!("删除向量 {} 缺事件体", e.dv_id))
+            })?;
+            if v.dv_id != e.dv_id {
+                return Err(SnapshotError::InvalidState(format!(
+                    "删除向量键值不符：键 {} 事件体 {}",
+                    e.dv_id, v.dv_id
+                )));
+            }
+            if deletions.insert(e.dv_id.clone(), v).is_some() {
+                return Err(SnapshotError::InvalidState(format!(
+                    "删除向量 {} 重复",
+                    e.dv_id
+                )));
+            }
+        }
         Ok(Self {
             tables,
             namespaces,
@@ -962,6 +1091,7 @@ impl CatalogState {
             datanodes,
             leases,
             in_flight,
+            deletions,
             snapshot_version: msg.revision,
             last_applied: msg.last_applied,
             schema_ver: msg.schema_ver,
@@ -1335,6 +1465,20 @@ mod snapshot_tests {
     }
 
     /// 一个"每个维度都非空"的状态：快照测试必须有东西可丢，否则测不出漏字段。
+    /// 一个最小的 DV 事件（`card` 必须 > 0 —— 空删除不进目录）。
+    fn dv_entry(dv_id: &str, table: &str, file: &str) -> DeletionEntry {
+        DeletionEntry {
+            dv_id: dv_id.into(),
+            table: table.into(),
+            file_path: file.into(),
+            batch_id: "b1".into(),
+            applied_at: 0, // 由 `apply_deletions` 分配
+            revoked_at: 0,
+            card: 3,
+            store_path: String::new(), // 由 `apply_deletions` 推导
+        }
+    }
+
     fn rich_state() -> CatalogState {
         let mut st = CatalogState::new();
         st.create_schema("analytics").unwrap();
@@ -1599,6 +1743,11 @@ mod snapshot_tests {
         cases.push(("in_flight", s));
 
         let mut s = rich_state();
+        s.apply_deletions(vec![dv_entry("dv-x", "public.cpu", "f1.parquet")])
+            .unwrap();
+        cases.push(("deletions", s));
+
+        let mut s = rich_state();
         s.record_idempotency(IdempotencyRecord {
             client_request_id: "kz".into(),
             batch_id: "b1".into(),
@@ -1631,6 +1780,109 @@ mod snapshot_tests {
                 "维度 `{name}` 变了但快照字节没变 → 快照漏了这个字段（换主/重启后会静默回退）"
             );
         }
+    }
+
+    /// DV 事件的**快照维度**：apply 之后立刻生效、旧快照看不到、幂等、撤销后失效。
+    #[test]
+    fn deletion_vectors_are_snapshot_scoped_and_idempotent() {
+        let mut s = rich_state();
+        let before = s.snapshot_version;
+        let sv_before = s.schema_ver;
+        let committed = s
+            .apply_deletions(vec![
+                dv_entry("dv-1", "public.cpu", "f1.parquet"),
+                dv_entry("dv-2", "public.cpu", "f2.parquet"),
+            ])
+            .unwrap();
+        assert!(committed > before, "apply 必须分配新的快照号");
+        assert_eq!(
+            s.schema_ver,
+            sv_before + 1,
+            "DV 变更要走全量缓存重建（schema_ver +1）"
+        );
+
+        // 提交前开始的查询：看不到这次删除（快照隔离）
+        assert!(
+            s.list_deletions("public.cpu", committed - 1).is_empty(),
+            "旧快照不许看到新删除（否则快照隔离不成立）"
+        );
+        assert_eq!(s.list_deletions("public.cpu", committed).len(), 2);
+        assert_eq!(s.list_deletions("public.cpu", u64::MAX).len(), 2, "长期有效");
+        // 别的表看不见（按表过滤）
+        assert!(s.list_deletions("public.other", u64::MAX).is_empty());
+        // 一次 DELETE 的两份 DV 共用同一个 applied_at（单快照原子）
+        assert!(
+            s.list_deletions("public.cpu", committed)
+                .iter()
+                .all(|d| d.applied_at == committed)
+        );
+
+        // 幂等：同一条记录重放两遍不写两份、**也不推快照号**
+        let snap = s.snapshot_version;
+        let again = s
+            .apply_deletions(vec![dv_entry("dv-1", "public.cpu", "f1.parquet")])
+            .unwrap();
+        assert_eq!(again, snap, "全部命中重复 ⇒ 不该有版本前进");
+        assert_eq!(s.all_deletions().len(), 2);
+
+        // 撤销（compaction 消费）：置 revoked_at，旧快照仍"当时看得见"
+        let at = s.snapshot_version + 1;
+        assert_eq!(s.revoke_deletions_for_file("f1.parquet", at), 1);
+        assert!(s.list_deletions("public.cpu", at).len() == 1, "撤销后不再生效");
+        assert!(
+            s.list_deletions("public.cpu", at - 1).len() == 2,
+            "撤销**之前**的快照仍应看到它（历史可回答）"
+        );
+        assert_eq!(
+            s.revoke_deletions_for_file("f1.parquet", at + 1),
+            0,
+            "已经是 revoked 的不再重复撤销"
+        );
+    }
+
+    /// 空删除 / 缺字段一律**拒绝**（它们都表达不了事实，却会让读侧去取不存在的对象）。
+    #[test]
+    fn deletion_entries_must_be_meaningful() {
+        let mut s = rich_state();
+        let mut empty_card = dv_entry("dv-0", "public.cpu", "f1.parquet");
+        empty_card.card = 0;
+        assert!(s.apply_deletions(vec![empty_card]).is_err(), "card=0 不该进目录");
+        let mut no_id = dv_entry("", "public.cpu", "f1.parquet");
+        no_id.dv_id = String::new();
+        assert!(s.apply_deletions(vec![no_id]).is_err(), "缺 dv_id");
+        let mut no_file = dv_entry("dv-1", "public.cpu", "");
+        no_file.file_path = String::new();
+        assert!(s.apply_deletions(vec![no_file]).is_err(), "缺 file_path");
+        // 空批次是 no-op（不推版本）
+        let snap = s.snapshot_version;
+        assert_eq!(s.apply_deletions(vec![]).unwrap(), snap);
+    }
+
+    /// 删表连带清掉它的 DV：留着只会在同名重建后张冠李戴（DV 锚定的是旧文件）。
+    #[test]
+    fn dropping_a_table_removes_its_deletion_vectors() {
+        let mut s = rich_state();
+        s.apply_deletions(vec![dv_entry("dv-1", "public.cpu", "f1.parquet")])
+            .unwrap();
+        assert_eq!(s.all_deletions().len(), 1);
+        s.drop_table("public.cpu").unwrap();
+        assert!(s.all_deletions().is_empty(), "表没了 ⇒ 它的 DV 也不该留");
+    }
+
+    /// 快照两向：DV **逐字段**过线（丢了就是已删行复活）。
+    #[test]
+    fn deletion_vectors_survive_snapshot_round_trip() {
+        let mut s = rich_state();
+        s.apply_deletions(vec![dv_entry("dv-1", "public.cpu", "f1.parquet")])
+            .unwrap();
+        let msg = s.to_snapshot_msg();
+        assert_eq!(msg.deletions.len(), 1);
+        let back = CatalogState::from_snapshot_msg(msg).unwrap();
+        assert_eq!(back.all_deletions(), s.all_deletions());
+        // 键值不符 ⇒ 拒绝（键是 1，体内写 2：这种快照装进去就是不确定性）
+        let mut bad = s.to_snapshot_msg();
+        bad.deletions[0].dv_id = "dv-other".into();
+        assert!(CatalogState::from_snapshot_msg(bad).is_err());
     }
 
     /// 重复键必须**拒绝**：重复键下"谁生效"取决于遍历顺序 = 不确定性。

@@ -229,6 +229,19 @@ pub struct SnapshotFileEntry {
     pub manifest: Option<crate::meta::FileManifest>,
 }
 
+/// 快照里的一条删除向量事件（键 = `dv_id`）。
+///
+/// **为什么要进快照**：DV 是**已提交的事实**（删了就是删了）。快照装进去之后必须原样恢复 ——
+/// 丢一份就等于"删除凭空消失"（已删的行**复活**），而那是比少数据更糟的失败：
+/// 用户以为删掉了、审计也看不出来。
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct SnapshotDeletionEntry {
+    #[prost(string, tag = "1")]
+    pub dv_id: String,
+    #[prost(message, optional, tag = "2")]
+    pub entry: Option<crate::dv::DeletionEntry>,
+}
+
 /// 快照里的一条幂等记录（键 = `client_request_id`）。
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct SnapshotIdempotencyEntry {
@@ -314,6 +327,9 @@ pub struct CatalogStateSnapshot {
     /// **在途批次**（T14.3）：丢一份就等于"没有在途" ⇒ 孤儿 GC 误删正在写的文件。
     #[prost(message, repeated, tag = "14")]
     pub in_flight: Vec<SnapshotInFlightEntry>,
+    /// **删除向量事件**（`F.3`，`delta-dml-design §3.2`）：丢一份 = 已删的行复活。
+    #[prost(message, repeated, tag = "15")]
+    pub deletions: Vec<SnapshotDeletionEntry>,
 }
 
 // ---------------------------------------------------------------- 载荷编解码

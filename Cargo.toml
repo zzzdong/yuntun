@@ -66,6 +66,11 @@ url = "2"
 # 不需要 `uniform-random`（那会拖进 `rand` 全家）；`binary-fuse` 我们也不用（`Xor8` 不在其门后）。
 xorf = { version = "0.13", default-features = false }
 
+# ---- 删除向量（F.3）----
+# `delta-dml-design.md §3.1` 点名的位图实现：行号集合要么空、要么很大，
+# 位图（而不是 `Vec<u32>`）是唯一合理形态；portable 序列化格式稳定。
+roaring = "0.11"
+
 # ---- 运行时 ----
 # CLI 参数解析（全仓统一，不手写：手写的 help/错误信息/补全迟早漂移）
 clap = { version = "4", features = ["derive", "env"] }

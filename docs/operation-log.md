@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§145，2026-09-27**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§146，2026-09-27**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -9285,3 +9285,72 @@ peeling 构造写错的后果是"多剪一个组" ⇒ **静默少数据**，而"
   **推导**（同 stem），于是索引可以**提交之后再写**（尽力而为），代价是读侧每个候选文件都要试一次
   GET（S3 上就是一次 404 往返）—— 本刀选了"manifest 记路径 + 提交前写"，因为它让"有没有索引"
   **可审计**、读侧零空转。
+
+---
+
+## 146. **F.3 第一刀：删除向量（DV）的表达层与目录能力**（2026-09-27）
+
+`plan.md` F 组最后一刀（`F.3` DELETE / UPDATE）按设计文档自己的里程碑切开做。
+这一刀只做**"删除这件事能被表达、持久化、被快照隔离"**那一层，**读侧生效与 SQL 前端留给下一刀**
+（下一节写清为什么这样切、以及两条抵押）。
+
+### 146.0 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `crates/model/src/dv.rs`（**新**） | `DeletionEntry`（快照维度的删除事件 + `active_at`）、`DvBitmap`（**roaring** 位图 + 自证帧：魔数/版本/长度/CRC）、`dv_object_path`（设计 §3.1 的路径形态）、**`keep_ranges`**（DV → "保留哪些行"）+ 8 条单测 |
+| `crates/model/src/snapshot.rs` | 快照载荷加 `deletions`（**tag 15**，只加不改）+ `SnapshotDeletionEntry` |
+| `crates/catalog/src/state.rs` | `deletions` 事件表 + `apply_deletions`（**单快照原子** / 按 `dv_id` 幂等 / 触发全量重建）+ `list_deletions(table, snapshot)`（读侧唯一入口）+ `revoke_deletions_for_file` + `drop_table` 连带清理 + 快照两向；"快照覆盖每个维度"用例**扩了一维**，另加 4 条用例 |
+| `crates/catalog/src/lib.rs` | `CatalogOps` 加三个方法；`MemoryCatalog` 参考实现 |
+| `crates/meta/src/remote_catalog.rs` | 远端形态：写入**明确报错**、读取**按不变量返空**（见 §146.3 的抵押①） |
+
+### 146.1 四个决定（都不是随手定的）
+
+1. **DV 是独立事件表，不挂 `FileManifest`**（设计 §3.2）。除了"manifest 是文件的事实"这条理由，
+   还有一条更硬的：**幂等域不同** —— 文件按 `batch_id` 幂等（重提交复用原 id），删除按 `dv_id` 幂等。
+   混进 manifest 会让这两套幂等互相污染。
+2. **"保留哪些行"（`keep_ranges`）放在 `model`**：它和"哪些行被删"是**同一事实的两种说法**。
+   分开放两个 crate 一定会漂移，而这里漂移的后果是本仓最不能接受的两类之一
+   （静默少数据 / 静默复活已删行）。
+3. **DV 解不开 ⇒ 报错**（与 `§145` 的索引**刻意相反**）：索引只影响"读多少"，DV 影响"读到什么"。
+   忽略一份坏索引 = 少省一点 IO；忽略一份坏 DV = **复活已删数据** —— 比少数据更糟，
+   因为用户以为删掉了（审计也看不出来）。
+4. **走 `schema_ver`（全量缓存重建）**：DV 进的是读快照的**新字段**，而增量通道只搬文件清单；
+   设计的"按表增量刷新入口"（`delta-dml-design §5.2`）是后续项。
+
+### 146.2 与设计的三处偏差（都是刻意的）
+
+| # | 偏差 | 为什么 |
+|---|---|---|
+| 1 | `DeletionEntry` 多一个 `table` 字段 | 设计 §3.2 里没有；但目录里每一类记录都按表分区，而 `list_deletions(table, snapshot)` 是读侧**唯一**入口 —— 不给表名就得全表扫描 |
+| 2 | `revoke_deletions_for_file` 先落在目录层 | 设计把它算在 M2（compaction 消费）。**先把 API 与用例立起来**，compaction 接线在 `F.3d`；否则"撤销"这件事没有可测的形状（而它的语义又是快照隔离的一半） |
+| 3 | 远端写入**明确报错**而非静默通过 | 删除是用户可见事实：静默不生效 = 用户以为删了 |
+
+### 146.3 本刀**没做**的（明确列表 + 两条抵押）
+
+1. **读侧生效**（把 DV 翻成 parquet 的整体 `RowSelection` 挂到 `PartitionedFile`）→ **`F.3b`**。
+   含：读模型（`CatalogSnapshot`）带 DV、缓存刷新、以及与 `§145` 的索引计划**互斥**
+   —— DF 明说 `ParquetAccessPlan` 与 `ParquetRowSelection` 只能给一个
+   （`Invalid parquet access extensions … Specify either … not both`），而带 DV 的文件按行号定位
+   天然要求"不许跳行组"（`delta-dml-design §5.1` 同一条纪律）；
+2. **`DELETE FROM t WHERE …`**（谓词定位 + 命中未提交行时 force flush）→ **`F.3c`**；
+3. **WAL `DeletePayload`（type 6）+ `replay_wal_dml` + 远端目录/metanode op** → **`F.3c`**；
+4. **compaction 消费 DV**（重写时一并消费 + `revoke` + 孤儿 GC 覆盖 `dv/`）→ **`F.3d`**；
+5. `UPDATE`（设计 M3，= DELETE + INSERT 一个 op 承载）→ 最后。
+
+> ⚠️ **两条抵押（写在明处，别让后来者踩）**
+>
+> ① **远端形态的 `list_deletions` 现在返回空**。它是**事实**而不是猜测：`RemoteCatalog::apply_deletions`
+> 直接报错 ⇒ 远端形态**不可能**存在 DV。但 **`F.3c` 必须把这两个方法一起接上** —— 只接写入不接读取，
+> 就是"静默复活已删行"。
+> ② **`F.3d` 之前不许让 DV 与 compaction 同时存在**：compaction 重写文件时若不消费 DV，
+> 已删的行会被**原样写进新文件**（复活）。现状满足这条（SQL 层还没有 `DELETE` ⇒ 造不出 DV），
+> 而 `F.3c` 一落地就必须立刻补 `F.3d`（或先加"跳过带 DV 的文件"的保守闸门）。
+
+### 146.4 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **456 passed / 0 failed / 0 ignored**
+  （本刀 +12：`model::dv` 8 条 + `catalog` 4 条；另把"快照覆盖每个维度"那条用例扩了一维，
+  否则新字段漏进快照时**没有任何断言会红**）；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；
+- 判据 **5/5**（规模行按判据数字更新：**57,206 行 / 20 crate / 459 测试函数**）。
