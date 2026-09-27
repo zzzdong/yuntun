@@ -8707,6 +8707,20 @@ or configure the session for `with_tokio`.            （vortex-error-0.86.1/src
 * 用 **`RuntimeSessionExt::with_handle`**（`vortex-io/src/runtime/mod.rs:18` 的文档点名了它）
   把它挂进**自己造的** session（不能挂到 `legacy_session()` 那个静态上），或走 `with_tokio`。
 
+#### 135.2.1 续：runtime 这条线已经查到底了（下一条动作 = 一次编译）
+
+| 问题 | 答案（全部来自 registry 源码） |
+|---|---|
+| session 怎么挂 runtime | `RuntimeSessionExt::with_handle(self, handle: Handle) -> VortexSession`（`vortex-io/src/session.rs:64`）；⚠️ 它内部是 `session.get_mut::<RuntimeSession>()` ⇒ session **必须先** `.with::<RuntimeSession>()` |
+| session 从哪来 | `VortexSession::empty().with::<ArraySession>().with::<KernelSession>()…`（`vortex-array/src/lib.rs:172` 的 `array_session()`）；`with_handle` 对**任何** `SessionExt` 都实现了 ⇒ `array_session().with::<RuntimeSession>().with_handle(..)` 即可 |
+| `Handle` 怎么造 | `Handle::new(Weak<dyn Executor>)`（`runtime/handle.rs:35`）；另有 `Handle::find()`（找当前上下文里的 runtime） |
+| 谁是 `Executor` | `Sender`（**`SingleThreadRuntime` 的通道句柄**，`runtime/single.rs:125`）、`tokio::runtime::Handle`（tokio.rs:44）、`SmolExecutor`、`WasmRuntime` —— ⚠️ `CurrentThreadRuntime` **不是** |
+| 最省的用法 | **`vortex_io::runtime::single::block_on(\|\| async { … })`**（`runtime/single.rs:197`，另有 `block_on_stream` @208）：它在内部装好 runtime 并驱动闭包 ⇒ 闭包里 `Handle::find()` 应当可用 |
+
+⇒ 下一次动手的顺序：① 把 encode/decode 的 vortex 调用整体包进 `single::block_on`；
+② 若 `Handle::find()` 仍为空，改成显式 `array_session().with::<RuntimeSession>().with_handle(Handle::new(Arc::downgrade(&sender)))`（sender 取自 `SingleThreadRuntime`）；
+③ 放回 `crates/format/tests/vortex_roundtrip.rs`（`§135.4` 已写好）。
+
 ### 135.3 草稿的形状（下一刀直接照抄）
 
 * 写：`ArrowSession::default().from_arrow_record_batch(batch.clone(), schema)` → `ArrayIteratorAdapter`
