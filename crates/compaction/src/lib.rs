@@ -22,6 +22,18 @@ use yuntun_model::meta::FileManifest;
 pub struct CompactionConfig {
     /// 同 shard 触发合并的最少文件数（默认 5）
     pub min_files: usize,
+    /// **删除占比阈值**（`F.3d-2`，`delta-dml-design §6.2` 建议 10%）。
+    ///
+    /// 一个文件的"被删行数 / 该文件行数"到这个比例 ⇒ **单个文件也要合并**（消费掉删除向量）。
+    /// 为什么要有它：删除是"标记"（读侧 merge-on-read），不消费就永远不会收敛 ——
+    /// 而"占比多少才值得重写一遍"是成本问题：大文件删掉几行，重写的代价远大于读时多过滤一下。
+    pub dv_ratio_threshold: f64,
+    /// **删除行数的绝对下界**（`F.3d-2`，设计建议 1000）。
+    ///
+    /// 与占比**两个都要满足**才触发（比"或"更保守）：占比拦"大文件删一点"，
+    /// 下界拦"小文件删几行"（小文件本来就该由 `min_files` 那条路顺带合并掉）。
+    /// 少了任何一条，一轮一轮的小重写就会变成新的抖动源。
+    pub dv_min_card: u64,
     /// 合并产物最大行数（超过则拆分；MVP 单文件全量）
     pub max_rows_per_output: u64,
     /// 作业循环间隔（默认 60s）
@@ -44,6 +56,9 @@ impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
             min_files: 5,
+            // 设计 §6.2 的建议值：10% + 1000 行
+            dv_ratio_threshold: 0.1,
+            dv_min_card: 1_000,
             max_rows_per_output: 5_000_000,
             interval: Duration::from_secs(60),
             orphan_grace: Duration::from_secs(3600),
@@ -199,7 +214,7 @@ async fn compact_shard_inner(
         .catalog
         .list_visible_files(table, snapshot, Some(shard))
         .await?;
-    if files.len() < compactor.cfg.min_files {
+    if files.is_empty() {
         return Ok(None);
     }
 
@@ -214,6 +229,21 @@ async fn compact_shard_inner(
     // 而它只在**旧文件已经不可见**之后才成立。顺序反了就是"旧文件还看得见 + DV 已撤销"
     // ⇒ 已删的行**当场复现**。所以撤销放在 `commit_compaction` **之后**（见下）。
     let dvs = deletion_bitmaps(&compactor.catalog, &compactor.store, table, snapshot).await?;
+
+    // 【F.3d-2】触发判定：**两条路，任一成立就合并这个 shard**
+    //   ① 文件数够多（原有口径，`§9.1`）；
+    //   ② **某个文件的删除占比 + 绝对行数都够大** ⇒ 单个文件也要消费掉它的 DV
+    //      （设计 §6.2："DV 占比 > 阈值即可单文件触发" + 下界防抖动）。
+    // 没有 ② 的那条路，DV 只能等"旁边攒够 min_files 个文件"才被消费 ——
+    // 一张写入稀疏的表可能永远等不到，删除成本就永远不收敛（台账 `D-10`）。
+    let dv_trigger = files.iter().any(|f| {
+        let card = dvs.get(&f.file_path).map(|d| d.card()).unwrap_or(0);
+        dv_worth_compacting(&compactor.cfg, card, f.row_count)
+    });
+    if files.len() < compactor.cfg.min_files && !dv_trigger {
+        return Ok(None);
+    }
+
     let mut batches = Vec::new();
     let mut consumed = 0usize;
     for f in &files {
@@ -342,6 +372,23 @@ async fn compact_shard_inner(
         "shard compacted"
     );
     Ok(Some(new_snapshot))
+}
+
+/// 这个文件**值得为删除重写一遍**吗（`F.3d-2`）。
+///
+/// 两个守卫**都必须满足**（比设计原文的"或"更保守）：
+///
+/// | 守卫 | 拦住的形态 | 不设它的后果 |
+/// |---|---|---|
+/// | `card >= dv_min_card` | 大文件里删了几行 | 每轮都重写一个大文件（写放大） |
+/// | `card / rows >= dv_ratio_threshold` | 大文件里删了"不少"但占比很低的行 | 同上，只是触发得更晚 |
+///
+/// 两条都过了才重写：此时的收益（读侧不用再过滤、文件更小）确实盖过重写的代价。
+pub fn dv_worth_compacting(cfg: &CompactionConfig, card: u64, rows: u64) -> bool {
+    if card == 0 || rows == 0 || card > rows {
+        return false;
+    }
+    card >= cfg.dv_min_card && (card as f64) / (rows as f64) >= cfg.dv_ratio_threshold
 }
 
 /// 该表在某快照下**生效中**的 DV，按文件归并成位图（`file_path → DvBitmap`）。

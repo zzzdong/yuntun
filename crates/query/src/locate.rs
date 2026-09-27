@@ -147,7 +147,7 @@ mod tests {
         let store = yuntun_store::create_store(&yuntun_store::StoreConfig::Memory).unwrap();
         let batch =
             RecordBatch::try_new(schema(), vec![Arc::new(Int64Array::from(values))]).unwrap();
-        let (path, _rows, _size) = yuntun_format::write_batch(
+        let (path, _bytes, _rows) = yuntun_format::write_batch(
             &store,
             "public.t",
             "s0",
