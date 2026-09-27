@@ -494,6 +494,13 @@ impl NodeHandle {
                     .values()
                     .map(crate::op::datanode_member_to_proto)
                     .collect(),
+                // 删除向量（`F.3c-3`）：与 `files` 同理，发**全部**（含已撤销的）——
+                // 客户端要回答"某个旧快照当时看得见什么"
+                deletions: st
+                    .all_deletions()
+                    .iter()
+                    .map(crate::op::deletion_to_proto)
+                    .collect(),
                 idempotency_keys: keys,
             }),
             full_reload: full,

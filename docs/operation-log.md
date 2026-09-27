@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§150，2026-09-27**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§151，2026-09-27**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -9659,3 +9659,58 @@ peeling 构造写错的后果是"多剪一个组" ⇒ **静默少数据**，而"
   只把锚定对象已消失的 DV 当孤儿；
 - `sql_delete_e2e`：表级 DML 租约被占时 DELETE **当场拒绝**并点名冲突，归还后又能删；
 - `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **5/5**。
+
+---
+
+## 151. **F.3 第六刀：远端目录/metanode op —— 默认形态（`embedded`）也能删（抵押①闭环）**（2026-09-27）
+
+`§146` 起落地的 DV 只在 `memory` 形态可用：`RemoteCatalog::apply_deletions` 是**明确报错**的桩，
+`list_deletions` 按不变量返空（**抵押①**）。这一刀把远端形态接上 —— 于是**默认装配**
+（进程内 1 节点 raft + fjall）也能删，而且读侧拿的就是目录里那一份。
+
+### 151.0 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `meta.proto` | `DeletionEntryMsg` / `ApplyDeletionsOp` / `RevokeDeletionsOp` + `oneof kind` 的 tag **18/19** + `PrefetchPayload.deletions = 6` + 迁移进度表补两行 |
+| `meta/src/op.rs` | `StateOp::{ApplyDeletions, RevokeDeletions}` + Kind 转换 + apply 分支 + `deletion_to_proto`/`deletion_from_proto` 成对镜像 |
+| `meta/src/lib.rs` | `PrefetchPayload.deletions` = 状态机的**全部** DV（含已撤销的） |
+| `meta/src/remote_catalog.rs` | `Cache.deletions`（键 `(dv_id, file_path)`）+ `apply()` 填充（upsert；全量刷新丢掉"表已不在"的死条目）+ **三个方法全部真实实现** |
+| `server/src/lib.rs` | `replay_wal_dml` **两种形态都跑**（关掉 `embedded` 的"WAL 已提交、目录未落"窗口） |
+| `crates/proto/tests/wire_compat.rs` | 分支数 9 → **11**（新 op 也进"逐字段无损"样本，`0`/空串会让"忘了搬字段"看不出来） |
+| 新用例 | `sql_delete_e2e` 加 **默认形态（embedded）** 一条（5 条全绿） |
+
+### 151.1 三个决定
+
+1. **DV 也"全量下发"（含已撤销的）**：与 `files` 里的**墓碑**同一个道理 ——
+   客户端要回答"**某个旧快照**当时看得见什么"，而 `revoked_at` 是那条窗口的另一端。
+   只发"当前生效"的，历史快照的删除就会被算丢（**读到本该被删掉的行**）。
+   全量刷新时顺带丢掉"表已不在"的死条目（状态机的 `drop_table` 会连带清 DV）。
+2. **重放两种形态都跑**：`memory` 靠它重建（否则删除复活）；`embedded` 靠它收敛
+   "WAL 已 append、op 还没提交"那道崩溃窗口（设计 §7 的恢复表）。
+   重复重放不产生变化（状态机按 `(dv_id, file_path)` 去重 ⇒ 全命中就不推快照号）。
+3. **撤销也必须走 op**：只改本地缓存 = 别的进程继续按这份 DV 过滤 ⇒ 本该出现的行被一直藏起来
+   （**少数据**）。所以 `RevokeDeletions` 与 `ApplyDeletions` 一起进 `oneof`。
+
+### 151.2 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **484 passed / 0 failed / 0 ignored**（本刀 +1）；
+- `sql_delete_e2e::delete_works_in_the_default_embedded_assembly`：
+  默认装配下 `DELETE` 成功（不再是"尚未接线"）、删后立刻查不到、**目录里真的有两行 DV**
+  （`deleted_card` 走的是 `RemoteCatalog::list_deletions` ⇒ 缓存视图 ⇒ `PrefetchPayload`）；
+- `memory` 形态的四条 e2e 仍绿（含"重启后仍生效"那条 —— 它靠 WAL 重放）；
+- `wire_compat`：`oneof kind` 的分支数断言 9 → 11（**它守着"加 op 必须同步"这条纪律**，
+  这次它没有自己变红，是因为样本列表里没有新分支 —— 这正是那条计数断言存在的理由）；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **5/5**。
+
+### 151.3 两条边界（一条进台账）
+
+1. **`embedded` 的"同进程重启"用例做不了**：实测在同一个测试进程里，
+   上一次 `Lakehouse` 被 drop 之后 **fjall 的目录锁不释放**（重试 5 秒仍 `FjallError: Locked`）⇒
+   第二次 `MetaNode::open` 起不来。产品形态下"重启"是**另一个进程**，所以这不是产品缺陷，
+   而是**夹具能力缺口**：想端到端证 `embedded` 的重启持久性，需要一个跨进程的 rig
+   （或给 `MetaNode` 暴露一个显式 `shutdown()` 并让装配层在退出时调用）。
+   已进台账 **`D-11`**（待做）。本刀用"读侧走目录"这条替代证明（见 §151.2 的第三条）。
+2. **DV 目前是全量下发**：DV 条数很大时，每次刷新都要过一遍全量。
+   设计 §5.2 早就记了"按表增量刷新入口"是后续项 —— 与文件清单的增量（`manifest_delta`）
+   一起做才有意义。不影响正确性。

@@ -35,6 +35,7 @@
 // | `RegisterDatanode` / `RemoveDatanode` | ✅（T12.3：名录走 raft，心跳不走） |
 // | `AcquireLease` / `RenewLease` / `ReleaseLease` | ✅（T14.1；结果 `LeaseGrant` 走 `ProposeResponse.result`） |
 // | `RecordInFlight` / `SweepInFlight` | ✅（T14.3：孤儿 GC 唯一能问的权威） |
+// | `ApplyDeletions` / `RevokeDeletions` | ✅（`F.3c-3`：删除向量 —— 必须走 raft，见下） |
 //
 // 纪律的另一半在 `wire_compat.rs`：那里有一条断言分支数的用例，加分支必须同时更新它。
 
@@ -110,6 +111,17 @@ message Op {
     // **在途登记的超时清扫**（T14.3）：写者崩在半路时，登记不能永远保护一个没人认领的文件。
     // 与摘除数据节点同形：**触发者是巡检（不进 raft），但结果（撤销保护）必须进**。
     SweepInFlightOp sweep_in_flight = 17;
+    // **删除向量的登记**（`F.3c-3`）。**必须走 raft**（与在途登记同一个理由）：
+    // 删除是"已提交的事实"，而**读侧**（查询进程）只从目录拿它 ——
+    // 只存在某个进程内存里的删除 = 别的进程照样把已删的行查出来（静默错结果）。
+    //
+    // 一次 DELETE 的**全部条目走同一条 op**：它们必须落进**同一个快照**
+    // （单快照原子：要么全生效、要么全不生效，设计 §3.3）。
+    ApplyDeletionsOp  apply_deletions  = 18;
+    // **撤销**锚定在某文件上的删除向量（`F.3d`：合并把那些行物理重写掉之后调用）。
+    // 为什么也要走 raft：撤销是"这份 DV 不再生效"的可见性事实 ——
+    // 只改本地，别的进程会继续按它过滤（少数据：本该出现的行被一直藏起来）。
+    RevokeDeletionsOp revoke_deletions = 19;
   }
 }
 
@@ -333,6 +345,10 @@ message PrefetchPayload {
   // 文件级增量（**含墓碑**：`deleted_at > since_snapshot` 的也要发）。
   // 只发"当前可见"会让客户端永远删不掉已删文件 → 查询读到已删数据（静默）。
   repeated FileEntry files  = 2;
+  // **删除向量事件**（`F.3c-3`）：与上面的 `files` 同一个道理 —— 要发**全部**（含已撤销的），
+  // 因为客户端要回答"**某个旧快照**当时看得见什么"（`revoked_at` 是那条窗口的另一端）。
+  // 只发"当前生效"的，客户端就会把历史快照的删除算丢（读到本该被删掉的行）。
+  repeated DeletionEntryMsg deletions = 6;
   // 幂等键集合（**只在全量刷新时给**，且有条数上限）。
   //
   // 为什么值得给：客户端的幂等预筛是**本地加速**（权威在 SM），新建的进程只知道自己写过的键
@@ -522,6 +538,31 @@ message DropColumnMsg {
 message DropShardOp {
   string table = 1;
   string shard = 2;
+}
+
+// **删除向量事件**（`F.3`）：`yuntun_model::dv::DeletionEntry` 的**逐字段镜像**
+// （本文件顶部那条纪律：不是 prost 消息，所以不能直接搬字节）。
+message DeletionEntryMsg {
+  string dv_id      = 1;
+  string table      = 2;
+  string file_path  = 3;
+  string batch_id   = 4;
+  uint64 applied_at = 5;
+  uint64 revoked_at = 6;
+  uint32 card       = 7;
+  string store_path = 8;
+}
+
+// 登记一批删除向量（`F.3c-3`）。
+message ApplyDeletionsOp {
+  repeated DeletionEntryMsg entries = 1;
+}
+
+// 撤销锚定在某文件上的删除向量（`F.3d`）。
+message RevokeDeletionsOp {
+  string file_path = 1;
+  // 撤销从哪个快照起生效。**必须显式携带**（状态机不读钟、也不猜"现在" —— 纪律 1）。
+  uint64 at = 2;
 }
 
 // Compaction 提交（L2）：旧批次标记删除 + 新文件 `valid_from = snapshot+1`，一次原子完成。

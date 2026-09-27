@@ -411,19 +411,21 @@ async fn build_embedded_catalog(
         // 在 ⑥ 建缓存 **之前**（DV 必须在数据对查询可见之前就位 —— 顺序反了会出现
         // "删掉的行短暂可见"的窗口），也在 `spawn_accumulator` 之前。
         //
-        // **只在 `memory` 形态下重放**：`embedded` 形态的目录是 raft 状态机（自己落盘 DV），
-        // 而"重放"要写目录 —— 那边的写路径还没接线（`§148` 的抵押①，`F.3c-2` 接）。
-        // 反过来在 `memory` 形态下不重放就是**已删的行会复活**（目录重启即空）。
-        if cfg.meta.mode == config::MetaMode::Memory {
-            let stats = yuntun_ingest::replay_wal_dml(&catalog, &wal).await?;
-            if stats.applied + stats.skipped > 0 {
-                tracing::info!(
-                    applied = stats.applied,
-                    skipped = stats.skipped,
-                    entries = stats.entries,
-                    "WAL 删除向量重放完成"
-                );
-            }
+        // **两种形态都要重放**（`F.3c-3` 起）：
+        //
+        // * `memory` 形态：目录重启即空 ⇒ 不重放就是**已删的行复活**；
+        // * `embedded` 形态：DV 本身由 raft 落盘，但**"WAL 已提交、目录还没落"**这道窗口
+        //   （崩溃在 append 与 propose 之间）只有靠重放收敛（设计 §7 的恢复表）。
+        //   重放是**幂等**的（状态机按 `(dv_id, file_path)` 去重，全命中就不推快照号），
+        //   所以"已经落盘的那些"重放一遍不产生任何变化。
+        let stats = yuntun_ingest::replay_wal_dml(&catalog, &wal).await?;
+        if stats.applied + stats.skipped > 0 {
+            tracing::info!(
+                applied = stats.applied,
+                skipped = stats.skipped,
+                entries = stats.entries,
+                "WAL 删除向量重放完成"
+            );
         }
 
         // ⑥ QueryEngine（缓存刷新在 spawn_background 中启动）

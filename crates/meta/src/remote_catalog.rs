@@ -32,7 +32,6 @@ use std::time::Duration;
 
 use tonic::transport::Channel;
 use yuntun_catalog::CatalogOps;
-use yuntun_model::dv::DeletionEntry;
 use yuntun_model::error::LakeError;
 use yuntun_model::meta::{FileManifest, IdempotencyRecord, TableMeta};
 use yuntun_model::ops::{
@@ -70,6 +69,11 @@ struct Cache {
     /// **数据节点名录**（T12.3）：来自同一次 `Prefetch` 的载荷 —— 与上面几个版本号
     /// 同源同版本，所以"按名录算归属"不会跨版本。
     datanodes: BTreeMap<String, yuntun_model::meta::DatanodeMember>,
+    /// **删除向量事件**（`F.3c-3`）：键 = `(dv_id, file_path)`（与状态机同一套身份）。
+    ///
+    /// 与 `files` 同一个道理：**已撤销的也要留在里面**（`revoked_at` 是"这份 DV 何时失效"的
+    /// 另一半 —— 删掉它就回答不了"某个旧快照当时看得见什么"）。
+    deletions: BTreeMap<(String, String), yuntun_model::dv::DeletionEntry>,
     /// 做过一次全量刷新（在此之前缓存是不可信的，读必须等）
     primed: bool,
     /// 墓碑回收的下界：**早于它的快照不可查**（见 `RemoteCatalog::file_retention`）
@@ -399,6 +403,20 @@ impl RemoteCatalog {
             if let Some(m) = f.manifest.as_ref() {
                 c.files.insert(f.batch_id.clone(), op::manifest_from_proto_pub(m));
             }
+        }
+
+        // 删除向量（`F.3c-3`）：upsert；**全量刷新时**顺带丢掉"表已经不在了"的条目
+        //（状态机的 `drop_table` 会连带清掉该表的 DV，客户端也得跟上，否则会留一堆
+        //  永远锚不到文件的死条目）。
+        if full {
+            let tables: BTreeSet<String> = c.tables.keys().cloned().collect();
+            c.deletions
+                .retain(|_, d| tables.contains(&normalize(&d.table)));
+        }
+        for m in &payload.deletions {
+            let d = op::deletion_from_proto(m);
+            c.deletions
+                .insert((d.dv_id.clone(), d.file_path.clone()), d);
         }
 
         // schema 名：**整体替换**（删掉的必须消失）
@@ -866,37 +884,64 @@ impl CatalogOps for RemoteCatalog {
 
     // ---------------------------------------------------------- 删除向量（F.3）
 
-    /// **本刀（`§146`）只落了内存参考实现**：远端形态的 DV 写入尚未接线。
-    ///
-    /// 这里**明确报错**而不是"静默成功"：删除是用户可见的事实，
-    /// 悄悄不生效 = 用户以为删了（比少数据更糟）。
-    async fn apply_deletions(&self, _entries: Vec<DeletionEntry>) -> Result<u64, LakeError> {
-        Err(LakeError::Other(
-            "删除向量的远端写入尚未接线（`plan.md` F.3b）：本刀只落了 MemoryCatalog 参考实现；             远端形态下 DELETE 一律报错，绝不假装成功"
-                .into(),
-        ))
+    /// **登记一批删除向量**（`F.3c-3`）：走 raft（删除是"已提交的事实"，读侧只从目录拿它）。
+    async fn apply_deletions(
+        &self,
+        entries: Vec<yuntun_model::dv::DeletionEntry>,
+    ) -> Result<u64, LakeError> {
+        let r = self
+            .propose(pb::Op {
+                now_ms: now_ms(),
+                kind: Some(pb::op::Kind::ApplyDeletions(pb::ApplyDeletionsOp {
+                    entries: entries.iter().map(op::deletion_to_proto).collect(),
+                })),
+            })
+            .await?;
+        self.refresh_best_effort().await;
+        // 快照号由状态机分配（单快照原子）→ 从刷新后的缓存读回，**不猜**
+        let _ = r;
+        Ok(self.cached(|c| c.snapshot))
     }
 
-    /// 远端形态**不可能有 DV**（上面那条 `apply_deletions` 直接拒绝）⇒ 空列表是**事实**，不是猜测。
-    ///
-    /// ⚠️ **`F.3b` 必须把这两个方法一起接上**：一旦远端能写 DV 而这里还返回空，
-    /// 就已经删掉的行就会**复活**（静默错结果）。这条注释是那个前提的显式抵押。
+    /// 某表在某快照下生效的删除向量：**从本地缓存读**（与 `list_visible_files` 同一个理由 ——
+    /// `LocalCatalog` 的刷新路径是逐表同步的，这里不能再过网络）。
     async fn list_deletions(
         &self,
-        _table: &str,
-        _snapshot: u64,
-    ) -> Result<Vec<DeletionEntry>, LakeError> {
-        Ok(Vec::new())
+        table: &str,
+        snapshot: u64,
+    ) -> Result<Vec<yuntun_model::dv::DeletionEntry>, LakeError> {
+        self.refresh().await?;
+        let key = normalize(table);
+        let mut out: Vec<yuntun_model::dv::DeletionEntry> = self.cached(|c| {
+            c.deletions
+                .values()
+                .filter(|d| normalize(&d.table) == key && d.active_at(snapshot))
+                .cloned()
+                .collect()
+        });
+        // 与状态机同序（那边是 `BTreeMap<(dv_id, file_path)>` 的键序）：对拍才有意义
+        out.sort_by(|a, b| (&a.dv_id, &a.file_path).cmp(&(&b.dv_id, &b.file_path)));
+        Ok(out)
     }
 
+    /// **撤销**锚定在某文件上的删除向量（`F.3d`：合并已把那些行物理重写掉）。
     async fn revoke_deletions_for_file(
         &self,
-        _file_path: &str,
-        _at: u64,
+        file_path: &str,
+        at: u64,
     ) -> Result<usize, LakeError> {
-        Err(LakeError::Other(
-            "删除向量的远端撤销尚未接线（`plan.md` F.3b/F.3c）".into(),
-        ))
+        let r = self
+            .propose(pb::Op {
+                now_ms: now_ms(),
+                kind: Some(pb::op::Kind::RevokeDeletions(pb::RevokeDeletionsOp {
+                    file_path: file_path.to_string(),
+                    at,
+                })),
+            })
+            .await?;
+        self.refresh_best_effort().await;
+        // 精确条数由状态机算出来随 `affected` 过线（客户端看不到"哪几条被撤销了"）
+        Ok(r.affected as usize)
     }
 
     async fn drop_shard(&self, table: &str, shard: &str) -> Result<u64, LakeError> {
@@ -1099,6 +1144,7 @@ mod tests {
                         manifest: Some(manifest),
                     }],
                     namespaces: vec!["public".into()],
+                    deletions: Vec::new(),
                     idempotency_keys: Vec::new(),
                 }),
             }

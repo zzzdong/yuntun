@@ -324,10 +324,27 @@ fn propose_request_roundtrips_for_every_op_variant() {
                 committed_at: 1_700_000_000,
             }),
         }),
+        // `F.3c-3`：删除向量的登记 —— **逐字段非零**（`0` / 空串会让"忘了搬字段"看不出来）
+        op::Kind::ApplyDeletions(ApplyDeletionsOp {
+            entries: vec![DeletionEntryMsg {
+                dv_id: "dv-1".into(),
+                table: "public.cpu".into(),
+                file_path: "yuntun/public/cpu/dt=w/shard=s0/b1.parquet".into(),
+                batch_id: "b1".into(),
+                applied_at: 42,
+                revoked_at: 0,
+                card: 7,
+                store_path: "yuntun/public/cpu/dt=w/shard=s0/dv/b1.parquet/dv-1.bin".into(),
+            }],
+        }),
+        op::Kind::RevokeDeletions(RevokeDeletionsOp {
+            file_path: "yuntun/public/cpu/dt=w/shard=s0/b1.parquet".into(),
+            at: 43,
+        }),
     ];
     assert_eq!(
         variants.len(),
-        9,
+        11,
         "分支数变了：请把新分支加进来，并更新 meta.proto 的迁移进度表"
     );
     for kind in variants {

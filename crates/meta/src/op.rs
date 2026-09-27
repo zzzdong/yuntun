@@ -64,6 +64,17 @@ pub enum StateOp {
         shard: String,
         now_ms: u64,
     },
+    /// `F.3c-3`：登记一批删除向量（一次 DELETE 的**全部条目** —— 单快照原子）。
+    ApplyDeletions {
+        entries: Vec<yuntun_model::dv::DeletionEntry>,
+        now_ms: u64,
+    },
+    /// `F.3d`：撤销锚定在某文件上的删除向量（合并已把那些行物理重写掉）。
+    RevokeDeletions {
+        file_path: String,
+        at: u64,
+        now_ms: u64,
+    },
     Compaction {
         old_batch_ids: Vec<String>,
         new_files: Vec<FileManifest>,
@@ -142,7 +153,9 @@ impl StateOp {
             | StateOp::RenewLease { now_ms, .. }
             | StateOp::ReleaseLease { now_ms, .. }
             | StateOp::RecordInFlight { now_ms, .. }
-            | StateOp::SweepInFlight { now_ms, .. } => *now_ms,
+            | StateOp::SweepInFlight { now_ms, .. }
+            | StateOp::ApplyDeletions { now_ms, .. }
+            | StateOp::RevokeDeletions { now_ms, .. } => *now_ms,
         }
     }
 }
@@ -270,6 +283,15 @@ pub fn decode_op(op: &pb::Op) -> Result<StateOp, MetaError> {
         },
         pb::op::Kind::RecordInFlight(r) => StateOp::RecordInFlight {
             batch_id: r.batch_id.clone(),
+            now_ms,
+        },
+        pb::op::Kind::ApplyDeletions(a) => StateOp::ApplyDeletions {
+            entries: a.entries.iter().map(deletion_from_proto).collect(),
+            now_ms,
+        },
+        pb::op::Kind::RevokeDeletions(r) => StateOp::RevokeDeletions {
+            file_path: r.file_path.clone(),
+            at: r.at,
             now_ms,
         },
         pb::op::Kind::SweepInFlight(s) => StateOp::SweepInFlight {
@@ -488,6 +510,34 @@ fn manifest_to_proto(f: &FileManifest) -> pb::FileManifestMsg {
 ///
 /// 逐字段搬，**不许省**：少一个字段意味着客户端的本地缓存里少一样东西，
 /// 而**不会有任何报错** —— 表现是"某个功能悄悄不生效"（本地难查、线上更难查）。
+/// `DeletionEntry` → proto（逐字段镜像；`PrefetchPayload` 与 op 都从这里走）。
+pub fn deletion_to_proto(d: &yuntun_model::dv::DeletionEntry) -> pb::DeletionEntryMsg {
+    pb::DeletionEntryMsg {
+        dv_id: d.dv_id.clone(),
+        table: d.table.clone(),
+        file_path: d.file_path.clone(),
+        batch_id: d.batch_id.clone(),
+        applied_at: d.applied_at,
+        revoked_at: d.revoked_at,
+        card: d.card,
+        store_path: d.store_path.clone(),
+    }
+}
+
+/// proto → `DeletionEntry`（与上面**成对**：只写一半就是"过线后字段悄悄丢"）。
+pub fn deletion_from_proto(m: &pb::DeletionEntryMsg) -> yuntun_model::dv::DeletionEntry {
+    yuntun_model::dv::DeletionEntry {
+        dv_id: m.dv_id.clone(),
+        table: m.table.clone(),
+        file_path: m.file_path.clone(),
+        batch_id: m.batch_id.clone(),
+        applied_at: m.applied_at,
+        revoked_at: m.revoked_at,
+        card: m.card,
+        store_path: m.store_path.clone(),
+    }
+}
+
 pub fn table_meta_to_proto(m: &TableMeta) -> pb::TableMeta {
     pb::TableMeta {
         // ⚠️ 线上以**全限定名**为权威：模型里 `name` 是裸名、schema 在另一个字段，
@@ -786,6 +836,29 @@ pub fn apply(state: &mut CatalogState, op: &StateOp) -> Result<ApplyOutcome, Met
             // 幂等：没有任何文件被标记删除（`n == 0`）= 无事可做
             let n = state.drop_shard(table, shard);
             Ok(ApplyOutcome::with_count(n))
+        }
+
+        StateOp::ApplyDeletions { entries, .. } => {
+            // 幂等与"有没有真的变"都由状态机自己判定（按 `(dv_id, file_path)` 去重）：
+            // 重复重放 ⇒ 快照号不变 ⇒ `hit()`（accepted=false 的那类语义）。
+            let before = state.current_snapshot();
+            state
+                .apply_deletions(entries.clone())
+                .map_err(MetaError::from_lake)?;
+            if state.current_snapshot() == before {
+                Ok(ApplyOutcome::hit())
+            } else {
+                Ok(ApplyOutcome::one())
+            }
+        }
+        StateOp::RevokeDeletions { file_path, at, .. } => {
+            // 撤销是"置 `revoked_at`"，不是删行（历史快照还要能回答"当时为什么少几行"）
+            let n = state.revoke_deletions_for_file(file_path, *at);
+            if n == 0 {
+                Ok(ApplyOutcome::hit())
+            } else {
+                Ok(ApplyOutcome::one())
+            }
         }
         StateOp::Compaction {
             old_batch_ids,

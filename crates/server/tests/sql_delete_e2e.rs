@@ -150,6 +150,60 @@ scan_interval_ms = 20
     .unwrap()
 }
 
+/// 起一次 `Lakehouse`（embedded 形态专用）：**重试**到 fjall 目录锁可用。
+///
+/// ⚠️ 实测：**同一进程内**重新打开同一个 meta 目录会一直 `FjallError: Locked`
+/// （`MetaNode::drop` 之后锁也没释放，重试 5 秒无效 —— `§151.3`）。
+/// 所以本用例**不做**"同进程重启"；这个助手留着是为了"起第一次"时的时序抖动。
+async fn build_embedded(cfg: &yuntun_server::Config, shutdown: CancellationToken) -> Arc<Lakehouse> {
+    for i in 0..25 {
+        match Lakehouse::build_with_shutdown(cfg, shutdown.clone()).await {
+            Ok(lh) => return Arc::new(lh),
+            Err(e) if format!("{e}").contains("Locked") => {
+                if i == 0 {
+                    // 记一条：看到它说明"上一次的锁还没放"，不是失败
+                    eprintln!("[test] meta 目录仍被上一次运行锁着，重试…");
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(e) => panic!("起 Lakehouse 失败：{e}"),
+        }
+    }
+    panic!("重试 5 秒仍拿不到 meta 目录（fjall 锁没释放）");
+}
+
+/// **默认形态**（`[meta] mode = "embedded"`：进程内 1 节点 raft + fjall 落盘）。
+///
+/// 与 `config()` 的唯一差别是目录形态 —— 这正是 `F.3c-3` 要证的那一件事：
+/// 删除向量的登记/读取**走目录（raft）**，而不是"某个进程的内存"。
+fn embedded_config(wal_dir: &str, store_root: &str, meta_dir: &str) -> yuntun_server::Config {
+    yuntun_server::Config::from_toml(&format!(
+        r#"
+[store]
+type = "local"
+root = "{store_root}"
+
+[wal]
+dir = "{wal_dir}"
+
+[meta]
+mode = "embedded"
+dir = "{meta_dir}"
+
+[chunk]
+spill_dir = "{wal_dir}/spill"
+
+[ingest]
+rows_threshold = 1
+time_threshold_secs = 5
+max_flush_delay_secs = 1
+flush_phase_spread_secs = 0
+scan_interval_ms = 20
+"#
+    ))
+    .unwrap()
+}
+
 async fn serve(
     lakehouse: &Arc<Lakehouse>,
     shutdown: CancellationToken,
@@ -465,4 +519,55 @@ async fn delete_refusals_are_explicit() {
         1
     );
     shutdown.cancel();
+}
+
+/// **默认形态（`embedded` metanode + raft）也能删**（`F.3c-3`）。
+///
+/// 三条：
+/// ① 登记走目录（`ApplyDeletions` op）—— 不是"某个进程的内存里删掉了"；
+/// ② 删后立刻查不到（缓存刷新那一步在 SQL 层同步做了）；
+/// ③ **读侧看到的也是目录里的那一份**：`deleted_card` 与查询结果都经
+///    `RemoteCatalog::list_deletions`（它从缓存视图读，而缓存视图来自 `PrefetchPayload.deletions`）
+///    —— 这正是**抵押①**要证的那件事："别的进程也看得见删除"。
+///
+/// > **为什么这条用例没有"重启"那一段**：fjall 的目录锁在**同一个测试进程内**上一次
+/// > `Lakehouse` 被 drop 之后**不释放**（实测重试 5 秒仍然 `Locked`，见 `§151.3`）——
+/// > 那是夹具的限制（产品形态下重启是**另一个进程**）。重启持久性由 `memory` 形态那条
+/// > （靠 WAL 重放）覆盖；`embedded` 形态的"元数据落盘"是本仓既有性质（fjall）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delete_works_in_the_default_embedded_assembly() {
+    let base_guard = yuntun_testkit::TestDir::tmpfs("sqldelete-embedded");
+    let base = base_guard.string();
+    let wal_dir = format!("{base}/wal");
+    let store_root = format!("{base}/store");
+    let meta_dir = format!("{base}/meta");
+    let cfg = embedded_config(&wal_dir, &store_root, &meta_dir);
+
+    // ============ 第一次运行 ============
+    {
+        let shutdown = CancellationToken::new();
+        let lakehouse = build_embedded(&cfg, shutdown.clone()).await;
+        let _bg = lakehouse.spawn_background(&cfg);
+        let mut client = serve(&lakehouse, shutdown.clone()).await;
+        execute_update(&mut client, "CREATE TABLE t (v BIGINT NOT NULL)").await;
+        assert_eq!(
+            execute_update(&mut client, "INSERT INTO t VALUES (1),(2),(3),(4)").await,
+            4
+        );
+        assert_eq!(
+            col_v_until(&mut client, "SELECT v FROM t ORDER BY v", &[1, 2, 3, 4]).await,
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(
+            execute_update(&mut client, "DELETE FROM t WHERE v IN (2, 4)").await,
+            2,
+            "默认形态下删除必须成功（不再是「尚未接线」）"
+        );
+        assert_eq!(col_v(&mut client, "SELECT v FROM t ORDER BY v").await, vec![1, 3]);
+        // 目录里真的有了（内部事实：不是只有查询缓存知道）
+        assert_eq!(deleted_card(&lakehouse, "public.t").await, 2);
+        shutdown.cancel();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
 }
