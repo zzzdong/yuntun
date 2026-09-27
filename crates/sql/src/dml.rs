@@ -47,7 +47,32 @@ use crate::{RawOutcome, SqlEngine, SqlError, session::SessionCtx};
 
 impl SqlEngine {
     /// `DELETE FROM t WHERE …`（见模块文档的六步）。
+    ///
+    /// 外层只做一件事：**先把表级 DML 租约拿到手**（与合并互斥，设计 §6.1）——
+    /// 删除的"定位 → 写位图 → 登记"必须相对**同一份基文件**成立：
+    ///
+    /// * 合并先跑、删除后跑 ⇒ 删除的位图锚在**已经转墓碑**的旧文件名上（惰性，删不掉东西）；
+    /// * 删除先跑、合并后跑 ⇒ 合并在读基文件时**看不到**这份位图 ⇒ **已删的行被写进新文件**（复活）。
+    ///
+    /// 两个方向都不能放任 ⇒ 两边用**同一把表级租约**（`yuntun_model::meta::dml_lease_purpose`）。
+    /// 拿不到就**当场拒绝**（不排队）：DELETE 是短操作，让调用方重试比在这里阻塞好。
+    ///
+    /// （表名解析两次是刻意的：外壳要表名才能取租约，本体要表名才能干活；`parse_delete_target` 是纯函数。）
     pub(crate) async fn execute_delete(
+        &self,
+        del: &Delete,
+        session: &SessionCtx,
+    ) -> Result<RawOutcome, SqlError> {
+        self.check_write()?;
+        let table = parse_delete_target(del, session)?;
+        let lease = DmlLease::acquire(self.catalog.clone(), &table).await?;
+        let out = self.execute_delete_inner(del, session).await;
+        lease.release().await;
+        out
+    }
+
+    /// 六步本体（见模块文档）。
+    async fn execute_delete_inner(
         &self,
         del: &Delete,
         session: &SessionCtx,
@@ -208,6 +233,63 @@ impl SqlEngine {
                 .or_insert(dv);
         }
         Ok(out)
+    }
+}
+
+/// DELETE 期间持有的**表级 DML 租约**（与合并互斥）。
+///
+/// ⚠️ **粒度是表**（不是 `(table, shard)`）：设计 §6.1 允许"退化为表级锁"，见
+/// `yuntun_model::meta::dml_lease_purpose` 的注释 —— 细粒度另开一刀（`§150.3`）。
+/// 现在的取舍：**宁可粗一点，也不要交错**。
+struct DmlLease {
+    catalog: std::sync::Arc<dyn yuntun_catalog::CatalogOps>,
+    purpose: String,
+    holder: String,
+    epoch: u64,
+}
+
+/// 租约时长：DELETE 是短操作（定位 + 写几个小对象 + 一次目录提交）；进程死掉时靠 TTL 释放。
+const DML_LEASE_TTL_MS: u64 = 30_000;
+
+impl DmlLease {
+    async fn acquire(
+        catalog: std::sync::Arc<dyn yuntun_catalog::CatalogOps>,
+        table: &str,
+    ) -> Result<Self, SqlError> {
+        let purpose = yuntun_model::meta::dml_lease_purpose(table);
+        let holder = format!("dml-{}", Uuid::now_v7());
+        let grant = catalog
+            .acquire_lease(
+                &purpose,
+                &holder,
+                yuntun_ingest::now_ms(),
+                DML_LEASE_TTL_MS,
+            )
+            .await
+            .map_err(SqlError::from_lake)?;
+        if !grant.granted {
+            return Err(SqlError::Unsupported(format!(
+                "另一处正在对表 {table} 做合并（表级 DML 租约被占用）：删除要等它结束再试 —— \
+                 两者必须在同一份基文件上串行（合并会消费删除向量，设计 §6.1）"
+            )));
+        }
+        Ok(Self {
+            catalog,
+            purpose,
+            holder,
+            epoch: grant.epoch,
+        })
+    }
+
+    /// 归还（best-effort）：还失败也只影响"接手方要不要等 TTL"，不影响这次删除的结果。
+    async fn release(self) {
+        if let Err(e) = self
+            .catalog
+            .release_lease(&self.purpose, &self.holder, self.epoch)
+            .await
+        {
+            tracing::warn!(error = %e, "释放删除租约失败（等待 TTL 过期即可）");
+        }
     }
 }
 

@@ -175,6 +175,26 @@ pub async fn compact_shard(
     snapshot: u64,
     lease_epoch: u64,
 ) -> Result<Option<u64>, LakeError> {
+    // 【F.3d】与**删除**互斥（表级 DML 租约）：合并会把基文件重写一遍（**消费**删除向量 ——
+    // 把已删的行丢掉），而删除要"定位 → 写位图 → 登记"相对**同一份基文件**成立。
+    // 两者交错的两个方向都错（见 `sql::dml` 的同名注释）。拿不到就**跳过本轮** ——
+    // 合并是后台作业，等下一轮没有代价（删除是用户操作，它优先）。
+    let Some(dml_lease) = TableDmlLease::acquire(compactor, table).await? else {
+        return Ok(None);
+    };
+    let out = compact_shard_inner(compactor, table, shard, snapshot, lease_epoch).await;
+    dml_lease.release().await;
+    out
+}
+
+/// 合并单个 shard 的本体（调用方已持有表级 DML 租约）。
+async fn compact_shard_inner(
+    compactor: &Compactor,
+    table: &str,
+    shard: &str,
+    snapshot: u64,
+    lease_epoch: u64,
+) -> Result<Option<u64>, LakeError> {
     let files = compactor
         .catalog
         .list_visible_files(table, snapshot, Some(shard))
@@ -183,13 +203,28 @@ pub async fn compact_shard(
         return Ok(None);
     }
 
-    // 读入全部文件 → concat（MVP：单文件输出；超限拆分留给 Phase 0.5）
+    // 【F.3d】删除向量（DV）：**读的时候就应用**（重写即消费）。
+    //
+    // 为什么必须在这一步应用：数据文件不可变，删除是"行位标记"；合并把文件读出来再写一遍 ——
+    // 若不带 DV，那些**已删的行会被原样写进新文件**（复活），而且此后没有任何 DV 能解释它们
+    // （新文件的行号与旧文件不成对应）。设计 §6.2 那句"行号随重写漂移 ⇒ DV 必须在重写时一并消费"
+    // 说的就是这件事。
+    //
+    // 为什么**必须先应用、后撤销**：`revoked_at` 的语义是"这份 DV 不再生效"，
+    // 而它只在**旧文件已经不可见**之后才成立。顺序反了就是"旧文件还看得见 + DV 已撤销"
+    // ⇒ 已删的行**当场复现**。所以撤销放在 `commit_compaction` **之后**（见下）。
+    let dvs = deletion_bitmaps(&compactor.catalog, &compactor.store, table, snapshot).await?;
     let mut batches = Vec::new();
+    let mut consumed = 0usize;
     for f in &files {
         let fb =
             yuntun_format::read_batch(&compactor.store, &f.file_path, compactor.format).await?;
-        for b in fb {
-            batches.push(b);
+        match dvs.get(&f.file_path) {
+            None => batches.extend(fb),
+            Some(dv) => {
+                consumed += 1;
+                batches.extend(apply_deletions(fb, dv, f.row_count, &f.file_path)?);
+            }
         }
     }
     if batches.is_empty() {
@@ -268,15 +303,109 @@ pub async fn compact_shard(
         commit_compaction_files(compactor, table, shard, old_ids, new_manifest, lease_epoch)
             .await?;
 
+    // 【F.3d】消费掉的 DV：在这里**撤销**（提交之后 —— 见上文"先应用后撤销"）。
+    //
+    // 撤销失败**不让整次合并失败**：合并已经提交且不可撤销，此时报错只会让调用方重试一次合并
+    //（多写一个文件），而残留的 DV 是**惰性**的 —— 它锚定的旧文件已经转墓碑，
+    // 读侧只会为"本次要读的文件"取 DV（`F.3b` 的 `file_deletions`）⇒ 它再也不会被应用。
+    // 但它会一直占据目录，所以这里**响亮地记一条 error**（`F.3d-2` 的清理口）。
+    for f in files.iter().filter(|f| dvs.contains_key(&f.file_path)) {
+        match compactor
+            .catalog
+            .revoke_deletions_for_file(&f.file_path, new_snapshot)
+            .await
+        {
+            Ok(n) if n > 0 => tracing::debug!(
+                table,
+                file = %f.file_path,
+                revoked = n,
+                snapshot = new_snapshot,
+                "删除向量已被合并消费并撤销"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::error!(
+                table,
+                file = %f.file_path,
+                error = %e,
+                "合并已完成，但撤销删除向量失败：残留条目是惰性的（旧文件已转墓碑），                 但会一直占着目录 —— 见 operation-log §150 的 F.3d-2"
+            ),
+        }
+    }
+
     tracing::info!(
         table,
         shard,
         merged_files = files.len(),
+        files_with_deletions = consumed,
         new_path = %new_path,
         new_snapshot,
         "shard compacted"
     );
     Ok(Some(new_snapshot))
+}
+
+/// 该表在某快照下**生效中**的 DV，按文件归并成位图（`file_path → DvBitmap`）。
+///
+/// 同一文件多份 DV 先 **OR**（删除是追加式的，设计 §2）；取不到/解不开 ⇒ **报错**
+///（合并是"把这些行写进新文件"的动作，拿不到位图就会把已删的行写进去 = 复活）。
+async fn deletion_bitmaps(
+    catalog: &Arc<dyn CatalogOps>,
+    store: &Arc<dyn object_store::ObjectStore>,
+    table: &str,
+    snapshot: u64,
+) -> Result<std::collections::HashMap<String, yuntun_model::dv::DvBitmap>, LakeError> {
+    let entries = catalog.list_deletions(table, snapshot).await?;
+    let mut out: std::collections::HashMap<String, yuntun_model::dv::DvBitmap> =
+        std::collections::HashMap::new();
+    for e in entries {
+        let bytes = yuntun_store::get_bytes(store.as_ref(), &e.store_path).await?;
+        let dv = yuntun_model::dv::DvBitmap::from_bytes(&bytes).map_err(|err| {
+            LakeError::Other(format!(
+                "{err}（表 {table} 的 {}，文件 {}）—— 合并必须能应用删除向量，                 取不到就拒绝重写（否则已删的行会被写进新文件）",
+                e.dv_id, e.file_path
+            ))
+        })?;
+        out.entry(e.file_path.clone())
+            .and_modify(|cur| cur.union_with(&dv))
+            .or_insert(dv);
+    }
+    Ok(out)
+}
+
+/// 把 DV 应用到一个文件的批次上：**丢掉落进位图的行**（行号是文件内的，跨批次累计）。
+///
+/// 与读侧 `F.3b` 的口径只有一个来源：`DvBitmap` 的行号 = 文件原始行序。
+/// 越界（`max >= row_count`）由 [`yuntun_model::dv::DvBitmap::keep_ranges`] 的统一护栏拒绝 ——
+/// 这里先调一次它，把"这份 DV 与这个文件对不上"挡在写新文件之前。
+fn apply_deletions(
+    batches: Vec<arrow::record_batch::RecordBatch>,
+    dv: &yuntun_model::dv::DvBitmap,
+    row_count: u64,
+    file_path: &str,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, LakeError> {
+    dv.keep_ranges(row_count).map_err(|e| {
+        LakeError::Other(format!("{e}（文件 {file_path}）"))
+    })?;
+    let mut out = Vec::with_capacity(batches.len());
+    let mut offset: u64 = 0;
+    for b in batches {
+        let n = b.num_rows() as u64;
+        let keep: arrow::array::BooleanArray = (offset..offset + n)
+            .map(|i| !dv.contains(i as u32))
+            .collect();
+        if keep.true_count() == 0 {
+            // 整批被删光：直接丢掉（不产生空批次 —— 空批次会让 concat 的 schema 推断变脆）
+        } else if keep.true_count() == n as usize {
+            out.push(b);
+        } else {
+            out.push(
+                arrow::compute::filter_record_batch(&b, &keep)
+                    .map_err(|e| LakeError::Other(format!("应用删除向量失败（{file_path}）：{e}")))?,
+            );
+        }
+        offset += n;
+    }
+    Ok(out)
 }
 
 /// 通过 [`CatalogOps::commit_compaction`] 提交（L2：旧文件 `deleted_at` + 新文件
@@ -295,6 +424,83 @@ async fn commit_compaction_files(
         .await
 }
 
+/// **表级 DML 租约**的持有者（`F.3d`）：合并期间挡住同一张表的删除。
+///
+/// 与 [`LeaseGate`] 的区别（别混）：
+///
+/// | | `LeaseGate`（`COMPACTION_LEASE`） | 本结构（`dml:<table>`） |
+/// |---|---|---|
+/// | 作用 | "谁是压缩作业" —— **全程持有** | "这张表此刻能不能改基文件" —— **每次合并持有** |
+/// | 粒度 | 全局（一个压缩器） | 表 |
+/// | 拿不到时 | 空转（别的节点在合并） | 跳过这张表（有删除在跑） |
+struct TableDmlLease {
+    catalog: Arc<dyn CatalogOps>,
+    purpose: String,
+    holder: String,
+    epoch: u64,
+}
+
+impl TableDmlLease {
+    /// `Ok(None)` = **别人正持有**（有删除在跑）⇒ 本轮跳过这张表；`Err` = 元数据面出错。
+    async fn acquire(
+        compactor: &Compactor,
+        table: &str,
+    ) -> Result<Option<Self>, LakeError> {
+        let purpose = yuntun_model::meta::dml_lease_purpose(table);
+        // holder 带 `-cmp` 后缀：与 DELETE 的持有者（`dml-<uuid>`）不会撞名，
+        // 也让"同一压缩器重复取租约"落在状态机的**幂等**分支上（T14.1 的语义）。
+        let holder = format!("{}-cmp", compactor.lease_holder);
+        let grant = compactor
+            .catalog
+            .acquire_lease(
+                &purpose,
+                &holder,
+                now_ms(),
+                compactor.cfg.lease_ttl.as_millis() as u64,
+            )
+            .await?;
+        if !grant.granted {
+            tracing::debug!(
+                table,
+                holder = %holder,
+                "跳过这张表的合并：表级 DML 租约被占用（有删除在跑）"
+            );
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            catalog: compactor.catalog.clone(),
+            purpose,
+            holder,
+            epoch: grant.epoch,
+        }))
+    }
+
+    async fn release(self) {
+        if let Err(e) = self
+            .catalog
+            .release_lease(&self.purpose, &self.holder, self.epoch)
+            .await
+        {
+            // 只影响"删除要多等一个 TTL"，不影响这次合并的结果
+            tracing::warn!(error = %e, purpose = %self.purpose, "释放表级 DML 租约失败（等 TTL 即可）");
+        }
+    }
+}
+
+/// **对账键**：一个对象靠哪个 `batch_id` 活命（`§12.2.1` / `delta-dml-design §6.2`）。
+///
+/// * **数据文件 / 索引文件**：自己的文件名 stem（`b7.parquet` / `b7.idx` → `b7`）；
+/// * **删除向量**：它**锚定**的数据文件的 batch_id ——
+///   ⚠️ 用 `extract_batch_id`（= 文件名 stem）会拿到 `dv_id`，而 `dv_id` **永远不在**
+///   `known_batch_ids` 里 ⇒ 每份 DV 都会被判成孤儿、静置期后删掉 ⇒ 它标记的行**复活**。
+///   这条是 `F.3d` 必须与"消费 DV"同刀落地的另一半（`§150`）。
+pub fn reconciliation_key(path: &str) -> Option<String> {
+    if let Some(anchor) = yuntun_format::dv_anchor_batch_id(path) {
+        return Some(anchor);
+    }
+    yuntun_format::extract_batch_id(path)
+}
+
 /// 孤儿文件判定（§9.1 / §12.2.1）：
 /// - S3 有、Meta 无 batch_id → 孤儿（崩溃于写 S3 后、CommitFiles 前）
 /// - S3 无、Meta 有 → 数据丢失，告警（人工介入）
@@ -309,7 +515,7 @@ pub fn classify_orphans(
     let _ = (last_modified_ms, grace);
     s3_paths
         .into_iter()
-        .filter(|p| match yuntun_format::extract_batch_id(p) {
+        .filter(|p| match reconciliation_key(p) {
             Some(id) => !known_batch_ids.contains(&id),
             None => true,
         })
@@ -404,7 +610,7 @@ pub fn spawn_orphan_cleanup_with_interval(
             let mut removed = 0usize;
             let mut current: HashSet<String> = HashSet::new();
             for (path, _size) in &objects {
-                let Some(bid) = yuntun_format::extract_batch_id(path) else {
+                let Some(bid) = reconciliation_key(path) else {
                     continue;
                 };
                 current.insert(bid.clone());
@@ -515,6 +721,47 @@ pub async fn list_s3_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **孤儿 GC 不许误删活着的删除向量**：对账键必须落在它锚定的数据文件上。
+    #[test]
+    fn orphan_reconciliation_protects_live_deletion_vectors() {
+        let known: HashSet<String> = ["b7".to_string()].into_iter().collect();
+        let paths: HashSet<String> = [
+            "yuntun/public/t/dt=w/shard=s0/b7.parquet".to_string(),
+            "yuntun/public/t/dt=w/shard=s0/b7.idx".to_string(),
+            // DV 锚定 b7 ⇒ 必须**被保护**（不能因为 `dv-1` 不在 known 里就删）
+            "yuntun/public/t/dt=w/shard=s0/dv/b7.parquet/dv-1.bin".to_string(),
+            // DV 锚定的数据文件已经不在了 ⇒ 它才是孤儿
+            "yuntun/public/t/dt=w/shard=s0/dv/gone.parquet/dv-2.bin".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        let mut orphans = classify_orphans(paths, &known, 0, Duration::from_secs(0));
+        orphans.sort();
+        assert_eq!(
+            orphans,
+            vec!["yuntun/public/t/dt=w/shard=s0/dv/gone.parquet/dv-2.bin".to_string()],
+            "活着的 DV 与其数据文件一样受保护；只有锚定对象已消失的 DV 才是孤儿"
+        );
+    }
+
+    #[test]
+    fn reconciliation_key_covers_data_index_and_dv() {
+        assert_eq!(
+            reconciliation_key("yuntun/public/t/dt=w/shard=s0/b7.parquet").as_deref(),
+            Some("b7")
+        );
+        assert_eq!(
+            reconciliation_key("yuntun/public/t/dt=w/shard=s0/b7.idx").as_deref(),
+            Some("b7"),
+            "索引与数据同 stem ⇒ 同一条口径"
+        );
+        assert_eq!(
+            reconciliation_key("yuntun/public/t/dt=w/shard=s0/dv/b7.parquet/dv-1.bin").as_deref(),
+            Some("b7"),
+            "DV 用锚定的数据文件"
+        );
+    }
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc as SArc;

@@ -429,5 +429,40 @@ async fn delete_refusals_are_explicit() {
         col_v_until(&mut client, "SELECT v FROM t ORDER BY v", &[1]).await,
         vec![1]
     );
+
+    // 【F.3d】合并正在跑（**表级 DML 租约**被占）时，DELETE **当场拒绝** ——
+    // 两者必须在同一份基文件上串行：合并会消费 DV，交错会让已删的行复活（或把 DV 挂到墓碑上）。
+    let dml_purpose = yuntun_model::meta::dml_lease_purpose("public.t");
+    let held = lakehouse
+        .catalog
+        .acquire_lease(&dml_purpose, "someone-else", yuntun_ingest::now_ms(), 30_000)
+        .await
+        .unwrap();
+    assert!(held.granted, "前提：这把租约现在被占着");
+    let msg = match lakehouse
+        .sql
+        .execute("DELETE FROM t WHERE v = 1", &mut session)
+        .await
+    {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("合并在跑时 DELETE 不许成功"),
+    };
+    assert!(
+        msg.contains("合并") && msg.contains("租约"),
+        "拒绝必须点名「和谁冲突」：{msg}"
+    );
+    // 归还租约之后又能删了（拒绝只是"此刻不行"，不是"永久不行"）
+    assert!(
+        lakehouse
+            .catalog
+            .release_lease(&dml_purpose, "someone-else", held.epoch)
+            .await
+            .unwrap(),
+        "归还必须成功（代次取自刚才那次授予）"
+    );
+    assert_eq!(
+        execute_update(&mut client, "DELETE FROM t WHERE v = 1").await,
+        1
+    );
     shutdown.cancel();
 }

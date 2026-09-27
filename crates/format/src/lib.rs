@@ -71,6 +71,29 @@ pub fn extract_batch_id(path: &str) -> Option<String> {
     Some(stem)
 }
 
+/// **删除向量（DV）对象的 GC 口径**：它锚定哪个数据文件（⇒ 用哪个 batch_id 保护它）。
+///
+/// DV 的路径是 `…/shard=…/dv/<数据文件名含扩展名>/<dv_id>.bin`（`delta-dml-design §3.1`）。
+///
+/// ⚠️ **最后一段是 `dv_id`，不是 `batch_id`** —— 若照 [`extract_batch_id`] 的口径对账，
+/// 每一份 DV 都会被判成孤儿（`dv_id` 永远不在 `known_batch_ids` 里），静置期一过就被删掉，
+/// 而它标记的那些行会**复活**（`F.3d` 差点踩上：`§150`）。
+/// 所以 DV 的保护判据只能取自它**锚定**的那一段（数据文件名）。
+pub fn dv_anchor_batch_id(path: &str) -> Option<String> {
+    let (_, after) = path.split_once("/dv/")?;
+    let file_name = after.split('/').next()?;
+    if file_name.is_empty() || file_name == after {
+        // `dv/` 后面必须紧跟一层"数据文件名"目录；否则这不是 DV 路径（保守返回 None）
+        return None;
+    }
+    Some(
+        file_name
+            .rsplit_once('.')
+            .map(|(stem, _)| stem.to_string())
+            .unwrap_or_else(|| file_name.to_string()),
+    )
+}
+
 /// 数据文件路径 → **索引文件路径**（`plan.md` F.4）：`…/x.parquet` → `…/x.idx`。
 ///
 /// 命名刻意与数据文件**同 stem**（只换扩展名），于是：
@@ -512,6 +535,27 @@ pub async fn list_objects(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **DV 的 GC 对账键是它锚定的数据文件**，不是 `dv_id`。
+    ///
+    /// 这条如果说错了，孤儿 GC 会把**活着的**删除向量当垃圾删掉（`dv_id` 永远不在
+    /// `known_batch_ids` 里）—— 那些行随之复活。
+    #[test]
+    fn dv_paths_are_anchored_to_their_data_file() {
+        let dv = "yuntun/public/t/dt=w/shard=s0/dv/b7.parquet/dv-1.bin";
+        assert_eq!(dv_anchor_batch_id(dv).as_deref(), Some("b7"), "锚定数据文件的 batch_id");
+        assert_eq!(
+            extract_batch_id(dv).as_deref(),
+            Some("dv-1"),
+            "`extract_batch_id` 拿到的是 dv_id —— 所以它**不能**用来给 DV 对账"
+        );
+        // 非 DV 路径：不冒充锚定
+        assert_eq!(dv_anchor_batch_id("yuntun/public/t/dt=w/shard=s0/b7.parquet"), None);
+        assert_eq!(dv_anchor_batch_id("yuntun/public/t/dt=w/shard=s0/b7.idx"), None);
+        // 形状不对（`dv/` 后面没有数据文件名那一层）⇒ 保守返回 None
+        assert_eq!(dv_anchor_batch_id("yuntun/public/t/dv/"), None);
+        assert_eq!(dv_anchor_batch_id("yuntun/public/t/dv/x"), None);
+    }
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc as SArc;

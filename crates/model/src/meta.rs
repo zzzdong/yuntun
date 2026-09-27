@@ -310,6 +310,19 @@ pub struct LeaseEntry {
 /// 两处各写一遍，改一处就静默失配（栅栏失效 = 白写）。
 pub const COMPACTION_LEASE: &str = "compaction";
 
+/// **表级 DML 租约**（`F.3d`）：删除与合并对**同一张表**互斥。
+///
+/// 为什么不复用 `COMPACTION_LEASE`：那把是**压缩作业的全程持有**（`LeaseGate` 拿到就一直续租）
+/// —— 复用它等于"只要压缩循环在跑，DELETE 永远拿不到租约"（实测就是这么炸的，`§150.2`）。
+///
+/// 为什么粒度取**表**而不是 `(table, shard)`：设计 §6.1 明写"跨 shard DML 也可退化为表级锁
+/// （实现择一，文档化选择）"。DELETE 是短操作，而"按 shard 名排序一次性获取"要在两处
+/// 都带上多把锁的生命周期管理；先取**安全的那一侧**，细粒度另开一刀（`§150.3`）。
+pub fn dml_lease_purpose(table: &str) -> String {
+    format!("dml:{table}")
+}
+
+
 /// 取租约的结果（`AcquireLease` 的 op 结果；trait 返回值同形状）。
 // `prost::Message` 自带 `Debug`/`Default`，重复 derive 会冲突
 #[derive(Clone, PartialEq, prost::Message)]
