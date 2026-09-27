@@ -250,6 +250,14 @@ impl CatalogOps for BrokenCatalog {
     ) -> Result<Vec<yuntun_model::dv::DeletionEntry>, yuntun_model::LakeError> {
         self.inner.list_deletions(table, snapshot).await
     }
+    async fn apply_update(
+        &self,
+        deletions: Vec<yuntun_model::dv::DeletionEntry>,
+        new_files: Vec<yuntun_model::meta::FileManifest>,
+        upd_id: &str,
+    ) -> Result<u64, yuntun_model::LakeError> {
+        self.inner.apply_update(deletions, new_files, upd_id).await
+    }
     async fn revoke_deletions_for_file(
         &self,
         file_path: &str,

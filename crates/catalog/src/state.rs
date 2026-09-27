@@ -641,6 +641,127 @@ impl CatalogState {
         Ok(next)
     }
 
+    /// **`UPDATE` 的原子提交**（`plan.md` F.7 决策 5、台账 `D-12` 已定）：
+    /// **删除向量 + 新行文件，一次快照**。
+    ///
+    /// # 为什么必须是"一个方法 + 一个快照号"
+    ///
+    /// `UPDATE` 的可见性口径是"读侧**不可能**看到'删了没插'或'插了没删'的中间态"。
+    /// 若分两步（先 [`Self::apply_deletions`] 再 [`Self::commit_files`]），两个事实会落在
+    /// **两个快照**上 —— 读侧必然能观察到中间态，而两种中间态都是**静默错**：
+    ///
+    /// * "删了没插" = 少数据（用户看到行凭空消失）；
+    /// * "插了没删" = **重复计数**（同一行出现两次，且不会报错）。
+    ///
+    /// 所以两个事实共用**同一个 `next_snapshot()`**：读侧要么看到旧状态、要么看到新状态。
+    ///
+    /// # 幂等（重放安全）
+    ///
+    /// 新文件按 `batch_id` 去重、删除向量按 `(dv_id, file_path)` 去重；
+    /// **两者全是重复** ⇒ **不推快照号**（与 `apply_deletions` / `commit_files` 同一条纪律）。
+    /// 重放一条已经生效过的 UPDATE 因此是**空操作**，不会把版本推上去。
+    pub fn apply_update(
+        &mut self,
+        entries: Vec<DeletionEntry>,
+        new_files: Vec<FileManifest>,
+        upd_id: &str,
+        now_secs: u64,
+    ) -> Result<u64, LakeError> {
+        // ① 归属校验：一次 UPDATE 只作用于**一张表**（跨表 UPDATE 是另一个特性，别在这里悄悄支持）
+        let mut table: Option<String> = None;
+        for t in new_files
+            .iter()
+            .map(|f| normalize_table(&f.table))
+            .chain(entries.iter().map(|e| normalize_table(&e.table)))
+        {
+            match &table {
+                None => table = Some(t),
+                Some(cur) if *cur != t => {
+                    return Err(LakeError::Other(format!(
+                        "UPDATE 的删除与新行必须属于同一张表：{cur} vs {t}"
+                    )));
+                }
+                _ => {}
+            }
+        }
+        let Some(table) = table else {
+            return Ok(self.snapshot_version); // 空 op：什么都不做
+        };
+
+        // ② 去重（重放幂等）
+        let fresh_files: Vec<FileManifest> = new_files
+            .into_iter()
+            .filter(|f| !f.batch_id.is_empty() && !self.files.contains_key(&f.batch_id))
+            .collect();
+        let fresh_dvs: Vec<DeletionEntry> = entries
+            .into_iter()
+            .filter(|e| {
+                !self
+                    .deletions
+                    .contains_key(&(e.dv_id.clone(), e.file_path.clone()))
+            })
+            .collect();
+        if fresh_files.is_empty() && fresh_dvs.is_empty() {
+            return Ok(self.snapshot_version);
+        }
+        for f in &fresh_files {
+            if f.batch_id.is_empty() {
+                return Err(LakeError::Other("UPDATE 的新文件缺 batch_id".into()));
+            }
+        }
+        for e in &fresh_dvs {
+            if e.dv_id.is_empty() || e.file_path.is_empty() {
+                return Err(LakeError::Other(
+                    "UPDATE 的删除向量缺必填字段（dv_id/file_path）".into(),
+                ));
+            }
+            if e.card == 0 {
+                return Err(LakeError::Other(format!(
+                    "UPDATE 的删除向量 {} 的 card 为 0：空删除不该进目录（`§3.1`）",
+                    e.dv_id
+                )));
+            }
+        }
+
+        // ③ **一个快照号服务两个事实** —— 这一行就是"原子"的全部
+        let next = self.next_snapshot();
+
+        for mut f in fresh_files {
+            f.valid_from = next;
+            f.status = FileStatus::Active as u32;
+            f.table = normalize_table(&f.table);
+            self.files.insert(f.batch_id.clone(), f);
+        }
+        for mut e in fresh_dvs {
+            e.table = normalize_table(&e.table);
+            e.applied_at = next;
+            e.revoked_at = 0;
+            if e.store_path.is_empty() {
+                e.store_path = yuntun_model::dv::dv_object_path(&e.file_path, &e.dv_id);
+            }
+            self.deletions
+                .insert((e.dv_id.clone(), e.file_path.clone()), e);
+        }
+
+        // ④ 版本推进：清单变了（增量通道要动）+ DV 是读快照的字段（缓存要全量重建）
+        if !upd_id.is_empty() {
+            // 幂等键：与 `commit_files` 的 `client_request_ids` 同一套口径
+            //（`upd_id` 的语义由 SQL 层定；这里只负责"登记成一条可查的事实"）
+            self.idempotency.insert(
+                upd_id.to_string(),
+                IdempotencyRecord {
+                    client_request_id: upd_id.to_string(),
+                    batch_id: String::new(),
+                    committed_at: now_secs,
+                },
+            );
+        }
+        self.bump_manifest_ver(&table);
+        self.bump_schema_ver();
+        self.last_applied += 1;
+        Ok(next)
+    }
+
     /// **某表在 `snapshot` 这个快照下生效的删除向量**（读侧唯一入口）。
     ///
     /// 过滤是**快照维度**的（`active_at`）：`applied_at <= snapshot < revoked_at`。
@@ -1872,6 +1993,89 @@ mod snapshot_tests {
             0,
             "已经是 revoked 的不再重复撤销"
         );
+    }
+
+    /// **`UPDATE` 的原子性**：删除向量与新行文件**共用同一个快照号**。
+    ///
+    /// 这条就是"原子可见"的**判据**：读侧按快照号切分，两个事实同号 ⇒ 要么都看得见、
+    /// 要么都看不见 —— 不存在"删了没插"（少数据）或"插了没删"（重复计数）的中间快照。
+    #[test]
+    fn update_puts_deletions_and_new_rows_on_one_snapshot() {
+        let mut s = rich_state();
+        let before = s.snapshot_version;
+        let files_before = s.list_visible_files("public.cpu", u64::MAX, None).len();
+
+        let mut new_file = commit_req("public.cpu", "b-upd", &[]).files[0].clone();
+        new_file.batch_id = "b-upd".into();
+        new_file.table = "public.cpu".into();
+        let dv = dv_entry("dv-upd", "public.cpu", "p/b1.parquet");
+
+        let snap = s
+            .apply_update(vec![dv.clone()], vec![new_file.clone()], "upd-1", 9_500)
+            .unwrap();
+        assert_eq!(snap, before + 1, "**一次状态转换、只推一个快照号**");
+
+        // 两个事实都在 `snap` 上生效（同一个号 ⇒ 同一时刻可见）
+        let files = s.list_visible_files("public.cpu", snap, None);
+        assert!(
+            files
+                .iter()
+                .any(|f| f.batch_id == "b-upd" && f.valid_from == snap),
+            "新文件必须在 `snap` 可见"
+        );
+        let live = s.list_deletions("public.cpu", snap);
+        assert_eq!(live.len(), 1, "删除向量也必须在 `snap` 生效");
+        assert_eq!(live[0].applied_at, snap, "两者**同号** —— 这就是原子性");
+
+        // 旧快照看到的是**旧状态**：新文件还不可见、删除也还没生效
+        assert!(
+            !s.list_visible_files("public.cpu", snap - 1, None)
+                .iter()
+                .any(|f| f.batch_id == "b-upd"),
+            "旧快照不许看到新行"
+        );
+        assert!(
+            s.list_deletions("public.cpu", snap - 1).is_empty(),
+            "旧快照不许看到删除（否则就是「删了没插」）"
+        );
+        assert!(
+            s.list_visible_files("public.cpu", u64::MAX, None).len() == files_before + 1,
+            "新文件确实进了清单"
+        );
+
+        // 幂等（重放）：完全重复 ⇒ 空操作，**不推快照号**
+        let again = s
+            .apply_update(vec![dv], vec![new_file], "upd-1", 9_501)
+            .unwrap();
+        assert_eq!(again, snap, "重放同一份 UPDATE 是空操作");
+        assert_eq!(s.list_deletions("public.cpu", snap).len(), 1, "不会插出第二份 DV");
+    }
+
+    /// `UPDATE` 的归属校验与空 op：跨表的"删 + 插"是另一个特性，不许悄悄支持。
+    #[test]
+    fn update_rejects_cross_table_and_is_a_noop_when_empty() {
+        let mut s = rich_state();
+        let mut other = commit_req("public.other", "b-x", &[]).files[0].clone();
+        other.batch_id = "b-x".into();
+        let e = s
+            .apply_update(
+                vec![dv_entry("dv-x", "public.cpu", "p/b1.parquet")],
+                vec![other],
+                "",
+                1,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("同一张表"), "跨表必须被拒绝：{e}");
+        assert_eq!(
+            s.apply_update(vec![], vec![], "", 1).unwrap(),
+            s.snapshot_version,
+            "空 op 不推版本"
+        );
+        // `card = 0` 的删除进不来（与 `apply_deletions` 同一条护栏）
+        let mut empty = dv_entry("dv-empty", "public.cpu", "p/b1.parquet");
+        empty.card = 0;
+        assert!(s.apply_update(vec![empty], vec![], "", 1).is_err());
     }
 
     /// **一次删除覆盖多个文件**：两个文件各留一份（键是 `(dv_id, file_path)`）。

@@ -30,6 +30,10 @@ struct Observed {
     visible_now: Vec<String>,
     /// `public.cpu` 在**旧快照**下可见的 batch_id（这条盯的是 MVCC：墓碑必须还在）
     visible_old: Vec<String>,
+    /// `public.cpu` 在"现在"生效的删除向量（`F.3c-3` 起进对拍）：`(dv_id, file_path, card)`
+    deletions_now: Vec<(String, String, u32)>,
+    /// 旧快照下生效的删除向量（撤销/生效的**窗口两端**都必须在两种形态下一致）
+    deletions_old: Vec<(String, String, u32)>,
 }
 
 async fn observed(c: &Arc<dyn CatalogOps>, old_snapshot: u64) -> Observed {
@@ -61,7 +65,22 @@ async fn observed(c: &Arc<dyn CatalogOps>, old_snapshot: u64) -> Observed {
         snapshot: c.current_snapshot().await,
         visible_now: ids(c.list_visible_files("public.cpu", u64::MAX, None).await.unwrap()),
         visible_old: ids(c.list_visible_files("public.cpu", old_snapshot, None).await.unwrap()),
+        deletions_now: dvs(c, u64::MAX).await,
+        deletions_old: dvs(c, old_snapshot).await,
     }
+}
+
+/// 某快照下生效的删除向量（排序后比较 —— 两边必须逐条一致）。
+async fn dvs(c: &Arc<dyn CatalogOps>, snapshot: u64) -> Vec<(String, String, u32)> {
+    let mut v: Vec<(String, String, u32)> = c
+        .list_deletions("public.cpu", snapshot)
+        .await
+        .expect("list_deletions")
+        .into_iter()
+        .map(|d| (d.dv_id, d.file_path, d.card))
+        .collect();
+    v.sort();
+    v
 }
 
 macro_rules! agree {
@@ -232,6 +251,69 @@ async fn remote_and_memory_catalogs_agree_on_the_same_ops() {
         now.visible_old.contains(&"b1".to_string()),
         "**旧快照**下必须仍能看到 b1（墓碑没被丢掉）：{now:?}"
     );
+
+    // ---- ⑥b UPDATE（`F.7` 决策 5：**一个 op 承载、原子可见**）----
+    //
+    // 断言两件事：① 两种形态一致（`Observed` 现在把 DV 也拉进了对拍）；
+    // ② **原子性的判据** —— 新行文件与删除向量落在**同一个快照号**上：读侧按快照号切分，
+    //    同号就意味着"要么都看得见、要么都看不见"，不存在"删了没插"或"插了没删"的中间态。
+    let dv = yuntun_model::dv::DeletionEntry {
+        dv_id: "dv-upd".into(),
+        table: "public.cpu".into(),
+        file_path: "p/b2.parquet".into(),
+        batch_id: "b2".into(),
+        applied_at: 0, // 由目录分配（两半共用一个）
+        revoked_at: 0,
+        card: 3,
+        store_path: String::new(), // 由目录按 §3.1 公式补
+    };
+    let mut new_file = commit("public.cpu", "b-upd", "", "s1").files[0].clone();
+    new_file.batch_id = "b-upd".into();
+    let rsnap = remote
+        .apply_update(vec![dv.clone()], vec![new_file.clone()], "upd-1")
+        .await
+        .expect("远端 UPDATE");
+    let msnap = memory
+        .apply_update(vec![dv.clone()], vec![new_file.clone()], "upd-1")
+        .await
+        .expect("本地 UPDATE");
+    assert_eq!(rsnap, msnap, "两种形态分配的快照号必须一致");
+    agree!("apply_update", remote, memory, old_snapshot);
+
+    for (name, c, snap) in [("远端", &remote, rsnap), ("本地", &memory, msnap)] {
+        let files = c.list_visible_files("public.cpu", snap, None).await.unwrap();
+        let nf = files
+            .iter()
+            .find(|f| f.batch_id == "b-upd")
+            .unwrap_or_else(|| panic!("{name}：新文件必须在 UPDATE 那一个快照上可见"));
+        assert_eq!(nf.valid_from, snap, "{name}：新文件与删除向量必须同号");
+        let live = c.list_deletions("public.cpu", snap).await.unwrap();
+        assert_eq!(live.len(), 1, "{name}：删除向量也在同一快照生效");
+        assert_eq!(live[0].applied_at, snap, "{name}：两者**同号** ⇒ 原子可见");
+        assert!(
+            !live[0].store_path.is_empty(),
+            "{name}：`store_path` 必须按 §3.1 的公式补上（重放/读侧靠它取位图）"
+        );
+        // 旧快照：两半都不可见（"要么都看见、要么都看不见"）
+        assert!(
+            !c.list_visible_files("public.cpu", snap - 1, None)
+                .await
+                .unwrap()
+                .iter()
+                .any(|f| f.batch_id == "b-upd"),
+            "{name}：旧快照不许看到新行"
+        );
+        assert!(
+            c.list_deletions("public.cpu", snap - 1).await.unwrap().is_empty(),
+            "{name}：旧快照不许看到删除（否则就是「删了没插」）"
+        );
+        // 重放同一份 op（幂等）：空操作，不推版本
+        let again = c
+            .apply_update(vec![dv.clone()], vec![new_file.clone()], "upd-1")
+            .await
+            .unwrap();
+        assert_eq!(again, c.current_snapshot().await, "{name}：重放不推版本");
+    }
 
     // ---- ⑦ 删表 ----
     remote.drop_table("analytics.metrics").await.expect("远端删表");

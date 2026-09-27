@@ -36,6 +36,7 @@
 // | `AcquireLease` / `RenewLease` / `ReleaseLease` | ✅（T14.1；结果 `LeaseGrant` 走 `ProposeResponse.result`） |
 // | `RecordInFlight` / `SweepInFlight` | ✅（T14.3：孤儿 GC 唯一能问的权威） |
 // | `ApplyDeletions` / `RevokeDeletions` | ✅（`F.3c-3`：删除向量 —— 必须走 raft，见下） |
+// | `Update` | ✅（`F.7` 决策 5：删除向量 + 新行**一条 op** —— 原子可见，见下） |
 //
 // 纪律的另一半在 `wire_compat.rs`：那里有一条断言分支数的用例，加分支必须同时更新它。
 
@@ -122,6 +123,13 @@ message Op {
     // 为什么也要走 raft：撤销是"这份 DV 不再生效"的可见性事实 ——
     // 只改本地，别的进程会继续按它过滤（少数据：本该出现的行被一直藏起来）。
     RevokeDeletionsOp revoke_deletions = 19;
+    // **`UPDATE` 的原子提交**（`plan.md` F.7 决策 5 / 台账 `D-12` 已定）。
+    //
+    // **必须走 raft**，而且**必须是一条 op**：`UPDATE` 的可见性口径是"读侧**不可能**看到
+    // '删了没插'或'插了没删'的中间态"。分成两条 op（先 `ApplyDeletions` 再 `CommitFiles`）
+    // 就会落在**两个快照**上，读侧必然能撞见中间态 —— 而两种中间态都是静默错
+    //（少数据 / **重复计数**）。状态机给两者分配**同一个快照号**，原子性就在那里。
+    UpdateOp update = 20;
   }
 }
 
@@ -556,6 +564,17 @@ message DeletionEntryMsg {
 // 登记一批删除向量（`F.3c-3`）。
 message ApplyDeletionsOp {
   repeated DeletionEntryMsg entries = 1;
+}
+
+// **`UPDATE` 的原子提交**（`F.7` 决策 5）：**删除向量 + 新行文件在同一条 op 里**。
+message UpdateOp {
+  // 被 UPDATE 命中的行（按文件标记删除）
+  repeated DeletionEntryMsg deletions = 1;
+  // UPDATE 产生的新行（每个源文件一个产物：**继承源文件的 shard / time_window**，
+  // 这样 `drop_shard` 与按分片的读路径语义不变）
+  repeated FileEntry new_files = 2;
+  // 幂等键（设计 §4.2 的 `upd_id`）：客户端可提供，用于重试去重与重放对账
+  string upd_id = 3;
 }
 
 // 撤销锚定在某文件上的删除向量（`F.3d`）。

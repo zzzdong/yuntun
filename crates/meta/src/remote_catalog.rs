@@ -924,6 +924,33 @@ impl CatalogOps for RemoteCatalog {
         Ok(out)
     }
 
+    /// **`UPDATE` 的原子提交**（`F.7` 决策 5）：一条 op 承载"删 + 插"。
+    async fn apply_update(
+        &self,
+        deletions: Vec<yuntun_model::dv::DeletionEntry>,
+        new_files: Vec<FileManifest>,
+        upd_id: &str,
+    ) -> Result<u64, LakeError> {
+        self.propose(pb::Op {
+            now_ms: now_ms(),
+            kind: Some(pb::op::Kind::Update(pb::UpdateOp {
+                deletions: deletions.iter().map(op::deletion_to_proto).collect(),
+                new_files: new_files
+                    .iter()
+                    .map(|f| pb::FileEntry {
+                        batch_id: f.batch_id.clone(),
+                        manifest: Some(op::manifest_to_proto_pub(f)),
+                    })
+                    .collect(),
+                upd_id: upd_id.to_string(),
+            })),
+        })
+        .await?;
+        self.refresh_best_effort().await;
+        // 快照号由状态机分配（两半共用同一个）→ 从刷新后的缓存读回，**不猜**
+        Ok(self.cached(|c| c.snapshot))
+    }
+
     /// **撤销**锚定在某文件上的删除向量（`F.3d`：合并已把那些行物理重写掉）。
     async fn revoke_deletions_for_file(
         &self,

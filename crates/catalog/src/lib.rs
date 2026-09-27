@@ -86,6 +86,18 @@ pub trait CatalogOps: Send + Sync {
         snapshot: u64,
     ) -> Result<Vec<DeletionEntry>, LakeError>;
 
+    /// **`UPDATE` 的原子提交**（`F.7` 决策 5）：删除向量 + 新行文件，**一个快照**。
+    ///
+    /// 为什么不是"先 `apply_deletions` 再 `commit_files`"：那两步会落在**两个快照**上，
+    /// 读侧必然能观察到中间态（"删了没插"少数据 / "插了没删"**重复计数**）—— 都是静默错。
+    /// 返回分配的快照号（两者共用的那一个）。
+    async fn apply_update(
+        &self,
+        deletions: Vec<DeletionEntry>,
+        new_files: Vec<FileManifest>,
+        upd_id: &str,
+    ) -> Result<u64, LakeError>;
+
     /// **撤销**锚定在某文件上的 DV（compaction 把那些行物理重写掉之后调用），返回条数。
     ///
     /// 置 `revoked_at` 而不是删行：删了就无法回答"某个历史快照当时看到什么"。
@@ -356,6 +368,20 @@ impl CatalogOps for MemoryCatalog {
         snapshot: u64,
     ) -> Result<Vec<DeletionEntry>, LakeError> {
         Ok(self.state.read().unwrap().list_deletions(table, snapshot))
+    }
+
+    async fn apply_update(
+        &self,
+        deletions: Vec<DeletionEntry>,
+        new_files: Vec<FileManifest>,
+        upd_id: &str,
+    ) -> Result<u64, LakeError> {
+        // 时钟在**宿主**取（状态机内读钟会让副本状态分叉 —— `state.rs` 纪律 1）
+        let now = now_secs();
+        self.state
+            .write()
+            .unwrap()
+            .apply_update(deletions, new_files, upd_id, now)
     }
 
     async fn revoke_deletions_for_file(

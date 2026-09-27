@@ -69,6 +69,13 @@ pub enum StateOp {
         entries: Vec<yuntun_model::dv::DeletionEntry>,
         now_ms: u64,
     },
+    /// `F.7` 决策 5：`UPDATE` 的**原子提交**（删除向量 + 新行文件，一个快照）。
+    Update {
+        entries: Vec<yuntun_model::dv::DeletionEntry>,
+        new_files: Vec<yuntun_model::meta::FileManifest>,
+        upd_id: String,
+        now_ms: u64,
+    },
     /// `F.3d`：撤销锚定在某文件上的删除向量（合并已把那些行物理重写掉）。
     RevokeDeletions {
         file_path: String,
@@ -155,7 +162,8 @@ impl StateOp {
             | StateOp::RecordInFlight { now_ms, .. }
             | StateOp::SweepInFlight { now_ms, .. }
             | StateOp::ApplyDeletions { now_ms, .. }
-            | StateOp::RevokeDeletions { now_ms, .. } => *now_ms,
+            | StateOp::RevokeDeletions { now_ms, .. }
+            | StateOp::Update { now_ms, .. } => *now_ms,
         }
     }
 }
@@ -283,6 +291,16 @@ pub fn decode_op(op: &pb::Op) -> Result<StateOp, MetaError> {
         },
         pb::op::Kind::RecordInFlight(r) => StateOp::RecordInFlight {
             batch_id: r.batch_id.clone(),
+            now_ms,
+        },
+        pb::op::Kind::Update(u) => StateOp::Update {
+            entries: u.deletions.iter().map(deletion_from_proto).collect(),
+            new_files: u
+                .new_files
+                .iter()
+                .filter_map(|e| e.manifest.as_ref().map(manifest_from_proto_pub))
+                .collect(),
+            upd_id: u.upd_id.clone(),
             now_ms,
         },
         pb::op::Kind::ApplyDeletions(a) => StateOp::ApplyDeletions {
@@ -844,6 +862,23 @@ pub fn apply(state: &mut CatalogState, op: &StateOp) -> Result<ApplyOutcome, Met
             let before = state.current_snapshot();
             state
                 .apply_deletions(entries.clone())
+                .map_err(MetaError::from_lake)?;
+            if state.current_snapshot() == before {
+                Ok(ApplyOutcome::hit())
+            } else {
+                Ok(ApplyOutcome::one())
+            }
+        }
+        StateOp::Update {
+            entries,
+            new_files,
+            upd_id,
+            ..
+        } => {
+            // 原子性由 `CatalogState::apply_update` 保证（两者共用**同一个**快照号）
+            let before = state.current_snapshot();
+            state
+                .apply_update(entries.clone(), new_files.clone(), upd_id, now / 1000)
                 .map_err(MetaError::from_lake)?;
             if state.current_snapshot() == before {
                 Ok(ApplyOutcome::hit())

@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§152，2026-09-27**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§153，2026-09-27**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -9780,3 +9780,69 @@ peeling 构造写错的后果是"多剪一个组" ⇒ **静默少数据**，而"
 > 它按"等攒批循环"的挂钟耐心判成败，重负载下会被邻居挤掉。
 > 与既知的两条（`query::partial_fanout::slow_sources…`、`chaos::disk_watermark…`）记在一起：
 > **要修都得给它们不依赖挂钟的判据。**
+
+---
+
+## 153. **F.3e-1：`UPDATE` 的原子提交（一个新 op：删 + 插同一个快照）**（2026-09-27）
+
+用户在 `D-12` 上的裁决：**采用 `plan.md` F.7 决策 5 —— "一个 op 承载、原子可见"**。
+这条裁决把 `UPDATE` 的实现路径定死了：**不能**用"先 `apply_deletions` 再 `commit_files`"
+两段式（那会落在两个快照上，读侧必然撞见中间态）。本刀落的就是那个"一个 op"。
+
+### 153.0 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `CatalogState::apply_update` | **一个 `next_snapshot()` 服务两个事实**：删除向量（`applied_at`）与新行文件（`valid_from`）**同号**；幂等（文件按 `batch_id`、DV 按 `(dv_id, file_path)`，全重复 ⇒ 不推版本）；归属校验（一次只作用于**一张表**） |
+| `meta.proto` | `UpdateOp { deletions, new_files, upd_id }`（`oneof kind` tag **20**）+ 迁移表补一行 |
+| `meta/src/op.rs` | `StateOp::Update` + Kind 转换 + apply（`hit()`/`one()` 按快照号是否推进判定） |
+| `CatalogOps::apply_update` | 新 trait 方法 + `MemoryCatalog`（宿主取钟）+ `RemoteCatalog`（propose）实现 |
+| `remote_catalog_parity.rs` | `Observed` **把删除向量也拉进对拍**（`deletions_now` / `deletions_old`）+ 新阶段 **⑥b**：两种形态的 `apply_update` 结果逐项一致 + **原子性判据** + 幂等重放 |
+| `state.rs` 单测 | `update_puts_deletions_and_new_rows_on_one_snapshot`（同号 = 原子）、`update_rejects_cross_table_and_is_a_noop_when_empty` |
+| `wire_compat` | 分支数 11 → **12** |
+
+### 153.1 原子性的**判据**（不是"看起来原子"）
+
+读侧是按**快照号**切分世界的（文件用 `valid_from`、删除向量用 `applied_at`/`revoked_at`）。
+于是"原子"这句话在代码里有一个**可断言的形状**：
+
+```
+文件.valid_from == 删除向量.applied_at == 本次 op 分配的那个快照号
+```
+
+三条断言都落在用例里（状态机 + 对拍各一遍）：
+
+* 新文件在 `snap` 可见、且 `valid_from == snap`；
+* 删除向量在 `snap` 生效、且 `applied_at == snap`（**同号**）；
+* **旧快照 `snap - 1` 下两半都不可见** —— 没有"删了没插"（少数据）也没有"插了没删"（重复计数）。
+* 另外：**一次状态转换只推一个快照号**（`snap == before + 1`）—— 若分两步就会是 +2。
+
+### 153.2 与设计文档的冲突：以用户裁决为准，并把文档改过来
+
+`delta-dml-design §4.2` 原来写的是"WAL 原子；**可见性不原子**（删即时、插经攒批）"，
+与 F.7 决策 5 正面冲突。本刀按裁决实现，并在设计文档里加了**显式修订块**
+（不重写历史：原文保留，加"修订（2026-09-27，用户决定）"并说清代价）——
+代价是：新行**不再走 Data 攒批那条路**，而是在 op 之前**先落成一个文件**
+（每个源文件一个产物，继承它的 `shard` / `time_window`），这样两半才能在同一个快照上生效。
+
+### 153.3 边界（`F.3e-2` 待做）
+
+1. **SQL 前端**（`UPDATE t SET … WHERE …`）：解析、把 `SET` 表达式求成新行、写文件、调 `apply_update`、
+   刷缓存 —— 下一刀。⇒ **现在还不能 `UPDATE`**（SQL 层没有分支）。
+2. **WAL `UpdatePayload`（type 7）+ `replay_wal_dml` 处理**：下一刀（与本刀同批）。
+   在它落地之前，`UPDATE` 不能对外开（否则崩溃就丢：WAL 里没有这条事实）。
+3. **`UPDATE … FROM` / `RETURNING` / 多表**：明确拒绝（下一刀跟在解析里）。
+4. 每个源文件一个产物：`UPDATE` 命中 N 个文件就产生 N 个新文件 + N 份 DV（都进同一条 op）。
+   好处是 `shard`/`time_window` 归属不变（`drop_shard` 语义不受影响）；代价是"宽 `UPDATE` 会碎文件" ——
+   合并迟早会收掉（`F.3d`）。
+
+### 153.4 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **491 passed / 0 failed / 0 ignored**（本刀 +3）；
+- 状态机：`update_puts_deletions_and_new_rows_on_one_snapshot`（同号 + 旧快照两半都不可见 + 幂等重放）、
+  `update_rejects_cross_table_and_is_a_noop_when_empty`（跨表拒绝、空 op 不推版本、`card = 0` 拒绝）；
+- `remote_catalog_parity` 阶段 ⑥b：**真 metanode（3 节点簇）**与 `MemoryCatalog` 的
+  `apply_update` 结果逐项一致（含 DV 的 `deletions_now/deletions_old` 对拍）、快照号一致、
+  原子性判据成立、重放不推版本；
+- `wire_compat`：`oneof kind` 分支数 11 → 12；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **5/5**。

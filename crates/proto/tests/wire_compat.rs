@@ -341,10 +341,28 @@ fn propose_request_roundtrips_for_every_op_variant() {
             file_path: "yuntun/public/cpu/dt=w/shard=s0/b1.parquet".into(),
             at: 43,
         }),
+        // `F.7` 决策 5：UPDATE —— **删 + 插在同一条 op 里**（原子可见）
+        op::Kind::Update(UpdateOp {
+            deletions: vec![DeletionEntryMsg {
+                dv_id: "dv-upd".into(),
+                table: "public.cpu".into(),
+                file_path: "yuntun/public/cpu/dt=w/shard=s0/b1.parquet".into(),
+                batch_id: "b1".into(),
+                applied_at: 44,
+                revoked_at: 0,
+                card: 2,
+                store_path: "yuntun/public/cpu/dt=w/shard=s0/dv/b1.parquet/dv-upd.bin".into(),
+            }],
+            new_files: vec![FileEntry {
+                batch_id: "b-upd".into(),
+                manifest: Some(to_manifest(&FileManifest::default())),
+            }],
+            upd_id: "upd-1".into(),
+        }),
     ];
     assert_eq!(
         variants.len(),
-        11,
+        12,
         "分支数变了：请把新分支加进来，并更新 meta.proto 的迁移进度表"
     );
     for kind in variants {
