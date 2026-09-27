@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§136，2026-09-27**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§137，2026-09-27**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -8777,6 +8777,54 @@ vortex 写入：Other error: Aggregate vortex.max not permitted by ctx
   `crates/format/src/lib.rs` 里 `vortex_tests` 模块那份，两者内容一致）。
 
 ### 136.3 验证
+
+- `cargo build -p yuntun-format`（默认）与 `--features vortex` → **均通过**（占位版）；
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **410 passed / 0 failed / 0 ignored**；
+- 文档一致性判据（`§123`）**5/5 绿**；
+- ⚠️ 边界同 `§135.4`：**默认套件不含 vortex**（可选依赖），往返用例仍随占位撤下。
+
+---
+
+## 137. `Vortex` codec 第四版：**假设错了** —— 根因是 `ctx` 的编码白名单（2026-09-27）
+
+### 137.0 结论
+
+`§136` 我判断"数组与写入不同源" ⇒ 改成**同一个 session**（`session.arrow()`）后，**错误一字未变**：
+
+```
+vortex 写入：Other error: Aggregate vortex.max not permitted by ctx
+```
+
+⇒ **假设错了**。顺着这条消息找到真正的检查点：
+
+```
+vortex-array-0.86.1/src/serde.rs:251
+    let encoding_idx = self.ctx.intern(&array.serialized_id)
+        .ok_or_else(|| vortex_err!("Serialized array ID {} not permitted by ctx", …))
+```
+
+⇒ `ctx` 维护的是**"已启用 edition 允许的编码"白名单**（见 `VortexWriteOptions` 的文档：
+*"When edition enforcement is enabled, the set of encodings permitted in the file is snapshotted
+from the session's enabled editions"*），而我们的 `array_session()` **没有启用任何 edition**
+⇒ 白名单为空 ⇒ 任何编码都 intern 不进去。
+
+已按纪律**退回占位**（两种构建都保持绿）。
+
+### 137.1 这一版新确认的（不因回退而失效）
+
+* `ArrowSessionExt::arrow(&self) -> SessionGuard<ArrowSession>`（`vortex-arrow/src/session.rs:844`）
+  ⇒ 造数组/读回数组都可以走 `session.arrow()`；
+* `async move` 会把捕获的 `buf` 一起搬走 ⇒ **字节缓冲区要在异步块内造并作为结果返回**
+  （否则外面拿不到字节，`§136` 的第三版就栽在这）；
+* runtime 的接法（`block_on` 给 `Handle` + `with::<RuntimeSession>()`）已经验证有效 ✓。
+
+### 137.2 下一刀（一步即可）
+
+**启用 edition**：入口在 `vortex::editions`（`vortex/src/lib.rs` 有 `pub mod editions`），
+或 `VortexWriteOptions` 上的 edition 开关 ⇒ 一次 `grep`（`EditionSession` / `fn with_edition`）
++ 一次编译即可收口。之后放回往返用例（`§136` 那份已写好）。
+
+### 137.3 验证
 
 - `cargo build -p yuntun-format`（默认）与 `--features vortex` → **均通过**（占位版）；
 - 全量 `cargo test --workspace --no-fail-fast -j 4` → **410 passed / 0 failed / 0 ignored**；
