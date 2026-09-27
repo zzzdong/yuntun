@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§133，2026-09-26**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§134，2026-09-27**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -8619,3 +8619,52 @@ EXPLAIN ANALYZE SELECT count(*) FROM audit WHERE event_time < 1000
 - `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
 - 文档一致性判据（`§123`）**5/5 绿**；
 - 规模：53,514 行 / 20 个 crate / 411 个测试函数（本刀不新增用例）。
+
+---
+
+## 134. `Vortex` codec 第一次尝试：**没接成，已退回占位**（附完整的 API 事实清单）（2026-09-27）
+
+### 134.0 结论
+
+`encode_vortex` / `decode_vortex` 的**第一版实现写出来了，但没编译过** ⇒ 按纪律**退回占位**
+（绝不能把编译不过的代码留在树上）。本刀的价值不在代码，在于把 **vortex 0.86 的 API 形状**
+摸清了 —— 下面这张表是下一刀的起点，别再考古一遍。
+
+### 134.1 已确证的 API（0.86.1，全部来自 registry 源码，不是猜的）
+
+| 用途 | 入口 | 位置 / 备注 |
+|---|---|---|
+| arrow → vortex | `ArrowSession::from_arrow_record_batch(batch, &Schema)` | `vortex-arrow/src/session.rs:522`；`ArrowSession: Default` ✅ |
+| vortex → arrow | `ArrowSession::execute_arrow(array, Option<&Field>, &mut ExecutionCtx)` | `session.rs:555`；`target = None` ⇒ 让 vortex 挑最便宜的物理类型（**我们只有字节、没有写入时的 schema，正是要 `None`**） |
+| `ExecutionCtx` | `session.create_execution_ctx()` | **必须** `use vortex::array::VortexSessionExecute`（trait 方法，`legacy_session()` 返回 `&'static VortexSession`） |
+| 弃用警告 | `FromArrowArray` / `IntoArrowArray` **已 deprecated** | 必须用 `ArrowSession`（否则 clippy 会红） |
+| 写（**async**） | `VortexWriteOptions::new(session).write(sink, stream)` | `vortex-file/src/writer.rs:223`；`sink: impl VortexWrite`、`stream: impl ArrayStream` |
+| 写（**同步**） | `BlockingWrite<'rt, B: BlockingRuntime>::write(sink, iter)` | `writer.rs:637`；⚠️ **要一个 `BlockingRuntime`**，怎么拿到还没查 ⇒ 别指望它 |
+| 迭代器 → stream | `ArrayStreamExt::into_array_stream()` | `vortex-array/src/iter.rs:69`（`std::iter::once(Ok(a))` **不是** `ArrayStream`） |
+| 扫描 → 数据 | `ScanBuilder::into_array_stream()` / `into_record_batch_stream(schema)` | `vortex-layout/src/scan/scan_builder.rs:117`、`scan/arrow.rs`（后者要显式 schema） |
+| 内存字节当输入 | `impl VortexReadAt for ByteBuffer` | `vortex-io/src/read_at.rs:204` ⇒ 不必落盘 |
+
+### 134.2 卡在哪（就这三处，下一刀直接照着改）
+
+1. **`VortexWriteOptions::new(session)` 的 `write` 是 async**，且 sink 要 `VortexWrite`（`Vec<u8>` 不是）；
+   同步那条路是 `BlockingWrite<…>`，**需要一个 `BlockingRuntime` 实例** —— 怎么构造没查到；
+2. **`VortexOpenOptions` 既没有 `new()` 也没有 `Default`** —— 它的构造入口还没找到（`open.rs` 里
+   只看到 `session()` 之类的方法）⇒ 读这一侧的入口不明；
+3. 于是 **encode / decode 两头都缺一个"入口对象"**（一个要 runtime、一个要 options 的构造器）。
+
+⇒ 下一步最省的做法：**在 `vortex-file` 源码里搜 `impl Default for VortexOpenOptions` 与
+`BlockingRuntime` 的实现者**（`grep -rn 'impl BlockingRuntime for'`），拿到这两个名字后，
+`§134.1` 那张表就足够把 codec 一次写对。
+
+### 134.3 为什么"没成"也要记
+
+`§130` 的教训是"**没核实就下结论**"，`§134` 的反面是"**试了但没成，也要留下路标**" ——
+差别在于：前者让下一次重新踩一遍坑，后者让下一次从**已知的三处**起步。
+本刀的产出是**一张 API 表 + 三个未解的名字**，不是代码。
+
+### 134.4 验证
+
+- `cargo build -p yuntun-format` → **通过**（默认路径，占位实现）；
+- `cargo build -p yuntun-format --features vortex` → **通过**（vortex 0.86 的树能编）；
+- 全量 / clippy 与 `§133` 同（本刀未改行为，代码回到 `§133` 的占位状态）；
+- 文档一致性判据（`§123`）**5/5 绿**。
