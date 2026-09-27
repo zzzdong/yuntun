@@ -234,24 +234,207 @@ fn decode_parquet(bytes: &[u8]) -> Result<Vec<arrow::record_batch::RecordBatch>,
     Ok(batches)
 }
 
-// ---------------- Vortex（feature flag 后面，ADR-1）----------------
+// ---------------- Vortex（feature flag 后面，ADR-1 / `§133`–`§139`）----------------
+//
+// # 为什么现在才写得出来
+//
+// `§130` 记过"Vortex 接不进来"：那时 `vortex 0.84` 用 **arrow 58**，与 datafusion 55 钉死的
+// **arrow 59** 不同代。`§133` 查明真相：**MSRV 1.94 把 cargo 逼退到 0.84**（0.86 要 rustc 1.95），
+// 而 **`vortex 0.86` 用 arrow-array ^59.2 —— 同代**。抬到 1.95 之后这条路才第一次真的通。
+//
+// # 四个"形状"上的坑（`§134`–`§138` 各踩过一遍，别再踩）
+//
+// 1. **session 必须有 runtime**：`array_session().with::<RuntimeSession>().with_handle(handle)`，
+//    `handle` 由 **`single::block_on` 直接递给闭包**（`FnOnce(Handle) -> Fut`）——
+//    别用 `Handle::find()`（裸线程里拿不到）；
+// 2. **edition 要先注册、再启用**：`register_default_editions(&session)` →
+//    `enable_default_editions(&session)`；前者填"编码白名单"（`§137` 的
+//    `… not permitted by ctx` 就是白名单为空），后者选版本（`§138` 的
+//    `cannot enable unregistered edition` 就是没先注册）；
+// 3. **数组与写入必须同源**：一律走 `session.arrow()`（`ArrowSessionExt`），
+//    别用 `ArrowSession::default()`；
+// 4. **`async move` 会搬走 `buf`** ⇒ 缓冲区在异步块内造、作为结果返回。
 
+#[cfg(feature = "vortex")]
+fn encode_vortex(batch: &arrow::record_batch::RecordBatch) -> Result<Vec<u8>, LakeError> {
+    use vortex::array::array_session;
+    use vortex::array::iter::{ArrayIteratorAdapter, ArrayIteratorExt};
+    use vortex::arrow::ArrowSessionExt;
+    use vortex::editions::{enable_default_editions, register_default_editions};
+    use vortex::file::VortexWriteOptions;
+    use vortex::io::runtime::single::block_on;
+    use vortex::io::session::{RuntimeSession, RuntimeSessionExt};
+
+    let schema = batch.schema();
+    let b = batch.clone();
+    block_on(|handle| async move {
+        let session = array_session().with::<RuntimeSession>().with_handle(handle);
+        register_default_editions(&session);
+        enable_default_editions(&session);
+        // 数组由**这个** session 的 arrow 入口造（坑 3）
+        let array = session
+            .arrow()
+            .from_arrow_record_batch(b, schema.as_ref())
+            .map_err(|e| LakeError::Other(format!("vortex 编码（RecordBatch → Array）：{e}")))?;
+        let dtype = array.dtype().clone();
+        let stream =
+            ArrayIteratorAdapter::new(dtype, std::iter::once(Ok(array))).into_array_stream();
+        // 缓冲区在块内造（坑 4）、作为结果返回
+        let mut buf: Vec<u8> = Vec::new();
+        VortexWriteOptions::new(session)
+            .write(&mut buf, stream)
+            .await
+            .map_err(|e| LakeError::Other(format!("vortex 写入：{e}")))?;
+        Ok::<Vec<u8>, LakeError>(buf)
+    })
+}
+
+#[cfg(feature = "vortex")]
+fn decode_vortex(bytes: &[u8]) -> Result<Vec<arrow::record_batch::RecordBatch>, LakeError> {
+    use arrow::array::StructArray;
+    use futures::TryStreamExt;
+    use vortex::array::{array_session, VortexSessionExecute};
+    use vortex::arrow::ArrowSessionExt;
+    use vortex::buffer::ByteBuffer;
+    use vortex::editions::{enable_default_editions, register_default_editions};
+    use vortex::file::OpenOptionsSessionExt;
+    use vortex::io::runtime::single::block_on;
+    use vortex::io::session::{RuntimeSession, RuntimeSessionExt};
+
+    let bytes = bytes.to_vec();
+    block_on(|handle| async move {
+        let session = array_session().with::<RuntimeSession>().with_handle(handle);
+        register_default_editions(&session);
+        enable_default_editions(&session);
+        // 内存字节 → `ByteBuffer` ⇒ 不必落盘
+        let file = OpenOptionsSessionExt::open_options(&session)
+            .open_buffer(ByteBuffer::from(bytes))
+            .map_err(|e| LakeError::Other(format!("vortex 打开：{e}")))?;
+
+        let arrays: Vec<_> = file
+            .scan()
+            .map_err(|e| LakeError::Other(format!("vortex 扫描：{e}")))?
+            .into_array_stream()
+            .map_err(|e| LakeError::Other(format!("vortex 数据流：{e}")))?
+            .try_collect()
+            .await
+            .map_err(|e| LakeError::Other(format!("vortex 读取：{e}")))?;
+
+        let mut out = Vec::with_capacity(arrays.len());
+        for a in arrays {
+            // 同样走**这个** session 的 arrow 入口（坑 3）；`target = None` ⇒ 由数据决定类型
+            let mut ctx = session.create_execution_ctx();
+            let arrow_array = session
+                .arrow()
+                .execute_arrow(a, None, &mut ctx)
+                .map_err(|e| LakeError::Other(format!("vortex → arrow：{e}")))?;
+            let st = arrow_array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| LakeError::Other("vortex 读出的顶层不是 StructArray".into()))?;
+            out.push(arrow::record_batch::RecordBatch::from(st.clone()));
+        }
+        Ok::<_, LakeError>(out)
+    })
+}
+
+#[cfg(not(feature = "vortex"))]
 fn encode_vortex(_batch: &arrow::record_batch::RecordBatch) -> Result<Vec<u8>, LakeError> {
-    // `§133` 起依赖**不再挡路**（`vortex 0.86` 与 arrow 59 同代）；真实现已写出并通过编译
-    // （`§138`），但写入仍差一步：`enable_default_editions` 报
-    // `cannot enable unregistered edition core2026.08.3` ⇒ session 要先挂 `EditionSession`。
-    // 按纪律退回占位；修法见 `§138.2`（一次 grep 即可）。
+    // `§133` 起依赖**不再挡路**（`vortex 0.86` 与 arrow 59 同代），只是默认不编进去：
+    // `cargo build -p yuntun-format --features vortex` 即拿到上面的真实现。
     Err(LakeError::Other(
-        "vortex format not enabled: 见 §138（session 需先挂 EditionSession）"
-            .into(),
+        "vortex format not enabled: build with --features vortex (§133)".into(),
     ))
 }
 
+#[cfg(not(feature = "vortex"))]
 fn decode_vortex(_bytes: &[u8]) -> Result<Vec<arrow::record_batch::RecordBatch>, LakeError> {
     Err(LakeError::Other(
-        "vortex format not enabled: 见 §138（session 需先挂 EditionSession）"
-            .into(),
+        "vortex format not enabled: build with --features vortex (§133)".into(),
     ))
+}
+
+#[cfg(all(test, feature = "vortex"))]
+mod vortex_tests {
+    use super::*;
+    use arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray};
+    use arrow::compute::concat_batches;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    fn batch(rows: usize) -> arrow::record_batch::RecordBatch {
+        let users: Vec<String> = (0..rows).map(|i| format!("u{}", i % 37)).collect();
+        arrow::record_batch::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("ts", DataType::Int64, true),
+                Field::new("amount", DataType::Float64, true),
+                Field::new("user", DataType::Utf8, true),
+                Field::new("ok", DataType::Boolean, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from((0..rows as i64).collect::<Vec<_>>())),
+                Arc::new(Float64Array::from(
+                    (0..rows).map(|i| i as f64 * 1.5).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(users)),
+                Arc::new(BooleanArray::from(
+                    (0..rows).map(|i| i % 3 == 0).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// **Vortex 真的能往返**（写进去 → 读出来 → 逐列相同）。
+    ///
+    /// 编译器说"能过"不等于"读得回来"：`§135` 第一版编译过了却在 vortex 内部 panic，
+    /// `§136`/`§138` 又各差一格。这条用例守的正是那一层。
+    #[test]
+    fn vortex_round_trips_a_batch_column_by_column() {
+        let b = batch(1_000);
+        let bytes = encode_batch(&b, DataFormat::Vortex).expect("vortex 编码应当成功");
+        assert!(!bytes.is_empty(), "编码结果不该是空的");
+        let out = decode_batch(&bytes, DataFormat::Vortex).expect("vortex 解码应当成功");
+        assert!(!out.is_empty(), "解码结果不该是空的");
+        // ⚠️ `RecordBatch::schema()` 返回的是一个**临时** `Arc<Schema>` ⇒ 先接住，
+        // 否则下面 `field(i).data_type()` 借的是已释放的临时值。
+        let want_schema = b.schema();
+        // ⚠️ **vortex 挑的是它自己最便宜的物理类型**，不是我们写进去时的那套：
+        // 这里字符串列读回来是 **`Utf8View`**（原 schema 是 `Utf8`）⇒ 直接拿原 schema 去
+        // `concat_batches` 会报 `expected Utf8 but found Utf8View`。
+        // 所以：**按各块自己的 schema 拼**，再**按原类型 cast 回去**逐列比
+        //（值的判定不受物理类型影响）。
+        let got = concat_batches(&out[0].schema(), &out).expect("把读到的块拼回来");
+        assert_eq!(got.num_rows(), 1_000, "行数必须回来");
+        assert_eq!(got.num_columns(), b.num_columns(), "列数必须回来");
+        for i in 0..b.num_columns() {
+            let want_ty = want_schema.field(i).data_type();
+            let got_col = arrow::compute::cast(got.column(i), want_ty)
+                .unwrap_or_else(|e| panic!("第 {i} 列 cast 到 {want_ty} 失败：{e}"));
+            assert_eq!(
+                b.column(i).as_ref(),
+                got_col.as_ref(),
+                "第 {i} 列（`{}`）必须**逐值**相同 —— 往返丢数据是最坏的失败形态",
+                want_schema.field(i).name()
+            );
+        }
+    }
+
+    /// **体积对照**（`T9.x` 的第三件）：把两个数字摆出来。
+    ///
+    /// ⚠️ **不断言"谁更小"**：压缩率取决于数据形状（这里 `ts` 递增，对 Parquet 的 delta 编码
+    /// 极友好；换成随机 UUID 结论会反过来）。断言一个方向只会造出"换数据就红"的用例。
+    #[test]
+    fn vortex_and_parquet_sizes_are_both_usable() {
+        let b = batch(1_000);
+        let v = encode_batch(&b, DataFormat::Vortex).expect("vortex 编码").len();
+        let p = encode_batch(&b, DataFormat::Parquet).expect("parquet 编码").len();
+        println!(
+            "vortex={v}B parquet={p}B ratio={:.2}（1k 行、ts 递增 —— 偏袒 Parquet 的 delta 编码）",
+            v as f64 / p as f64
+        );
+        assert!(v > 0 && p > 0, "两种格式都得真写出东西：vortex={v} parquet={p}");
+    }
 }
 
 /// 列举 prefix 下所有对象（孤儿清理用，转发 store）。

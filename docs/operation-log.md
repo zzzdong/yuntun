@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§138，2026-09-27**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§139，2026-09-27**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -8872,3 +8872,45 @@ default core edition is registered:
 - 全量 `cargo test --workspace --no-fail-fast -j 4` → **410 passed / 0 failed / 0 ignored**；
 - 文档一致性判据（`§123`）**5/5 绿**；
 - ⚠️ 边界同 `§135.4`：**默认套件不含 vortex**（可选依赖），往返用例仍随占位撤下。
+
+---
+
+## 139. `Vortex` codec **成了**：往返逐值相同 + 与 Parquet 的体积对照（`T9.x` 收口）（2026-09-27）
+
+### 139.0 结果
+
+`encode_vortex` / `decode_vortex` **真实现上线**（`--features vortex`）：
+
+```
+vortex 往返：4 类列（i64 / f64 / utf8 / bool）× 1000 行 → **逐值相同** ✅
+体积对照：vortex=23800B  parquet=6680B  ratio=3.56
+```
+
+⚠️ 这个 3.56 **不能**读成"Parquet 更好"：这份数据里 `ts` 是**递增整数**，
+对 Parquet 的 delta 编码极友好；而 vortex 侧我们**没开压缩器**（`BtrBlocksCompressor` 尚未接）。
+用例因此**只断言两者都可用、并把两个数字打出来**，不断言方向 —— 换个数据形状结论就会翻。
+
+### 139.1 最后四格（`§134`–`§138` 的收官）
+
+1. **edition 先注册、再启用**：`register_default_editions(&session)` → `enable_default_editions(&session)`
+   （`vortex/src/editions/mod.rs`）—— 前者填编码白名单（`§137` 的 `not permitted by ctx`），
+   后者选版本（`§138` 的 `cannot enable unregistered edition`）；
+2. **数组与写入同源**：`session.arrow()`（`ArrowSessionExt`）；
+3. **`async move` 会搬走 `buf`** ⇒ 缓冲区在块内造、作为结果返回；
+4. **读回的物理类型可能是另一种**：字符串列回来是 **`Utf8View`**（原 schema 是 `Utf8`）——
+   vortex 挑的是它自己最便宜的物理类型 ⇒ 下游要对齐原 schema 得 `cast`
+   （用例里就是这么比的：按块自己的 schema 拼、再按原类型 cast 后逐值比）。
+
+### 139.2 验证
+
+- `cargo test -p yuntun-format --features vortex --lib vortex_tests` → **2/2**；
+- `cargo clippy -p yuntun-format --features vortex --all-targets` → 本仓告警 **0**；
+- 默认全量 `cargo test --workspace -j 4` → **410 passed / 0 failed / 0 ignored**
+  （vortex 用例是 `#[cfg(feature = "vortex")]` ⇒ 不在默认套件里，见边界）；
+- 判据 5/5。
+
+### 139.3 边界（写明）
+
+* **默认套件不含 vortex**（可选依赖）⇒ 这条往返只在 `--features vortex` 下跑；
+* `T9.x` 还剩"**对比**"这一件的下半：接入 `BtrBlocksCompressor` 后再测一轮，
+  以及把"默认格式"切到 vortex 的决策（`ADR-1`）尚未做。
