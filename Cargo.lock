@@ -7051,6 +7051,7 @@ dependencies = [
  "futures",
  "object_store",
  "parquet",
+ "sqlparser",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

@@ -16,6 +16,8 @@ datafusion-functions-json = "0.55"
 datafusion-datasource = { workspace = true }
 datafusion-datasource-parquet = { workspace = true }
 arrow = { workspace = true }
+# `F.1`：语句路由要**自己**判定语句类型（DDL/DML 不进 DataFusion）
+sqlparser = { workspace = true }
 object_store = { workspace = true }
 url = { workspace = true }
 thiserror = { workspace = true }

@@ -837,7 +837,7 @@ R2 Catalog 冻结（✅ 已完成）──► R3 metanode + raft
 先把"非 SELECT 的语句"从 DataFusion 手里接过来：用 sqlparser 解析出 `Statement`，按类型路由到
 我们自己的 DDL / DML 处理；`SELECT` 仍走 DataFusion（`§132` 已确认：块级剪枝由它的优化器提供）。
 
-* 刀 **R0 语句路由**：`sql()` 增加"先解析、再分流"；未知语句给出**可读的拒绝**（而不是解析错误）。
+* 刀 **R0 语句路由**：✅ **已落地**（`§142`）：`query/src/stmt.rs::classify` + `sql_with_partial` 分流；六类语句被接管并给出"已识别但尚未支持"的可读拒绝；SELECT 原样不变（6 条用例）。
 * 验收：① `ALTER` / `DELETE` / `UPDATE` 各自不再报语法/不支持，而是进入我们的处理；
   ② `SELECT` 行为**逐字不变**（对拍用例：路由前后同一批查询的结果一致）；③ 非法语句的报错可读。
 

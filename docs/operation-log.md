@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§141，2026-09-27**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§142，2026-09-27**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -8997,3 +8997,47 @@ F.1 的落点已确定：`QueryEngine::sql_with_partial`（`crates/query/src/lib
 ### 141.4 验证
 
 - 判据 **5/5 绿**；**功能代码零改动**；`plan.md` 版本三处统一。
+
+---
+
+## 142. **F.1 语句路由**落地（三块新功能的共同前提）（2026-09-27）
+
+### 142.0 做了什么
+
+`plan.md` F 组的第一刀：**把"不是查询"的语句从 DataFusion 手里接过来**。
+
+* 新增 `crates/query/src/stmt.rs`：`classify(sql) -> Result<StmtKind, String>`
+  —— 用 **sqlparser**（`0.62`，**本来就是** workspace 依赖，不必新增）判定语句类型；
+* `QueryEngine::sql_with_partial` 最前面分流：**DDL / DML 由我们接管**，**查询类原样交给 DataFusion**
+  （`§132` 实测：块级剪枝是它的优化器给的，别抢）。
+
+### 142.1 这一刀**只立骨架与错误形态**（不假成功）
+
+被接管的语句（`ALTER TABLE` / `CREATE TABLE` / `DROP TABLE` / `DELETE` / `UPDATE`）返回
+**"已被识别、但尚未支持"** 的可读错误，并**点名是哪一句、指向 plan 的哪一刀**（`F.2` / `F.3`）：
+
+```
+ALTER TABLE 已被识别、但**尚未支持**：见 plan.md F.2（SQL 形式的 schema 变更）
+```
+
+⇒ 既不是假成功，也不是 DataFusion 那句不知所云的解析错误。真正的处理由 `F.2` / `F.3` 各自补。
+
+### 142.2 验收（6 条）
+
+* 纯函数 3 条（模块内）：查询类原样通过；六类语句被**认出来**且 `routed()`；解析失败给可读原因；
+* 端到端 3 条（`query/tests/stmt_routing.rs`）：
+  ① `ALTER` / `DELETE` / `UPDATE` 各自**被接管**且报错点名语句类型（**不再**掉回 DataFusion 的
+  `sql parser error`）；② **`SELECT` 行为不变**（同一查询仍是 10 —— 路由层不许把查询弄脏）；
+  ③ 垃圾 SQL 的报错可读（含"SQL 解析失败"）。
+
+### 142.3 两个刻意的选择
+
+* **不猜**：除明确列出的六类外，其它形状（`INSERT` 等）一律**交回 DataFusion**，让它给自己的结论
+  （猜错的代价是拦截了本可执行的语句）；
+* **多语句只按第一条判定**：多语句事务的语义留给后续一刀，现在不猜。
+
+### 142.4 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **416 passed / 0 failed / 0 ignored**；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 判据 5/5。
