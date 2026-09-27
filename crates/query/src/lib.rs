@@ -335,16 +335,12 @@ impl QueryEngine {
         schema: &str,
     ) -> Result<QueryOutcome, DataFusionError> {
         // **F.1 语句路由**（`plan.md` F 组 / `§142`）：先用 sqlparser 判定语句类型 ——
-        // DDL / DML 分流到我们（本刀给"已识别但尚未支持"的**可读**拒绝，真正的处理由
-        // `F.2` / `F.3` 补），查询类**原样**交给 DataFusion
-        //（`§132` 实测：块级剪枝是它的优化器给的，别抢）。
+        // DDL / DML 分流到我们的处理（`F.2` 的 DDL 落在 **SQL 层** `yuntun-sql::SqlEngine`；
+        // `F.3` 的 DELETE / UPDATE 尚未支持）⇒ 这里给出**可读**拒绝；查询类**原样**交给
+        // DataFusion（`§132` 实测：块级剪枝是它的优化器给的，别抢）。
         match crate::stmt::classify(query) {
             Ok(kind) if kind.routed() => {
-                return Err(DataFusionError::NotImplemented(format!(
-                    "{} 已被识别、但**尚未支持**：见 plan.md {}",
-                    kind.as_str(),
-                    kind.plan_section()
-                )));
+                return Err(DataFusionError::NotImplemented(kind.rejection()));
             }
             Ok(_) => {} // 查询类：走下面原路径
             // 解析失败：给**可读**的原因（不是 sqlparser 的原始错误）

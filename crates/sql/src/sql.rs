@@ -22,13 +22,15 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use arrow_cast::cast;
 use sqlparser::ast::{
-    ArrayElemTypeDef, ColumnDef, CreateTable, DataType as SqlDataType, Expr, FunctionArg,
-    FunctionArgExpr, FunctionArguments, ObjectName, Statement,
+    AlterColumnOperation, AlterTable, AlterTableOperation, ArrayElemTypeDef, ColumnDef, CreateTable,
+    DataType as SqlDataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName,
+    Statement,
 };
 use sqlparser::ast::{ExactNumberInfo, TimezoneInfo, Value};
 use sqlparser::dialect::{Dialect as SqlDialect, GenericDialect};
 use sqlparser::parser::Parser;
 use yuntun_model::error::LakeError;
+use yuntun_model::schema::SchemaChange;
 
 use crate::session::SessionCtx;
 
@@ -323,6 +325,120 @@ fn decimal_type(info: &ExactNumberInfo) -> Result<DataType, LakeError> {
         )));
     }
     Ok(DataType::Decimal128(p as u8, s))
+}
+
+// ------------------------------------------------------------ ALTER TABLE（F.2）
+
+/// `ALTER TABLE` 解析结果（`plan.md` F.2「SQL 形式的 schema 变更」）。
+///
+/// **只承载"真能执行"的那部分**：`ADD COLUMN` / `DROP COLUMN` —— 它们各自对应
+/// [`SchemaChange`] 的一个载体（`model/src/schema.rs`）。其余形状（重命名 / 改类型 /
+/// 可空性）在 `SchemaChange` 里**没有载体**，所以在**解析这一层**就明确拒绝
+/// （报错说明"为什么不行"，而不是让它掉到 `apply_change` 里变成一句天书）。
+#[derive(Debug, Clone)]
+pub struct ParsedAlterTable {
+    /// 本语句要施加的**一个** schema 变更（一条语句 = 一个原子变更）
+    pub change: SchemaChange,
+    /// `ADD COLUMN IF NOT EXISTS` / `DROP COLUMN IF EXISTS`：目标状态**已满足**时跳过
+    /// （不报错、不推版本），供重放 / 客户端重试使用
+    pub idempotent: bool,
+}
+
+/// `ALTER TABLE` AST → 一个 [`SchemaChange`]（plan F.2）。
+///
+/// 支持与拒绝的边界（**是设计，不是没做完**）：
+///
+/// | 语句 | 处理 | 为什么 |
+/// |---|---|---|
+/// | `ADD [COLUMN] [IF NOT EXISTS] c <type>` | [`SchemaChange::AddColumn`]（缺列填 null） | 向后兼容演进（§8.1） |
+/// | `DROP [COLUMN] [IF EXISTS] c` | [`SchemaChange::DropColumn`]（**逻辑**删除） | 旧文件保持不动，读侧按当前 schema 对齐 |
+/// | `ALTER COLUMN c TYPE …` / `MODIFY` / `CHANGE` | **拒绝** | 改类型 = 破坏性（老文件读不出来是静默事故，plan F.2 明令禁止） |
+/// | `ALTER COLUMN c {SET,DROP} NOT NULL` | **拒绝** | `SchemaChange` 没有可空性载体 —— 与重命名同类（见下） |
+/// | `RENAME COLUMN` / `RENAME TO` | **拒绝** | `SchemaChange` 只有 加列 / 宽化 / 删列 三种；重命名要先在 model 层加载体并同步 proto + 快照格式 |
+///
+/// ⚠️ 拒绝是**明确**的：报错点名语句形状与原因，绝不静默接受（静默接受 = 客户端以为改了、实际没改）。
+pub fn parse_alter_table(alter: &AlterTable) -> Result<ParsedAlterTable, LakeError> {
+    if alter.operations.len() != 1 {
+        return Err(LakeError::Other(format!(
+            "ALTER TABLE 一次只支持一个操作（收到 {} 个）：请拆成多条语句 \
+             （多个操作的**部分成功**语义代价高，本刀不做）",
+            alter.operations.len()
+        )));
+    }
+    match &alter.operations[0] {
+        AlterTableOperation::AddColumn {
+            column_def,
+            if_not_exists,
+            column_position,
+            ..
+        } => {
+            if column_position.is_some() {
+                return Err(LakeError::Other(
+                    "ALTER TABLE ADD COLUMN 不支持 FIRST / AFTER：列序由 schema 决定\
+                     （旧文件按列名对齐，不按位置）"
+                        .into(),
+                ));
+            }
+            Ok(ParsedAlterTable {
+                change: SchemaChange::AddColumn {
+                    field: column_def_to_field(column_def)?,
+                },
+                idempotent: *if_not_exists,
+            })
+        }
+        AlterTableOperation::DropColumn {
+            column_names,
+            if_exists,
+            ..
+        } => {
+            let [name] = column_names.as_slice() else {
+                return Err(LakeError::Other(format!(
+                    "ALTER TABLE DROP COLUMN 一次只支持一列（收到 {} 列）：请拆成多条语句",
+                    column_names.len()
+                )));
+            };
+            Ok(ParsedAlterTable {
+                change: SchemaChange::DropColumn {
+                    column: name.value.clone(),
+                },
+                idempotent: *if_exists,
+            })
+        }
+        // ---- 明确拒绝（每一条都点名"为什么"，否则用户只会看到"不支持"）----
+        AlterTableOperation::RenameColumn { .. } | AlterTableOperation::RenameTable { .. } => {
+            Err(LakeError::Other(
+                "ALTER TABLE 重命名尚未支持：SchemaChange 目前只有 加列 / 宽化 / 删列 三种载体\
+                 （model/src/schema.rs），重命名需要先在 model 层加载体并同步 proto 与快照格式"
+                    .into(),
+            ))
+        }
+        AlterTableOperation::AlterColumn { column_name, op } => Err(match op {
+            AlterColumnOperation::SetDataType { .. } => LakeError::Other(format!(
+                "ALTER TABLE ALTER COLUMN {column_name} TYPE 被**拒绝**：改类型是破坏性变更\
+                 （老文件读不出来就是静默事故，plan.md F.2）"
+            )),
+            AlterColumnOperation::SetNotNull | AlterColumnOperation::DropNotNull => {
+                LakeError::Other(format!(
+                    "ALTER TABLE ALTER COLUMN {column_name} 可空性变更尚未支持：\
+                     SchemaChange 没有可空性载体（与重命名同类，需先在 model 层加载体）"
+                ))
+            }
+            other => LakeError::Other(format!(
+                "ALTER TABLE ALTER COLUMN {column_name} {other} 尚未支持：\
+                 本刀只支持 ADD COLUMN / DROP COLUMN"
+            )),
+        }),
+        AlterTableOperation::ModifyColumn { .. } | AlterTableOperation::ChangeColumn { .. } => {
+            Err(LakeError::Other(
+                "ALTER TABLE MODIFY / CHANGE COLUMN 被**拒绝**：它携带类型（或名字）变更，\
+                 属破坏性变更（plan.md F.2 禁止）"
+                    .into(),
+            ))
+        }
+        other => Err(LakeError::Other(format!(
+            "ALTER TABLE 操作尚未支持：{other}（本刀只支持 ADD COLUMN / DROP COLUMN）"
+        ))),
+    }
 }
 
 // ------------------------------------------------------------ INSERT VALUES
@@ -1251,6 +1367,98 @@ mod tests {
                 true
             )))
         );
+    }
+
+    // ---- ALTER TABLE（F.2）----
+
+    fn alter_of(sql: &str) -> AlterTable {
+        match parse(sql) {
+            Statement::AlterTable(a) => a,
+            other => panic!("{sql} 不是 ALTER TABLE：{other}"),
+        }
+    }
+
+    #[test]
+    fn alter_add_and_drop_column_map_to_schema_change() {
+        let p = parse_alter_table(&alter_of("ALTER TABLE t ADD COLUMN c BIGINT NOT NULL")).unwrap();
+        assert!(!p.idempotent);
+        match p.change {
+            SchemaChange::AddColumn { field } => {
+                assert_eq!(field.name(), "c");
+                assert_eq!(field.data_type(), &DataType::Int64);
+                assert!(!field.is_nullable(), "NOT NULL 必须带过来");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // `IF NOT EXISTS` / `IF EXISTS` ⇒ 幂等（目标态已满足时跳过，而不是报错）
+        let p = parse_alter_table(&alter_of(
+            "ALTER TABLE t ADD COLUMN IF NOT EXISTS c VARCHAR",
+        ))
+        .unwrap();
+        assert!(p.idempotent);
+        assert!(matches!(p.change, SchemaChange::AddColumn { .. }));
+
+        let p = parse_alter_table(&alter_of("ALTER TABLE t DROP COLUMN c")).unwrap();
+        assert_eq!(
+            p.change,
+            SchemaChange::DropColumn {
+                column: "c".into()
+            }
+        );
+        assert!(!p.idempotent);
+
+        let p = parse_alter_table(&alter_of("ALTER TABLE t DROP COLUMN IF EXISTS c")).unwrap();
+        assert!(p.idempotent);
+    }
+
+    /// 破坏性变更与"没有载体"的形状：**一律明确拒绝**（静默接受 = 客户端以为改了、实际没改）。
+    #[test]
+    fn alter_rejects_destructive_and_unrepresentable_shapes() {
+        for sql in [
+            // 破坏性：改类型
+            "ALTER TABLE t ALTER COLUMN c TYPE VARCHAR",
+            "ALTER TABLE t ALTER COLUMN c SET DATA TYPE VARCHAR",
+            "ALTER TABLE t MODIFY COLUMN c VARCHAR",
+            "ALTER TABLE t CHANGE COLUMN c d VARCHAR",
+            // 没有载体：可空性 / 重命名
+            "ALTER TABLE t ALTER COLUMN c SET NOT NULL",
+            "ALTER TABLE t ALTER COLUMN c DROP NOT NULL",
+            "ALTER TABLE t RENAME COLUMN c TO d",
+            "ALTER TABLE t RENAME TO t2",
+        ] {
+            let e = parse_alter_table(&alter_of(sql)).expect_err(sql);
+            assert!(!e.to_string().is_empty(), "{sql} 的拒绝理由不能是空");
+        }
+
+        // 拒绝的**理由**要对得上（不然用户看到的又是一句"不支持"）
+        let e = parse_alter_table(&alter_of("ALTER TABLE t ALTER COLUMN c TYPE VARCHAR")).unwrap_err();
+        assert!(e.to_string().contains("破坏性"), "{e}");
+        let e = parse_alter_table(&alter_of("ALTER TABLE t RENAME COLUMN c TO d")).unwrap_err();
+        assert!(e.to_string().contains("载体"), "{e}");
+        // 不支持的类型：与 CREATE TABLE 共用同一条映射（不另造一份）
+        assert!(parse_alter_table(&alter_of("ALTER TABLE t ADD COLUMN c TIMESTAMPTZ")).is_err());
+    }
+
+    /// 解析器本身不收的形状（例如多操作 / MySQL 列序）也必须落在"明确拒绝"里。
+    ///
+    /// 写成"能解析就断言被拒"：这两种形状能不能过**词法**取决于方言，而本用例要守的是
+    /// "**不许静默接受**"—— 两条路都算通过。
+    #[test]
+    fn alter_exotic_shapes_are_never_silently_accepted() {
+        for sql in [
+            "ALTER TABLE t ADD COLUMN c INT, DROP COLUMN d",
+            "ALTER TABLE t ADD COLUMN c INT FIRST",
+            "ALTER TABLE t ADD COLUMN c INT AFTER d",
+            "ALTER TABLE t DROP COLUMN a, b",
+        ] {
+            if let Ok(Statement::AlterTable(a)) = parse_single(sql) {
+                assert!(
+                    parse_alter_table(&a).is_err(),
+                    "{sql} 不该被静默接受（本刀只做单操作的 ADD/DROP COLUMN）"
+                );
+            }
+        }
     }
 
     #[test]

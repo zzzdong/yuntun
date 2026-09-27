@@ -5,7 +5,8 @@
 > + **《重构路线 S0–S6》（`refactor.md`）**
 > + **《阶段 0 实现操作日志》§25**（2026-09-15，chunk 层落地与对既有设计的逐条对照审查）
 > **版本**：v2.3
-> **日期**：2026-09-18（v2.3 于 2026-09-27 追加 **F 组**：SQL 形式的 schema 变更 / DELETE·UPDATE / 行组级索引 —— **计划阶段，尚未动代码**）
+> **日期**：2026-09-18（v2.3 于 2026-09-27 追加 **F 组**：SQL 形式的 schema 变更 / DELETE·UPDATE /
+> 行组级索引。**进度**：`F.1` 语句路由 ✅（`§142`）、`F.2` schema 变更 ✅（`§144`）；`F.3` / `F.4` 未动代码）
 >
 > **v2.2 相对 v2.1 的核心变更**：T8 基线压测入库 + **P0 ①/③ 定案**（`max_flush_delay_secs=0`、
 > `flush_phase_spread_secs=30`）并**正式修订 ADR-10**（v12）；chaos **11/11**；P0 ② `rows_threshold`
@@ -814,14 +815,15 @@ R2 Catalog 冻结（✅ 已完成）──► R3 metanode + raft
 
 ---
 
-**文档结束 · 开发计划任务书 v2.2**
+**文档结束 · 开发计划任务书 v2.3**
 
 ---
 
 
-## F 组：SQL 形式的 schema 变更 / DELETE·UPDATE / 行组级索引（计划，2026-09-27；**尚未动代码**）
+## F 组：SQL 形式的 schema 变更 / DELETE·UPDATE / 行组级索引（2026-09-27；**F.1/F.2 已落地**）
 
-> 状态：**计划阶段，尚未动代码**。本节是三块功能的 WBS + 每刀的可测验收 + 风险与开放问题。
+> 状态：`F.1` 语句路由 ✅（`§142`）、`F.2` schema 变更 ✅（`§144`）；**`F.3`（DELETE/UPDATE）与
+> `F.4`（行组级索引）尚未动代码**。本节是三块功能的 WBS + 每刀的可测验收 + 风险与开放问题。
 
 ### F.0 现状（已查证的接缝，不是印象）
 
@@ -837,19 +839,30 @@ R2 Catalog 冻结（✅ 已完成）──► R3 metanode + raft
 先把"非 SELECT 的语句"从 DataFusion 手里接过来：用 sqlparser 解析出 `Statement`，按类型路由到
 我们自己的 DDL / DML 处理；`SELECT` 仍走 DataFusion（`§132` 已确认：块级剪枝由它的优化器提供）。
 
-* 刀 **R0 语句路由**：✅ **已落地**（`§142`）：`query/src/stmt.rs::classify` + `sql_with_partial` 分流；六类语句被接管并给出"已识别但尚未支持"的可读拒绝；SELECT 原样不变（6 条用例）。
-* 验收：① `ALTER` / `DELETE` / `UPDATE` 各自不再报语法/不支持，而是进入我们的处理；
+* 刀 **R0 语句路由**：✅ **已落地**（`§142`；`§144` 后报错话术按事实改成两类）：`query/src/stmt.rs::classify` + `sql_with_partial` 分流；六类语句被接管并给出**可读拒绝**；SELECT 原样不变。
+  注意**真正处理 DDL 的是 SQL 层**（`yuntun-sql`，见 `F.2`）—— `QueryEngine` 的分流是第二道防线，
+  它的正确话术是"本引擎不执行 DDL"，不是"尚未支持"（`§144.2`）。
+* 验收：① `ALTER` / `DELETE` / `UPDATE` 各自不再报语法/不支持，而是进入我们的处理
+  （`ALTER` 由 `§144` 接上；`DELETE`/`UPDATE` 仍报"尚未支持"并指向 `F.3`）；
   ② `SELECT` 行为**逐字不变**（对拍用例：路由前后同一批查询的结果一致）；③ 非法语句的报错可读。
 
 ### F.2 ① SQL 形式的 schema 变更
 
-* 语法（先窄后宽）：`ALTER TABLE … ADD COLUMN`、`DROP COLUMN`、`RENAME COLUMN`、`RENAME TABLE`；
-  `CREATE TABLE`（带 schema / 分区）、`DROP TABLE`（catalog 已支持）。
-* 语义：**只做向后兼容的演进**（加列、放宽可空性、重命名）；**禁止**破坏性变更（改类型、收紧可空性）
+> **状态：已落地（2026-09-27，`§144`）**。落点 = **`yuntun-sql::SqlEngine`**（**不是** `QueryEngine`：
+> `ADD COLUMN` 要的"SQL 类型 → Arrow"映射本就在 sql 层，且 DDL 的其余部分全在那儿 —— 理由见 `§144.1`，
+> 那一处**更正了 `§143.2` 的初判**）。本刀支持 `ADD COLUMN` / `DROP COLUMN`；
+> **重命名 / 可空性**因 `SchemaChange` 无载体而暂缓（**明确拒绝**，见 `§144.3` —— 加载体要动 proto 与快照格式）。
+
+* 语法（先窄后宽）：✅ `ALTER TABLE … ADD COLUMN` / `DROP COLUMN`（含 `IF [NOT] EXISTS`）；
+  ⏳ `RENAME COLUMN` / `RENAME TABLE`、可空性变更（**缺载体**，另开一刀）；
+  ✅ `CREATE TABLE`（列定义）、`DROP TABLE`（catalog 早已支持）。
+* 语义：**只做向后兼容的演进**（加列）；**禁止**破坏性变更（改类型、收紧可空性）
   —— 老文件读不出来就是静默事故（`C8`：不同文件可有不同的 `schema_ver` ⇒ 读侧按文件的版本对齐 ✓）。
-* 落点：路由到 `evolve_schema`（已存在）⇒ 走 raft ⇒ 版本 +1 ⇒ 客户端缓存失效。
+* 落点：`SqlEngine::dispatch` 的 `AlterTable` 分支 → `evolve_schema`（已存在）⇒ 走 raft ⇒ 版本 +1
+  ⇒ WAL DDL 记录 ⇒ 客户端缓存失效。
 * 验收：① DDL 后新写入带新列；② **旧文件仍可读**（缺列按 null 对齐）；③ 版本号 +1 且**其它表不受影响**；
   ④ OCC：并发两个 DDL **只有一个成功**；⑤ 破坏性变更被**明确拒绝**（不是静默接受）。
+  —— 五条 + 两条反面（只读拒绝 / WAL 重放）都有用例：`crates/server/tests/sql_alter_e2e.rs`。
 
 ### F.3 ② DELETE / UPDATE
 
@@ -908,4 +921,4 @@ R2 Catalog 冻结（✅ 已完成）──► R3 metanode + raft
 
 ---
 
-> 落款：yuntun 开发计划任务书 v2.3（F 组为 2026-09-27 追加的计划，**尚未动代码**）
+> 落款：yuntun 开发计划任务书 v2.3（F 组为 2026-09-27 追加；**F.1 `§142` / F.2 `§144` 已落地**，`F.3` / `F.4` 尚未动代码）

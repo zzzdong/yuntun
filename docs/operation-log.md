@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§143，2026-09-27**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§144，2026-09-27**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -9082,3 +9082,94 @@ ALTER TABLE 已被识别、但**尚未支持**：见 plan.md F.2（SQL 形式的
 ### 143.4 本刀验证
 
 功能代码**零改动**（只加本节文档）；判据 5/5。
+
+---
+
+## 144. **F.2 SQL 形式的 schema 变更**落地（`ALTER TABLE` 加列 / 删列）（2026-09-27）
+
+### 144.0 做了什么
+
+`plan.md` F 组第二刀：把 `ALTER TABLE` 从"已被识别、但尚未支持"变成**真能改 schema**。
+
+* `crates/sql/src/sql.rs`：新增 `parse_alter_table(&AlterTable) -> ParsedAlterTable`
+  —— 一条语句 → **一个** `SchemaChange`（`ADD COLUMN` → `AddColumn`，`DROP COLUMN` → `DropColumn`）
+  ＋ `idempotent`（`IF NOT EXISTS` / `IF EXISTS`）；
+* `crates/sql/src/lib.rs::dispatch`：新增 `Statement::AlterTable` 分支 —— 读当前 schema 与版本
+  （OCC 基线）⇒ `evolve_schema`（唯一 OCC 作用点，走 raft）⇒ **WAL DDL 记录** ⇒ 刷新查询缓存；
+* `crates/model/src/wal_record.rs`：`ddl_op::ALTER_TABLE = 4`（`arrow_schema` = **变更后的目标 schema**）；
+* `crates/ingest/src/ddl.rs`：重放新增 `ALTER_TABLE` 分支 —— `converge_schema` 把表**收敛到目标态**
+  （用 `classify` 求差 + 自己找"多余的列"以支持删列），幂等；
+* `crates/query/src/stmt.rs`：DDL 的拒绝话术跟上事实（见 144.2）。
+
+### 144.1 落点：**在 `yuntun-sql`，不在 `QueryEngine`**（更正 `§143.2`）
+
+`§143.2` 记的是"F.2 要先给 `QueryEngine` 加 `catalog_ops: Option<Arc<dyn CatalogOps>>`，
+把 `ALTER TABLE` 解析成 `SchemaChange` 再调 `evolve_schema`"。**这一刀改在 `yuntun-sql` 落地**，
+依据是三条**代码事实**（查出来的，不是偏好）：
+
+| # | 事实 | 后果 |
+|---|---|---|
+| 1 | `ADD COLUMN` 要"SQL 类型 → Arrow"的映射，而 `map_column_type` / `column_def_to_field` 在 **`crates/sql/src/sql.rs`**；依赖方向是 `sql → query`（不可逆） | 在 `query` 里实现只剩两条路：**复制一份类型映射**（两处真相）或把它下移（`sqlparser` 进 `model` —— 把 SQL 方言知识塞进最底层）。两条都不要 |
+| 2 | DDL 的其余部分**已经在 `yuntun-sql`**：`CREATE/DROP TABLE`、`CREATE/DROP DATABASE`、WAL DDL 追加与重放、只读拒绝（`check_write`）、查询缓存刷新 | 放 `query` 会把 DDL 拆成两半：读的人得同时看两个 crate 才知道一条 `ALTER` 到底干了什么 |
+| 3 | `SqlEngine` **本来就持有写句柄** `catalog: Arc<dyn CatalogOps>`，`new_readonly` 也已经是"可读拒绝"（`SqlError::ReadOnly`） | `§143.2` 要的"注入写句柄 + 未注入时给可读拒绝"**本层已经存在**，不必再造一份 |
+
+⇒ 因此 `§143.2` 记的那处结构**没做、也不需要做**。所有协议入口（Flight 简易轨 / FlightSQL /
+MySQL wire）都经 `SqlEngine::execute(_stream)`，**没有路径**会被这个落点漏掉。
+
+### 144.2 `F.1` 的报错跟着事实改了一遍
+
+`§142` 里 `ALTER TABLE` 的拒绝是"已被识别、但**尚未支持**：见 plan.md F.2" —— `F.2` 落地之后
+那就是**假话**（它已经支持了，只是不在 `QueryEngine` 里）。报错也是产品的一部分：过期的报错
+会把用户送到错误的层。现在按事实分两类（`StmtKind::rejection`）：
+
+* **DDL**（`ALTER`/`CREATE`/`DROP TABLE`）⇒ "由 SQL 层执行（`yuntun-sql::SqlEngine`，plan.md F.2）：
+  QueryEngine 只执行查询、不持 Catalog 写句柄"；
+* **DML**（`DELETE` / `UPDATE`）⇒ 仍然是"已被识别、但**尚未支持**：见 plan.md F.3"。
+
+判据（`query/tests/stmt_routing.rs`）**刻意拆成两条**：一条断言 DDL 的报错**不该**含"尚未支持"、
+**必须**指向 `SqlEngine`；另一条断言 DML **必须**含"尚未支持"。写成一条会两边都松。
+
+### 144.3 语义与边界（**没做的部分写在明处**）
+
+| 语句 | 结果 |
+|---|---|
+| `ADD [COLUMN] [IF NOT EXISTS] c <type>` | ✅ 向后兼容演进（旧文件缺该列 ⇒ 读出来是 null） |
+| `DROP [COLUMN] [IF EXISTS] c` | ✅ **逻辑**删除：旧文件不动，读侧按当前 schema 对齐（§8.1） |
+| 目标态已满足**且没写 `IF`** | ✅ **明确报错**（绝不静默成功）；写了 `IF` ⇒ no-op（**不推版本、不写 WAL**） |
+| `ALTER COLUMN c TYPE …` / `MODIFY` / `CHANGE` | ❌ **拒绝**：改类型是破坏性变更（`plan.md` F.2 明令禁止） |
+| `ALTER COLUMN c {SET,DROP} NOT NULL` | ❌ 拒绝：`SchemaChange` **没有可空性载体** |
+| `RENAME COLUMN` / `RENAME TO` | ❌ 拒绝：`SchemaChange` 只有 加列 / 宽化 / 删列 三种载体 |
+| 一条语句多个操作 / `DROP COLUMN a, b` / `ADD COLUMN c INT FIRST` | ❌ 拒绝：一条语句 = **一个**原子变更（避免"部分成功"语义） |
+| `DROP` 到零列 | ❌ 拒绝（要清空整表请用 `DROP TABLE`） |
+
+**"重命名 / 可空性缺载体"是这一刀最要紧的边界**：它不是"忘了做"，而是要在
+`model/src/schema.rs` 的 `SchemaChange` 上加变体 —— 而那个枚举**过 proto（`EvolveSchemaOp.change`）
+与快照载荷**，加一个变体是**跨副本的格式变更**（`SchemaChangeKind`、proto、快照版本、
+`meta/src/op.rs` 的穷尽转换都要动）。那是独立的一刀，不塞进 F.2。
+
+### 144.4 验收（`plan.md` F.2 五条 ＋ 两条本仓最看重的反面）
+
+用例：`crates/server/tests/sql_alter_e2e.rs`（5 条端到端）＋ `crates/sql/src/sql.rs` 的 3 条纯函数用例。
+
+| # | 验收 | 证据（都在用例里） |
+|---|---|---|
+| ① | DDL 后**新写入带新列** | `ALTER ADD c` 后 `INSERT (3,'z',30)`，查 `a=3` 得 30 |
+| ② | **旧文件仍可读**（缺列按 null 对齐） | 用例**先等旧数据真落成文件**（`wait_for_files`：轮询 `list_visible_files` 非空）—— 否则这条测的是热数据那条路；随后 `count(*)=3`、`sum(a)=6`、`WHERE c IS NULL` = 2 行 |
+| ③ | 版本 **+1** 且**其它表不受影响** | `t` 的 `current_schema_version` 1→2；**对照表** `other` 的版本一字未动 |
+| ④ | **OCC：并发两个 DDL 只有一个成功** | 同一条 `ADD COLUMN c` 并发两遍 × 3 轮（`tokio::join!`）：**恰好一个** `Ok`；输家要么"版本冲突"（OCC）要么"已满足"（目标态已存在）；版本只 +1、列只有一个。⚠️ **两种交错都只有一个赢家 ⇒ 断言不依赖调度时序** —— 写成"两个不同的 DDL"就会变成抖的用例 |
+| ⑤ | 破坏性变更**被明确拒绝** | 改类型报错含"破坏性"；可空性 / 重命名报错含"载体"；**版本不动**（拒绝 = 没改） |
+| ⑥ | 无写入侧 ⇒ **可读拒绝** | `SqlEngine::new_readonly` 上 `ADD COLUMN` ⇒ `SqlError::ReadOnly`；**对照**：同一句在 `lakehouse.sql`（有写入侧）上成功 ⇒ 证明拒绝来自策略/能力，不是语句本身 |
+| ⑦ | `ALTER` 经 **WAL DDL 重放**跨重启 | `[meta] mode="memory"`（**元数据不落盘** ⇒ 只有重放这一条路）：重启后表回到 v3 = `[a, c]`（`CREATE` + 加列 + 删列三条记录依次重放，`converge_schema` 的两个分支都被走到） |
+
+### 144.5 验证与顺手修掉的文档漂移
+
+- `cargo test --workspace --no-fail-fast -j 4` → **425 passed / 0 failed / 0 ignored**；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**（仅外部 `proc-macro-error2` 的
+  future-incompat 提示，`status.md §2.1` 已记）；
+- 判据 **5/5**（规模行按判据报出的数字更新：**54,927 行 / 20 crate / 428 测试函数**）；
+- **既有抖动（不是本刀引入）**：`yuntun-chaos::disk_watermark_aborts_oldest_batch_then_releases_segments`
+  在全量并行下超时（73s > 60s 上限），**单跑 0.12s 通过** —— 与 `status.md §4` 记的
+  "chaos 与其余 binary 并行争 CPU/IO"同源，未重复排查；
+- **顺手修掉的三处版本漂移**（都不是本刀引入，但"文档不许比现实旧"）：根 `README.md` 引用
+  `plan.md v2.2`、`plan.md` 正文末"文档结束 · v2.2"、`status.md §7` 转述的 `v2.2`
+  —— 一律改到当前的 **v2.3**（`plan.md` 从 `§141` 起就是 v2.3）。

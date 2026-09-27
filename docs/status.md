@@ -20,7 +20,7 @@
   （`§103` —— 顺出并修掉"多节点真部署根本起不来"的**启动顺序/选主判据**两处缺陷）、
   **网络分区**下少数派**不能提交**而多数派照常提交（`§104`：可切断链路、零生产改动、含**常驻反证**）、
   数据进程的冷存储接**真 S3**（单机 `§101` / 多节点 `§102`）、**压缩触发策略**（`§105`）。
-- **质量网**：388 用例全绿（**0 ignored**） / clippy 本仓 0 告警 / chaos **11/11** / T8 基线已入库 /
+- **质量网**：425 用例全绿（**0 ignored**） / clippy 本仓 0 告警 / chaos **11/11** / T8 基线已入库 /
   **六个真缺陷全部已修**（含最后一条 `§28.1` 的读侧栅栏 `§99`；`§103` 的两处多节点缺陷；
   `§108` 的"**对端换 IP 后 leader 再也送不到**"—— 容器化真集群里复现，见 `tests/cluster.sh smoke`）；
   **写停摆也已修**（`§106` → `§111`）：小压缩阈值**且**有 follower 落后时集群写不进的根因
@@ -52,7 +52,7 @@
 
 ## 2. 能力矩阵（standalone 今天能做到什么）
 
-规模：**53,942 行 Rust / 20 个 crate / 419 个测试函数 / 416 个用例通过（0 ignored） / clippy 0 警告**
+规模：**54,927 行 Rust / 20 个 crate / 428 个测试函数 / 425 个用例通过（0 ignored） / clippy 0 警告**
 工具链：**rustc 1.98.1 + edition 2024**（20 个 crate 全走 `edition.workspace = true`；见 `operation-log §59`）；
 **MSRV 声明 `1.94`**（下界由依赖 `datafusion 55` 决定，**不是** policy 想取的 1.92；**尚未经真·1.94 编译验证**，见 `§60`）。
 全仓仅余 1 条**外部依赖**告警（`proc-macro-error2 v2.0.1`，来自 `opensrv-mysql`，非本仓代码）。
@@ -64,7 +64,7 @@
 | 交付形态 | 单二进制 `yuntun` + 一份 TOML，单命令启动；Flight SQL `:50051` + MySQL wire `:3306` 同开 |
 | SQL 语义 | `crates/sql` 是**唯一实现**，两端口共用（不是两套代码）；`SELECT`/CTE/聚合/`information_schema`/8 个 JSON 函数，DataFusion 55 执行 |
 | 写入 | `INSERT ... VALUES` / `INSERT ... SELECT` / Flight `DoPut` / CLI（CSV/JSONL/Parquet）；**三条入口汇入同一 ingest 管线** |
-| DDL | `CREATE/DROP TABLE`、`CREATE/DROP DATABASE`；类型覆盖 `DECIMAL`/`ARRAY<T>`/`MAP(K,V)`/`JSON` |
+| DDL | `CREATE/DROP TABLE`、`CREATE/DROP DATABASE`、**`ALTER TABLE ADD/DROP COLUMN`**（`§144`，`F.2`）；类型覆盖 `DECIMAL`/`ARRAY<T>`/`MAP(K,V)`/`JSON` |
 | 元数据 | `SHOW TABLES/COLUMNS/DATABASES`、`DESCRIBE`、`SHOW CREATE TABLE` |
 | 客户端 | mysql CLI / 驱动预编译 / DBeaver+JDBC / ADBC+pyarrow 均已验（T1–T3） |
 | 幂等 | 三通道（SQL 注释 / CLI `--key` / `FlightData.app_metadata`）；**语义 = 一次请求一次键 + 批次派生键**（§3） |
@@ -77,7 +77,9 @@
 
 ### 2.2 明确不能（**都是明确报错，不是静默错**）
 
-`UPDATE` / `DELETE` / `ALTER TABLE` / 事务 / 视图 / 存储过程 → 报错；
+`UPDATE` / `DELETE` / 事务 / 视图 / 存储过程 → 报错；
+**`ALTER TABLE` 只支持 `ADD COLUMN` / `DROP COLUMN`**（`§144`）：改类型（**破坏性**）、
+可空性变更、重命名（`SchemaChange` 无载体）**都是明确拒绝**，不是静默接受；
 MySQL 端口 **trust 无鉴权**（按网络隔离部署）；MySQL 轨结果集仍先收集后逐行写（Flight 轨已流式）；
 指标只有日志、无 HTTP 导出；SQL DDL 的 `TIMESTAMP(p)` 精度不入 schema。
 
@@ -122,7 +124,8 @@ MySQL 端口 **trust 无鉴权**（按网络隔离部署）；MySQL 轨结果集
 
 | 层 | 证据 | 位置 |
 |---|---|---|
-| 单元 / 集成 | **410 passed / 0 failed / 0 ignored**；411 个测试函数；`clippy --workspace --all-targets` 0 警告（本仓） | `cargo test --workspace` |
+| 单元 / 集成 | **425 passed / 0 failed / 0 ignored**；428 个测试函数；`clippy --workspace --all-targets` 0 警告（本仓） | `cargo test --workspace` |
+| **SQL DDL：schema 变更（`F.2`）** | `ALTER TABLE ADD/DROP COLUMN`：新写入带新列 / **旧文件仍可读**（缺列填 null）/ 版本 +1 且**其它表不动** / 并发两个 DDL **只有一个成功**（OCC）/ 破坏性变更与"无载体"形状**被明确拒绝** / 只读形态给**可读拒绝** / 经 **WAL DDL 重放**跨重启 | `crates/server/tests/sql_alter_e2e.rs`（5 条）+ `crates/sql/src/sql.rs` 解析用例 3 条；`operation-log §144` |
 | **容器化多节点**（需 podman） | `tests/cluster.sh smoke`：三节点真集群 → 真断网 → 多数派仍写 → 接回**必须收敛**（`§108`）；`soak [轮数] [条数]`：**反复**冻结/断网下的收敛回归（`§112`）；`lossy` / `netem-run "<netem 参数>"`：丢包与延迟（`§113`） | `bash tests/cluster.sh smoke` / `soak 3 5` / `lossy 20 8` |
 | chaos（真实磁盘 + 跨重启 + 并发） | **11/11** 场景；进程中抓出**五个真缺陷**（**全部已修**，含 `§28.1` 读侧栅栏 `§99`） | `crates/chaos` 模块文档 + `operation-log §27–§31`/`§99` |
 | 性能基线 | 提交时刻分布 / 峰值提交数 / `seal→committed` / 文件数·天 / 单文件行数 | `operation-log §32`（`bench_baseline`） |
@@ -236,15 +239,15 @@ window_closed    files= 3
 | 文档 | 定位 | 时效（2026-09-24） | 本轮动作 / 欠账 |
 |---|---|---|---|
 | **`status.md`（本文）** | 现状基线 | ✅ 最新 | v1.1：里程碑账（M1–M6 齐）、多节点边界、缺口重排、证据网补 R4–R6 |
-| `operation-log.md` | 实施日志 + **偏差与证据**（§1–§143） | ✅ 最新 | 每刀一节的纪律保持；§98（M4 并发真写）/ §99（读侧栅栏）/ §100（客户端落点）/ §101（真实 S3 单机读写）/ §102（数据进程接 S3 + 多节点真 S3 对拍）/ §103（3 个真 metanode 进程 + 修掉多节点启动缺陷）/ §104（网络分区：少数派不能提交）/ §105（压缩触发策略）/ §106（写停摆复现）/ §107（写停摆**机制钉死**：乐观推进 + 丢一条 append；修法由 `§110`/`§111` 落地）/ §108（**容器化三节点真集群**：真断网 + 接回收敛断言，抓出并修掉"对端换 IP 后 leader 再也送不到"）/ §109（容器真集群检验 `§106`：**这一形态下没复现**，另拿到**快照安装**的正面证据）/ §110（续查：首因是**传输队列的队头阻塞**）/ §111（**写停摆修好**：出站分两条队列 + 优先发携带条目的，探针转正 ⇒ **0 ignored**）/ §112（`tests/cluster.sh soak`：反复冻结/断网下的收敛回归）/ §113（有损/延迟链路 + **部署包线**：对称延迟 1.5s 就反复选举）/ §114（`T8.x`「R3 后打同一 Meta」：**raft 元数据的代价** p99 +14.5%）/ §115（**3 节点** raft 元数据：代价主体是**串行化**，峰值提交 34→23→13）/ §116（把 **RTT** 加进去：跨区 30ms ⇒ p99 +39.7%、**峰值提交塌到 7 次/秒**）/ §117（netem 做满：抖动/丢包/乱序组合）/ §118（`Join` 上半刀：在线加 learner + 地址随 conf change 复制）/ §119（`Join` 下半刀：新节点 `--join` 在线加入并追平 + 地址表落盘）/ §120（提升 learner→voter + 两个被照出来的真问题：`Status.applied_index` 停摆、成员表顺序）/ §121（**移除成员**：`Meta.Remove` + 最后一个 voter 的硬门槛 + 进程级"4 voter 对照实验"）/ §122（对外口径校正：写停摆已修而文档仍写"未修"）/ §123（**偏差审计 + 判据化**：五类差异 + `closeout.md` 台账 + **5 条文档一致性判据**）/ §124（台账逐条闭环：`D-2` CPU 段下阻塞池、`D-3`/`D-4` 定案、`D-1` 决策备忘）/ §125（`durable` 落地 v1：WAL 段持续归档 + 丢盘拉回走既有恢复通路 + 有对照组的验收）/ §126（`D-6` 闭环：端到端 —— 拉回后经既有恢复通路重新变成可见文件，带对照组）/ §127（`D-5` 闭环：datanode 补接线 ⇒ **台账 §1 清空**）/ §128（成员变更的运维 CLI，`T11.5` 收尾）/ §129（`T13.2` 第一半：min/max 真算进 manifest + `scan` 文件级剪枝）/ §130（`T9.x` Vortex 被 arrow 版本挡住 + 台账 `D-7`）/ §131（`T6.14` 第一刀：硬分区两层验证）/ §132（`T13.2` 另一半核实 + 更正 `§129.3`）/ §133（采用 crates.io `vortex 0.86` + datafusion 55.1）/ §134（codec 首试：API 事实表）/ §135（codec 第二版：编译过、跑起来 panic（缺 runtime））/ §136（codec 第三版：runtime 接上）/ §137（codec 第四版：根因是 ctx 的 edition 白名单）/ §138（codec 第五版：edition 走对，差"注册"一格）/ §139（codec 成了：往返逐值相同 + 体积对照）/ §140（实测：Vortex 体积 3.5–4.5 倍 ⇒ 台账 `D-8` 待决策）/ §141（三块新功能的计划与决策）/ §142（`F.1` SQL 语句路由落地）/ §143（**`F.2` 接缝查证**：`SchemaChange` 在 `model/src/schema.rs`、`QueryEngine` 需注入写句柄 —— 尚未动代码） |
-| `plan.md` | 开发计划任务书（阶段 WBS / 里程碑 / 风险） | ✅ 已同步 | §8.4 门槛账更新为 M2–M6 全 ✅（引用 §98/§99）；§2.1/§七 缺陷状态同步 |
-| `architecture.md` | 架构设计（12 个 ADR + 域设计） | ✅ 已修版本漂移 | v12：ADR-10 正式修订（含"≤1 文件/窗口"的限定语 + **"客户端软路由未实现"现状注**）；**欠**：§4 ADR-9 的 RPO 口径表述 |
+| `operation-log.md` | 实施日志 + **偏差与证据**（§1–§144） | ✅ 最新 | 每刀一节的纪律保持；§98（M4 并发真写）/ §99（读侧栅栏）/ §100（客户端落点）/ §101（真实 S3 单机读写）/ §102（数据进程接 S3 + 多节点真 S3 对拍）/ §103（3 个真 metanode 进程 + 修掉多节点启动缺陷）/ §104（网络分区：少数派不能提交）/ §105（压缩触发策略）/ §106（写停摆复现）/ §107（写停摆**机制钉死**：乐观推进 + 丢一条 append；修法由 `§110`/`§111` 落地）/ §108（**容器化三节点真集群**：真断网 + 接回收敛断言，抓出并修掉"对端换 IP 后 leader 再也送不到"）/ §109（容器真集群检验 `§106`：**这一形态下没复现**，另拿到**快照安装**的正面证据）/ §110（续查：首因是**传输队列的队头阻塞**）/ §111（**写停摆修好**：出站分两条队列 + 优先发携带条目的，探针转正 ⇒ **0 ignored**）/ §112（`tests/cluster.sh soak`：反复冻结/断网下的收敛回归）/ §113（有损/延迟链路 + **部署包线**：对称延迟 1.5s 就反复选举）/ §114（`T8.x`「R3 后打同一 Meta」：**raft 元数据的代价** p99 +14.5%）/ §115（**3 节点** raft 元数据：代价主体是**串行化**，峰值提交 34→23→13）/ §116（把 **RTT** 加进去：跨区 30ms ⇒ p99 +39.7%、**峰值提交塌到 7 次/秒**）/ §117（netem 做满：抖动/丢包/乱序组合）/ §118（`Join` 上半刀：在线加 learner + 地址随 conf change 复制）/ §119（`Join` 下半刀：新节点 `--join` 在线加入并追平 + 地址表落盘）/ §120（提升 learner→voter + 两个被照出来的真问题：`Status.applied_index` 停摆、成员表顺序）/ §121（**移除成员**：`Meta.Remove` + 最后一个 voter 的硬门槛 + 进程级"4 voter 对照实验"）/ §122（对外口径校正：写停摆已修而文档仍写"未修"）/ §123（**偏差审计 + 判据化**：五类差异 + `closeout.md` 台账 + **5 条文档一致性判据**）/ §124（台账逐条闭环：`D-2` CPU 段下阻塞池、`D-3`/`D-4` 定案、`D-1` 决策备忘）/ §125（`durable` 落地 v1：WAL 段持续归档 + 丢盘拉回走既有恢复通路 + 有对照组的验收）/ §126（`D-6` 闭环：端到端 —— 拉回后经既有恢复通路重新变成可见文件，带对照组）/ §127（`D-5` 闭环：datanode 补接线 ⇒ **台账 §1 清空**）/ §128（成员变更的运维 CLI，`T11.5` 收尾）/ §129（`T13.2` 第一半：min/max 真算进 manifest + `scan` 文件级剪枝）/ §130（`T9.x` Vortex 被 arrow 版本挡住 + 台账 `D-7`）/ §131（`T6.14` 第一刀：硬分区两层验证）/ §132（`T13.2` 另一半核实 + 更正 `§129.3`）/ §133（采用 crates.io `vortex 0.86` + datafusion 55.1）/ §134（codec 首试：API 事实表）/ §135（codec 第二版：编译过、跑起来 panic（缺 runtime））/ §136（codec 第三版：runtime 接上）/ §137（codec 第四版：根因是 ctx 的 edition 白名单）/ §138（codec 第五版：edition 走对，差"注册"一格）/ §139（codec 成了：往返逐值相同 + 体积对照）/ §140（实测：Vortex 体积 3.5–4.5 倍 ⇒ 台账 `D-8` 待决策）/ §141（三块新功能的计划与决策）/ §142（`F.1` SQL 语句路由落地）/ §143（**`F.2` 接缝查证**：`SchemaChange` 在 `model/src/schema.rs`、`QueryEngine` 需注入写句柄 —— 尚未动代码）/ §144（**`F.2` 落地**：`ALTER TABLE ADD/DROP COLUMN` 走 `evolve_schema`；**落点更正到 `yuntun-sql`**（类型映射在 sql 层、DDL 已全在那儿）；WAL DDL 重放"收敛到目标 schema"；五条验收 + 只读拒绝 + 破坏性变更明确拒绝） |
+| `plan.md` | 开发计划任务书（阶段 WBS / 里程碑 / 风险） | ✅ 已同步（v2.3） | §8.4 门槛账更新为 M2–M6 全 ✅（引用 §98/§99）；§2.1/§七 缺陷状态同步；**F 组**（`§141`）＋ **F.1/F.2 落地状态**（`§142`/`§144`） |
+| `architecture.md` | 架构设计（12 个 ADR + 域设计） | ✅ 已修版本漂移 | v12：ADR-10 正式修订（含"≤1 文件/窗口"的限定语 + **"客户端软路由未实现"现状注**）；**§6.3 补 schema 变更的落地边界现状注**（`§144`）；**欠**：§4 ADR-9 的 RPO 口径表述 |
 | `design.md` | 详细设计（模块/接口/状态机/配置） | ⚠️ 部分章节是阶段 0 意图，实现有偏差 | 已声明"实现偏差以 operation-log 为准"；**欠**：§11 `[chunk]` 段与 `idle_timeout` 整段重写 |
 | `refactor.md` | 分布式改造指南（S0–S6 / R0–R6 怎么改） | ✅ S1–S6 主要项已落地（R2–R6，见 `operation-log §38–§100`），其余仍是改造指南 | 状态列待逐条回填 |
 | `architecture-with-chunk.md` | chunk 层目标态架构（v2） | ✅ 有效（`plan.md` 依据之一） | 已标注与 `architecture.md` v12 的关系；§5.3 含"seal 是窗口对齐"限定语 + 相位量级定案 |
 | `sql-access-design.md` | 多协议接入设计 | ✅ 有效 | — |
 | `delta-dml-design.md` | DELETE/UPDATE 设计草案 | ✅ 有效（未实现） | — |
-| `README.md` | 对外门面 | ✅ 引用 `plan.md v2.2` + 指向 `status.md` | 保持 |
+| `README.md` | 对外门面 | ✅ 引用 `plan.md v2.3` + 指向 `status.md` | SQL 支持面（DDL 行 / 不支持行）已按 `§144` 同步 |
 | `closeout.md` | **偏差台账**（未闭环 / 已登记 / 待销账）+ 判据清单（`§123`） | ✅ 新增 | "可机核的一律写成判据"——判据在 `crates/testkit/tests/docs_consistency.rs`，跑全量即验 |
 
 ---

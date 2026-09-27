@@ -26,7 +26,8 @@ use yuntun_catalog::CatalogOps;
 use yuntun_ingest::Ingestor;
 use yuntun_model::error::LakeError;
 use yuntun_model::meta::serialize_schema;
-use yuntun_model::ops::CreateTableRequest;
+use yuntun_model::ops::{CreateTableRequest, EvolveSchemaRequest};
+use yuntun_model::schema::SchemaChange;
 use yuntun_model::wal_record::{ddl_op, DdlPayload};
 pub use params::SqlValue;
 use yuntun_query::{PartialRead, PartialSink, QueryEngine};
@@ -695,6 +696,89 @@ impl SqlEngine {
                     .map_err(|e| SqlError::Internal(e.to_string()))?;
                 Ok(RawOutcome::Affected(0))
             }
+            // F.2：SQL 形式的 schema 变更（ADD COLUMN / DROP COLUMN）→ `evolve_schema`（走 raft）
+            //
+            // 落点为什么在**本层**而不是 `QueryEngine`：① `ADD COLUMN` 要 SQL 类型 → Arrow 的
+            // 映射，而那份映射（`map_column_type` / `column_def_to_field`）就在**本 crate**；
+            // ② DDL 的其余部分（CREATE/DROP TABLE、WAL DDL 追加与重放、只读拒绝、缓存刷新）
+            // 已经全在这里 —— 换个地方等于把 DDL 拆成两半。写入句柄 `catalog` 本层已有。
+            Statement::AlterTable(alter) => {
+                self.check_write()?;
+                let table = sql::resolve_table_ref(&alter.name, session);
+                if table.is_empty() {
+                    return Err(SqlError::Unsupported(
+                        "invalid table name in ALTER TABLE".into(),
+                    ));
+                }
+                let parsed = sql::parse_alter_table(&alter)
+                    .map_err(|e| SqlError::Unsupported(e.to_string()))?;
+                // 当前 schema + 版本：OCC 的基线（C8：OCC 只作用于 EvolveSchema）
+                let Some((schema, version)) = self
+                    .catalog
+                    .table_schema(&table)
+                    .await
+                    .map_err(SqlError::from_lake)?
+                else {
+                    return Err(SqlError::NotFound(table));
+                };
+                // 目标状态已满足：`IF NOT EXISTS` / `IF EXISTS` ⇒ **跳过**（不推版本、不写 WAL）；
+                // 没写 IF 的 ⇒ 明确报错。**绝不静默成功**（那是"客户端以为改了、实际没改"）
+                let satisfied = match &parsed.change {
+                    SchemaChange::AddColumn { field } => {
+                        schema.field_with_name(field.name()).is_ok()
+                    }
+                    SchemaChange::DropColumn { column } => {
+                        schema.field_with_name(column).is_err()
+                    }
+                    // 非列级变更由 `parse_alter_table` 挡在门外，这里取保守值
+                    _ => false,
+                };
+                if satisfied {
+                    if parsed.idempotent {
+                        return Ok(RawOutcome::Affected(0));
+                    }
+                    return Err(SqlError::Unsupported(format!(
+                        "ALTER TABLE 的目标状态已满足：{}（加 `IF NOT EXISTS` / `IF EXISTS` \
+                         可让同一条语句幂等）",
+                        parsed.change.describe()
+                    )));
+                }
+                // 删到零列 ⇒ 拒绝（表连 schema 都没了；要清空表请 DROP TABLE）
+                if matches!(parsed.change, SchemaChange::DropColumn { .. })
+                    && schema.fields().len() <= 1
+                {
+                    return Err(SqlError::Unsupported(
+                        "DROP COLUMN 会删掉最后一列 ⇒ 拒绝（要清空整表请用 DROP TABLE）".into(),
+                    ));
+                }
+                let resp = self
+                    .catalog
+                    .evolve_schema(EvolveSchemaRequest {
+                        table: table.clone(),
+                        change: parsed.change.clone(),
+                        expected_version: version,
+                    })
+                    .await
+                    .map_err(alter_error)?;
+                // DDL WAL 权威记录（**全限定名** + **目标 schema**）：重启后重放把表收敛到新
+                // schema。写"目标 schema"而不是 change：change 与"当时当前 schema"绑在一起，
+                // 而重放时可能已经演进过（幂等）—— 目标态才是重放该收敛到的**事实**。
+                self.append_ddl(DdlPayload {
+                    op: ddl_op::ALTER_TABLE,
+                    table,
+                    arrow_schema: serialize_schema(&resp.new_schema),
+                    default_format: String::new(),
+                })
+                .await?;
+                // 本地缓存立即感知新 schema（`schema_ver` 变 ⇒ 全量重建）：
+                // 否则"DDL 之后的新写入带新列"要等下一个刷新周期才成立
+                self.query
+                    .catalog()
+                    .refresh(&self.catalog)
+                    .await
+                    .map_err(|e| SqlError::Internal(e.to_string()))?;
+                Ok(RawOutcome::Affected(0))
+            }
             Statement::Drop {
                 object_type,
                 if_exists,
@@ -760,10 +844,27 @@ impl SqlEngine {
             }
             other => Err(SqlError::Unsupported(format!(
                 "only SELECT / SHOW TABLES / SHOW DATABASES / INSERT / CREATE TABLE / \
-                 DROP TABLE / CREATE DATABASE / DROP DATABASE are supported, got: {}",
+                 ALTER TABLE (ADD|DROP COLUMN) / DROP TABLE / CREATE DATABASE / DROP DATABASE \
+                 are supported, got: {}",
                 crate::sql::sql_snippet(&other.to_string())
             ))),
         }
+    }
+}
+
+/// `evolve_schema` 失败 → SqlError（F.2）。
+///
+/// **OCC 冲突必须是一条"可读的冲突"**：`LakeError::SchemaChanged` 落进 `from_lake` 的兜底分支
+/// 会变成 `Internal`（"服务端内部错误"），于是客户端会去重试整条语句 —— 而它其实只是
+/// "并发 DDL 里你是输家"。这条映射把它变回一条**客户端语义**的错误（`Precondition`）。
+fn alter_error(e: LakeError) -> SqlError {
+    match e {
+        LakeError::SchemaChanged { actual_version, .. } => SqlError::Precondition(format!(
+            "schema 版本冲突：表已被另一个 DDL 演进到 v{actual_version}\
+             （OCC 下并发 DDL 只有一个成功）；请重读 schema 后重试"
+        )),
+        LakeError::InvalidSchemaChange(msg) => SqlError::Unsupported(msg),
+        other => SqlError::from_lake(other),
     }
 }
 

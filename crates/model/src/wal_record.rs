@@ -127,13 +127,16 @@ pub struct BatchAbortPayload {
 /// 再分流 batch 恢复**，保证 SQL 写入的数据崩溃重启后表存在、可恢复（S1.6 验收）。
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct DdlPayload {
-    /// 0 = CreateTable, 1 = DropTable, 2 = CreateSchema, 3 = DropSchema
+    /// 0 = CreateTable, 1 = DropTable, 2 = CreateSchema, 3 = DropSchema, 4 = AlterTable
     #[prost(uint32, tag = "1")]
     pub op: u32,
     /// 表标识（**全限定 `schema.table`**）或 schema 名（CreateSchema/DropSchema）
     #[prost(string, tag = "2")]
     pub table: String,
-    /// CreateTable：Arrow Schema（IPC 序列化，model::meta::serialize_schema）
+    /// CreateTable / AlterTable：Arrow Schema（IPC 序列化，model::meta::serialize_schema）。
+    ///
+    /// AlterTable 存的是**变更后的目标 schema**（不是"变更本身"）：重放时按它把表
+    /// **收敛到目标态**，于是"重放时表已经演进过"（幂等）不需要特殊分支。
     #[prost(bytes = "vec", tag = "3")]
     pub arrow_schema: Vec<u8>,
     /// CreateTable：default_format（"parquet" | "vortex"）
@@ -148,6 +151,8 @@ pub mod ddl_op {
     /// 多 schema：CREATE DATABASE / CREATE SCHEMA（`DdlPayload.table` = schema 名）
     pub const CREATE_SCHEMA: u32 = 2;
     pub const DROP_SCHEMA: u32 = 3;
+    /// `ALTER TABLE`（F.2）：`arrow_schema` = **变更后的目标 schema**（重放即收敛到它）
+    pub const ALTER_TABLE: u32 = 4;
 }
 
 /// WAL Record 枚举。

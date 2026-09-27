@@ -6,7 +6,7 @@
 
 > **现状与下一步**见 [`docs/status.md`](docs/status.md)（唯一现状入口）；
 > 文档索引与冲突裁决顺序见 [`docs/README.md`](docs/README.md)。
-> 设计文档：[`plan.md`](docs/plan.md)（任务书 v2.2 / 阶段划分）、`architecture.md`（架构 + ADR）、
+> 设计文档：[`plan.md`](docs/plan.md)（任务书 v2.3 / 阶段划分）、`architecture.md`（架构 + ADR）、
 > `design.md`（详细设计）、`refactor.md`（分布式改造指南）、`sql-access-design.md`（多协议接入）、
 > `operation-log.md`（实施日志与证据）。
 
@@ -104,10 +104,10 @@ SQL 支持面（详见 `docs/sql-access-design.md` §4）：
 |---|---|
 | 查询 | `SELECT`（含 CTE / 聚合 / `information_schema.*`），非限定表名 `FROM t` 直接可用 |
 | 写入 | `INSERT ... VALUES` / `INSERT ... SELECT` |
-| DDL | `CREATE TABLE`（`IF NOT EXISTS` / `NOT NULL`；类型：`TINYINT/SMALLINT/INT/BIGINT`（含无符号）、`FLOAT/DOUBLE`、`BOOLEAN`、`DATE`、`DATETIME/TIMESTAMP`、`DECIMAL(p,s)`、`CHAR/VARCHAR(n)/TEXT/STRING`、`JSON/JSONB`（→ UTF8 文本存储）、`BINARY/VARBINARY/BLOB`、`ARRAY<T>` / `T[]`、`MAP(K,V)`（嵌套元素递归支持，Parquet round-trip 无损）/ `DROP TABLE`（`IF EXISTS`）/ `CREATE DATABASE` / `DROP DATABASE`（均 WAL 权威，重启可恢复） |
+| DDL | `CREATE TABLE`（`IF NOT EXISTS` / `NOT NULL`；类型：`TINYINT/SMALLINT/INT/BIGINT`（含无符号）、`FLOAT/DOUBLE`、`BOOLEAN`、`DATE`、`DATETIME/TIMESTAMP`、`DECIMAL(p,s)`、`CHAR/VARCHAR(n)/TEXT/STRING`、`JSON/JSONB`（→ UTF8 文本存储）、`BINARY/VARBINARY/BLOB`、`ARRAY<T>` / `T[]`、`MAP(K,V)`（嵌套元素递归支持，Parquet round-trip 无损）/ `DROP TABLE`（`IF EXISTS`）/ `CREATE DATABASE` / `DROP DATABASE`（均 WAL 权威，重启可恢复）；**`ALTER TABLE ADD/DROP COLUMN`**（含 `IF [NOT] EXISTS`；OCC 演进、走 raft，旧文件缺列按 null 对齐 —— 改类型 / 可空性 / 重命名**明确拒绝**） |
 | 元数据 | `SHOW TABLES/FULL TABLES`、`SHOW COLUMNS/FULL COLUMNS`、`DESCRIBE`、`SHOW CREATE TABLE`、`SHOW DATABASES`、`SHOW VARIABLES`、`SHOW COLLATION/CHARSET/ENGINES/KEYS` |
 | 方言兼容 | `SET` / `USE` / `BEGIN` / `COMMIT` / `ROLLBACK` = no-op（单语句自动提交） |
-| 不支持 | `UPDATE` / `DELETE` / `ALTER TABLE` / `CREATE TABLE AS SELECT` / `CREATE OR REPLACE` / 复杂类型（`STRUCT` 等）/ `_BINARY` 字面量 / MySQL JSON 路径操作符 `->` `->>`（用 JSON 函数替代）/ 视图 / 存储过程 / 事务语义 → 明确报错（绝不静默返回错误结果）；加列走写入侧 schema 演化（ingest / Flight DoPut），无 SQL `ALTER` |
+| 不支持 | `UPDATE` / `DELETE` / `ALTER TABLE` 的**改类型·可空性·重命名** / `CREATE TABLE AS SELECT` / `CREATE OR REPLACE` / 复杂类型（`STRUCT` 等）/ `_BINARY` 字面量 / MySQL JSON 路径操作符 `->` `->>`（用 JSON 函数替代）/ 视图 / 存储过程 / 事务语义 → 明确报错（绝不静默返回错误结果）；加列除 SQL `ALTER TABLE ADD COLUMN` 外，也走写入侧 schema 演化（ingest / Flight DoPut） |
 | JSON 函数 | `json_get / json_get_{str,int,float,bool,json,array}` / `json_as_text` / `json_contains` / `json_length` / `json_object_keys` / `json_from_scalar`（`datafusion-functions-json` 0.55）。**路径不带 `$`**：`json_get_int(doc, 'a.b')`；`json_get` 返回 JSON 变体联合（wire 按文本回传） |
 
 ### 2.2 DBeaver（MySQL）连接

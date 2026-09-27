@@ -14,7 +14,8 @@ use std::sync::Arc;
 
 use yuntun_catalog::CatalogOps;
 use yuntun_model::meta::{deserialize_schema, IngestConfig};
-use yuntun_model::ops::CreateTableRequest;
+use yuntun_model::ops::{CreateTableRequest, EvolveSchemaRequest};
+use yuntun_model::schema::{classify, SchemaChange, SchemaCompatibility};
 use yuntun_model::wal_record::{ddl_op, Record};
 use yuntun_wal::writer::WalWriter;
 
@@ -26,6 +27,7 @@ pub async fn replay_wal_ddl(
     let records = reader.scan_from(0)?;
     let mut created = 0usize;
     let mut dropped = 0usize;
+    let mut altered = 0usize;
     for (_, rec) in records {
         let Record::Ddl(p) = rec else { continue };
         let res = match p.op {
@@ -79,6 +81,13 @@ pub async fn replay_wal_ddl(
                 Err(yuntun_model::error::LakeError::SchemaNotFound(_)) => Ok(()),
                 Err(e) => Err(e),
             },
+            // F.2：`ALTER TABLE` —— 把表的 schema **收敛到记录里的目标态**（幂等）
+            ddl_op::ALTER_TABLE => {
+                let target = deserialize_schema(&p.arrow_schema)?;
+                let n = converge_schema(catalog, &p.table, &target).await?;
+                altered += n;
+                Ok(())
+            }
             other => {
                 tracing::warn!(op = other, table = %p.table, "unknown ddl op in WAL, skipping");
                 Ok(())
@@ -88,8 +97,68 @@ pub async fn replay_wal_ddl(
             tracing::warn!(table = %p.table, error = %e, "replay WAL DDL failed");
         }
     }
-    if created > 0 || dropped > 0 {
-        tracing::info!(created, dropped, "replayed WAL DDL records");
+    if created > 0 || dropped > 0 || altered > 0 {
+        tracing::info!(created, dropped, altered, "replayed WAL DDL records");
     }
     Ok(())
+}
+
+/// 把 `table` 的 schema **收敛到 `target`**（幂等；`ALTER TABLE` 的重放路径，F.2）。
+///
+/// 为什么记录里存的是**目标 schema** 而不是"变更本身"：重放时表可能**已经**演进过
+/// （节点重启前就落过目录 / raft 快照；重放本身也会重复执行）—— 记目标态则只需
+/// "还差什么就补什么"，天然幂等，与上面 CREATE/DROP 两条同为一条纪律。
+///
+/// 每轮只施加**一个** `SchemaChange`（`classify` 一次给一个），循环到没有差异为止 ——
+/// 上限 32 轮防死循环（正常至多两三轮：加列 / 删列各一次）。
+async fn converge_schema(
+    catalog: &Arc<dyn CatalogOps>,
+    table: &str,
+    target: &arrow::datatypes::SchemaRef,
+) -> Result<usize, yuntun_model::error::LakeError> {
+    let mut applied = 0usize;
+    for _ in 0..32 {
+        let Some((current, version)) = catalog.table_schema(table).await? else {
+            // 表不在（本记录之前那条 CREATE 没重放出来）⇒ 交给后面的记录，不在这里造表
+            return Ok(applied);
+        };
+        let change = match classify(&current, target) {
+            SchemaCompatibility::Compatible => {
+                // `classify` 只回答"目标列都被覆盖了吗"，**看不见多余的列** ——
+                // 删列要在这里自己找（否则重放一条 `DROP COLUMN` 会静默不生效）
+                match current
+                    .fields()
+                    .iter()
+                    .find(|f| target.field_with_name(f.name()).is_err())
+                {
+                    Some(extra) => SchemaChange::DropColumn {
+                        column: extra.name().clone(),
+                    },
+                    None => return Ok(applied),
+                }
+            }
+            SchemaCompatibility::NeedsEvolve(c) => c,
+            SchemaCompatibility::Incompatible(reason) => {
+                return Err(yuntun_model::error::LakeError::InvalidSchemaChange(format!(
+                    "WAL DDL 重放：{table} 无法收敛到目标 schema（{reason}）"
+                )))
+            }
+        };
+        match catalog
+            .evolve_schema(EvolveSchemaRequest {
+                table: table.to_string(),
+                change,
+                expected_version: version,
+            })
+            .await
+        {
+            Ok(_) => applied += 1,
+            // 与别的 DDL 撞了版本：**下一轮重读**（这个循环本来就以"重读当前态"开头）
+            Err(yuntun_model::error::LakeError::SchemaChanged { .. }) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(yuntun_model::error::LakeError::Other(format!(
+        "WAL DDL 重放：{table} 的 schema 收敛未在 32 轮内完成"
+    )))
 }

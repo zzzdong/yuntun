@@ -7,11 +7,14 @@
 //! 自己接住 ⇒ 于是先立一个**分流层**：用 `sqlparser` 判定语句类型，非查询类交给我们的处理，
 //! 查询类**原样**交给 DataFusion（`§132` 已确认：块级剪枝是它的优化器给的，别抢）。
 //!
-//! # 这一刀做到哪
+//! # 这一层做到哪（`F.2` 之后的情况）
 //!
-//! **只立骨架与错误形态**：被分流的语句返回**"已识别但尚未支持"**的可读错误（点名是哪种语句、
-//! 指向 plan 的哪一节）—— 不是假成功，也不是 DataFusion 那句不知所云的解析错误。
-//! 真正的处理由 F.2 / F.3 各自补上。
+//! 被分流的语句一律返回**可读**的拒绝（不是假成功，也不是 DataFusion 那句不知所云的解析错误），
+//! 但**两类拒绝说的不是同一件事**（见 [`StmtKind::rejection`]）：
+//!
+//! - **DDL 已在 SQL 层落地**（`F.2`，落点 `yuntun-sql::SqlEngine`）⇒ 这里说的是"本引擎
+//!   不执行 DDL、不持写句柄"；
+//! - **DML（`DELETE` / `UPDATE`）是真未支持**（`F.3`）。
 
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -47,13 +50,26 @@ impl StmtKind {
         }
     }
 
-    /// 处理它的那一刀（`plan.md` F 组），便于报错时指路。
-    pub fn plan_section(&self) -> &'static str {
+    /// 被接管语句的**可读拒绝**（由 `sql_with_partial` 使用）。
+    ///
+    /// 两类必须分开说（它们是不同的事实，混成一句就会有一半是假话）：
+    ///
+    /// - **DDL**（`F.2` 已落地）：`ALTER TABLE` / `CREATE TABLE` / `DROP TABLE` 的实现在
+    ///   **SQL 层**（`yuntun-sql::SqlEngine`）—— 那里有 SQL→Arrow 的类型映射、只读拒绝、
+    ///   WAL DDL 追加与重放、缓存刷新。所以正确说法是"**本引擎不执行 DDL**"，而不是"尚未支持"；
+    /// - **DML**（`F.3` 未做）：`DELETE` / `UPDATE` 才是真的尚未支持。
+    pub fn rejection(&self) -> String {
         match self {
-            StmtKind::AlterTable => "F.2（SQL 形式的 schema 变更）",
-            StmtKind::CreateTable | StmtKind::DropTable => "F.2",
-            StmtKind::Delete | StmtKind::Update => "F.3（DELETE / UPDATE）",
-            StmtKind::Query => "—",
+            StmtKind::AlterTable | StmtKind::CreateTable | StmtKind::DropTable => format!(
+                "{} 由 SQL 层执行（`yuntun-sql::SqlEngine`，plan.md F.2）：\
+                 QueryEngine 只执行查询、不持 Catalog 写句柄",
+                self.as_str()
+            ),
+            StmtKind::Delete | StmtKind::Update => format!(
+                "{} 已被识别、但**尚未支持**：见 plan.md F.3（DELETE / UPDATE）",
+                self.as_str()
+            ),
+            StmtKind::Query => "QUERY 不需要拒绝（原样交给 DataFusion）".to_string(),
         }
     }
 }
