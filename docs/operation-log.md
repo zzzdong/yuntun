@@ -9773,3 +9773,10 @@ peeling 构造写错的后果是"多剪一个组" ⇒ **静默少数据**，而"
 - `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **5/5**。
 
 > **台账 `D-10` 闭环**：设计 §6.2 的"DV 占比触发"已落地（含下界与防抖动判据）。
+
+> **又观测到一条全量抖动**（与本刀无关，单独跑必过）：
+> `yuntun-ingest::flush_e2e::ingest_accumulate_flush_reaches_manifest_and_wal_terminal`
+> 在全量并行下偶发失败（那一轮该二进制跑了 26s；单独跑 0.02s 通过）——
+> 它按"等攒批循环"的挂钟耐心判成败，重负载下会被邻居挤掉。
+> 与既知的两条（`query::partial_fanout::slow_sources…`、`chaos::disk_watermark…`）记在一起：
+> **要修都得给它们不依赖挂钟的判据。**
