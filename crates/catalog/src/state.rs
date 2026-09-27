@@ -89,7 +89,15 @@ pub struct CatalogState {
     /// **另一个维度的事实**，有它自己的快照窗口（`applied_at` / `revoked_at`）。
     /// 混进 manifest 会让"文件"与"删除"互相污染（重提交/幂等按 batch_id 走，
     /// 而删除按 dv_id 走）。
-    deletions: BTreeMap<String, DeletionEntry>,
+    /// 键 = **`(dv_id, file_path)`**，不是 `dv_id`。
+    ///
+    /// 为什么：**一条 DELETE 记录可以覆盖多个文件**（`DeletePayload.deletions` 是列表，
+    /// 设计 §4.1 的 `dv_id` 是"这次删除"的 id），而 DV 对象路径是
+    /// `dv/<数据文件名>/<dv_id>.bin` —— 真正的身份是"这次删除 × 这个文件"这一对。
+    /// 只按 `dv_id` 作键的话，删两个文件的请求会**只留下一个**（后者覆盖前者，
+    /// 或先到的把后来的判成重复）⇒ 另一个文件里的行会"已删却还查得到"。
+    /// （`§148` 在写 DML 重放时撞出来的；`§146` 的单文件用例当时盖住了它。）
+    deletions: BTreeMap<(String, String), DeletionEntry>,
     /// 结构变更计数（表 / schema / schema 演进）—— 缓存**全量重建**的触发器（S2-5）
     schema_ver: u64,
     /// 文件清单变更计数 —— 缓存**增量刷新**的触发器（S2-5）
@@ -606,7 +614,10 @@ impl CatalogState {
                     e.dv_id
                 )));
             }
-            if !self.deletions.contains_key(&e.dv_id) {
+            if !self
+                .deletions
+                .contains_key(&(e.dv_id.clone(), e.file_path.clone()))
+            {
                 fresh.push(e);
             }
         }
@@ -623,7 +634,8 @@ impl CatalogState {
                 // 免得读侧拿着空路径去 GET 一个不存在的位置
                 e.store_path = yuntun_model::dv::dv_object_path(&e.file_path, &e.dv_id);
             }
-            self.deletions.insert(e.dv_id.clone(), e);
+            self.deletions
+                .insert((e.dv_id.clone(), e.file_path.clone()), e);
         }
         self.schema_ver += 1;
         Ok(next)
@@ -954,8 +966,8 @@ impl CatalogState {
             deletions: self
                 .deletions
                 .iter()
-                .map(|(k, v)| SnapshotDeletionEntry {
-                    dv_id: k.clone(),
+                .map(|((dv_id, _), v)| SnapshotDeletionEntry {
+                    dv_id: dv_id.clone(),
                     entry: Some(v.clone()),
                 })
                 .collect(),
@@ -1083,7 +1095,7 @@ impl CatalogState {
                 )));
             }
         }
-        let mut deletions: BTreeMap<String, DeletionEntry> = BTreeMap::new();
+        let mut deletions: BTreeMap<(String, String), DeletionEntry> = BTreeMap::new();
         for e in &msg.deletions {
             let v = e.entry.clone().ok_or_else(|| {
                 SnapshotError::InvalidState(format!("删除向量 {} 缺事件体", e.dv_id))
@@ -1094,7 +1106,10 @@ impl CatalogState {
                     e.dv_id, v.dv_id
                 )));
             }
-            if deletions.insert(e.dv_id.clone(), v).is_some() {
+            if deletions
+                .insert((e.dv_id.clone(), v.file_path.clone()), v)
+                .is_some()
+            {
                 return Err(SnapshotError::InvalidState(format!(
                     "删除向量 {} 重复",
                     e.dv_id
@@ -1857,6 +1872,36 @@ mod snapshot_tests {
             0,
             "已经是 revoked 的不再重复撤销"
         );
+    }
+
+    /// **一次删除覆盖多个文件**：两个文件各留一份（键是 `(dv_id, file_path)`）。
+    ///
+    /// 这条是 `§148` 补的：只按 `dv_id` 作键时，删两个文件的请求会让另一个文件里的行
+    /// "已删却还查得到"（`§146` 的单文件用例盖住了它）。
+    #[test]
+    fn one_delete_record_can_cover_several_files() {
+        let mut s = rich_state();
+        let snap = s
+            .apply_deletions(vec![
+                dv_entry("dv-batch", "public.cpu", "f1.parquet"),
+                dv_entry("dv-batch", "public.cpu", "f2.parquet"),
+            ])
+            .unwrap();
+        let live = s.list_deletions("public.cpu", snap);
+        assert_eq!(live.len(), 2, "同一个 dv_id 下两个文件都要留（键是「删除 × 文件」）");
+        assert_eq!(
+            live.iter().filter(|d| d.file_path == "f1.parquet").count(),
+            1
+        );
+        // 幂等仍按 (dv_id, file_path)：重放同一条记录不写两份
+        let again = s
+            .apply_deletions(vec![
+                dv_entry("dv-batch", "public.cpu", "f1.parquet"),
+                dv_entry("dv-batch", "public.cpu", "f2.parquet"),
+            ])
+            .unwrap();
+        assert_eq!(again, s.snapshot_version, "完全重复 ⇒ 不推快照号");
+        assert_eq!(s.all_deletions().len(), 2);
     }
 
     /// 空删除 / 缺字段一律**拒绝**（它们都表达不了事实，却会让读侧去取不存在的对象）。

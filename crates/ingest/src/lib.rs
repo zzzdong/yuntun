@@ -17,6 +17,9 @@ pub mod ddl;
 
 /// WAL 里的 DDL 重放（启动恢复路径；`standalone` 与数据节点共用同一份实现）
 pub use ddl::replay_wal_ddl;
+/// `F.3`：DML（DELETE）的 WAL 重放 —— 启动时把删除收敛回目录。
+pub mod dml;
+pub use dml::{ReplayDmlStats, replay_wal_dml};
 pub mod flush;
 pub mod pipeline;
 pub mod wal_archive;
@@ -29,7 +32,7 @@ pub use flush::{
     abort_batch, flush_chunk, flush_chunk_with_id, payloads_to_batches, recommit_into_catalog,
     FlushDeps, FlushOutcome, LiveBatchTracker,
 };
-pub use pipeline::{Ingestor, IngestorConfig};
+pub use pipeline::{ForceFlushDone, Ingestor, IngestorConfig};
 pub use wal_archive::{archive_once, restore, spawn_archiver, ArchiveConfig};
 pub use schema_cache::SchemaCache;
 pub use source::{IngestSource, Receipt};

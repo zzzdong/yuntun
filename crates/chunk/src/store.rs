@@ -999,6 +999,24 @@ impl ChunkStore {
         self.inner.lock().unwrap().chunks.get(&id).map(|c| c.state)
     }
 
+    /// **某表全部在途 chunk**（`F.3` 的强制 flush 用；按 id 升序 ⇒ 确定性）。
+    ///
+    /// 为什么要"按表"而不是"按 key"：删除的语义是**表级**的（`DELETE FROM t`），
+    /// 而调用方并不知道该表此刻有哪些 (shard, window, epoch) 组合。
+    pub fn chunk_ids_of_table(&self, table: &str) -> Vec<ChunkId> {
+        let mut ids: Vec<ChunkId> = self
+            .inner
+            .lock()
+            .unwrap()
+            .chunks
+            .values()
+            .filter(|c| c.key.shard.table == table)
+            .map(|c| c.id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// 某 key 下全部 chunk（诊断 / 单测）。
     pub fn chunk_ids_of(&self, key: &ChunkKey) -> Vec<ChunkId> {
         self.inner

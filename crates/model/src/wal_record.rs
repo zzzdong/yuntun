@@ -26,6 +26,8 @@ pub enum RecordType {
     BatchAbort = 4,
     /// S1.7：DDL 事件（CREATE/DROP TABLE），启动重放重建 Catalog 表清单
     Ddl = 5,
+    /// `F.3`：**DELETE**（行位删除向量）—— 启动重放重建 `DeletionEntry`（`delta-dml-design §1.1` ③）
+    Delete = 6,
 }
 
 impl RecordType {
@@ -37,6 +39,7 @@ impl RecordType {
             3 => Self::BatchCommitted,
             4 => Self::BatchAbort,
             5 => Self::Ddl,
+            6 => Self::Delete,
             _ => return None,
         })
     }
@@ -155,6 +158,44 @@ pub mod ddl_op {
     pub const ALTER_TABLE: u32 = 4;
 }
 
+/// type=6 Delete（`F.3`；`delta-dml-design §4.1`）。
+///
+/// **一条 DELETE 只有一条记录**：MVP 是单物理 WAL（`shard_key` 只是逻辑分片），
+/// 跨逻辑 shard 的删除**合并**在同一条 payload 里 ⇒ 天然原子（要么全生效、要么全不生效）。
+///
+/// 位图**内联**在记录里（而不是只记对象路径）的理由：重放要能**只靠 WAL**重建目录
+/// （`§1.1` 的 ③）—— 对象存储是副产品，WAL 才是权威（ADR-3）。
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct DeletePayload {
+    #[prost(string, tag = "1")]
+    pub table: String,
+    /// 幂等 id（= 触发它的请求 id；重放按它去重）
+    #[prost(string, tag = "2")]
+    pub dv_id: String,
+    #[prost(message, repeated, tag = "3")]
+    pub deletions: Vec<FileDeletion>,
+    /// 表世代（与 `ChunkStore::liveness` 同源）：重放时**校验失败就跳过** ——
+    /// `DROP` → 同名重建之后，旧世代的删除不得挂到新表上（`plan.md` M0 ⑥）
+    #[prost(uint64, tag = "4")]
+    pub schema_epoch: u64,
+}
+
+/// 一个数据文件上的删除（`FileDeletion`）。
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct FileDeletion {
+    #[prost(string, tag = "1")]
+    pub file_path: String,
+    /// 归属批次（清理对账键 `dv → file_path → batch_id`，`delta-dml-design §6.2`）。
+    ///
+    /// 设计 §4.1 的 `FileDeletion` 没写这一条 —— 但**重放时清单还是空的**
+    /// （内存目录只重放了 DDL），`batch_id` 无处可推，只能从记录里带（同 `§146.2` 偏差 1 的道理）。
+    #[prost(string, tag = "2")]
+    pub batch_id: String,
+    /// 该文件内被删行号的位图：`DvBitmap::to_bytes()`（roaring + 自证帧：魔数/版本/CRC）
+    #[prost(bytes = "vec", tag = "3")]
+    pub bitmap: Vec<u8>,
+}
+
 /// WAL Record 枚举。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Record {
@@ -164,6 +205,7 @@ pub enum Record {
     BatchCommitted(BatchCommittedPayload),
     BatchAbort(BatchAbortPayload),
     Ddl(DdlPayload),
+    Delete(DeletePayload),
 }
 
 impl Record {
@@ -175,6 +217,7 @@ impl Record {
             Record::BatchCommitted(_) => RecordType::BatchCommitted,
             Record::BatchAbort(_) => RecordType::BatchAbort,
             Record::Ddl(_) => RecordType::Ddl,
+            Record::Delete(_) => RecordType::Delete,
         }
     }
 
@@ -186,6 +229,7 @@ impl Record {
             Record::BatchAbort(p) => Some(&p.batch_id),
             Record::Data(_) => None,
             Record::Ddl(_) => None,
+            Record::Delete(_) => None,
         }
     }
 
@@ -199,6 +243,7 @@ impl Record {
             Record::BatchCommitted(p) => p.encode_to_vec(),
             Record::BatchAbort(p) => p.encode_to_vec(),
             Record::Ddl(p) => p.encode_to_vec(),
+            Record::Delete(p) => p.encode_to_vec(),
         }
     }
 
@@ -227,6 +272,9 @@ impl Record {
             ),
             RecordType::Ddl => Record::Ddl(
                 DdlPayload::decode(payload).map_err(|e| WalError::Other(e.to_string()))?,
+            ),
+            RecordType::Delete => Record::Delete(
+                DeletePayload::decode(payload).map_err(|e| WalError::Other(e.to_string()))?,
             ),
         })
     }
@@ -296,6 +344,29 @@ mod tests {
         assert_eq!(FileHeader::decode(&buf).unwrap(), h);
     }
 
+    /// `F.3`：DELETE 记录里的位图**过线之后仍解得出**（帧带 CRC，坏一字节就该拒绝）。
+    #[test]
+    fn delete_payload_keeps_the_bitmaps_decodable() {
+        let payload = DeletePayload {
+            table: "public.t".into(),
+            dv_id: "dv-1".into(),
+            deletions: vec![FileDeletion {
+                file_path: "p/a.parquet".into(),
+                batch_id: "b1".into(),
+                bitmap: crate::dv::DvBitmap::from_positions([1, 2, 3]).to_bytes(),
+            }],
+            schema_epoch: 7,
+        };
+        let bytes = Record::Delete(payload.clone()).encode_payload();
+        let back = Record::decode(RecordType::Delete as u8, &bytes).unwrap();
+        let Record::Delete(back) = back else {
+            panic!("类型串了：{back:?}");
+        };
+        assert_eq!(back, payload);
+        let dv = crate::dv::DvBitmap::from_bytes(&back.deletions[0].bitmap).unwrap();
+        assert_eq!(dv.card(), 3, "位图必须原样过线（重放靠它重建 DeletionEntry）");
+    }
+
     #[test]
     fn file_header_bad_magic() {
         let mut buf = FileHeader {
@@ -350,6 +421,24 @@ mod tests {
                 table: "t".into(),
                 arrow_schema: vec![9, 9],
                 default_format: "parquet".into(),
+            }),
+            // `F.3`：DELETE（位图内联；跨逻辑 shard 合并成一条）
+            Record::Delete(DeletePayload {
+                table: "public.t".into(),
+                dv_id: "dv-1".into(),
+                deletions: vec![
+                    FileDeletion {
+                        file_path: "p/a.parquet".into(),
+                        batch_id: "b1".into(),
+                        bitmap: crate::dv::DvBitmap::from_positions([0, 5]).to_bytes(),
+                    },
+                    FileDeletion {
+                        file_path: "p/b.parquet".into(),
+                        batch_id: "b2".into(),
+                        bitmap: crate::dv::DvBitmap::from_positions([7]).to_bytes(),
+                    },
+                ],
+                schema_epoch: 3,
             }),
         ];
         for r in records {

@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§147，2026-09-27**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§148，2026-09-27**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -9429,3 +9429,73 @@ peeling 构造写错的后果是"多剪一个组" ⇒ **静默少数据**，而"
   ⑥ **带 DV 且挂了索引**的文件跑谓词查询仍然对（`not both` 的反证）；
 - `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；
 - 判据 **5/5**。
+
+---
+
+## 148. **F.3 第三刀：DELETE 的写侧就绪（WAL 记录 + 强制 flush + 重放）**（2026-09-27）
+
+这一刀把 DELETE 需要的**写侧机械**全部立起来（WAL 记录 / 把在途数据落盘 / 重启重放），
+**SQL 前端留到下一刀**（`F.3c-2`）—— 顺序这样切是因为写侧每一件都能独立验证，
+而它们全都错了（或漏了）的话，前端接上去只会把错误放大。
+
+### 148.0 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `model::wal_record` | `DeletePayload` / `FileDeletion` / `RecordType::Delete = 6` + `Record` 各分支 + 往返用例（位图过线仍可解） |
+| `chunk` | `ChunkStore::chunk_ids_of_table`（按表取在途 chunk，确定性排序） |
+| `ingest::pipeline` | 强制 flush 的**命令通道** + `Ingestor::force_flush(table)` + `force_flush_table`（封口 → 走**唯一执行体** → 收尾核对）；`flush_chunk_by_id` 改为返回 `Option<FlushOutcome>` |
+| `ingest::dml`（新） | `replay_wal_dml`：只靠 WAL 重建 `DeletionEntry`（位图内联 / `store_path` 回推 / 幂等 / **世代校验**） |
+| `catalog::state` | **键设计修正**：DV 事件表从 `dv_id` 改成 **`(dv_id, file_path)`**（见 §148.2）+ 用例 |
+| `server` | 启动四段顺序补上 ⑤.5（按 `[meta] mode` 门控，见 §148.3） |
+| 新用例 | `crates/ingest/tests/force_flush.rs`（2 条）、`crates/ingest/tests/replay_wal_dml.rs`（1 条） |
+
+### 148.1 三个决定
+
+1. **强制 flush 走命令通道，不许"调用方自己拿 chunk store 去 flush"**。
+   `flush_input` 只在 `mark_committed` **之后**才返回 `None`，所以两个执行体（到期通路 + 强制通路）
+   会同时拿到同一个 chunk 的输入 ⇒ 同一批数据落成**两个文件** = 重复计数。
+   设计 §4.3 的原话就是"触达点是攒批 accumulator（命令通道 mpsc 或共享句柄）"——
+   本刀取**通道**：请求交给攒批循环，它在**扫描完 WAL 之后**处理（刚 fsync 的 Data 先成为 chunk），
+   处理完回执；调用方同步等回执（超时 30s ⇒ 报错）。
+2. **强制 flush 之后要"核对"，不"相信过程"**：`flush_chunk_by_id` 对读回失败是**延后重试**
+   （记 backoff，不报错），而调用方是**删除** —— 带着"还有未提交数据"的认知去删就是**静默漏删**
+   （那批行落盘后会以"没被删掉"的样子出现）。所以 `force_flush_table` 最后统计
+   "该表是否还有非终态 chunk"，有就**报错**。
+3. **重放只靠 WAL**：位图**内联**在记录里（`card` 从位图量出来，不信记录里的数字）、
+   `store_path` 按 `§3.1` 公式回推、`(dv_id, file_path)` 幂等去重、
+   **世代不符就跳过并告警**（`DROP` → 同名重建之后，旧世代的删除不得挂到新表上）。
+
+### 148.2 修正：DV 事件表的键从 `dv_id` 改成 `(dv_id, file_path)`
+
+- **发现路径**：写重放时意识到**一条 DELETE 记录可以覆盖多个文件**
+  （`DeletePayload.deletions` 是列表，`dv_id` 是"这次删除"的 id；DV 对象路径
+  `dv/<数据文件名>/<dv_id>.bin` 已经把"文件"作为一层）。
+  而 `§146` 建表时用了 `BTreeMap<dv_id, …>` ⇒ 删两个文件的请求只会留下**一个**条目
+  （另一个文件里的行"已删却还查得到"）。
+- **`§146` 为什么没抓到**：那时的用例都是"一个 dv_id 一个文件"（同一刀里 `commit_files`
+  的键问题也刚暴露过，见 `D-9`），单文件形态把键的缺陷盖住了。
+- **修法**：键 = `(dv_id, file_path)`（身份 = "这次删除 × 这个文件"），快照正向取 `dv_id` 部分；
+  新增用例 `one_delete_record_can_cover_several_files`（两个文件两个条目 + 幂等仍成立）。
+
+### 148.3 边界（明确没做的）
+
+1. **SQL `DELETE FROM t WHERE …`**（谓词定位 → 写位图对象 → WAL 追加 → `apply_deletions` → 刷缓存）
+   ＝ **`F.3c-2`**。⇒ **现在仍然不能删**（SQL 层没有 `DELETE` 分支）。
+2. **远端目录 / metanode op**（**抵押①**）：`RemoteCatalog::apply_deletions` 仍然明确报错、
+   `list_deletions` 仍然返空。因此 `replay_wal_dml` 在装配层**只对 `[meta] mode = memory` 生效**
+   —— `embedded`（默认形态）的 DV 写入随 `F.3c-2` 一起接（那时两边同时成立，不会出现
+   "能写不能读"的窗口）。
+3. **compaction 消费 DV + 孤儿 GC 覆盖 `dv/`** ＝ `F.3d`（**抵押②**：现在仍造不出 DV ⇒ 不冲突）。
+4. `UPDATE`（设计 M3）＝ 最后。
+
+### 148.4 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **470 passed / 0 failed / 0 ignored**
+  （本刀 +6：`model` 往返 1、`catalog` 多文件键 1、`ingest` 强制 flush 2 + 重放 1 + `liveness` 单测 1）；
+- 关键断言：
+  * 强制 flush：**落盘前清单为空**（证明确实在途）→ 落盘后行数对得上 → **没有非终态 chunk** →
+    再调一次是 no-op；**攒批循环不在时明确报错**（不假装成功）；
+  * 重放：一条记录覆盖两个文件 ⇒ 两个条目、`card` 来自位图、`store_path` 按公式回推、
+    同一批共用快照号、**旧世代那条被跳过**；再重放一遍不推快照号；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **5/5**。

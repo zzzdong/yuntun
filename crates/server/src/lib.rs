@@ -405,6 +405,27 @@ async fn build_embedded_catalog(
             tracing::info!(redone, committed, "recovered batches from WAL");
         }
 
+        // ⑤.5 **DML WAL 重放**（`F.3`，设计 §1.1 的 ③）：把 DELETE 从 WAL 收敛回目录。
+        //
+        // 位置：必须在 ⑤ `resume_recovered` **之后**（对空 Manifest 应用 DV 无意义）、
+        // 在 ⑥ 建缓存 **之前**（DV 必须在数据对查询可见之前就位 —— 顺序反了会出现
+        // "删掉的行短暂可见"的窗口），也在 `spawn_accumulator` 之前。
+        //
+        // **只在 `memory` 形态下重放**：`embedded` 形态的目录是 raft 状态机（自己落盘 DV），
+        // 而"重放"要写目录 —— 那边的写路径还没接线（`§148` 的抵押①，`F.3c-2` 接）。
+        // 反过来在 `memory` 形态下不重放就是**已删的行会复活**（目录重启即空）。
+        if cfg.meta.mode == config::MetaMode::Memory {
+            let stats = yuntun_ingest::replay_wal_dml(&catalog, &wal).await?;
+            if stats.applied + stats.skipped > 0 {
+                tracing::info!(
+                    applied = stats.applied,
+                    skipped = stats.skipped,
+                    entries = stats.entries,
+                    "WAL 删除向量重放完成"
+                );
+            }
+        }
+
         // ⑥ QueryEngine（缓存刷新在 spawn_background 中启动）
         let cache = Arc::new(yuntun_query::LocalCatalog::new());
         // 读己之写：查询侧接线热数据读侧（进程内 chunk；分离部署换成 `RemoteShard`，零改动）

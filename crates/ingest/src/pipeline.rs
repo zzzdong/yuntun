@@ -140,12 +140,40 @@ pub struct Ingestor {
     pub chunks: Arc<ChunkStore>,
     /// M0：攒批重放跳过集——已被终态批次"认领"的 (组键, 半开区间)。
     pub replay_skip: Mutex<Vec<ReplaySkip>>,
+    /// **强制 flush 的命令通道**（`F.3` DELETE/UPDATE 的前置，设计 §4.3）。
+    ///
+    /// 为什么是通道、而不是"调用方自己拿 chunk store 去 flush"：
+    /// **flush 只能有一个执行体**。到期通路（攒批循环）与强制通路若各自去 flush 同一个 chunk，
+    /// 两边都会拿到 `flush_input`（它只在 `mark_committed` **之后**才返回 `None`）
+    /// ⇒ 同一批数据落成**两个文件** = 重复计数。所以强制通路把请求**交给**攒批循环
+    /// （设计 §4.3 的原话："触达点是攒批 accumulator（命令通道 mpsc 或共享句柄）"）。
+    force_flush_tx: tokio::sync::mpsc::UnboundedSender<ForceFlushReq>,
+    /// 攒批循环**取走一次**（`take`）—— 通道由循环独占，避免两个执行体抢。
+    force_flush_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ForceFlushReq>>>,
     /// 攒批线程已吸收到哪条 WAL seq（观测用，T6.12）。
     ///
     /// `wal.synced_seq() - absorbed_seq` = **WAL 积压**：已 fsync 但尚未进 chunk 的记录数。
     /// 它同时是"内存越限"的缓冲池大小 —— 没有任何指标比它更能解释"为什么内存超了"。
     absorbed_seq: AtomicU64,
 }
+
+/// 一次强制 flush 请求（`F.3`）。`ack` 是回执：**调用方要等它**（否则可能删到还没落盘的行）。
+pub struct ForceFlushReq {
+    pub table: String,
+    pub ack: tokio::sync::oneshot::Sender<Result<ForceFlushDone, LakeError>>,
+}
+
+/// 强制 flush 的结果（诊断 + 断言用）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ForceFlushDone {
+    /// 落盘的 chunk 数
+    pub chunks: usize,
+    /// 落盘的行数
+    pub rows: u64,
+}
+
+/// 强制 flush 的等待上界：超了就当"写侧无响应"报错（**不降级** —— 调用它的是删除）
+const FORCE_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// 攒批重放的跳过声明：一个已重提交/重做的批次对其 Data 区间的"认领"。
 /// 判定为二维（组键 + 半开区间）——纯整数区间会把别的组落在组内空洞里的
@@ -195,6 +223,7 @@ impl Ingestor {
         store: Arc<dyn object_store::ObjectStore>,
         chunks: Arc<ChunkStore>,
     ) -> Self {
+        let (force_flush_tx, force_flush_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             cfg,
             wal,
@@ -204,7 +233,43 @@ impl Ingestor {
             schema_cache: Arc::new(SchemaCache::default()),
             chunks,
             replay_skip: Mutex::new(Vec::new()),
+            force_flush_tx,
+            force_flush_rx: Mutex::new(Some(force_flush_rx)),
             absorbed_seq: AtomicU64::new(0),
+        }
+    }
+
+    /// **强制 flush 某表的全部在途数据**（`F.3` DELETE/UPDATE 的前置步骤）。
+    ///
+    /// 语义（三条，缺一条就会出错）：
+    ///
+    /// 1. **同步**：返回时该表的在途数据**已经落盘且已提交**（调用方据此才能"扫出要删的行"——
+    ///    否则刚插进来的行还在内存里，扫不到 ⇒ 删不掉 ⇒ 等它落盘后**复活**）；
+    /// 2. **先吸收再 flush**：请求由攒批循环在"扫描 WAL"**之后**处理 —— 刚 fsync 的 Data
+    ///    先成为 chunk，才可能被 flush；
+    /// 3. **不许默默失败**：flush 之后若该表**仍有非终态 chunk** ⇒ **报错**
+    ///    （调用方是删除：带着"还有未提交数据"的认知去删 = 静默漏删）。
+    pub async fn force_flush(&self, table: &str) -> Result<ForceFlushDone, LakeError> {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        self.force_flush_tx
+            .send(ForceFlushReq {
+                table: table.to_string(),
+                ack: ack_tx,
+            })
+            .map_err(|_| {
+                LakeError::Other(format!(
+                    "强制 flush 失败：攒批循环未在运行（表 {table}）—— 写侧没有可用执行体"
+                ))
+            })?;
+        match tokio::time::timeout(FORCE_FLUSH_TIMEOUT, ack_rx).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => Err(LakeError::Other(format!(
+                "强制 flush 失败：攒批循环在处理表 {table} 的请求时退出"
+            ))),
+            Err(_) => Err(LakeError::Other(format!(
+                "强制 flush 超时（{} s）：表 {table} 的在途数据未能落盘",
+                FORCE_FLUSH_TIMEOUT.as_secs()
+            ))),
         }
     }
 
@@ -419,10 +484,27 @@ impl Ingestor {
         let mut last_read: u64 = 0;
         let mut interval = tokio::time::interval(self.cfg.scan_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // `F.3`：强制 flush 的接收端由**本循环独占**（`take` 走）—— 见 `force_flush` 的注释。
+        let mut force_rx = self.force_flush_rx.lock().unwrap().take();
+        let mut force_pending: std::collections::VecDeque<ForceFlushReq> =
+            std::collections::VecDeque::new();
 
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
+                // 强制 flush 请求：**立刻醒一轮**（不等到下一个 tick）——
+                // 调用方（DELETE）在等它的回执，攒批间隔不该成为删除的延迟
+                req = async {
+                    match force_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        // 已被别的执行体取走（或未装配）：这一支永久 pending
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(req) = req {
+                        force_pending.push_back(req);
+                    }
+                }
                 _ = interval.tick() => {}
             }
 
@@ -487,7 +569,70 @@ impl Ingestor {
             for id in plan.flush {
                 self.flush_chunk_by_id(id).await;
             }
+
+            // ---------- ③b 强制 flush（`F.3` DELETE/UPDATE 的前置）----------
+            //
+            // 位置有讲究：必须在 ① 扫描 WAL **之后** —— 刚 fsync 的 Data 得先成为 chunk，
+            // 才谈得上把它 flush 掉；否则"刚插的行"还不在任何 chunk 里，删除会漏掉它。
+            // 去重：同一轮里同一张表只处理一次（多个请求各自自己会等回执）。
+            while let Some(req) = force_pending.pop_front() {
+                let out = self.force_flush_table(&req.table, now).await;
+                // 回执失败只有一个原因：调用方走了（超时/取消）—— 记一条即可
+                if req.ack.send(out).is_err() {
+                    tracing::debug!(table = %req.table, "force flush 回执无人接收（调用方已离开）");
+                }
+            }
         }
+        // 循环退出：把还没回执的请求**显式失败**掉（否则调用方要等到超时）
+        for req in force_pending {
+            let _ = req.ack.send(Err(LakeError::Other(
+                "攒批循环已退出：强制 flush 未执行".into(),
+            )));
+        }
+    }
+
+    /// 强制 flush 一张表的全部在途 chunk（**只由攒批循环调用** —— 单执行体）。
+    ///
+    /// 收尾**核对**而不是"相信过程"：flush 之后若该表仍有非终态 chunk ⇒ 返回错误。
+    /// 理由：`flush_chunk_by_id` 对读回失败是"延后重试"（不报错，记 backoff），
+    /// 而调用方是**删除** —— 带着"还有未提交数据"的认知去删就是**静默漏删**，
+    /// 那批行落盘后会以"没被删掉"的样子出现（复活）。所以这里必须把这件事说破。
+    async fn force_flush_table(
+        self: &Arc<Self>,
+        table: &str,
+        now: u64,
+    ) -> Result<ForceFlushDone, LakeError> {
+        let mut done = ForceFlushDone::default();
+        for id in self.chunks.chunk_ids_of_table(table) {
+            // 未封口的先封口（`seal` 对已封口的是 no-op；原因记 `Manual` = 调用方要求）
+            if let Err(e) = self.chunks.seal(id, now) {
+                tracing::warn!(chunk = %id, error = %e, "force flush: seal failed");
+                continue;
+            }
+            if let Some(out) = self.flush_chunk_by_id(id).await {
+                done.chunks += 1;
+                done.rows += out.row_count;
+            }
+        }
+        let left: Vec<ChunkId> = self
+            .chunks
+            .chunk_ids_of_table(table)
+            .into_iter()
+            .filter(|id| {
+                !matches!(
+                    self.chunks.chunk_state(*id),
+                    None | Some(yuntun_chunk::ChunkState::Flushed)
+                        | Some(yuntun_chunk::ChunkState::Released)
+                )
+            })
+            .collect();
+        if !left.is_empty() {
+            return Err(LakeError::Other(format!(
+                "强制 flush 之后表 {table} 仍有 {} 个在途 chunk 未落盘——                 拒绝在「还有未提交数据」的表上继续（那批行会被漏删）",
+                left.len()
+            )));
+        }
+        Ok(done)
     }
 
     /// 把一条已 fsync 的 WAL Data 记录吸收进 chunk（读己之写 + 攒批）。
@@ -533,16 +678,21 @@ impl Ingestor {
         Ok(())
     }
 
-    /// flush 单个 chunk（到期执行体）。
-    async fn flush_chunk_by_id(self: &Arc<Self>, id: ChunkId) {
+    /// flush 单个 chunk（**唯一的执行体**：到期通路与强制通路都走这里）。
+    ///
+    /// 返回 `Some(outcome)` = 这次真的落盘了；`None` = 没做（已被别人 flush / 读回失败延后）。
+    async fn flush_chunk_by_id(
+        self: &Arc<Self>,
+        id: ChunkId,
+    ) -> Option<crate::flush::FlushOutcome> {
         let input = match self.chunks.flush_input(id) {
             Ok(Some(x)) => x,
-            Ok(None) => return,
+            Ok(None) => return None,
             Err(e) => {
                 // spill 读回失败：批次保持非终态，WAL 是权威（架构 §2.6）
                 tracing::error!(chunk = %id, error = %e, "chunk read failed, defer flush");
                 self.chunks.note_flush_failure(id, now_ms());
-                return;
+                return None;
             }
         };
         // DROP 语义：陈旧世代的数据不得提交（否则会挂到重建的同名表上，R9）
@@ -553,7 +703,7 @@ impl Ingestor {
                 "discarding stale chunk instead of flushing"
             );
             self.chunks.discard_chunk(id);
-            return;
+            return None;
         }
 
         let deps = self.deps();
@@ -574,10 +724,12 @@ impl Ingestor {
                 if let Err(e) = self.chunks.mark_committed(id, out.snapshot) {
                     tracing::error!(chunk = %id, error = %e, "mark_committed failed");
                 }
+                Some(out)
             }
             Err(e) => {
                 tracing::error!(error = %e, "flush failed (batch left non-terminal, monitor will abort)");
                 self.chunks.note_flush_failure(id, now_ms());
+                None
             }
         }
     }

@@ -122,6 +122,9 @@ pub fn apply_record(state: &mut BatchStateMap, rec: &Record, _seq: u64) {
         }
         // S1.7：DDL 事件不参与批次状态机（由启动重放直接应用 Catalog）
         Record::Ddl(_) => {}
+        // `F.3`：DELETE 同理 —— 批次状态机管的是"数据怎么落盘"，
+        // 删除由启动重放的 `replay_wal_dml` 直接重建 `DeletionEntry`（另一条线）
+        Record::Delete(_) => {}
     }
 }
 
