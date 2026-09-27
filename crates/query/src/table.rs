@@ -278,6 +278,11 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
             .map(|t| prune_visible_files(&self.schema, &t.files, filters))
             .unwrap_or_default();
         let total = kept.len() + dropped;
+        // **谓词下推**（`§132`）：让 `ParquetSource` 拿谓词去用 row-group / page 的 footer 统计
+        // 在**文件内部**跳读 —— 这才是"块级剪枝"（`§129` 只做到**文件**级）。
+        //
+        // ⚠️ 下推**不改变正确性**：表级声明的是 `Inexact`（见下面的 `supports_filters_pushdown`），
+        // 谓词仍由上层算子**再过滤一遍** —— 这里省的只是 IO，不是"把过滤责任交出去"。
         if kept.len() < total {
             tracing::debug!(
                 table = %self.ident,
@@ -340,14 +345,16 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
     ) -> datafusion::common::Result<Vec<TableProviderFilterPushDown>> {
         // 表级一律 `Inexact`：我们**不承诺**把谓词吃干净。
         //
-        // ⚠️ 这句注释以前是错的 —— 它写着"谓词交给 Parquet row-group 统计在 scan 内部处理
-        // （ParquetSource 默认行为）"，但 `scan` 当时把 `filters` **整个丢掉**、也从不给
-        // `ParquetSource` 传谓词 ⇒ **一行都没剪**。现在是诚实的：我们在 `scan` 里做的是
-        // **文件级剪枝**（按清单 `min`/`max`，`§129`，见 `prune` 模块），**剩下的谓词由上层算子
-        // 过滤**（所以 `Inexact` 是对的）。
+        // 两件事分开看（`§132` 更正过一次判读，别再把它们混在一起）：
         //
-        // `T13.2` 的另一半 —— 把谓词**下推进 `ParquetSource`**，让 row-group（块级）统计也参与
-        // 剪枝 —— **尚未做**（需要 logical `Expr` → `PhysicalExpr`，`scan` 的 `state` 能给）。
+        // ① **我们**在 `scan` 里做的是**文件级剪枝**（按清单 `min`/`max`，`§129`，见 `prune` 模块）
+        //    —— 这件事以前确实没做；`scan` 当时把 `filters` **整个丢掉**，所以"按文件跳读"是缺的。
+        // ② **块级（row-group）剪枝不需要我们做**：DataFusion 的优化器会把 `WHERE` 里的谓词
+        //    **自己**推到 `DataSourceExec` 里，`ParquetSource` 拿它去用 row-group / page 的 footer
+        //    统计跳读。`§132` 实测：**在 `scan` 里额外 `with_predicate` 一下，与不推的指标一模一样**
+        //    ⇒ 我原以为缺的"另一半"不缺，那根线是**冗余**的（已回退）。
+        //
+        // 所以 `Inexact` 仍然是对的：谓词由**上层算子**过滤，我们只负责**别漏掉该读的文件**。
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 

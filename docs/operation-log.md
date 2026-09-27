@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§131，2026-09-26**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§132，2026-09-26**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -8358,7 +8358,7 @@ per-file 统计落进 manifest**，再让 scan 剪枝"* —— 这一刀做的�
 `scan` 里接上它，并把"**全被剪掉**"这一格处理好（不能塞一个空的 `FileGroup` —— 扫描器会报错），
 直接落到"空执行计划"那一支（语义正好：没有数据）。
 
-### 129.3 顺手纠正一句**假注释**
+### 129.3 ~~顺手纠正一句**假注释**~~（⚠️ 这句判读**错了**，见 `§132.2`）
 
 `supports_filters_pushdown` 原先写着"谓词交给 Parquet row-group 统计在 scan 内部处理
 （`ParquetSource` 默认行为）" —— **那是假的**：`scan` 把 `filters` 整个丢掉（形参名就叫
@@ -8490,3 +8490,71 @@ plan 的 `T6.14` 列了四件：① 触发 spill 的**真实压力曲线**；②
   `cargo test -p yuntun-query --test hard_partition` → **1/1**；
 - 文档一致性判据（`§123`）**5/5 绿**（本刀被它拦过一次：改了代码没同步规模行）；
 - 规模：53,332 行 / 20 个 crate / 410 个测试函数。
+
+---
+
+## 132. `T13.2` 另一半的核实结果：**块级剪枝早就由 DataFusion 在做**，我加的那根线是冗余的（已回退）（2026-09-26）
+
+### 132.0 结论先说
+
+`§129` 结尾写着"`T13.2` 的另一半（把谓词下推进 `ParquetSource` 让块级统计参与剪枝）**尚未做**"。
+这一刀去接它，结果接出个**反结论**：
+
+> **块级（row-group）剪枝本来就在工作** —— 谓词是 **DataFusion 的优化器自己**推进 `DataSourceExec`
+> 的，`ParquetSource` 早就在用 row-group / page 的 footer 统计跳读。
+> 我在 `scan` 里额外做一次 `with_predicate`，与不做的**指标一模一样** ⇒ **冗余，已回退**。
+
+### 132.1 实验（可复现）
+
+在 `scan` 里加 `ParquetSource::with_predicate(...)`（logical `Expr` → `PhysicalExpr`：
+`state.create_physical_expr` + `ParquetSource::with_predicate`），然后用一个能断言的指标验证：
+
+```text
+EXPLAIN ANALYZE SELECT count(*) FROM audit WHERE event_time < 1000
+  → row_groups_pruned_statistics = 1     ← 加了下推：剪了 1 组
+```
+
+按纪律（"一条绿的测试要先证明它能红"）**把那次下推关掉再跑** ⇒ **照样是 1、照样绿** ✗✗
+⇒ 剪枝**不是**我们这根线带来的 ⇒ 它来自 DataFusion 自己的 `PushDownFilter`。
+⇒ 回退：删掉下推助手、保留注释的**正确版本**。
+
+### 132.2 更正 `§129.3` 的一句判读（我上轮说错了）
+
+`§129.3` 我写过："那句注释（`谓词交给 Parquet row-group 统计在 scan 内部处理`）是**假的**"。
+**这个判读是错的**：注释说的是 **DataFusion 优化器**的行为，而它没写错 —— `scan` 自己忽略
+`filters` **不影响**优化器把谓词推进它返回的那个 `DataSourceExec`。真正缺的**只有**文件级那一半
+（`§129` 已补 ✓）。已在 `supports_filters_pushdown` 的注释里把两件事分开写清楚。
+
+（连着 `§118.5`、`§129.0`，这是第三次自我更正 —— 共同点是：**判读太快**。
+凡"这行代码没用"的猜测，先做一次"关掉它看会不会红"的实验再下结论。）
+
+### 132.3 留下什么：一条**系统行为**的回归证据
+
+新 `crates/query/tests/row_group_pruning.rs`：一个 parquet、两个 row group（每组 100 行、
+`event_time` 递增 ⇒ 两组统计区间不相交）⇒ `WHERE event_time < 100` 断言
+`row_groups_pruned_statistics > 0`，并断言结果照旧是 100。
+
+* 为什么它**必须**靠块级：文件级 `[min, max]` 是 `[0, 199]`、与谓词**有交集** ⇒
+  `§129` 的文件级剪枝器在这里一条都剪不掉。**两半各管一段，互不冒充**。
+* 它**不**指向某一行代码（关掉我们的下推它照样绿）⇒ 守的是"**这条链别退化**"；
+  真正属于我们的那一半由 `prune.rs` 的 8 条单测守着。这点写在用例头注释里。
+
+### 132.4 一记教训：**造测试数据的代价会转嫁给邻居**
+
+第一版这条用例走的是真 ingest（`e2e.rs` 那套）：`yuntun-format` 的 `MAX_ROWS_PER_ROW_GROUP`
+是 **65,536** 的常量 ⇒ 想造两个 row group 就要 **7 万行 + 真 WAL**。它能过，但全量并行时把
+`chaos::disk_watermark_aborts_oldest_batch_then_releases_segments`（断言"WAL 批次全部终态"）
+**挤红了** —— 而那条**单独跑 3/3 绿、0.11s**。
+
+⇒ 改成：**内存存储 + 手写小 row group**（`parquet` 仅作 dev-dep，
+`set_max_row_group_row_count(Some(100))`）⇒ **0.03s、不碰盘、不碰 WAL**，
+那条 chaos 用例在全量里**回绿**（这是"修好了"的证据，不是"它本来就飘"）。
+
+### 132.5 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **410 passed / 0 failed / 0 ignored**
+  （**含**那条被挤红过、现已回绿的 chaos 用例）；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 本刀用例 `cargo test -p yuntun-query --test row_group_pruning` → **1/1**（0.03s）；
+- 文档一致性判据（`§123`）**5/5 绿**；
+- 规模：53,514 行 / 20 个 crate / 411 个测试函数。

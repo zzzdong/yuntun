@@ -38,4 +38,8 @@ yuntun-wal = { path = "../wal" }
 yuntun-store = { path = "../store" }
 tokio-util = { workspace = true }
 tempfile = "3"
+# 仅测试：`§132` 的 row-group 剪枝用例要**手写小 row group** 的 parquet
+#（`yuntun-format` 的组大小是 65,536 行的常量，拿它造两组要 7 万行 —— 会把并行跑的
+# chaos 时序用例挤红，实测过一次，见 `§132`）
+parquet = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

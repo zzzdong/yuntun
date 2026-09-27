@@ -5560,6 +5560,7 @@ dependencies = [
  "datafusion-functions-json",
  "futures",
  "object_store",
+ "parquet",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
