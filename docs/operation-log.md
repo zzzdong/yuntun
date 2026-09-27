@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§134，2026-09-27**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§135，2026-09-27**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -8668,3 +8668,60 @@ EXPLAIN ANALYZE SELECT count(*) FROM audit WHERE event_time < 1000
 - `cargo build -p yuntun-format --features vortex` → **通过**（vortex 0.86 的树能编）；
 - 全量 / clippy 与 `§133` 同（本刀未改行为，代码回到 `§133` 的占位状态）；
 - 文档一致性判据（`§123`）**5/5 绿**。
+
+---
+
+## 135. `Vortex` codec：**写出了、编译过了，但跑起来在 vortex 内部 panic** ⇒ 退回占位（2026-09-27）
+
+### 135.0 结论
+
+`encode_vortex` / `decode_vortex` 的第一版**写完并通过编译**（`cargo build -p yuntun-format
+--features vortex` ✅）—— 这是 `§133` 之后第一次真的成立。但它**一跑就 panic**：
+
+```
+Assertion failed error: Runtime handle not configured in Vortex session.
+Please setup a `CurrentThreadRuntime` or `SingleThreadRuntime`,
+or configure the session for `with_tokio`.            （vortex-error-0.86.1/src/lib.rs:361）
+```
+
+⇒ 按纪律**退回占位**（绝不能把"编译得过、跑起来炸"的代码留在树上），两种配置都保持绿。
+
+### 135.1 这次新确认的 API（补 `§134.1` 那张表）
+
+| 卡点（`§134` 留下的） | 答案 |
+|---|---|
+| 怎么造 `VortexOpenOptions` | **`OpenOptionsSessionExt::open_options(session)`**（`vortex-file/src/lib.rs:33`）—— 它既无 `new()` 也无 `Default` |
+| 读是同步还是 async | `open_buffer<B: Into<ByteBuffer>>(buffer)` **是同步的** ⇒ 正配我们同步的编解码 |
+| `write` 会吞掉 sink，字节怎么取回 | **`impl<W: VortexWrite> VortexWrite for &mut W`**（`vortex-io/src/write.rs:90`）⇒ 传 **`&mut Vec<u8>`**（直接传 `Vec<u8>` 会被 move 走、取不回来） |
+| 单块数据怎么变成 `ArrayStream` | 先用 **`ArrayIteratorAdapter::new(dtype, iter)`** 包成 `ArrayIterator`，再 `ArrayIteratorExt::into_array_stream()`（`vortex-array/src/iter.rs`；trait 名是 **`ArrayIteratorExt`** 不是 `ArrayStreamExt`） |
+
+### 135.2 唯一剩下的阻塞：session 里没有运行时句柄
+
+`legacy_session()` 只是 `array_session()`：它挂了 `ArraySession` / `KernelSession` / `DTypeSession` /
+`ScalarFnSession` / `StatsSession` / `AggregateFnSession` / `MemorySession` —— **没有 runtime**
+（`vortex-array/src/lib.rs` 里 `array_session` 的构造），而写入/读取都要它。
+
+修法方向（**下一步就照这个做**）：
+
+* `CurrentThreadRuntime::new()`（`vortex-io/src/runtime/current.rs:40`）或 `SingleThreadRuntime`；
+* 用 **`RuntimeSessionExt::with_handle`**（`vortex-io/src/runtime/mod.rs:18` 的文档点名了它）
+  把它挂进**自己造的** session（不能挂到 `legacy_session()` 那个静态上），或走 `with_tokio`。
+
+### 135.3 草稿的形状（下一刀直接照抄）
+
+* 写：`ArrowSession::default().from_arrow_record_batch(batch.clone(), schema)` → `ArrayIteratorAdapter`
+  → `into_array_stream()` → `futures::executor::block_on(VortexWriteOptions::new(session).write(&mut buf, stream))`；
+* 读：`OpenOptionsSessionExt::open_options(session).open_buffer(ByteBuffer::from(bytes))` → `file.scan()?`
+  → `into_array_stream()` → `block_on(stream.try_collect())` → 每块
+  `ArrowSession::execute_arrow(a, None, &mut session.create_execution_ctx())` → downcast `StructArray`
+  → `RecordBatch::from(..)`；
+* 两个都要 `use vortex::array::VortexSessionExecute`（`create_execution_ctx` 是 trait 方法）。
+
+### 135.4 验证与边界
+
+- `cargo build -p yuntun-format` 与 `--features vortex` → **均通过**（占位版）；
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **410 passed / 0 failed / 0 ignored**；
+- ⚠️ **边界**：本刀未留下可用用例 —— vortex 的往返用例（`crates/format/tests/vortex_roundtrip.rs`，
+  已写好：4 类列 × 1000 行逐列比对 + 与 Parquet 的体积对照）**随占位一并撤下**，
+  等 `§135.2` 的 runtime 接好后放回。**默认套件不含 vortex**（可选依赖），这条缺口只存在于
+  `--features vortex` 这一路。

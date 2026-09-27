@@ -237,19 +237,18 @@ fn decode_parquet(bytes: &[u8]) -> Result<Vec<arrow::record_batch::RecordBatch>,
 // ---------------- Vortex（feature flag 后面，ADR-1）----------------
 
 fn encode_vortex(_batch: &arrow::record_batch::RecordBatch) -> Result<Vec<u8>, LakeError> {
-    // ADR-1: Vortex 依赖锁定 Git Commit 后启用。
-    // 启用步骤：workspace Cargo.toml 添加
-    //   vortex-datafusion = { git = "https://github.com/vortex-data/vortex.git", rev = "<锁定 commit>" }
-    // 并在此调用 vortex 的 ArrayData encode API。
+    // `§133` 起依赖**不再挡路**（`vortex 0.86` 与 arrow 59 同代）；真实现的第一版已写出
+    // 并通过编译（`§135`），但**跑起来会在 vortex 内部 panic**（session 缺运行时句柄）
+    // ⇒ 按纪律退回占位，等 `RuntimeSessionExt::with_handle` 接好再打开（见 `§135.2`）。
     Err(LakeError::Other(
-        "vortex format not enabled: build with --features vortex and pin a git commit (ADR-1)"
+        "vortex format not enabled: 见 §135（runtime handle 未接入前不可用）"
             .into(),
     ))
 }
 
 fn decode_vortex(_bytes: &[u8]) -> Result<Vec<arrow::record_batch::RecordBatch>, LakeError> {
     Err(LakeError::Other(
-        "vortex format not enabled: build with --features vortex and pin a git commit (ADR-1)"
+        "vortex format not enabled: 见 §135（runtime handle 未接入前不可用）"
             .into(),
     ))
 }
