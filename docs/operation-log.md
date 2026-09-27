@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§137，2026-09-27**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§138，2026-09-27**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -8825,6 +8825,48 @@ from the session's enabled editions"*），而我们的 `array_session()` **没�
 + 一次编译即可收口。之后放回往返用例（`§136` 那份已写好）。
 
 ### 137.3 验证
+
+- `cargo build -p yuntun-format`（默认）与 `--features vortex` → **均通过**（占位版）；
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **410 passed / 0 failed / 0 ignored**；
+- 文档一致性判据（`§123`）**5/5 绿**；
+- ⚠️ 边界同 `§135.4`：**默认套件不含 vortex**（可选依赖），往返用例仍随占位撤下。
+
+---
+
+## 138. `Vortex` codec 第五版：**edition 这条路走对了**，还差"注册"这一格（2026-09-27）
+
+### 138.0 结论
+
+按 `§137.2` 启用 edition（`vortex::editions::enable_default_editions(&session)`）——
+**错误变了** ✓（从 `… not permitted by ctx` 到新的断言）⇒ 方向对了，但报：
+
+```
+default core edition is registered:
+  Other error: cannot enable unregistered edition core2026.08.3
+```
+
+⇒ `edition` 要先**注册**才能启用（`array_session()` 里没有 `EditionSession`）。
+已按纪律**退回占位**（两种构建都保持绿）。
+
+### 138.1 这一版新确认的（不因回退而失效）
+
+* `vortex::editions::enable_default_editions(&session)`（`vortex-0.86.1/src/editions/mod.rs:78`）
+  是启用 edition 的入口 —— 它把"已启用 edition 允许的编码"填进 ctx 白名单，
+  `§137` 那个 `serde.rs:251` 的 `not permitted by ctx` 就是靠它消掉的；
+* session 组装顺序：`array_session().with::<RuntimeSession>().with_handle(handle)`，
+  再 `enable_default_editions(&session)` ✓；
+* `async move` 会把 `buf` 一起搬走 ⇒ 缓冲区在块内造并作为结果返回 ✓；
+* ⚠️ 模板里残留过一层**嵌套的 `async move {`**（闭包里又套异步块 ⇒ 返回"future 的 future"）
+  ⇒ 编译时表现为莫名其妙的类型错误，值得记住。
+
+### 138.2 下一刀（一次 grep + 一次编译）
+
+`EditionSession` 在 **`vortex-edition-0.86.1/src/session.rs:35`** ⇒ 把它挂进 session
+（`array_session().with::<RuntimeSession>().with::<EditionSession>()`，导出路径待确认）
+再 `enable_default_editions(&session)`；随后放回往返用例（`§136` 那份已写好：
+4 类列 × 1000 行逐列比对 + 与 Parquet 的体积对照）。
+
+### 138.3 验证
 
 - `cargo build -p yuntun-format`（默认）与 `--features vortex` → **均通过**（占位版）；
 - 全量 `cargo test --workspace --no-fail-fast -j 4` → **410 passed / 0 failed / 0 ignored**；

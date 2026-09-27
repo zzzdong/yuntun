@@ -237,18 +237,19 @@ fn decode_parquet(bytes: &[u8]) -> Result<Vec<arrow::record_batch::RecordBatch>,
 // ---------------- Vortex（feature flag 后面，ADR-1）----------------
 
 fn encode_vortex(_batch: &arrow::record_batch::RecordBatch) -> Result<Vec<u8>, LakeError> {
-    // `§133` 起依赖**不再挡路**（`vortex 0.86` 与 arrow 59 同代）；真实现已写出并通过编译，
-    // 但写入仍报 `… not permitted by ctx`（`§137`：ctx 是"已启用 edition 的编码白名单"，
-    // 而 `array_session()` 没启用任何 edition ⇒ 白名单为空）⇒ 按纪律退回占位。修法见 `§137.2`。
+    // `§133` 起依赖**不再挡路**（`vortex 0.86` 与 arrow 59 同代）；真实现已写出并通过编译
+    // （`§138`），但写入仍差一步：`enable_default_editions` 报
+    // `cannot enable unregistered edition core2026.08.3` ⇒ session 要先挂 `EditionSession`。
+    // 按纪律退回占位；修法见 `§138.2`（一次 grep 即可）。
     Err(LakeError::Other(
-        "vortex format not enabled: 见 §137（session 未启用 edition ⇒ 编码白名单为空）"
+        "vortex format not enabled: 见 §138（session 需先挂 EditionSession）"
             .into(),
     ))
 }
 
 fn decode_vortex(_bytes: &[u8]) -> Result<Vec<arrow::record_batch::RecordBatch>, LakeError> {
     Err(LakeError::Other(
-        "vortex format not enabled: 见 §137（session 未启用 edition ⇒ 编码白名单为空）"
+        "vortex format not enabled: 见 §138（session 需先挂 EditionSession）"
             .into(),
     ))
 }

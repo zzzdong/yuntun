@@ -491,7 +491,7 @@ SQL `INSERT` 返回成功时数据仅落 WAL（与 Flight DoPut 语义一致）�
 | T6.15 | TTL 分片移除 + segment 清理闸门（R21） | 阶段 0 遗留 | 影响 WAL 磁盘占用（与 §2.2 的 P2 联动） |
 | T7.x | SQL 写入路径专项 Chaos | Flight SQL / INSERT × 崩溃点组合 | 验证与 DoPut 同等持久性 |
 | T8.x | 压测与基线入库 | 吞吐 / P99 / 内存曲线 / **CommitFiles 瞬时并发** / 文件数·天 | P0 的证据来源。**✅ 已入库**：`bench_baseline`（提交时刻分布 + 峰值并发 + 文件数·天 + seal→committed）→ `operation-log §32`；**遗留**：~~**R3 后打同一 Meta**~~ ✅ **已量**（`§114`：同机 A/B，内存目录 vs 单节点 raft 元数据；p50 +0.9% 而 **p99 +14.5%**、峰值提交 −32% ⇒ **raft 把突发串行化**）；**剩余**：多节点 raft 与跨机 RTT；原记：**R3 后打同一 Meta 的真并发**（本轮已给本机多进程上界，§37）、真实 S3/MinIO（**本机 SeaweedFS 上：单机读写两向 + 多节点并发写对拍/冷读均已验**，`§101` / `§102` / `scripts/s3_*_smoke.sh`）、跨机、组级剪枝收益、内存曲线时序 |
-| T9.x | Vortex（锁 commit + feature + 对比） | **版本死结已解**（`§133`）：crates.io `vortex 0.86`（arrow 59.2+）、`rust-version` 1.95、依赖已接入；runtime 已接上（`§136`）。**只剩一处**：`ctx` 是"已启用 edition 的编码白名单"，`array_session()` 未启用 edition ⇒ 写入报 `… not permitted by ctx`（`§137`，`serde.rs:251`）⇒ 启用 edition 即可；用例（往返 + 体积对照）已备好、随占位撤下 |
+| T9.x | Vortex（锁 commit + feature + 对比） | **版本死结已解**（`§133`：crates.io `vortex 0.86` + `rust-version` 1.95）；runtime 已接上（`§136`）、ctx 白名单的根因已定位（`§137`）。**只差一格**（`§138`）：session 要先挂 `EditionSession` 再 `enable_default_editions`（现报 `cannot enable unregistered edition`）⇒ 一次 grep + 一次编译；用例（往返 + 体积对照）已备好、随占位撤下 |
 
 **准出（阶段 3 的准入）**
 
