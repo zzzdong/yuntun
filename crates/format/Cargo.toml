@@ -10,7 +10,10 @@ rust-version.workspace = true
 # 默认使用 Parquet 回退路径，保证阶段 0 始终可用。
 [features]
 default = []
-vortex = []
+# `§133`：**不再锁 Git commit**（ADR-1 原方案）⇒ 改用 **crates.io 的 0.86**。
+# 理由很硬：0.84/0.85 用 arrow **58**，只有 **0.86** 用 arrow **59.2+**、
+# 才与 datafusion 55 同代（`§130` 实测：`cargo add vortex` 会被 MSRV 逼着退到 0.84 ⇒ 两代 arrow）。
+vortex = ["dep:vortex"]
 
 [dependencies]
 yuntun-model = { path = "../model" }
@@ -23,6 +26,9 @@ tokio = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
+# Vortex 主格式（`§133`）：**可选** —— 默认仍是 Parquet 回退路径。
+# 0.86 与 arrow 59 同代，这才让"两次编码互不串味"这件事第一次有可能成立。
+vortex = { version = "0.86", optional = true }
 uuid = { workspace = true }
 serde = { workspace = true }
 bytes = { workspace = true }

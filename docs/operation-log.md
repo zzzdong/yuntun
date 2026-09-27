@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§132，2026-09-26**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§133，2026-09-26**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -8558,3 +8558,64 @@ EXPLAIN ANALYZE SELECT count(*) FROM audit WHERE event_time < 1000
 - 本刀用例 `cargo test -p yuntun-query --test row_group_pruning` → **1/1**（0.03s）；
 - 文档一致性判据（`§123`）**5/5 绿**；
 - 规模：53,514 行 / 20 个 crate / 411 个测试函数。
+
+---
+
+## 133. 采用 **crates.io 的 vortex 0.86** + datafusion 55（→55.1）/ arrow 59 + 次要包升最新（2026-09-26）
+
+### 133.0 这一刀的**关键发现**：`D-7` 的死结解开了
+
+`§130` 我下过结论："`T9.x` Vortex **接不进来**"（`vortex 0.84` 用 arrow **58**，本仓被 datafusion 55
+钉在 **arrow 59** ⇒ 两代 arrow、`RecordBatch` 不互通）。**那个结论只对了一半**：
+
+| 版本 | 要求的 arrow | 说明 |
+|---|---|---|
+| `vortex 0.84 / 0.85` | **arrow-array ^58** | `§130` 实测到的那一代 ⇒ 死结 |
+| **`vortex 0.86.1`** | **arrow-array ^59.2** ✅ | **与本仓 arrow 59 同代** —— 死结不存在 |
+
+而 `§130` 之所以看到 0.84，是因为 **`rust-version = 1.94` 把 cargo 逼退了**：
+`vortex 0.86` 要求 **rustc 1.95**（索引里 `rust_version = "1.95"`），cargo 于是静默回退到 0.84 ——
+**它回退的时候不会告诉你"你其实想要的那版可用"**。⇒ 教训：cargo 的"自动降版本"提示
+（`ignoring vortex@0.86.1 … to maintain rust-version`）必须当**决策信号**读，不是噪音。
+
+### 133.1 改了什么
+
+| 项 | 之前 | 现在 | 为什么 |
+|---|---|---|---|
+| `rust-version` | 1.94 | **1.95** | `vortex 0.86` 的下界就是 1.95（本机工具链 **1.98.1**，够） |
+| `vortex` 依赖 | 无（占位 + 注释说要锁 Git commit） | **crates.io `0.86`，可选**（`vortex = ["dep:vortex"]`） | 见下条偏离 |
+| `datafusion` | 55.0.0 | **55.1.0** | 用户要求的"次版本升最新" |
+| 其余次要包 | — | **69 个升级、新增 108 个、移除 1 个** | `cargo update`（在现有 semver 范围内取最新） |
+
+**一处偏离 ADR-1**：ADR-1 写着"Vortex 依赖**必须锁定 Git Commit**"。本刀改用 **crates.io 版本
+0.86** —— 理由：0.86 是唯一与 arrow 59 同代的版本，而"锁 git rev"此刻没有可锁的对象
+（我们要的就是它的发布版）。这条偏离已登记，将来若需要跟进上游未发布修复，再改回 git 锁。
+
+**依赖树代价（记一笔）**：vortex 0.86 带来 **+108 个包**（含一整条 async 运行时：
+`async-executor` / `async-fs` / `async-net` / `async-process`…）。这是"要 Vortex"这件事的**真实价格**，
+不该只记在 `Cargo.lock` 里 —— 若将来要选择"是否让它进默认构建"，这就是决策依据之一。
+
+### 133.2 **未做**：codec 仍是占位 —— 但**不再被版本挡住**
+
+`encode_vortex` / `decode_vortex` 现在**仍然返回错误**（占位）✗。区别是：以前是**接不进来**，
+现在是**还没接**。这一刀把考古做完了，API 事实记在这里，下一刀别再重新找一遍：
+
+* ✅ `VortexWriteOptions::write<W: Write>(self, w, iter: impl ArrayIterator) -> VortexResult<WriteSummary>`
+  —— **同步**入口（`vortex-file-0.86.1/src/writer.rs:636`）⇒ 可以直接接进我们同步的 `encode`；
+* ⚠️ `VortexOpenOptions::open(self, source: Arc<dyn VortexReadAt>) -> VortexResult<VortexFile>`
+  —— 是 **async**（`open.rs:223`）⇒ 同步侧要驱动它：用 `futures::executor::block_on`
+  （`futures` **已经是**本 crate 的依赖，不用新增）。vortex 自己内部也是这么干的（`open.rs:6`）；
+* ✅ `impl VortexReadAt for ByteBuffer`（`vortex-io-0.86.1/src/read_at.rs:204`）⇒
+  内存字节（我们的 `Vec<u8>`）包成 `ByteBuffer` 就能当输入；
+* ⚠️ arrow 互转的 `FromArrowArray` / `IntoArrowArray` **已弃用**（deprecated）⇒
+  必须改用 **`ArrowSession`**（`from_arrow_record_batch` / `execute_arrow`）。
+  **它的确切路径还没钉死**（不在 `vortex-arrow/src/lib.rs` 顶层）⇒ 这是下一刀的第一个动作。
+
+### 133.3 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **410 passed / 0 failed / 0 ignored**
+  （在 **datafusion 55.1** 之下，默认路径全绿）；
+- `cargo build -p yuntun-format --features vortex` → **通过**（vortex 0.86 的整棵树能编译）；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 文档一致性判据（`§123`）**5/5 绿**；
+- 规模：53,514 行 / 20 个 crate / 411 个测试函数（本刀不新增用例）。
