@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§142，2026-09-27**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§143，2026-09-27**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -9041,3 +9041,44 @@ ALTER TABLE 已被识别、但**尚未支持**：见 plan.md F.2（SQL 形式的
 - 全量 `cargo test --workspace --no-fail-fast -j 4` → **416 passed / 0 failed / 0 ignored**；
 - `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
 - 判据 5/5。
+
+---
+
+## 143. `F.2` 的接缝查证（**尚未动代码**，为下一刀留路标）（2026-09-27）
+
+### 143.0 为什么单独记一节
+
+`F.1`（语句路由）已落地 ✓，下一步是 `F.2`（SQL 形式的 schema 变更）。本刀**只做查证**：
+把 `F.2` 要用的每一个名字钉死，下一刀直接照抄 —— 免得像 `§134`/`§135` 那样
+"重新考古一遍"（那次教训就是：查到的形状必须落进文档）。
+
+### 143.1 已钉死的接缝（全部来自源码，非猜测）
+
+| 用途 | 入口 | 位置 |
+|---|---|---|
+| 演进 schema（唯一 OCC 作用点） | `CatalogOps::evolve_schema(req) -> EvolveSchemaResponse` | `catalog/src/lib.rs:52` |
+| 请求 | `EvolveSchemaRequest { table, change: SchemaChange, expected_version }` | `model/src/ops.rs:76` |
+| 响应 | `EvolveSchemaResponse { new_schema, version }` | `model/src/ops.rs:83` |
+| 变更类型 | `SchemaChange::{AddColumn { field }, WidenType, DropColumn}`（`SchemaChangeKind` 0/1/2） | **`model/src/schema.rs:37`**（从 `model/src/lib.rs:31` 再导出） |
+| 兼容性判定/应用 | `yuntun_model::schema::{classify, apply_change, SchemaCompatibility}` | 同上（`F.2` 的"破坏性变更要拒绝"直接用它） |
+| 可照抄的调用模板 | `catalog/src/lib.rs:538`（既有用例里的 `evolve_schema` 调用） | — |
+
+### 143.2 F.2 要新增的那一处结构（**这是关键前提**）
+
+`QueryEngine` 现在只有 `catalog: Arc<LocalCatalog>` —— 那是**读缓存**，不是写句柄
+（`query/src/lib.rs:68`）。所以 `F.2` 必须先给它一个**可选的写句柄**：
+
+* 新增字段 `catalog_ops: Option<Arc<dyn CatalogOps>>` + 构造器 `with_catalog_ops(...)`；
+* 未注入时，`ALTER TABLE` 给**可读拒绝**（"本进程为只读形态，DDL 需要注入写句柄"）——
+  这与 `§74` 的"只读数据进程"形态是同一件事，别让它静默成功；
+* 注入后：路由分支 `StmtKind::AlterTable` ⇒ 解析出 `SchemaChange` ⇒ `evolve_schema`
+  （`expected_version` 取当前表版本 ⇒ OCC 冲突就如实报错）⇒ 成功后**刷新本地缓存**（版本 +1）。
+
+### 143.3 F.2 的验收（照 plan 的 F.2，验收项已写好）
+
+① DDL 后新写入带新列；② **旧文件仍可读**（缺列按 null 对齐）；③ 版本 +1 且**其它表不受影响**；
+④ **OCC：并发两个 DDL 只有一个成功**；⑤ 破坏性变更（改类型 / 收紧可空性）**被明确拒绝**。
+
+### 143.4 本刀验证
+
+功能代码**零改动**（只加本节文档）；判据 5/5。
