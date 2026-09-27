@@ -7,7 +7,7 @@
 > **版本**：v2.3
 > **日期**：2026-09-18（v2.3 于 2026-09-27 追加 **F 组**：SQL 形式的 schema 变更 / DELETE·UPDATE /
 > 行组级索引。**进度**：`F.1` 语句路由 ✅（`§142`）、`F.2` schema 变更 ✅（`§144`）、
-> `F.4` 行组级索引 ✅（`§145`）；`F.3`（DELETE/UPDATE）**第一刀** ✅（`§146`，读侧与 SQL 前端待续））
+> `F.4` 行组级索引 ✅（`§145`）；`F.3`（DELETE/UPDATE）**前两刀** ✅（`§146`/`§147`，SQL 前端待续））
 >
 > **v2.2 相对 v2.1 的核心变更**：T8 基线压测入库 + **P0 ①/③ 定案**（`max_flush_delay_secs=0`、
 > `flush_phase_spread_secs=30`）并**正式修订 ADR-10**（v12）；chaos **11/11**；P0 ② `rows_threshold`
@@ -824,7 +824,7 @@ R2 Catalog 冻结（✅ 已完成）──► R3 metanode + raft
 ## F 组：SQL 形式的 schema 变更 / DELETE·UPDATE / 行组级索引（2026-09-27；**F.1/F.2/F.4 已落地**）
 
 > 状态：`F.1` 语句路由 ✅（`§142`）、`F.2` schema 变更 ✅（`§144`）、`F.4` 行组级索引 ✅（`§145`）、
-> `F.3` DELETE/UPDATE **第一刀**（DV 表达层与目录能力）✅（`§146`）—— 读侧生效（`F.3b`）、
+> `F.3` DELETE/UPDATE **前两刀**（DV 表达层/目录能力 + 读侧生效）✅（`§146`/`§147`）——
 > SQL `DELETE` + WAL（`F.3c`）、compaction 消费（`F.3d`）待续。本节是三块功能的 WBS + 每刀的可测验收 + 风险与开放问题。
 
 ### F.0 现状（已查证的接缝，不是印象）
@@ -868,12 +868,14 @@ R2 Catalog 冻结（✅ 已完成）──► R3 metanode + raft
 
 ### F.3 ② DELETE / UPDATE
 
-> **状态：第一刀已落地（2026-09-27，`§146`）** —— **删除向量的表达层与目录能力**
-> （`model::dv` + `CatalogState::apply_deletions/list_deletions/revoke` + 快照 tag 15 + `CatalogOps` 三方法）。
-> **尚未落地**（都已排刀，两条抵押见 `§146.3`）：**读侧生效**（DV → parquet 整体 `RowSelection`，
-> 含与 `F.4` 索引计划的互斥）＝ `F.3b`；**SQL `DELETE` + WAL `DeletePayload` + `replay_wal_dml` + 远端目录**＝ `F.3c`；
+> **状态：第一、二刀已落地（2026-09-27）** —— ①`§146` 删除向量的**表达层与目录能力**
+> （`model::dv` + `CatalogState::apply_deletions/list_deletions/revoke` + 快照 tag 15 + `CatalogOps` 三方法）；
+> ②`§147` **读侧生效**（带 DV 的文件挂 parquet **整体行选择**，DF 自己拆到行组；
+> 与 `F.4` 的索引计划**互斥且 DV 优先**；DV 坏/越界/行数不符一律**报错**；
+> 顺带补 `commit_files`「一个批次一个文件」护栏 = 台账 `D-9`）。
+> **尚未落地**（都已排刀，两条抵押见 `§146.3`）：**SQL `DELETE` + WAL `DeletePayload` + `replay_wal_dml` + 远端目录**＝ `F.3c`；
 > **compaction 消费 DV + 孤儿 GC 覆盖 `dv/`**＝ `F.3d`；`UPDATE`（设计 M3）＝ 最后。
-> ⇒ **现在仍不能删**（SQL 层没有 `DELETE`；也造不出 DV）。
+> ⇒ **现在仍不能删**（SQL 层没有 `DELETE`；也造不出 DV）—— 但"删除一旦登记，读侧必然尊重它"已成立。
 
 * 数据文件不可变 ⇒ 行级删除只能"**标记**"：采用 **deletion vector（位置删除）**
   —— 每个数据文件一个 `.del`，记录被删行的位置集合（位图 / roaring）。
@@ -912,7 +914,7 @@ R2 Catalog 冻结（✅ 已完成）──► R3 metanode + raft
 
 ### F.5 刀的顺序（建议）
 
-**R0 语句路由 ✅ → ① schema 变更 ✅ → ③ 索引 ✅ → ② DELETE / UPDATE（进行中：`§146` 第一刀 ✅）**
+**R0 语句路由 ✅ → ① schema 变更 ✅ → ③ 索引 ✅ → ② DELETE / UPDATE（进行中：`§146`/`§147` 前两刀 ✅）**
 
 理由：① 最小、独立、能立刻用；③ 是纯读路径收益，而且 DELETE 的"扫出要删的行"正好复用它；
 ② 最复杂（牵动 compaction / GC / 快照隔离），放在有前两者兜底之后。
@@ -937,4 +939,4 @@ R2 Catalog 冻结（✅ 已完成）──► R3 metanode + raft
 
 ---
 
-> 落款：yuntun 开发计划任务书 v2.3（F 组为 2026-09-27 追加；**F.1 `§142` / F.2 `§144` / F.4 `§145` 已落地**，`F.3` 第一刀 `§146` 已落地、其余待续）
+> 落款：yuntun 开发计划任务书 v2.3（F 组为 2026-09-27 追加；**F.1 `§142` / F.2 `§144` / F.4 `§145` 已落地**，`F.3` 前两刀 `§146`/`§147` 已落地、其余待续）

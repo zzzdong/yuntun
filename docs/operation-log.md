@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§146，2026-09-27**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§147，2026-09-27**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -9354,3 +9354,78 @@ peeling 构造写错的后果是"多剪一个组" ⇒ **静默少数据**，而"
   否则新字段漏进快照时**没有任何断言会红**）；
 - `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；
 - 判据 **5/5**（规模行按判据数字更新：**57,206 行 / 20 crate / 459 测试函数**）。
+
+---
+
+## 147. **F.3 第二刀：删除向量（DV）在读侧生效**（2026-09-27）
+
+`§146` 把 DV 立成了"能表达、能登记、能过快照"的事实，这一刀把它接到**读路径**上：
+带 DV 的文件在 `scan` 时拿到一个**整体行选择**（"保留哪些行"），于是
+**已提交但尚未 compaction 的删除立刻不可见**（`plan.md` F.3 验收①，`F.7` 决策②）。
+
+### 147.0 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `query::cache` | `CachedTable.deletions`（读快照里的 DV）+ `deletions_for` / `has_deletions`；**全量与增量两条刷新路径都取** DV，且与文件用**同一个快照号** |
+| `query::table` | `file_deletions`（逐文件取位图 → 同文件多份 **OR** → 失败**报错**）+ `scan` 给带 DV 的文件挂 `ParquetRowSelection` + `group_plans` 对带 DV 的文件**一个索引都不取** |
+| `catalog::state::commit_files` | **顺带补的护栏**：一个批次只许一个文件（见 §147.2） |
+| `crates/query/tests/deletion_vector.rs`（新） | 7 条读侧用例（见 §147.4） |
+
+### 147.1 三个决定
+
+1. **DV 走 DataFusion 的"整体行选择"扩展**
+   （`ParquetRowSelection::new(RowSelection::from_consecutive_ranges(保留区间, 总行数))`）。
+   DF 的文档原话就是"给**外部索引**用"，而且**它自己**用 parquet footer 把整体选择拆成
+   **逐行组**的访问计划 ⇒ 流式、不物化、顺带少读字节。设计 §9 把"DV → RowSelection"排在 M2，
+   实测这条路**现在**就通 —— 于是 `delta-dml-design §5.1` 的
+   "带 DV 的文件禁用 row-group 裁剪"落成了**更精确**的形态：
+   *该跳过哪些行由 DV 说了算，行组粒度由 DF 拆*。
+2. **DV 与索引互斥，DV 优先**。两个理由，缺一不可：
+   * DataFusion 只接受**一个** access extension —— `ParquetAccessPlan` 与 `ParquetRowSelection`
+     同时挂会直接报错（`Invalid parquet access extensions … not both`）；
+   * 语义：DV 按**文件行号**定位，跳行组会让"读到第几行"与"文件里第几行"错位。
+   ⇒ 带 DV 的文件**连索引对象都不下载**（省一次 IO，也省掉"两个扩展谁先"的整类问题）。
+3. **失败即错**（`§146.1` 决定③的延续）：取不到 / 解不开 / 基数与目录不符 / 行号越界 /
+   清单里的行数与文件不符 ⇒ **整次查询失败**。索引坏了退回全读（只影响"读多少"），
+   DV 坏了必须报错（它决定"读到什么"）。
+
+### 147.2 顺带发现并修掉的：`files` 以 `batch_id` 为键 ⇒ 一次提交两个文件会**静默丢文件**
+
+- **怎么发现的**：造"两个文件"夹具时，第一个文件从清单里消失了 —— `EXPLAIN` 的
+  `file_groups` 只剩 B。往下查：`CatalogState::commit_files` 里
+  `self.files.insert(req.batch_id.clone(), f)`，而循环里**每个**文件都被赋成同一个
+  `req.batch_id` ⇒ 后一个把前一个**覆盖掉**。
+- **影响**：调用方一次传两个文件 = 数据从清单里消失（查询少数据、**零报错**）。
+  现实里所有调用点都是"一次一个文件"（`flush_batch` 的形态；compaction 的每个新文件本来
+  就带自己的 `batch_id`），所以一直没炸 —— 但这正是本仓最怕的形态（**静默少数据 + 无人发现**）。
+- **修法**：在 `commit_files` **最前面**拒绝 `files.len() > 1`（先于任何写入 ⇒ **拒绝是原子的**，
+  不会留下"半个请求"）+ 单测（`one_batch_must_not_carry_two_files`）。
+  为什么不改成"支持多文件"：`files` 的键、幂等对账、孤儿清理的
+  `dv → file_path → batch_id` 推导**全都建立在"一个批次一个文件"上** —— 改键是另一件事，
+  且没有需求。
+- **进台账**：`D-9`（与本刀同刀闭环）。
+
+### 147.3 边界（明确没做的）
+
+1. **SQL `DELETE FROM t WHERE …`**（谓词定位 + 命中未提交行时 force flush）+
+   **WAL `DeletePayload`（type 6）+ `replay_wal_dml`** + **远端目录/metanode op** ⇒ `F.3c`
+   （**抵押①仍在**：远端 `list_deletions` 返空）；
+2. **compaction 消费 DV + 孤儿 GC 覆盖 `dv/`** ⇒ `F.3d`（**抵押②仍在**：现在还造不出 DV，
+   所以"compaction 复活已删行"不成立）；
+3. **统计**：`statistics()` 仍返回 `None`（设计 §5.4 的"逐文件 `row_count − card`"未接）——
+   不影响正确性，只影响优化器的选择；
+4. **热点数据（未提交 chunk）不参与 DV**：DV 只作用于已提交文件；所以"删刚插的行"
+   还需要 `F.3c` 的 force flush（设计 §4.3）。
+
+### 147.4 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **464 passed / 0 failed / 0 ignored**
+  （本刀 +8：7 条读侧用例 + 1 条护栏用例）；
+- `crates/query/tests/deletion_vector.rs` 的 7 条：
+  ① 删后查不到、**其余逐行一致**；② 同文件多份 DV **叠加**；③ 只影响被锚定的文件 +
+  **整文件删光**只得 0 行；④ **旧读者（未刷新的快照）仍看到完整表**（快照隔离）；
+  ⑤ 坏 DV / 基数不符 / 行号越界 / 清单行数不符 ⇒ **查询报错并点名**；
+  ⑥ **带 DV 且挂了索引**的文件跑谓词查询仍然对（`not both` 的反证）；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；
+- 判据 **5/5**。

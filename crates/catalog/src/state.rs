@@ -435,6 +435,25 @@ impl CatalogState {
         req: CommitFilesRequest,
         now_secs: u64,
     ) -> Result<CommitFilesResponse, LakeError> {
+        // ⓪ **一个 batch_id ↔ 一个文件**（`files` 以 `batch_id` 为键）。
+        //
+        // 这条不变量此前是**隐式**的：一次请求带两个文件时，后一个会把前一个**静默覆盖**
+        // —— 文件从清单里消失（查询少数据，且没有任何报错）。`§147` 撞到过它
+        // （造"两个文件"夹具时才发现）。
+        //
+        // 为什么这条对 DV 尤其要紧：删除向量的清理对账键是
+        // `dv → file_path → batch_id`（`delta-dml-design §6.2`）—— 一个批次挂两个文件时
+        // 这条推导就不再是函数，孤儿清理会**认错文件**。
+        //
+        // 放在**最前面**（先于任何写入）：否则"报错"与"留下半个请求"会同时发生。
+        if req.files.len() > 1 {
+            return Err(LakeError::Other(format!(
+                "同一批次 {} 提交了 {} 个文件：`files` 以 batch_id 为键，多出来的文件会被静默覆盖（= 数据从清单里消失）。请让每个批次只带一个文件（`flush_batch` 的形态）",
+                req.batch_id,
+                req.files.len()
+            )));
+        }
+
         // ① batch_id 幂等检查（已提交过 → 成功返回，不报错）
         if self.files.contains_key(&req.batch_id) {
             return Ok(self.dup_commit_response());
@@ -1464,7 +1483,6 @@ mod snapshot_tests {
         }
     }
 
-    /// 一个"每个维度都非空"的状态：快照测试必须有东西可丢，否则测不出漏字段。
     /// 一个最小的 DV 事件（`card` 必须 > 0 —— 空删除不进目录）。
     fn dv_entry(dv_id: &str, table: &str, file: &str) -> DeletionEntry {
         DeletionEntry {
@@ -1479,6 +1497,7 @@ mod snapshot_tests {
         }
     }
 
+    /// 一个"每个维度都非空"的状态：快照测试必须有东西可丢，否则测不出漏字段。
     fn rich_state() -> CatalogState {
         let mut st = CatalogState::new();
         st.create_schema("analytics").unwrap();
@@ -1883,6 +1902,25 @@ mod snapshot_tests {
         let mut bad = s.to_snapshot_msg();
         bad.deletions[0].dv_id = "dv-other".into();
         assert!(CatalogState::from_snapshot_msg(bad).is_err());
+    }
+
+    /// **一个 batch_id 只能带一个文件**：多带的会被静默覆盖 = 数据从清单里消失。
+    #[test]
+    fn one_batch_must_not_carry_two_files() {
+        let mut s = rich_state();
+        let mut req = commit_req("public.cpu", "b-multi", &[]);
+        let mut second = req.files[0].clone();
+        second.file_path = "p/b-multi-2.parquet".into();
+        req.files.push(second);
+        let e = s.commit_files(req, 9_001).unwrap_err().to_string();
+        assert!(e.contains("同一批次"), "必须点名不变量：{e}");
+        assert!(e.contains("静默覆盖"), "必须说清后果：{e}");
+        assert!(
+            s.list_visible_files("public.cpu", u64::MAX, None)
+                .iter()
+                .all(|f| f.batch_id != "b-multi"),
+            "被拒绝的请求不该留下这个批次的**任何**文件（拒绝必须是原子的）"
+        );
     }
 
     /// 重复键必须**拒绝**：重复键下"谁生效"取决于遍历顺序 = 不确定性。

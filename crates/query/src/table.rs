@@ -66,11 +66,16 @@ use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_datasource::PartitionedFile;
 use datafusion_datasource_parquet::source::ParquetSource;
-use datafusion_datasource_parquet::ParquetAccessPlan;
+use datafusion_datasource_parquet::{ParquetAccessPlan, ParquetRowSelection};
+// 整体行选择（DV 的载体）：DF 明说这是给"**外部索引**"用的扩展点，
+// 它会用 parquet footer 把它拆成**逐行组**的访问计划（`delta-dml-design §5.2` 的 M2 提前实现了）
+use datafusion::parquet::arrow::arrow_reader::RowSelection;
+use std::collections::HashMap;
 use std::sync::Arc;
 use crate::cache::HotShards;
 use crate::partial::{MissingSource, PartialSink};
 use std::time::Duration;
+use yuntun_model::dv::DvBitmap;
 use yuntun_model::meta::FileManifest;
 
 /// 读路径的装配事实（一次查询一整套）：**对象存储 + 两个读侧旋钮**。
@@ -154,6 +159,92 @@ impl YuntunTableProvider {
         }
     }
 
+    /// **带删除向量的文件 → 该文件"被删掉的行号"位图**（`plan.md` F.3b）。
+    ///
+    /// 三条纪律，与索引那三条**刻意相反**（`§146.1` 决定③）：
+    ///
+    /// 1. **失败一律报错，绝不降级**：取不到 / 解不开 / 基数不符 ⇒ 整次查询**失败**。
+    ///    索引失败退回全读（只影响"读多少"），而 DV 影响"**读到什么**" ——
+    ///    忽略一份 DV = **复活已删的行**（用户以为删了、审计也看不出来，比少数据更糟）；
+    /// 2. **同一文件多份 DV 先 OR**：设计 §2 的删除是**追加式**的（同文件多次 DELETE 不合并），
+    ///    读侧必须逐份叠加；
+    /// 3. **并取 + 一个总预算**：与热读/索引同一套形状（`§88`：N 个来源的等待是 `max`），
+    ///    预算复用热读那条（"这次查询愿意等多久"是同一个概念）。
+    async fn file_deletions(
+        &self,
+        kept: &[&FileManifest],
+    ) -> Result<HashMap<String, DvBitmap>, datafusion::error::DataFusionError> {
+        use datafusion::error::DataFusionError;
+        let Some(table) = self.snapshot.get(&self.ident) else {
+            return Ok(HashMap::new());
+        };
+        if !table.has_deletions() {
+            return Ok(HashMap::new());
+        }
+        // 只取"本次真的要读的文件"的 DV：快照里可能还有锚定在别的文件上的 DV
+        // （例如被文件级剪枝剪掉的文件）—— 那些与本次查询无关
+        let wanted: Vec<(String, Vec<yuntun_model::dv::DeletionEntry>)> = kept
+            .iter()
+            .filter_map(|f| {
+                let ds = table
+                    .deletions_for(&f.file_path)
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (!ds.is_empty()).then(|| (f.file_path.clone(), ds))
+            })
+            .collect();
+        if wanted.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let deadline = tokio::time::Instant::now() + self.hot_read_budget;
+        let budget_ms = self.hot_read_budget.as_millis();
+        let store = self.store.clone();
+        let ident = self.ident.clone();
+        let futures = wanted.into_iter().map(|(path, entries)| {
+            let store = store.clone();
+            async move {
+                let mut merged = DvBitmap::new();
+                for e in &entries {
+                    let bytes = tokio::time::timeout_at(
+                        deadline,
+                        yuntun_store::get_bytes(store.as_ref(), &e.store_path),
+                    )
+                    .await
+                    .map_err(|_| {
+                        format!(
+                            "取删除向量 {} 超出预算（{budget_ms} ms）：{}",
+                            e.dv_id, e.store_path
+                        )
+                    })?
+                    .map_err(|err| format!("取删除向量 {} 失败：{err}", e.dv_id))?;
+                    let dv = DvBitmap::from_bytes(&bytes)
+                        .map_err(|err| format!("{err}（文件 {path} 上的 {}）", e.dv_id))?;
+                    if dv.card() != u64::from(e.card) {
+                        return Err(format!(
+                            "删除向量 {} 的基数与目录不符：目录记 {} 行、位图里 {} 行                             （对象与登记不是同一次写入）",
+                            e.dv_id,
+                            e.card,
+                            dv.card()
+                        ));
+                    }
+                    merged.union_with(&dv);
+                }
+                Ok::<_, String>((path, merged))
+            }
+        });
+        let mut out = HashMap::new();
+        for r in futures::future::join_all(futures).await {
+            let (path, dv) = r.map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "表 {ident} 的删除向量读不出来：{e} ——                      不能假装没有删除（那些行会「已删却还查得到」）"
+                ))
+            })?;
+            out.insert(path, dv);
+        }
+        Ok(out)
+    }
+
     /// 逐个候选文件取索引并算出"**跳过哪些行组**"（`plan.md` F.4）。
     ///
     /// 三条纪律：
@@ -164,10 +255,20 @@ impl YuntunTableProvider {
     ///    预算复用热读那条（"这次查询愿意等多久"是同一个概念）；
     /// 3. **只对 parquet 挂**：`ParquetAccessPlan` 是 parquet 读取器的扩展点 ——
     ///    路径不是 `.parquet` 的文件（例如 vortex）挂了也没人认。
+    ///
+    /// `dvs` = 带删除向量的文件（**这些文件一个索引都不取**）：
+    ///
+    /// * DataFusion 只接受**一个** access extension —— `ParquetAccessPlan` 与
+    ///   `ParquetRowSelection` 同时挂会直接报错
+    ///   （`Invalid parquet access extensions … Specify either … not both`）；
+    /// * 更根本的理由是**语义**：DV 按**文件行号**定位，而跳行组会让"读到第几行"
+    ///   与"文件里第几行"错位（`delta-dml-design §5.1` 的同一条纪律）。
+    ///   两害相权，DV 优先（剪枝只省 IO，DV 决定对错）。
     async fn group_plans(
         &self,
         files: &[&FileManifest],
         filters: &[Expr],
+        dvs: &HashMap<String, DvBitmap>,
     ) -> Vec<Option<ParquetAccessPlan>> {
         let store = self.store.clone();
         let deadline = tokio::time::Instant::now() + self.hot_read_budget;
@@ -179,6 +280,7 @@ impl YuntunTableProvider {
                 if f.index_path.is_empty()
                     || f.row_count == 0
                     || !f.file_path.ends_with(".parquet")
+                    || dvs.contains_key(&f.file_path)
                 {
                     return None;
                 }
@@ -400,12 +502,45 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
                 .iter()
                 .map(|f| PartitionedFile::new(f.file_path.clone(), f.file_size))
                 .collect();
+            // 【F.3b｜删除向量】带 DV 的文件：把"**保留哪些行**"作为**整体行选择**交给
+            // parquet 读取器（DF 用它把访问计划拆到行组粒度），于是
+            // 「已提交但尚未 compaction 的删除」在读侧立即生效（设计 §5.2 的"读到即不可见"）。
+            //
+            // 位置：放在文件级剪枝**之后**、索引/扫描**之前** —— 与设计 §5.4 要求的次序一致。
+            let dvs = self.file_deletions(&kept).await?;
+            for (pf, f) in files.iter_mut().zip(kept.iter()) {
+                let Some(dv) = dvs.get(&f.file_path) else {
+                    continue;
+                };
+                if !f.file_path.ends_with(".parquet") {
+                    // 不认识的格式上挂不了行选择 ⇒ **报错**而不是"当没有删除"：
+                    // 后者会把这批已删的行原样查出来（静默错结果）
+                    return Err(datafusion::error::DataFusionError::Execution(format!(
+                        "文件 {} 带删除向量但不是 parquet：这条读路径无法按行号应用 DV，                         拒绝返回「已删却还查得到」的结果",
+                        f.file_path
+                    )));
+                }
+                let ranges = dv.keep_ranges(f.row_count).map_err(|e| {
+                    datafusion::error::DataFusionError::Execution(format!(
+                        "{}（文件 {}）",
+                        e, f.file_path
+                    ))
+                })?;
+                let selection =
+                    RowSelection::from_consecutive_ranges(ranges.into_iter(), f.row_count as usize);
+                *pf = pf.clone().with_extension(ParquetRowSelection::new(selection));
+            }
+
             // 【F.4｜两级剪枝的第二级】文件级已定"读哪些文件"，这里再定"文件里读哪些组"：
             // 有索引 + 有谓词才去取索引（没谓词就没有依据，连索引都不必读）。
             // 没挂上 plan 的文件原样全读 —— 失败/拿不准都走这条路（见 `group_plans`）。
+            // **带 DV 的文件一个索引都不取**（两个扩展互斥 + 行号对齐，见 `group_plans`）。
             if self.index_pruning && !filters.is_empty() {
-                let plans = self.group_plans(&kept, filters).await;
-                for (pf, plan) in files.iter_mut().zip(plans) {
+                let plans = self.group_plans(&kept, filters, &dvs).await;
+                for ((pf, f), plan) in files.iter_mut().zip(kept.iter()).zip(plans) {
+                    if dvs.contains_key(&f.file_path) {
+                        continue;
+                    }
                     if let Some(plan) = plan {
                         *pf = pf.clone().with_extension(plan);
                     }

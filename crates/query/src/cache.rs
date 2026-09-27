@@ -29,6 +29,7 @@ use std::time::Duration;
 use datafusion::error::DataFusionError;
 use tokio_util::sync::CancellationToken;
 use yuntun_catalog::CatalogOps;
+use yuntun_model::dv::DeletionEntry;
 use yuntun_model::meta::{FileManifest, TableMeta};
 use yuntun_model::ops::CatalogVersion;
 use yuntun_store::ShardReader;
@@ -41,6 +42,30 @@ pub struct CachedTable {
     pub schema_version: u64,
     /// 该表在 `snapshot` 下可见的文件（快照隔离：以刷新时的 snapshot 为界）
     pub files: Vec<FileManifest>,
+    /// 该表在 `snapshot` 下**生效**的删除向量（`plan.md` F.3b）。
+    ///
+    /// 为什么放在**读快照**里而不是让 `scan` 去问目录：`scan` 是**同步**的，
+    /// 而目录接口是异步的（远端形态还要过网络）—— 读路径的"零网络"纪律（C7/`§61`）
+    /// 要求规划期的输入在刷新期就已经备齐。
+    ///
+    /// 过滤是**快照维度**的（`DeletionEntry::active_at`，在目录侧完成）：
+    /// 提交前开始的查询因此看不到这次删除 —— 这是快照隔离的读侧一半。
+    pub deletions: Vec<DeletionEntry>,
+}
+
+impl CachedTable {
+    /// 锚定在 `file_path` 上、且在本快照**生效**的删除向量（按 `dv_id` 升序，确定性）。
+    pub fn deletions_for(&self, file_path: &str) -> Vec<&DeletionEntry> {
+        self.deletions
+            .iter()
+            .filter(|d| d.file_path == file_path)
+            .collect()
+    }
+
+    /// 本表是否有文件带着生效的删除向量（`scan` 据此跳过索引计划：两个扩展互斥）。
+    pub fn has_deletions(&self) -> bool {
+        !self.deletions.is_empty()
+    }
 }
 
 /// 成员表里的一条：**数据节点名录**（T12.3 第一刀）。
@@ -414,6 +439,12 @@ impl LocalCatalog {
                 .list_visible_files(&ident, snapshot_no, None)
                 .await
                 .map_err(|e| self.record_error(e.to_string()))?;
+            // DV 与文件**用同一个快照号**取：两者是"同一时刻世界"的两半，
+            // 差一个号就会出现"文件按新快照、删除按旧快照"的错配（那正是复活/少数据的形状）。
+            let deletions = catalog
+                .list_deletions(&ident, snapshot_no)
+                .await
+                .map_err(|e| self.record_error(e.to_string()))?;
             tables.insert(
                 ident,
                 Arc::new(CachedTable {
@@ -421,6 +452,7 @@ impl LocalCatalog {
                     schema,
                     schema_version,
                     files,
+                    deletions,
                 }),
             );
         }
@@ -485,6 +517,12 @@ impl LocalCatalog {
                         .list_visible_files(ident, snapshot_no, None)
                         .await
                         .map_err(|e| self.record_error(e.to_string()))?;
+                    // ⚠️ **增量路径也必须带上 DV**：只带文件 = 把这次刷新之前的删除**丢掉**
+                    //（那些行会立刻复活）。这条漏了不会报错，只会"多几行"—— 最难发现的那类错。
+                    let deletions = catalog
+                        .list_deletions(ident, snapshot_no)
+                        .await
+                        .map_err(|e| self.record_error(e.to_string()))?;
                     next.tables.insert(
                         ident.clone(),
                         Arc::new(CachedTable {
@@ -492,6 +530,7 @@ impl LocalCatalog {
                             schema,
                             schema_version,
                             files,
+                            deletions,
                         }),
                     );
                 }
