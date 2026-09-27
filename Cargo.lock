@@ -7141,14 +7141,17 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "arrow-cast",
+ "object_store",
  "sqlparser",
  "thiserror 2.0.21",
+ "tracing",
  "uuid",
  "yuntun-catalog",
  "yuntun-format",
  "yuntun-ingest",
  "yuntun-model",
  "yuntun-query",
+ "yuntun-store",
 ]
 
 [[package]]

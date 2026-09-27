@@ -16,6 +16,8 @@ pub mod params;
 pub mod session;
 pub mod shim;
 pub mod sql;
+/// `F.3`：DML（`DELETE`）的前端 —— 定位 → 写位图 → WAL → 目录 → 刷缓存。
+pub(crate) mod dml;
 
 use std::sync::Arc;
 
@@ -518,6 +520,8 @@ impl SqlEngine {
     ) -> Result<RawOutcome, SqlError> {
         use sqlparser::ast::{Expr, ObjectType, SetExpr, Statement, TableObject};
         match stmt {
+            // `F.3`：`DELETE FROM t WHERE …`（写侧前端，见 `dml` 模块文档的六步顺序）
+            Statement::Delete(delete) => self.execute_delete(&delete, session).await,
             Statement::Query(q) => {
                 // 只读查询 → DataFusion（非限定表名按会话 schema 解析，G2 + 多 schema）
                 let text = q.to_string();

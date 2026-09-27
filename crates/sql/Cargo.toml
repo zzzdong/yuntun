@@ -11,8 +11,12 @@ yuntun-ingest = { path = "../ingest" }
 yuntun-query = { path = "../query" }
 yuntun-catalog = { path = "../catalog" }
 yuntun-format = { path = "../format" }
+# `F.3`：删除向量的对象读写（`put_bytes` / `get_bytes`）与 `Arc<dyn ObjectStore>`
+yuntun-store = { path = "../store" }
+object_store = { workspace = true }
 arrow = { workspace = true }
 arrow-cast = "59"
 sqlparser = { workspace = true, features = ["visitor"] }
 uuid = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }

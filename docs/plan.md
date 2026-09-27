@@ -824,8 +824,9 @@ R2 Catalog 冻结（✅ 已完成）──► R3 metanode + raft
 ## F 组：SQL 形式的 schema 变更 / DELETE·UPDATE / 行组级索引（2026-09-27；**F.1/F.2/F.4 已落地**）
 
 > 状态：`F.1` 语句路由 ✅（`§142`）、`F.2` schema 变更 ✅（`§144`）、`F.4` 行组级索引 ✅（`§145`）、
-> `F.3` DELETE/UPDATE **前两刀**（DV 表达层/目录能力 + 读侧生效）✅（`§146`/`§147`）——
-> SQL `DELETE` + WAL（`F.3c`）、compaction 消费（`F.3d`）待续。本节是三块功能的 WBS + 每刀的可测验收 + 风险与开放问题。
+> `F.3` DELETE/UPDATE **已落地**：DV 表达层/目录能力（`§146`）+ 读侧生效（`§147`）+
+> 写侧机械（WAL 记录/强制 flush/重放，`§148`）+ SQL `DELETE FROM t WHERE …`（`§149`）——
+> **`DELETE` 在 `memory` 形态可用**；compaction 消费 DV（`F.3d`）、远端目录（`F.3c-3`）、`UPDATE` 待续。本节是三块功能的 WBS + 每刀的可测验收 + 风险与开放问题。
 
 ### F.0 现状（已查证的接缝，不是印象）
 
@@ -875,7 +876,12 @@ R2 Catalog 冻结（✅ 已完成）──► R3 metanode + raft
 > 顺带补 `commit_files`「一个批次一个文件」护栏 = 台账 `D-9`）。
 > **尚未落地**（都已排刀，两条抵押见 `§146.3`）：**SQL `DELETE` + WAL `DeletePayload` + `replay_wal_dml` + 远端目录**＝ `F.3c`；
 > **compaction 消费 DV + 孤儿 GC 覆盖 `dv/`**＝ `F.3d`；`UPDATE`（设计 M3）＝ 最后。
-> ⇒ **现在仍不能删**（SQL 层没有 `DELETE`；也造不出 DV）—— 但"删除一旦登记，读侧必然尊重它"已成立。
+> ③`§149` **SQL 前端**：`DELETE FROM t WHERE …`（定位扫描 → 位图对象 → WAL → 目录 → 刷缓存）
+> ⇒ **能删了**（`[meta] mode = "memory"` 形态；`embedded` 形态的目录写路径未接线，
+> DELETE 会**明确报错**而不是静默不生效）。
+> **仍缺**：**compaction 消费 DV + 孤儿 GC 覆盖 `dv/`** ＝ `F.3d`（⚠️ 优先级已升高：
+> DV 现在造得出来，合并带 DV 的文件会**复活已删行**）；远端目录/metanode op（抵押①）＝ `F.3c-3`；
+> `UPDATE` ＝ 最后；无 `WHERE` 的全表删（设计 §7 的 `purge_table_files`）＝ 随 `F.3d`。
 
 * 数据文件不可变 ⇒ 行级删除只能"**标记**"：采用 **deletion vector（位置删除）**
   —— 每个数据文件一个 `.del`，记录被删行的位置集合（位图 / roaring）。
@@ -914,7 +920,7 @@ R2 Catalog 冻结（✅ 已完成）──► R3 metanode + raft
 
 ### F.5 刀的顺序（建议）
 
-**R0 语句路由 ✅ → ① schema 变更 ✅ → ③ 索引 ✅ → ② DELETE / UPDATE（进行中：`§146`/`§147` 前两刀 ✅）**
+**R0 语句路由 ✅ → ① schema 变更 ✅ → ③ 索引 ✅ → ② DELETE / UPDATE（`§146`–`§149` 四刀 ✅，余 `F.3d`/`F.3c-3`/UPDATE）**
 
 理由：① 最小、独立、能立刻用；③ 是纯读路径收益，而且 DELETE 的"扫出要删的行"正好复用它；
 ② 最复杂（牵动 compaction / GC / 快照隔离），放在有前两者兜底之后。
@@ -939,4 +945,4 @@ R2 Catalog 冻结（✅ 已完成）──► R3 metanode + raft
 
 ---
 
-> 落款：yuntun 开发计划任务书 v2.3（F 组为 2026-09-27 追加；**F.1 `§142` / F.2 `§144` / F.4 `§145` 已落地**，`F.3` 前两刀 `§146`/`§147` 已落地、其余待续）
+> 落款：yuntun 开发计划任务书 v2.3（F 组为 2026-09-27 追加；**F.1 `§142` / F.2 `§144` / F.4 `§145` 已落地**，`F.3` 四刀 `§146`–`§149` 已落地、其余（`F.3d`/`F.3c-3`/`UPDATE`）待续）

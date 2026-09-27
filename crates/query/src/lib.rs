@@ -13,6 +13,8 @@
 pub mod cache;
 /// 组级剪枝（`F.4`）：把索引文件变成"跳过哪些行组"。
 pub mod index;
+/// `F.3`：DML 的定位扫描（在一个文件上求谓词，取回命中行号）。
+pub mod locate;
 pub mod partial;
 pub mod stmt;
 pub mod prune;
