@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§135，2026-09-27**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§136，2026-09-27**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -8739,3 +8739,46 @@ or configure the session for `with_tokio`.            （vortex-error-0.86.1/src
   已写好：4 类列 × 1000 行逐列比对 + 与 Parquet 的体积对照）**随占位一并撤下**，
   等 `§135.2` 的 runtime 接好后放回。**默认套件不含 vortex**（可选依赖），这条缺口只存在于
   `--features vortex` 这一路。
+
+---
+
+## 136. `Vortex` codec 第三版：**runtime 那条线通了**，露出最后一处（2026-09-27）
+
+### 136.0 结论
+
+按 `§135.2.1` 的清单实施：**runtime 接上了** ✓（vortex 不再内部 panic），但写入报出**新错**：
+
+```
+vortex 写入：Other error: Aggregate vortex.max not permitted by ctx
+```
+
+⇒ 数组是用 **`ArrowSession::default()`**（另一个 session）造的，与**写入用的那个 session 不同源**
+⇒ 写入时的 ctx 不认它带出来的 aggregate。已按纪律**退回占位**（两种构建都保持绿）。
+
+### 136.1 这次新确认的（补 `§135.2.1`）
+
+* `single::block_on` 的闭包签名是 **`FnOnce(Handle) -> Fut`** —— runtime 的 `Handle`
+  **直接作为参数递进来** ⇒ 别用 `Handle::find()`（那条路只在 tokio / wasm 上下文里找得到，
+  我们这里是裸线程，拿到的是 `None`）；
+* session 必须 `array_session().with::<RuntimeSession>().with_handle(handle)`（顺序不能反：
+  `with_handle` 内部是 `get_mut::<RuntimeSession>()` ⇒ `RuntimeSession` 得先挂上）；
+* `CurrentThreadRuntime` **不是** `Executor`（`Executor` 是 `Sender` / `tokio::runtime::Handle` 等），
+  但它通过 `block_on` 提供的 `Handle` 已经够用。
+
+### 136.2 剩下的最后一处（下一刀就这一步）
+
+数组必须由**同一个 session** 的 arrow 入口造，而不是 `ArrowSession::default()`：
+
+* 参照 vortex 自己的写法（`ArrowSession::execute_arrow` 内部就是 `ctx.session().clone().arrow()`）
+  ⇒ 应当是 **`session.arrow().from_arrow_record_batch(batch.clone(), schema)`**；
+* 需要确认 `session.arrow()` 这个扩展来自哪个 trait（大概率是 `ArrowSessionExt` 之类）
+  ⇒ **一次 grep + 一次编译**即可收口；
+* 之后放回 `crates/format/tests/vortex_roundtrip.rs`（`§135.4` 那份已写好，或直接用
+  `crates/format/src/lib.rs` 里 `vortex_tests` 模块那份，两者内容一致）。
+
+### 136.3 验证
+
+- `cargo build -p yuntun-format`（默认）与 `--features vortex` → **均通过**（占位版）；
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **410 passed / 0 failed / 0 ignored**；
+- 文档一致性判据（`§123`）**5/5 绿**；
+- ⚠️ 边界同 `§135.4`：**默认套件不含 vortex**（可选依赖），往返用例仍随占位撤下。

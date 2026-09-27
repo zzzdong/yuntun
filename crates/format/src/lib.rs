@@ -237,18 +237,19 @@ fn decode_parquet(bytes: &[u8]) -> Result<Vec<arrow::record_batch::RecordBatch>,
 // ---------------- Vortex（feature flag 后面，ADR-1）----------------
 
 fn encode_vortex(_batch: &arrow::record_batch::RecordBatch) -> Result<Vec<u8>, LakeError> {
-    // `§133` 起依赖**不再挡路**（`vortex 0.86` 与 arrow 59 同代）；真实现的第一版已写出
-    // 并通过编译（`§135`），但**跑起来会在 vortex 内部 panic**（session 缺运行时句柄）
-    // ⇒ 按纪律退回占位，等 `RuntimeSessionExt::with_handle` 接好再打开（见 `§135.2`）。
+    // `§133` 起依赖**不再挡路**（`vortex 0.86` 与 arrow 59 同代）；真实现已写出并通过编译
+    // （`§135`/`§136`），但**跑起来还差最后一处**：写入报
+    // `Aggregate vortex.max not permitted by ctx`（数组是用**另一个** `ArrowSession::default()`
+    // 造的，与写入用的 session 不同源）⇒ 按纪律退回占位；修法见 `§136.2`。
     Err(LakeError::Other(
-        "vortex format not enabled: 见 §135（runtime handle 未接入前不可用）"
+        "vortex format not enabled: 见 §136（数组须由同一个 session 的 arrow 入口造）"
             .into(),
     ))
 }
 
 fn decode_vortex(_bytes: &[u8]) -> Result<Vec<arrow::record_batch::RecordBatch>, LakeError> {
     Err(LakeError::Other(
-        "vortex format not enabled: 见 §135（runtime handle 未接入前不可用）"
+        "vortex format not enabled: 见 §136（数组须由同一个 session 的 arrow 入口造）"
             .into(),
     ))
 }
