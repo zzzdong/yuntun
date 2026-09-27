@@ -420,20 +420,56 @@ mod vortex_tests {
         }
     }
 
-    /// **体积对照**（`T9.x` 的第三件）：把两个数字摆出来。
+    /// **体积对照**（`T9.x` 的第三件）：**两种数据形状**，各把两个数字摆出来。
     ///
-    /// ⚠️ **不断言"谁更小"**：压缩率取决于数据形状（这里 `ts` 递增，对 Parquet 的 delta 编码
-    /// 极友好；换成随机 UUID 结论会反过来）。断言一个方向只会造出"换数据就红"的用例。
+    /// ⚠️ **不断言"谁更小"**：压缩率取决于数据形状 —— 下面两份数据就是反例：
+    /// `ts` 递增时 Parquet 的 delta 编码占尽便宜；换成**高基数随机串**，结论会往回走。
+    /// 断言一个方向只会造出"换数据就红"的用例 ⇒ 这里只断言**两条路都可用**。
+    ///
+    /// 另一件要记的：vortex **默认就开着压缩**（`vortex-file/src/writer.rs` 里
+    /// `BtrBlocksCompressorBuilder::default()` 是缺省策略）⇒ 下面这两个数字**都是压缩后**的。
     #[test]
-    fn vortex_and_parquet_sizes_are_both_usable() {
-        let b = batch(1_000);
-        let v = encode_batch(&b, DataFormat::Vortex).expect("vortex 编码").len();
-        let p = encode_batch(&b, DataFormat::Parquet).expect("parquet 编码").len();
-        println!(
-            "vortex={v}B parquet={p}B ratio={:.2}（1k 行、ts 递增 —— 偏袒 Parquet 的 delta 编码）",
-            v as f64 / p as f64
-        );
-        assert!(v > 0 && p > 0, "两种格式都得真写出东西：vortex={v} parquet={p}");
+    fn sizes_are_reported_for_two_data_shapes() {
+        for (label, b) in [
+            ("递增整数（偏袒 Parquet 的 delta）", batch(1_000)),
+            ("高基数随机串（偏袒字典/FSST）", random_strings_batch(1_000)),
+        ] {
+            let v = encode_batch(&b, DataFormat::Vortex).expect("vortex 编码").len();
+            let p = encode_batch(&b, DataFormat::Parquet).expect("parquet 编码").len();
+            println!("{label}: vortex={v}B parquet={p}B ratio={:.2}", v as f64 / p as f64);
+            assert!(v > 0 && p > 0, "两种格式都得真写出东西：vortex={v} parquet={p}");
+            // 两种形状下都要**读得回来**（体积之外，可用性同样要看）
+            let back = decode_batch(
+                &encode_batch(&b, DataFormat::Vortex).expect("vortex 编码"),
+                DataFormat::Vortex,
+            )
+            .expect("vortex 解码");
+            assert!(!back.is_empty(), "{label}: vortex 解码结果不该为空");
+        }
+    }
+
+    /// 高基数随机串（模拟 UUID / 事件 id）—— 与递增整数正好是两种极端形状。
+    fn random_strings_batch(rows: usize) -> arrow::record_batch::RecordBatch {
+        // 用**确定性**的伪随机（LCG）：用例必须可复现，不能靠 `rand`
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let ids: Vec<String> = (0..rows)
+            .map(|_| format!("id-{:016x}-{:016x}", next(), next()))
+            .collect();
+        arrow::record_batch::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("ts", DataType::Int64, true),
+                Field::new("id", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from((0..rows as i64).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(ids)),
+            ],
+        )
+        .unwrap()
     }
 }
 
