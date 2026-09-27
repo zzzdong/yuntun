@@ -6786,6 +6786,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "xorf"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f13846c9009c0e550697ddde851e934b5dfafbce757a5ef5edfdb27ea20803e"
+
+[[package]]
 name = "xxhash-rust"
 version = "0.8.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7024,6 +7030,7 @@ dependencies = [
  "serde",
  "thiserror 2.0.21",
  "uuid",
+ "xorf",
 ]
 
 [[package]]

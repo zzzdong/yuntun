@@ -218,6 +218,8 @@ message FileManifestMsg {
   uint64 committed_at_ms    = 17;  // 提交成功时刻
   string seal_reason        = 18;  // 封口原因（可观测性：为什么这个 chunk 被封）
   string seal_pressure      = 19;  // 触发的压力档位（内存/磁盘水位）
+  string index_path         = 20;  // 行组级索引文件路径（F.4；空 = 该文件无索引）
+  uint64 index_size         = 21;  // 索引文件字节数（0 = 无索引/未记录）
 }
 
 message StatisticsLiteMsg {

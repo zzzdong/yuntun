@@ -71,6 +71,21 @@ pub fn extract_batch_id(path: &str) -> Option<String> {
     Some(stem)
 }
 
+/// 数据文件路径 → **索引文件路径**（`plan.md` F.4）：`…/x.parquet` → `…/x.idx`。
+///
+/// 命名刻意与数据文件**同 stem**（只换扩展名），于是：
+///
+/// * `extract_batch_id` 对两者给出**同一个** batch_id ⇒ 孤儿清理/GC 把它们当同一批
+///   一起保护、一起回收（索引是**额外对象**，口径不同就会留垃圾或删掉活索引，`plan.md` F.6）；
+/// * 不需要在目录里再加一个"索引在哪"的映射（`FileManifest.index_path` 仍然记着，
+///   那是给读侧用的，不承担 GC 口径）。
+pub fn index_path(data_path: &str) -> String {
+    match data_path.rsplit_once('.') {
+        Some((stem, _ext)) => format!("{stem}.idx"),
+        None => format!("{data_path}.idx"),
+    }
+}
+
 /// 将 RecordBatch 编码并写入对象存储，返回 (路径, 字节数, 行数)。
 pub async fn write_batch(
     store: &Arc<dyn object_store::ObjectStore>,
@@ -199,7 +214,11 @@ pub fn decode_batch(
 /// 且对当前文件规模**不改变行为**（27k 行 < 64k → 仍是 1 组），只作为
 /// "文件变大时不要退化成单组" 的**显式上界**。改这个值必须同时给
 /// （文件大小、扫描剪枝、写入峰值内存）三组数据。
-const MAX_ROWS_PER_ROW_GROUP: usize = 65_536;
+///
+/// ⚠️ **这个值不在这里定义**：行组级索引（`plan.md` F.4）按**行组序号**说话，
+/// 必须与它逐行对齐 ⇒ 唯一真相在 [`yuntun_model::index::INDEX_GROUP_ROWS`]
+/// （那儿同时记着"为什么必须对齐"）。这里只保留别名，免得两个常量各自漂移。
+pub use yuntun_model::index::INDEX_GROUP_ROWS as MAX_ROWS_PER_ROW_GROUP;
 
 fn encode_parquet(batch: &arrow::record_batch::RecordBatch) -> Result<Vec<u8>, LakeError> {
     use parquet::arrow::ArrowWriter;

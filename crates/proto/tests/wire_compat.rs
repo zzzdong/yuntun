@@ -50,6 +50,8 @@ fn to_manifest(f: &FileManifest) -> FileManifestMsg {
         committed_at_ms: f.committed_at_ms,
         seal_reason: f.seal_reason.clone(),
         seal_pressure: f.seal_pressure.clone(),
+        index_path: f.index_path.clone(),
+        index_size: f.index_size,
     }
 }
 
@@ -85,6 +87,8 @@ fn from_manifest(m: &FileManifestMsg) -> FileManifest {
         committed_at_ms: m.committed_at_ms,
         seal_reason: m.seal_reason.clone(),
         seal_pressure: m.seal_pressure.clone(),
+        index_path: m.index_path.clone(),
+        index_size: m.index_size,
     }
 }
 
@@ -161,6 +165,8 @@ fn rich_commit_request() -> CommitFilesRequest {
                 committed_at_ms: 222,
                 seal_reason: "time_threshold".into(),
                 seal_pressure: "memory:0.42".into(),
+                index_path: "p/b-42-0.idx".into(),
+                index_size: 4096,
             },
             FileManifest {
                 file_path: "p/b-42-1.parquet".into(),
@@ -182,6 +188,8 @@ fn rich_commit_request() -> CommitFilesRequest {
                 committed_at_ms: 444,
                 seal_reason: "rows_threshold".into(),
                 seal_pressure: "disk:0.80".into(),
+                index_path: String::new(), // 另一条：**没有**索引（F.4 的合法状态）
+                index_size: 0,
             },
         ],
         schema_version: 2,

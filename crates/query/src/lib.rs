@@ -11,6 +11,8 @@
 //! scan 由 `list_visible_files(snapshot)` 结果构造 Parquet 文件组。
 
 pub mod cache;
+/// 组级剪枝（`F.4`）：把索引文件变成"跳过哪些行组"。
+pub mod index;
 pub mod partial;
 pub mod stmt;
 pub mod prune;
@@ -24,7 +26,7 @@ pub use cache::{
 };
 pub use partial::{MissingSource, PartialPolicy, PartialRead, PartialRejected, PartialSink};
 pub use provider::{YuntunCatalogProvider, YuntunSchemaProvider};
-pub use table::{HotReadStale, YuntunTableProvider};
+pub use table::{HotReadStale, ReadPath, YuntunTableProvider};
 
 /// 流式结果集类型（S1.10：`do_get` 边算边发；协议层无需直接依赖 datafusion）。
 pub use datafusion::execution::SendableRecordBatchStream;
@@ -65,6 +67,7 @@ pub const SCHEMA_NAME: &str = "public";
 /// 都等满"的乘积（一个来源最坏数个 RPC），才能真的收住最坏情况。
 pub const DEFAULT_HOT_READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
+#[derive(Clone)]
 pub struct QueryEngine {
     store: std::sync::Arc<dyn object_store::ObjectStore>,
     catalog: std::sync::Arc<LocalCatalog>,
@@ -74,6 +77,11 @@ pub struct QueryEngine {
     partial_policy: PartialPolicy,
     /// 整段热读的总预算（`§88`）：默认 [`DEFAULT_HOT_READ_BUDGET`]，装配层可覆盖。
     hot_read_budget: std::time::Duration,
+    /// **行组级索引剪枝**（`plan.md` F.4）：默认开。
+    ///
+    /// 关掉只为一件事 —— **对拍**（同一查询开/关必须逐行一致）。
+    /// 不放进 TOML：它不是一个"运维旋钮"，而是那条断言的载体（`table::ReadOptions`）。
+    index_pruning: bool,
 }
 
 /// 一次查询的结果：批次 + **完整性标记**（`crate::partial`）。
@@ -106,6 +114,7 @@ impl QueryEngine {
             runtime: None,
             partial_policy: PartialPolicy::default(),
             hot_read_budget: DEFAULT_HOT_READ_BUDGET,
+            index_pruning: true,
         }
     }
 
@@ -129,6 +138,7 @@ impl QueryEngine {
             runtime: Some(std::sync::Arc::new(runtime)),
             partial_policy: PartialPolicy::default(),
             hot_read_budget: DEFAULT_HOT_READ_BUDGET,
+            index_pruning: true,
         })
     }
 
@@ -174,6 +184,20 @@ impl QueryEngine {
     /// 当前热读总预算。
     pub fn hot_read_budget(&self) -> std::time::Duration {
         self.hot_read_budget
+    }
+
+    /// 开关**行组级索引剪枝**（`F.4`；默认开）。
+    ///
+    /// 唯一用途是**对拍**：同一批查询在"开"与"关"下必须**逐行一致** ——
+    /// 剪错 = 静默少数据，而这条开关就是那个断言的载体（`query/tests/index_parity.rs`）。
+    pub fn with_index_pruning(mut self, on: bool) -> Self {
+        self.index_pruning = on;
+        self
+    }
+
+    /// 当前索引剪枝开关。
+    pub fn index_pruning(&self) -> bool {
+        self.index_pruning
     }
 
     /// 本地 Catalog（物化视图：刷新由后台任务驱动）。
@@ -241,7 +265,11 @@ impl QueryEngine {
                 snapshot,
                 hot,
                 partial,
-                self.hot_read_budget,
+                ReadPath {
+                    store: self.store.clone(),
+                    hot_read_budget: self.hot_read_budget,
+                    index_pruning: self.index_pruning,
+                },
             )),
         );
         Ok(ctx)

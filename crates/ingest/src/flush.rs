@@ -185,6 +185,28 @@ pub async fn flush_chunk_with_id(
         }
     };
 
+    // ⑤.5 行组级索引（`plan.md` F.4）：**数据文件写成功之后**再写索引。
+    //
+    // 三条都是刻意的：
+    // * **顺序**：索引是"指向那个数据文件的行组"的 → 反过来写会留下指向空气的索引；
+    // * **失败语义**：索引是**派生对象**（丢了只是少省一点 IO，不影响读到什么）⇒
+    //   写失败**不**让整次 flush 失败 —— 否则等于拿**数据**去换**优化**；
+    //   此时 manifest 的 `index_path` 留空 = 如实声明"该文件没有索引"（读侧退回全读）；
+    // * **列集**：与 manifest 的 `stats` **同一个来源**（`default_sort_columns`）——
+    //   索引只给排序列做（`plan.md` F.4 的决定），不另设一套列清单。
+    let sort_cols = yuntun_model::meta::default_sort_columns(&merged.schema());
+    let (index_path, index_size) = match write_index(deps, &file_path, &merged, &sort_cols).await {
+        Ok(x) => x,
+        Err(e) => {
+            tracing::warn!(
+                batch_id = %batch_id,
+                error = %e,
+                "索引文件写失败：该文件退化为**无索引**（读侧不剪组，只是少省 IO）"
+            );
+            (String::new(), 0)
+        }
+    };
+
     // WAL: BatchS3Written
     let s3written = Record::BatchS3Written(BatchS3WrittenPayload {
         batch_id: batch_id.clone(),
@@ -217,10 +239,12 @@ pub async fn flush_chunk_with_id(
         partition_key: input.shard.window.clone(),
         // 冷热边界按实例切分（架构 §4.4）
         source_instance: deps.instance_id.clone(),
-        stats: Some(compute_stats_lite(
-            &merged,
-            &yuntun_model::meta::default_sort_columns(&merged.schema()),
-        )?),
+        // 与索引**同一个列集**（`sort_cols`）：文件级 stats 与组级 zone map 的列必须一致，
+        // 否则"文件级剪掉一半、组级剪另一半"这种解释不清的状态就会出现
+        stats: Some(compute_stats_lite(&merged, &sort_cols)?),
+        // 行组级索引（F.4）：空串 = 该文件没有索引（没有排序列 / 索引写失败）
+        index_path,
+        index_size,
         // 写侧结束时刻（**chunk 的真实封口时刻**，由 chunk 层带出）
         // → 与 committed_at_ms 之差即"封口到持久化"的实际耗时，即对外承诺的上界口径
         sealed_at_ms: input.sealed_at_ms,
@@ -452,6 +476,33 @@ async fn write_to_object_store(
         deps.format,
     )
     .await?;
+    Ok((path, size))
+}
+
+/// 建 + 写行组级索引（`plan.md` F.4），返回 `(路径, 字节数)`。
+///
+/// * 没有可索引的列（表里没有 `event_time` 之类的排序列）⇒ **不写**，返回空路径
+///   （"不存在索引"是合法状态，不是错误：读侧对两者一视同仁地退回全读）；
+/// * 建索引是**纯 CPU**（整列哈希 + filter 构造）⇒ 走阻塞池（`§124` 的那条纪律：
+///   别在 async worker 上干重活，旁边就是写入攒批与查询响应）。
+async fn write_index(
+    deps: &FlushDeps,
+    data_path: &str,
+    batch: &arrow::record_batch::RecordBatch,
+    columns: &[String],
+) -> Result<(String, u64), LakeError> {
+    if columns.is_empty() {
+        return Ok((String::new(), 0));
+    }
+    let path = yuntun_format::index_path(data_path);
+    let owned = batch.clone(); // 浅拷贝：列缓冲是 `Arc`，不复制数据
+    let cols = columns.to_vec();
+    let bytes = yuntun_format::cpu_off_thread("index", move || {
+        Ok(yuntun_model::index::IndexFile::build(&owned, &cols)?.to_bytes())
+    })
+    .await?;
+    let size = bytes.len() as u64;
+    yuntun_store::put_bytes(deps.store.as_ref(), &path, bytes).await?;
     Ok((path, size))
 }
 

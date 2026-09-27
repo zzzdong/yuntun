@@ -59,16 +59,37 @@ use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_groups::FileGroup;
+use crate::index::group_access_plan;
 use crate::prune::prune_visible_files;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_datasource::PartitionedFile;
 use datafusion_datasource_parquet::source::ParquetSource;
+use datafusion_datasource_parquet::ParquetAccessPlan;
 use std::sync::Arc;
 use crate::cache::HotShards;
 use crate::partial::{MissingSource, PartialSink};
 use std::time::Duration;
+use yuntun_model::meta::FileManifest;
+
+/// 读路径的装配事实（一次查询一整套）：**对象存储 + 两个读侧旋钮**。
+///
+/// 为什么绑在一起：它们都是"**这次查询怎么读**"的东西，且**同源注入**
+/// （`QueryEngine` → provider 链）。逐个加参数要在三个 provider 之间手工穿一遍，
+/// 而**漏穿一个的后果是静默不生效** —— 这类"漏了不报错"的接线正是本仓最防的。
+#[derive(Debug, Clone)]
+pub struct ReadPath {
+    /// 对象存储：索引文件的读取出口（数据文件由 DataFusion 经 `store_url` 读）。
+    pub store: Arc<dyn object_store::ObjectStore>,
+    /// 整段热读的总预算（`§88`）：超预算的来源按"拿不到"降级（`§77`）。
+    pub hot_read_budget: Duration,
+    /// **行组级索引剪枝**（`plan.md` F.4）：默认开。
+    ///
+    /// 关掉只为一件事：**对拍**（同一查询开/关必须**逐行一致**）——
+    /// 剪错 = 静默少数据，所以这条开关是那个断言的载体，不是给运维调的旋钮。
+    pub index_pruning: bool,
+}
 
 /// 单个来源的热读结果 —— **够用就好**的三态。
 ///
@@ -104,6 +125,10 @@ pub struct YuntunTableProvider {
     /// 与 `§78` 的**传输层超时**不是一回事：那个是"**一个 RPC** 最多等多久"，
     /// 这个是"**这次查询**愿意为热数据等多久"。
     hot_read_budget: Duration,
+    /// 行组级索引剪枝（`F.4`）：见 [`ReadPath::index_pruning`]。
+    index_pruning: bool,
+    /// 索引文件的读取出口（`F.4`）
+    store: Arc<dyn object_store::ObjectStore>,
 }
 
 impl YuntunTableProvider {
@@ -113,7 +138,7 @@ impl YuntunTableProvider {
         schema: arrow::datatypes::SchemaRef,
         hot: HotShards,
         partial: Arc<PartialSink>,
-        hot_read_budget: Duration,
+        read: ReadPath,
     ) -> Self {
         Self {
             snapshot,
@@ -123,8 +148,84 @@ impl YuntunTableProvider {
                 .unwrap_or_else(|_| ObjectStoreUrl::local_filesystem()),
             hot,
             partial,
-            hot_read_budget,
+            hot_read_budget: read.hot_read_budget,
+            index_pruning: read.index_pruning,
+            store: read.store,
         }
+    }
+
+    /// 逐个候选文件取索引并算出"**跳过哪些行组**"（`plan.md` F.4）。
+    ///
+    /// 三条纪律：
+    ///
+    /// 1. **失败一律退回"不剪"**：取不到 / 解不开 / 形状对不上 / 超预算 ⇒ `None`
+    ///    （索引只影响"读多少"，**绝不影响"读到什么"** —— 它是派生对象）；
+    /// 2. **并取 + 一个总预算**：与热读同一套形状（`§88`：N 个来源的等待是 `max` 而不是相加），
+    ///    预算复用热读那条（"这次查询愿意等多久"是同一个概念）；
+    /// 3. **只对 parquet 挂**：`ParquetAccessPlan` 是 parquet 读取器的扩展点 ——
+    ///    路径不是 `.parquet` 的文件（例如 vortex）挂了也没人认。
+    async fn group_plans(
+        &self,
+        files: &[&FileManifest],
+        filters: &[Expr],
+    ) -> Vec<Option<ParquetAccessPlan>> {
+        let store = self.store.clone();
+        let deadline = tokio::time::Instant::now() + self.hot_read_budget;
+        let schema = self.schema.clone();
+        let futures = files.iter().map(|f| {
+            let store = store.clone();
+            let schema = schema.clone();
+            async move {
+                if f.index_path.is_empty()
+                    || f.row_count == 0
+                    || !f.file_path.ends_with(".parquet")
+                {
+                    return None;
+                }
+                let bytes = match tokio::time::timeout_at(
+                    deadline,
+                    yuntun_store::get_bytes(store.as_ref(), &f.index_path),
+                )
+                .await
+                {
+                    Ok(Ok(b)) => b,
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            table = %f.table,
+                            index = %f.index_path,
+                            error = %e,
+                            "索引读取失败：该文件退回全读（不剪组）"
+                        );
+                        return None;
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            index = %f.index_path,
+                            "取索引超出本次查询的读预算：该文件退回全读（不剪组）"
+                        );
+                        return None;
+                    }
+                };
+                let index = match yuntun_model::index::IndexFile::from_bytes(&bytes) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        tracing::warn!(index = %f.index_path, error = %e, "索引不可用：退回全读");
+                        return None;
+                    }
+                };
+                let plan = group_access_plan(&schema, &index, f.row_count, filters);
+                if let Some(p) = &plan {
+                    tracing::debug!(
+                        index = %f.index_path,
+                        groups = p.len(),
+                        scanned = p.row_group_indexes().len(),
+                        "行组级剪枝：这个文件有组被跳过"
+                    );
+                }
+                plan
+            }
+        });
+        futures::future::join_all(futures).await
     }
 }
 
@@ -295,10 +396,21 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
         // ⚠️ **全被剪掉**时不能塞一个空的 `FileGroup`（扫描器会报错）⇒ 直接跳过这一支；
         // 下面第 ③ 支会给一个空的执行计划，语义正好（没有数据）。
         if !kept.is_empty() {
-            let files: Vec<PartitionedFile> = kept
+            let mut files: Vec<PartitionedFile> = kept
                 .iter()
                 .map(|f| PartitionedFile::new(f.file_path.clone(), f.file_size))
                 .collect();
+            // 【F.4｜两级剪枝的第二级】文件级已定"读哪些文件"，这里再定"文件里读哪些组"：
+            // 有索引 + 有谓词才去取索引（没谓词就没有依据，连索引都不必读）。
+            // 没挂上 plan 的文件原样全读 —— 失败/拿不准都走这条路（见 `group_plans`）。
+            if self.index_pruning && !filters.is_empty() {
+                let plans = self.group_plans(&kept, filters).await;
+                for (pf, plan) in files.iter_mut().zip(plans) {
+                    if let Some(plan) = plan {
+                        *pf = pf.clone().with_extension(plan);
+                    }
+                }
+            }
 
             let source: Arc<dyn FileSource> = Arc::new(ParquetSource::new(
                 datafusion_datasource::table_schema::TableSchemaBuilder::new(schema.clone())

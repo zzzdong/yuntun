@@ -211,6 +211,16 @@ pub struct FileManifest {
     /// 与 `seal_reason` 配对：区分"阈值触发"与"水位触发"的硬证据。
     #[prost(string, tag = "19")]
     pub seal_pressure: String,
+    /// **行组级索引文件路径**（`plan.md` F.4；空 = 该文件没有索引）。
+    ///
+    /// 索引是**派生对象**：`{同批次的 .idx}`（`yuntun_format::index_path`）。
+    /// 读侧据此决定"这个文件的哪些行组可以不读"；**缺失/损坏一律退回"全读"** ——
+    /// 索引只影响"读多少"，不影响"读到什么"。
+    #[prost(string, tag = "20")]
+    pub index_path: String,
+    /// 索引文件字节数（观测 / 成本口径；0 = 无索引或未记录）。
+    #[prost(uint64, tag = "21")]
+    pub index_size: u64,
 }
 
 impl FileManifest {

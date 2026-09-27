@@ -9,6 +9,8 @@ rust-version.workspace = true
 [dependencies]
 arrow = { workspace = true }
 crc32fast = { workspace = true }
+# F.4 行组级索引：XOR filter（零假阴性是硬要求，见 workspace Cargo.toml 的说明）
+xorf = { workspace = true }
 prost = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }

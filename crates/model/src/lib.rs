@@ -16,6 +16,8 @@
 pub mod arrow_util;
 pub mod batch;
 pub mod error;
+/// 行组级索引文件（`plan.md` F.4）：zone map + XOR filter + 帧编解码。
+pub mod index;
 pub mod meta;
 pub mod ops;
 pub mod private_dir;

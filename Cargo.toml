@@ -58,6 +58,14 @@ parquet = "59"
 object_store = { version = "0.13", features = ["aws"] }
 url = "2"
 
+# ---- 索引（F.4）----
+# 行组级等值索引：**XOR filter**（`plan.md` F.4 / F.7 决定 #4「允许新增依赖」）。
+# 为什么用它而不是自实现：构造算法（peeling）写错只会"多剪一个组" ⇒ **静默少数据**，
+# 而"零假阴性"正是这个结构存在的前提 —— 用被广泛验证的实现比自造一个稳妥。
+# 关掉默认 feature：`Xor8` 的构造在 xorf 内部用**确定性的 splitmix64 种子**，
+# 不需要 `uniform-random`（那会拖进 `rand` 全家）；`binary-fuse` 我们也不用（`Xor8` 不在其门后）。
+xorf = { version = "0.13", default-features = false }
+
 # ---- 运行时 ----
 # CLI 参数解析（全仓统一，不手写：手写的 help/错误信息/补全迟早漂移）
 clap = { version = "4", features = ["derive", "env"] }

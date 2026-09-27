@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§144，2026-09-27**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§145，2026-09-27**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -9173,3 +9173,115 @@ MySQL wire）都经 `SqlEngine::execute(_stream)`，**没有路径**会被这个
 - **顺手修掉的三处版本漂移**（都不是本刀引入，但"文档不许比现实旧"）：根 `README.md` 引用
   `plan.md v2.2`、`plan.md` 正文末"文档结束 · v2.2"、`status.md §7` 转述的 `v2.2`
   —— 一律改到当前的 **v2.3**（`plan.md` 从 `§141` 起就是 v2.3）。
+
+---
+
+## 145. **F.4 行组级索引**落地（写时生成 `.idx` + 读时跳过整组）（2026-09-27）
+
+### 145.0 做了什么
+
+`plan.md` F 组第三刀（按 `F.5` 的顺序：`F.2` 之后做索引，因为 `F.3` 的"扫出要删的行"正好复用它）：
+
+| 位置 | 改动 |
+|---|---|
+| `crates/model/src/index.rs`（**新**） | 索引文件格式：**帧头（魔数+版本+长度+CRC）+ prost 载荷**；逐组 zone map（复用 `ColumnStatLite`）+ 逐列 **XOR filter**；`build`（按行切组）/ `matches_shape`（读侧硬前提）/ `to_bytes`·`from_bytes` / **键编码** `IndexKey` + `key_hash` + `arrow_key` |
+| `crates/format` | **组大小唯一真相**：`INDEX_GROUP_ROWS` 由 model 定义、format 引用（原先 format 自己一个常量）；新增 `index_path(data_path)`（`x.parquet → x.idx`，**同 stem**） |
+| `crates/model/src/meta.rs` + `proto/meta.proto` + `meta/src/op.rs` | `FileManifest.index_path` / `index_size`（**tag 20/21**，只加字段不改老编号）+ proto 镜像两个方向 + `wire_compat` 样本（含"无索引"那条） |
+| `crates/ingest/src/flush.rs` | 数据文件写成功后**再**写索引（`write_index`，CPU 走阻塞池）；**索引写失败不失败整次 flush**（派生对象；manifest 如实留空）|
+| `crates/query/src/index.rs`（**新**） | 组级决策：`group_access_plan` → `ParquetAccessPlan`（挂到 `PartitionedFile.extensions`）|
+| `crates/query/src/prune.rs` | 把判定抽成 `can_prune_with(schema, stats, rows, constraints)` —— **文件级与组级共用同一套数学**；`Constraint` 带**类型族**，新增 `scalar_matches_column`（时间刻度**逐档核对**）|
+| `crates/query/src/{table,provider,lib}.rs` | 读路径装配 `ReadPath{store, hot_read_budget, index_pruning}`；`scan` 里在文件级剪枝之后**并取**索引（同一预算）并挂计划；`QueryEngine::with_index_pruning`（**只为对拍**）|
+
+### 145.1 四个设计决定（都不是随手定的）
+
+**① "组"就是 parquet 行组，且组大小**只有一处定义**。** 消费方式是把 `ParquetAccessPlan` 交给
+DataFusion 的 parquet 读取器，而它**按行组序号**说话 ⇒ 我们的组必须与文件里的行组一一对应。
+所以 `INDEX_GROUP_ROWS` 放在 `model::index`（连同"为什么必须对齐"），`format` 引用它写
+`max_row_group_row_count`。**对不上就不挂计划**（`matches_shape`：组大小 + 行数 + 组数三者一致）
+—— DF 在"计划长度 ≠ 行组数"时是**直接报错**，硬凑会把一次本来正确的查询弄失败。
+
+**② 这一刀真正的新能力是 XOR filter，不是 zone map。** 组级 min/max 与 DataFusion 自己用
+footer 统计做的那层**重复**（`§132` 已实测）；而本项目**写入侧并不排序**（`event_time` 只是业务
+约定）⇒ 组的 `[min,max]` 往往很宽，**只有等值 filter 能证明"这个值不在这一组里"**。
+`plan.md` F.7 #1 定的"range 就用 min-max、不另做区间集合"因此不影响本刀的收益。
+
+**③ XOR filter 用 `xorf`（F.7 #4 允许新增依赖），并且必须去重后构造。** 加依赖时
+**关掉它的默认 feature**（`default-features = false`）：构造用的种子在 `xorf` 内部由
+`splitmix64` 生成，不需要 `uniform-random`（那会拖进 `rand` 全家），也不碰 `Xor8` 门后的
+`binary-fuse` —— 于是 `Cargo.lock` 只多了 `xorf` 一条。
+理由不是省事：
+peeling 构造写错的后果是"多剪一个组" ⇒ **静默少数据**，而"零假阴性"正是这个结构存在的前提。
+另外 `xorf::Xor8` 的字段是公开的，所以**不需要** serde/bincode 就能自己序列化；
+构造种子在 `xorf` 内部是**确定**的（`splitmix64(1)` 起），于是"同数据 ⇒ 同索引字节"（有用例）。
+
+**④ 键编码必须跨二进制稳定。** 索引文件会被**将来的**二进制读回来，所以
+`key_hash` 写死：整型取位模式、字节串走 **FNV-1a 64**（不许用 `std::hash::DefaultHasher`
+—— 它的算法**不保证跨 Rust 版本稳定**，那样一次升级就会静默剪错组）。用例直接钉住具体数字
+（`FNV("a") = 0xaf63dc4c8601ec8c` 等）。
+
+### 145.2 验收（`plan.md` F.4 四条，逐条给证据）
+
+**① 索引随写入生成**：`crates/query/tests/index_parity.rs::index_is_written_and_registered_by_flush`
+走**真 ingest 路径**（WAL→攒批→flush），断言 manifest 的 `index_path` 非空、与数据文件**同 stem**、
+对象真在、`index_size` 对得上、能解回来且 `matches_shape` 成立。
+> **边界（"两种格式都要"）**：**生成侧与格式无关**（索引是从 `RecordBatch` 按行切出来的，
+> parquet 与 vortex 同一条通路，`flush` 里没有任何格式分支）；**消费侧目前只对 `.parquet` 生效**
+> —— vortex 文件在当前读路径里本来就没人读（`scan` 固定用 `ParquetSource`），那是
+> `D-8`/ADR-1 待决的事，不在本刀范围。
+
+**② "只有索引能剪掉的组"真的被跳过**：`index_pruning_skips_a_group_that_footer_stats_cannot`
+构造 3 组的文件（组 0 全是偶数、组 1/2 在别处），查询 `WHERE event_time = 1`：
+`1` 落在组 0 的 `[0, 131070]` **区间内** ⇒ footer 统计剪不掉它，**只有我们的 filter 能**。
+证据是 IO 级的 `EXPLAIN ANALYZE` 的 `bytes_scanned`（实测）：
+**开索引 `0` / 关索引 `563`** —— 开索引时**一个数据页都没读**。
+（`§129.4` 当时只做到"断言决策函数"；这一刀把证据推到了**真实读取的字节数**。）
+
+**③ 对拍：开/关索引结果逐格一致**（最关键）：`open_and_closed_pruning_agree_cell_by_cell`
+跑 8 条查询（等值命中/未命中、区间跨界、`!=`、尾巴组、无谓词、类型族对不上的字符串谓词），
+开/关两次的**每个格子**都必须相等。剪错 = 静默少数据，这条是唯一的防线。
+
+**④ 拿不准一律不剪**：`crates/query/src/index.rs` 的 5 条"不剪"用例（无谓词 / `OR` 形状 /
+形状对不上 / 类型族对不上 / **一个组都没剪掉就不给计划**）+ model 侧 11 条（零假阴性、CRC、
+魔数、版本、确定性……）。其中"`Some(plan)` ⟺ 真的剪掉过至少一个组"是刻意做成的**可断言性质**。
+
+### 145.3 一个顺带修好的旧缺口（同一条纪律，必须写下来）
+
+`prune::literal_bound` 原先**不认时间戳/日期标量** ⇒ 对 `event_time TIMESTAMP`（README 快启
+用的就是它）这类表，**连文件级剪枝都是空转**。本刀为了做"同刻度才可剪"的护栏，顺手把
+`Timestamp(四档)` / `Date32` 标量接上了，并按**类型族**收窄（`scalar_matches_column`：刻度必须逐档相等，
+否则丢约束）。于是文件级剪枝对时序表**第一次真的生效**。
+> 这是**行为变化**（剪得比以前多）⇒ 由本刀的 8 条对拍 + `§129` 既有单测共同兜着；
+> 护栏本身也单独立了：刻度不同的字面量**必须**被丢掉（`timestamp_needs_matching_unit`）。
+
+### 145.4 边界与未做（**写在明处**）
+
+1. **只给排序列做**（`plan.md` F.4 的决定）：列集 = `default_sort_columns`，与 manifest 的
+   `stats` **同源**。没有 `event_time` 的表 ⇒ **不生成索引**（不是错误，读侧退回全读）；
+2. **浮点/布尔/十进制不索引**：浮点的 `=` 有 `NaN`/`-0.0` 边界（风险大于收益）；
+   布尔的**字面量侧**还不认布尔标量 ⇒ 建了也没人用（不占体积地留着编码表项）；
+3. **compaction 产物暂不生成索引**（它走自己的写路径）：合并后的大文件退化为"无索引" ⇒
+   只是少剪，不剪错。**下一步**（与 `F.4` 的"写入收口"合起来看）；
+4. **索引文件的 GC 口径**：靠**同 stem**（`x.parquet` / `x.idx` 都归到同一个 batch_id，
+   `extract_batch_id` 一致）⇒ 孤儿清理把它们当同一批一起保护、一起回收。
+   这条是**命名约定**换来的，所以有用例钉住（`index_path` 与 `file_path` 的关系）；
+5. **索引读取**：每个候选文件一次 GET，**并取**且在热读预算内（`§88` 同一套形状）；
+   失败/超时/解不开 ⇒ 该文件**退回全读**（索引只影响"读多少"，绝不影响"读到什么"）；
+6. **不是一个运维旋钮**：`with_index_pruning(false)` 只为对拍存在（未进 TOML）。
+
+### 145.5 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **444 passed / 0 failed / 0 ignored**；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**（顺手修掉两处新引入的
+  `match_like_matches_macro` / 多余的 `.into_iter()`）；
+- 判据 **5/5**（规模行按判据数字更新：**56,473 行 / 20 crate / 447 测试函数**）；
+- **两次并行抖动（都记录在案，都不是本刀引入、也都未复现）**：
+  ① `yuntun-ingest::flush_e2e::ingest_accumulate_flush_reaches_manifest_and_wal_terminal`
+  在"2 秒轮询窗口"内没等到文件（`left: 0, right: 1`，该二进制整体 28.6s）——**单跑 0.02s 通过**、
+  紧随的整轮全量也全绿（该二进制 0.55s）；
+  ② `yuntun-chaos::disk_watermark_aborts_oldest_batch_then_releases_segments`（`status.md §4` 记的
+  那条**已知** flaky，超过 60s 上限）——**单跑 0.11s 通过**；再跑一轮全量 **444 passed / 0 failed**。
+  ⇒ 与"并行争 CPU/IO"同源（`status.md §4`）。**但第 ① 条值得记一句**：这一刀确实给 flush
+  关键路径加了两件事（建索引 + 一次 PUT）。将来若要**去掉它**：`index_path` 可以从数据路径
+  **推导**（同 stem），于是索引可以**提交之后再写**（尽力而为），代价是读侧每个候选文件都要试一次
+  GET（S3 上就是一次 404 往返）—— 本刀选了"manifest 记路径 + 提交前写"，因为它让"有没有索引"
+  **可审计**、读侧零空转。

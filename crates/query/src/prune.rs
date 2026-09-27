@@ -23,19 +23,42 @@ use datafusion::logical_expr::{Expr, Operator};
 use yuntun_model::meta::{decode_bound, StatBound, StatisticsLite};
 
 /// 一条能从过滤器里读出来的**单列约束**。
+///
+/// `kind` 不是装饰：`StatBound` 把"天/秒/毫秒/纳秒"全压成 `I(x)`，而**单位不同的两个数
+/// 直接比大小会剪错**（静默少数据）。所以凡"时间刻度"类的字面量，都必须与列类型**逐档核对**
+/// （见 [`scalar_matches_column`]）。
 #[derive(Debug, Clone)]
-struct Constraint {
-    column: String,
-    op: Operator,
-    value: StatBound,
+pub(crate) struct Constraint {
+    pub(crate) column: String,
+    pub(crate) op: Operator,
+    pub(crate) value: StatBound,
+    pub(crate) kind: ScalarKind,
+}
+
+/// 字面量的类型族（够用来判断"能不能和这一列比"）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScalarKind {
+    Int,
+    UInt,
+    Float,
+    Bytes,
+    Date32,
+    /// 时间戳：**四种刻度分开**（单位不同 ⇒ 数值不同 ⇒ 不可比）
+    TsSecond,
+    TsMilli,
+    TsMicro,
+    TsNano,
 }
 
 /// 把过滤器拆成"能用的单列约束"（`AND` 递归，其余形状放弃）。
-fn constraints(e: &Expr, out: &mut Vec<Constraint>) {
+///
+/// `schema` 是必需的：约束能不能用，取决于"字面量与这一列是不是同一族"
+/// —— 见 [`scalar_matches_column`]（`F.4` 的组级剪枝与文件级剪枝**共用**这一段）。
+pub(crate) fn constraints(e: &Expr, schema: &Schema, out: &mut Vec<Constraint>) {
     match e {
         Expr::BinaryExpr(b) if b.op == Operator::And => {
-            constraints(&b.left, out);
-            constraints(&b.right, out);
+            constraints(&b.left, schema, out);
+            constraints(&b.right, schema, out);
         }
         Expr::BinaryExpr(b) => {
             let (col, op, lit) = match (b.left.as_ref(), b.right.as_ref()) {
@@ -44,7 +67,7 @@ fn constraints(e: &Expr, out: &mut Vec<Constraint>) {
                 (Expr::Literal(v, _), Expr::Column(c)) => (c.name.clone(), flip(b.op), v),
                 _ => return,
             };
-            // 只有这六种能给出"文件级"的确定性判断
+            // 只有这六种能给出"文件级 / 组级"的确定性判断
             if !matches!(
                 op,
                 Operator::Gt
@@ -56,14 +79,54 @@ fn constraints(e: &Expr, out: &mut Vec<Constraint>) {
             ) {
                 return;
             }
-            let Some(value) = literal_bound(lit) else {
+            let Some((value, kind)) = literal_bound(lit) else {
                 return;
             };
-            out.push(Constraint { column: col, op, value });
+            // 列不在 schema 里、或字面量与列**不同族** ⇒ 这条约束**不可用**（宁可不剪）
+            let Ok(f) = schema.field_with_name(&col) else {
+                return;
+            };
+            if !scalar_matches_column(kind, f.data_type()) {
+                return;
+            }
+            out.push(Constraint {
+                column: col,
+                op,
+                value,
+                kind,
+            });
         }
         // 其它形状（OR / NOT / 函数 / IS NULL…）：不做判断
         _ => {}
     }
+}
+
+/// 字面量与这一列**能不能比**（不能 ⇒ 这条约束既不许剪文件、也不许剪组）。
+///
+/// 数值族之间放宽（位模式一致，DataFusion 本来也会先做类型强转），但**凡涉及"刻度"
+/// （时间戳）就必须逐刻度相等**：`Timestamp(Millisecond)` 的列配上
+/// `Timestamp(Nanosecond)` 的字面量，两边在 `StatBound` 里都是 `I(x)`，
+/// 直接比大小会得出**完全错误**的结论 —— 后果是静默少数据。
+pub(crate) fn scalar_matches_column(kind: ScalarKind, dt: &arrow::datatypes::DataType) -> bool {
+    use arrow::datatypes::{DataType as D, TimeUnit};
+    matches!(
+        (kind, dt),
+        (ScalarKind::Int | ScalarKind::UInt, D::Int8 | D::Int16 | D::Int32 | D::Int64)
+            | (
+                ScalarKind::Int | ScalarKind::UInt,
+                D::UInt8 | D::UInt16 | D::UInt32 | D::UInt64
+            )
+            | (ScalarKind::Float, D::Float32 | D::Float64)
+            | (
+                ScalarKind::Bytes,
+                D::Utf8 | D::LargeUtf8 | D::Binary | D::LargeBinary
+            )
+            | (ScalarKind::Date32, D::Date32)
+            | (ScalarKind::TsSecond, D::Timestamp(TimeUnit::Second, _))
+            | (ScalarKind::TsMilli, D::Timestamp(TimeUnit::Millisecond, _))
+            | (ScalarKind::TsMicro, D::Timestamp(TimeUnit::Microsecond, _))
+            | (ScalarKind::TsNano, D::Timestamp(TimeUnit::Nanosecond, _))
+    )
 }
 
 fn flip(op: Operator) -> Operator {
@@ -76,23 +139,30 @@ fn flip(op: Operator) -> Operator {
     }
 }
 
-/// 字面量 → [`StatBound`]（不认识的类型 ⇒ `None` ⇒ 不做判断）。
-fn literal_bound(v: &datafusion::scalar::ScalarValue) -> Option<StatBound> {
+/// 字面量 → `(StatBound, 类型族)`（不认识的类型 ⇒ `None` ⇒ 不做判断）。
+fn literal_bound(v: &datafusion::scalar::ScalarValue) -> Option<(StatBound, ScalarKind)> {
     use datafusion::scalar::ScalarValue as S;
+    use ScalarKind as K;
     // ⚠️ `ScalarValue` 的数值变体带 `Option`（NULL 的可表示性）—— 这里只认**有值**的
     Some(match v {
-        S::Int8(Some(x)) => StatBound::I(*x as i64),
-        S::Int16(Some(x)) => StatBound::I(*x as i64),
-        S::Int32(Some(x)) => StatBound::I(*x as i64),
-        S::Int64(Some(x)) => StatBound::I(*x),
-        S::UInt8(Some(x)) => StatBound::U(*x as u64),
-        S::UInt16(Some(x)) => StatBound::U(*x as u64),
-        S::UInt32(Some(x)) => StatBound::U(*x as u64),
-        S::UInt64(Some(x)) => StatBound::U(*x),
-        S::Float32(Some(x)) => StatBound::F(*x as f64),
-        S::Float64(Some(x)) => StatBound::F(*x),
-        S::Utf8(Some(x)) | S::LargeUtf8(Some(x)) => StatBound::B(x.as_bytes().to_vec()),
-        S::Binary(Some(x)) | S::LargeBinary(Some(x)) => StatBound::B(x.clone()),
+        S::Int8(Some(x)) => (StatBound::I(*x as i64), K::Int),
+        S::Int16(Some(x)) => (StatBound::I(*x as i64), K::Int),
+        S::Int32(Some(x)) => (StatBound::I(*x as i64), K::Int),
+        S::Int64(Some(x)) => (StatBound::I(*x), K::Int),
+        S::UInt8(Some(x)) => (StatBound::U(*x as u64), K::UInt),
+        S::UInt16(Some(x)) => (StatBound::U(*x as u64), K::UInt),
+        S::UInt32(Some(x)) => (StatBound::U(*x as u64), K::UInt),
+        S::UInt64(Some(x)) => (StatBound::U(*x), K::UInt),
+        S::Float32(Some(x)) => (StatBound::F(*x as f64), K::Float),
+        S::Float64(Some(x)) => (StatBound::F(*x), K::Float),
+        S::Utf8(Some(x)) | S::LargeUtf8(Some(x)) => (StatBound::B(x.as_bytes().to_vec()), K::Bytes),
+        S::Binary(Some(x)) | S::LargeBinary(Some(x)) => (StatBound::B(x.clone()), K::Bytes),
+        // 时间刻度：`Date32` = 天；时间戳**四档分开标**（`scalar_matches_column` 逐档核对）
+        S::Date32(Some(x)) => (StatBound::I(*x as i64), K::Date32),
+        S::TimestampSecond(Some(x), _) => (StatBound::I(*x), K::TsSecond),
+        S::TimestampMillisecond(Some(x), _) => (StatBound::I(*x), K::TsMilli),
+        S::TimestampMicrosecond(Some(x), _) => (StatBound::I(*x), K::TsMicro),
+        S::TimestampNanosecond(Some(x), _) => (StatBound::I(*x), K::TsNano),
         _ => return None,
     })
 }
@@ -148,14 +218,27 @@ pub fn can_prune(schema: &Schema, f: &FileStats<'_>, filters: &[Expr]) -> bool {
     };
     let mut cs = Vec::new();
     for e in filters {
-        constraints(e, &mut cs);
+        constraints(e, schema, &mut cs);
     }
-    for c in &cs {
+    can_prune_with(schema, stats, f.row_count, &cs)
+}
+
+/// 用**已解析的约束**判一次（组级剪枝要按组反复判，重复解析纯属浪费）。
+///
+/// `stats` / `row_count` 描述的是**被判定的那一块**：文件级传文件的，
+/// 组级传那个组的（`F.4`）—— 同一套数学，两级共用。
+pub(crate) fn can_prune_with(
+    schema: &Schema,
+    stats: &StatisticsLite,
+    row_count: u64,
+    cs: &[Constraint],
+) -> bool {
+    for c in cs {
         let Some(col) = stats.columns.iter().find(|s| s.name == c.column) else {
             continue; // 这一列没统计 ⇒ 不判断
         };
         // 整列全 null：比较谓词**必然不成立**（NULL 不满足任何比较）
-        if f.row_count > 0 && col.null_count == f.row_count {
+        if row_count > 0 && col.null_count == row_count {
             return true;
         }
         let Ok(dt) = schema.field_with_name(&c.column).map(|fd| fd.data_type()) else {

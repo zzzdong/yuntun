@@ -410,6 +410,10 @@ fn manifest_from_proto(m: &pb::FileManifestMsg) -> FileManifest {
         committed_at_ms: m.committed_at_ms,
         seal_reason: m.seal_reason.clone(),
         seal_pressure: m.seal_pressure.clone(),
+        // F.4 行组级索引：**派生对象的位置也要过线** —— 漏了它，远端目录回来就"没有索引"
+        // （而这不是错，只是静默少省 IO —— 正是那种"不报错、只变差"的漂移，必须镜像）
+        index_path: m.index_path.clone(),
+        index_size: m.index_size,
     }
 }
 
@@ -469,6 +473,8 @@ fn manifest_to_proto(f: &FileManifest) -> pb::FileManifestMsg {
         committed_at_ms: f.committed_at_ms,
         seal_reason: f.seal_reason.clone(),
         seal_pressure: f.seal_pressure.clone(),
+        index_path: f.index_path.clone(),
+        index_size: f.index_size,
     }
 }
 
@@ -879,6 +885,8 @@ mod tests {
                 committed_at_ms: 12,
                 seal_reason: "time_threshold".into(),
                 seal_pressure: "memory:0.1".into(),
+                index_path: "p/b-1.idx".into(),
+                index_size: 64,
             }],
             schema_version: 1,
             row_count: 7,
