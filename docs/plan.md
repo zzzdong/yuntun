@@ -889,8 +889,10 @@ R2 Catalog 冻结（✅ 已完成）──► R3 metanode + raft
 > `replay_wal_dml` 一条 op 重建两半 + `query::locate::locate_and_project`（一次扫描拿两半、
 > **逐行对齐是契约**）+ `sql::dml::execute_update` 七步 + 端到端（旧值没了/新值在/未命中不变/
 > 快照号 +1/旧快照看旧世界/重启仍生效/**已删的行不会被更新复活**）。
+> ⑨`§155` **`D-13` 闭环（DML 与 schema 演进）**：定位路径先按**表 schema** 对齐
+> （复用**同一个** `arrow_util::align_batch`）再补行号列 ⇒ `ADD COLUMN` 之后老文件（缺列）上的
+> `DELETE`/`UPDATE` 与 `SELECT` 的 NULL 语义**完全一致**（"跳过缺列文件并告警"这条备选明确不用）。
 > **仍缺**（已排刀）：租约细粒度 `(table, shard)` ＝ `F.3d-3`；孤儿 DV 回收 ＝ `F.3d-4`；
-> 缺列（schema 演进后）文件上的 `UPDATE` ＝ 台账 `D-13`；
 > ⑤`§151` **远端目录/metanode op**（`ApplyDeletions`/`RevokeDeletions` + 载荷下发 + 客户端缓存）
 > ⇒ **默认形态（`embedded`）也能删，抵押①闭环**；`UPDATE` ＝ 最后；
 > 无 `WHERE` 的全表删（设计 §7 的 `purge_table_files`）＝ 随 `F.3d`。
@@ -932,7 +934,7 @@ R2 Catalog 冻结（✅ 已完成）──► R3 metanode + raft
 
 ### F.5 刀的顺序（建议）
 
-**R0 语句路由 ✅ → ① schema 变更 ✅ → ③ 索引 ✅ → ② DELETE / UPDATE（`§146`–`§154` 九刀 ✅，余 `F.3d-3`/`F.3d-4`/`D-13`）**
+**R0 语句路由 ✅ → ① schema 变更 ✅ → ③ 索引 ✅ → ② DELETE / UPDATE（`§146`–`§155` 十刀 ✅，余 `F.3d-3`/`F.3d-4`）**
 
 理由：① 最小、独立、能立刻用；③ 是纯读路径收益，而且 DELETE 的"扫出要删的行"正好复用它；
 ② 最复杂（牵动 compaction / GC / 快照隔离），放在有前两者兜底之后。
@@ -957,4 +959,4 @@ R2 Catalog 冻结（✅ 已完成）──► R3 metanode + raft
 
 ---
 
-> 落款：yuntun 开发计划任务书 v2.3（F 组为 2026-09-27 追加；**F.1 `§142` / F.2 `§144` / F.4 `§145` 已落地**，`F.3` 九刀 `§146`–`§154` 已落地、其余（`F.3d-3`/`F.3d-4`/`D-13`）待续）
+> 落款：yuntun 开发计划任务书 v2.3（F 组为 2026-09-27 追加；**F.1 `§142` / F.2 `§144` / F.4 `§145` 已落地**，`F.3` 十刀 `§146`–`§155` 已落地、其余（`F.3d-3`/`F.3d-4`/无 WHERE 全表删）待续）

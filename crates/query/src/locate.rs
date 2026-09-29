@@ -67,7 +67,9 @@ pub struct ProjectedRows {
 
 /// 在 `path` 指的文件上求 `predicate_sql`，返回命中行号。
 ///
-/// `schema` 是**表**的 schema（列名解析按它；文件里的列顺序/多寡不影响谓词语义）。
+/// `schema` 是**表**的 schema：列名解析按它，且文件批会先**对齐**到它
+/// （缺列补 NULL、多列丢掉、类型宽化 —— 与查询路径同一套语义，见 `read_with_row_idx`）；
+/// 文件里的列顺序/多寡因此不影响谓词语义。
 pub async fn locate_matching_rows(
     store: &Arc<dyn ObjectStore>,
     path: &str,
@@ -75,7 +77,7 @@ pub async fn locate_matching_rows(
     schema: &SchemaRef,
     predicate_sql: &str,
 ) -> Result<LocatedRows, DataFusionError> {
-    let (with_idx, rows) = read_with_row_idx(store, path, fmt).await?;
+    let (with_idx, rows) = read_with_row_idx(store, path, fmt, schema).await?;
     if with_idx.is_empty() {
         return Ok(LocatedRows::default());
     }
@@ -109,7 +111,7 @@ pub async fn locate_and_project(
     predicate_sql: &str,
     projection_sql: &str,
 ) -> Result<ProjectedRows, DataFusionError> {
-    let (with_idx, rows) = read_with_row_idx(store, path, fmt).await?;
+    let (with_idx, rows) = read_with_row_idx(store, path, fmt, schema).await?;
     if with_idx.is_empty() {
         return Ok(ProjectedRows {
             rows,
@@ -176,11 +178,27 @@ pub async fn locate_and_project(
     })
 }
 
-/// 读文件 + 补行号列（文件内、0 起、跨批次连续 —— 这就是 DV 的口径）。
+/// 读文件 + **按表 schema 对齐** + 补行号列（文件内、0 起、跨批次连续 —— 这就是 DV 的口径）。
+///
+/// # 为什么要对齐（`§155`，台账 `D-13`）
+///
+/// schema 演进（`ALTER TABLE ADD COLUMN` / 类型宽化）之后，**老文件里没有新列**。
+/// 读路径早就处理了这件事（`ParquetSource` 的 `TableSchemaBuilder`：缺列 → NULL），
+/// 写入路径也是（`flush::align_batch`）；但**定位路径曾经漏了** ⇒
+/// `DELETE FROM t WHERE 新列 IS NULL` 会以一个 schema 错误**整条失败**，
+/// 而查询那边明明把这些行显示成 NULL。
+///
+/// 语义必须**和查询看到的一致** —— "谓词/表达式看到的就是用户看到的"，否则 DML 与 SELECT
+/// 会对同一批行给出不同答案（那是本仓最不能接受的失败形态：静默不一致）。
+/// 所以这里复用**同一个** `arrow_util::align_batch`：缺列补 NULL、多列丢掉、类型按提升格 cast。
+///
+/// 对齐放在补行号列**之前**：行号只与"第几个"有关，与列怎么对齐无关；
+/// 而这样得到的批次 schema 恰好是表 schema ⇒ `UPDATE` 的产物文件天然与表同 schema。
 async fn read_with_row_idx(
     store: &Arc<dyn ObjectStore>,
     path: &str,
     fmt: yuntun_format::DataFormat,
+    schema: &SchemaRef,
 ) -> Result<(Vec<RecordBatch>, u64), DataFusionError> {
     let batches = yuntun_format::read_batch(store, path, fmt)
         .await
@@ -194,13 +212,19 @@ async fn read_with_row_idx(
     let mut with_idx: Vec<RecordBatch> = Vec::with_capacity(batches.len());
     for b in &batches {
         let n = b.num_rows();
-        let mut fields: Vec<Field> = b
+        let aligned = yuntun_model::arrow_util::align_batch(b, schema).map_err(|e| {
+            DataFusionError::Execution(format!(
+                "文件 {path} 与表 schema 对齐失败：{e} —— \
+                 拒绝「按没对齐的列去定位」（谓词看到的列与用户看到的必须一致）"
+            ))
+        })?;
+        let mut fields: Vec<Field> = aligned
             .schema()
             .fields()
             .iter()
             .map(|f| f.as_ref().clone())
             .collect();
-        let mut cols: Vec<Arc<dyn Array>> = b.columns().to_vec();
+        let mut cols: Vec<Arc<dyn Array>> = aligned.columns().to_vec();
         fields.push(Field::new(ROW_IDX_COLUMN, DataType::UInt32, false));
         cols.push(Arc::new(UInt32Array::from(
             (rows..rows + n as u64)
@@ -296,6 +320,143 @@ mod tests {
         .await
         .unwrap();
         (store, path)
+    }
+
+    /// 写一个**自定义 schema** 的文件（测 schema 演进：老文件缺列 / 多列 / 类型窄）。
+    async fn write_file_with(
+        schema: SchemaRef,
+        cols: Vec<Arc<dyn Array>>,
+    ) -> (Arc<dyn ObjectStore>, String) {
+        let store = yuntun_store::create_store(&yuntun_store::StoreConfig::Memory).unwrap();
+        let batch = RecordBatch::try_new(schema, cols).unwrap();
+        let (path, _bytes, _rows) = yuntun_format::write_batch(
+            &store,
+            "public.t",
+            "s0",
+            "w",
+            "b-locate",
+            &batch,
+            yuntun_format::DataFormat::Parquet,
+        )
+        .await
+        .unwrap();
+        (store, path)
+    }
+
+    /// **老文件缺列**（`ALTER TABLE ADD COLUMN` 之后）⇒ 缺的那列按 **NULL** 参与谓词与投影。
+    ///
+    /// 这是台账 `D-13` 的单测面：语义必须与查询一致（查询那边老文件的缺列也是 NULL）——
+    /// 否则 `DELETE FROM t WHERE 新列 IS NULL` 会**整条失败**，而用户看到的那些行明明是 NULL。
+    #[tokio::test]
+    async fn a_file_missing_a_column_sees_it_as_null() {
+        let (store, path) = write_file(vec![1, 2, 3]).await; // 只有 v
+        let table = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Int64, true),
+            Field::new("note", DataType::Utf8, true),
+        ])) as SchemaRef;
+
+        // `IS NULL` ⇒ 老文件的行**全部**命中（以前这里是"列不存在"的报错）
+        let got = locate_matching_rows(
+            &store,
+            &path,
+            yuntun_format::DataFormat::Parquet,
+            &table,
+            "note IS NULL",
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.positions, vec![0, 1, 2], "缺列 = NULL ⇒ IS NULL 全都命中");
+
+        // `= 'x'` ⇒ 一行都不命中（NULL 的三值逻辑：比较结果是 NULL，不是真）
+        let got = locate_matching_rows(
+            &store,
+            &path,
+            yuntun_format::DataFormat::Parquet,
+            &table,
+            "note = 'x'",
+        )
+        .await
+        .unwrap();
+        assert!(got.positions.is_empty(), "NULL 不等于任何值");
+
+        // 投影：老值原样、新列全 NULL，且**结果 schema 就是表 schema**（写出去的产物要能被读回来）
+        let got = locate_and_project(
+            &store,
+            &path,
+            yuntun_format::DataFormat::Parquet,
+            &table,
+            "note IS NULL",
+            "\"v\", \"note\"",
+        )
+        .await
+        .unwrap();
+        let b = got.batch.expect("有命中就有批次");
+        assert_eq!(b.schema().fields().len(), 2);
+        assert_eq!(b.schema().field(1).name(), "note");
+        assert_eq!(b.column(1).null_count(), 3, "缺列补的 NULL");
+    }
+
+    /// **老文件有多余的列**（`DROP COLUMN` 之后）⇒ 对齐时丢掉：谓词/投影只见表 schema 的列。
+    #[tokio::test]
+    async fn extra_columns_are_dropped_by_alignment() {
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Int64, true),
+            Field::new("gone", DataType::Int64, true),
+        ])) as SchemaRef;
+        let (store, path) = write_file_with(
+            file_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(Int64Array::from(vec![9, 9, 9])),
+            ],
+        )
+        .await;
+        let table = schema(); // 只有 v
+        let got = locate_and_project(
+            &store,
+            &path,
+            yuntun_format::DataFormat::Parquet,
+            &table,
+            "v >= 2",
+            "\"v\"",
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.positions, vec![1, 2]);
+        let b = got.batch.unwrap();
+        assert_eq!(
+            b.schema().fields().len(),
+            1,
+            "对齐到表 schema：多余的列必须被丢掉（否则产物文件会带着表没有的列）"
+        );
+    }
+
+    /// **老文件类型更窄**（`Int32` 文件 vs `Int64` 表）⇒ 按提升格 cast 后正常求值。
+    #[tokio::test]
+    async fn a_narrower_column_is_widened_before_evaluation() {
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            DataType::Int32,
+            true,
+        )])) as SchemaRef;
+        let (store, path) = write_file_with(
+            file_schema,
+            vec![Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3]))],
+        )
+        .await;
+        let got = locate_and_project(
+            &store,
+            &path,
+            yuntun_format::DataFormat::Parquet,
+            &schema(), // Int64 表
+            "v = 3",
+            "\"v\" + 10 AS \"v\"",
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.positions, vec![2], "宽化之后等值比较才有意义");
+        let b = got.batch.unwrap();
+        assert_eq!(b.column(0).data_type(), &DataType::Int64, "产物的类型按表 schema");
     }
 
     #[tokio::test]
