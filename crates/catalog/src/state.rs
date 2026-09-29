@@ -715,6 +715,21 @@ impl CatalogState {
                     e.dv_id
                 )));
             }
+            // **锚定的文件必须还活着**（设计 §6.1："原 CAS 校验降级为断言"）：
+            // 合并会把旧文件标墓碑 ⇒ 清单过期时这份 DV 会"惰性失效"（读侧按**文件内行号**
+            // 找行，而文件已经不在了）—— 那就是一个**静默不生效的删除**，比报错糟得多。
+            // 与 `§146.1` 决定③同源：DV 的问题一律响亮失败。
+            if self
+                .files
+                .get(&e.batch_id)
+                .is_some_and(|m| m.deleted_at != 0)
+            {
+                return Err(LakeError::Other(format!(
+                    "删除向量 {} 锚定的文件（batch {}）已经下线（合并抢先跑过？）：拒绝登记 —— \
+                     登记了也读不到（按行号找行时文件已不在），等于一次**静默不生效的删除**",
+                    e.dv_id, e.batch_id
+                )));
+            }
             if !self
                 .deletions
                 .contains_key(&(e.dv_id.clone(), e.file_path.clone()))
@@ -815,6 +830,18 @@ impl CatalogState {
                 return Err(LakeError::Other(
                     "UPDATE 的删除向量缺必填字段（dv_id/file_path）".into(),
                 ));
+            }
+            // 同 `apply_deletions`：**锚定的文件必须还活着**（CAS 降级为断言，设计 §6.1）
+            if self
+                .files
+                .get(&e.batch_id)
+                .is_some_and(|m| m.deleted_at != 0)
+            {
+                return Err(LakeError::Other(format!(
+                    "UPDATE 的删除向量 {} 锚定的文件（batch {}）已经下线（合并抢先跑过？）：\
+                     拒绝登记 —— 登记了也读不到，等于一次**静默不生效的更新**",
+                    e.dv_id, e.batch_id
+                )));
             }
             if e.card == 0 {
                 return Err(LakeError::Other(format!(
@@ -2063,6 +2090,36 @@ mod snapshot_tests {
                 "维度 `{name}` 变了但快照字节没变 → 快照漏了这个字段（换主/重启后会静默回退）"
             );
         }
+    }
+
+    /// **锚定已下线文件的 DV 必须被拒绝**（设计 §6.1：原 CAS 校验降级为断言）。
+    ///
+    /// 这条盯的失败形态很具体：合并抢先把基文件标了墓碑，而我还拿着过期清单去登记 DV ——
+    /// 读侧按**文件内行号**找行时文件已经不在了 ⇒ **删除静默不生效**（用户以为删了）。
+    /// 宁可在这里响亮失败。
+    #[test]
+    fn deletion_vectors_anchored_on_tombstoned_files_are_refused() {
+        let mut s = rich_state();
+        let file = s.list_visible_files("public.cpu", u64::MAX, None)[0].clone();
+        // 让这个文件下线（整表清除是最直接的方式）
+        s.purge_table_files("public.cpu", "p1").unwrap();
+        let e = s
+            .apply_deletions(vec![dv_entry("dv-1", "public.cpu", &file.file_path)])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("已经下线") && e.contains("静默不生效的删除"),
+            "必须点名原因与后果：{e}"
+        );
+
+        // 清单里**找不到**这个 batch（老记录 / 重放里的历史条目）⇒ 放行：
+        // 不假装它下线了（宁可放行，也不要把重放卡死在一个推不出来的判断上）
+        let mut legacy = dv_entry("dv-2", "public.cpu", &file.file_path);
+        legacy.batch_id = String::new();
+        assert!(
+            s.apply_deletions(vec![legacy]).is_ok(),
+            "找不到清单时不拦（这条宽容是刻意的，写在这里免得被当成漏洞）"
+        );
     }
 
     /// 整表清除：**一个快照**把此刻可见的文件全下线，旧快照仍看得见（快照隔离）。

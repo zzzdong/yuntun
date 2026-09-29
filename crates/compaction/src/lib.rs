@@ -190,11 +190,11 @@ pub async fn compact_shard(
     snapshot: u64,
     lease_epoch: u64,
 ) -> Result<Option<u64>, LakeError> {
-    // 【F.3d】与**删除**互斥（表级 DML 租约）：合并会把基文件重写一遍（**消费**删除向量 ——
+    // 【F.3d-3】与**DML** 互斥（`(table, shard)` 级租约）：合并会把基文件重写一遍（**消费**删除向量 ——
     // 把已删的行丢掉），而删除要"定位 → 写位图 → 登记"相对**同一份基文件**成立。
     // 两者交错的两个方向都错（见 `sql::dml` 的同名注释）。拿不到就**跳过本轮** ——
     // 合并是后台作业，等下一轮没有代价（删除是用户操作，它优先）。
-    let Some(dml_lease) = TableDmlLease::acquire(compactor, table).await? else {
+    let Some(dml_lease) = ShardDmlLease::acquire(compactor, table, shard).await? else {
         return Ok(None);
     };
     let out = compact_shard_inner(compactor, table, shard, snapshot, lease_epoch).await;
@@ -202,7 +202,7 @@ pub async fn compact_shard(
     out
 }
 
-/// 合并单个 shard 的本体（调用方已持有表级 DML 租约）。
+/// 合并单个 shard 的本体（调用方已持有**这个分片**的 DML 租约）。
 async fn compact_shard_inner(
     compactor: &Compactor,
     table: &str,
@@ -471,29 +471,33 @@ async fn commit_compaction_files(
         .await
 }
 
-/// **表级 DML 租约**的持有者（`F.3d`）：合并期间挡住同一张表的删除。
+/// **`(table, shard)` 级 DML 租约**的持有者（`F.3d-3`）：合并期间挡住**同一个分片**的 DML。
 ///
 /// 与 [`LeaseGate`] 的区别（别混）：
 ///
-/// | | `LeaseGate`（`COMPACTION_LEASE`） | 本结构（`dml:<table>`） |
+/// | | `LeaseGate`（`COMPACTION_LEASE`） | 本结构（`dml:<table>:<shard>`） |
 /// |---|---|---|
-/// | 作用 | "谁是压缩作业" —— **全程持有** | "这张表此刻能不能改基文件" —— **每次合并持有** |
-/// | 粒度 | 全局（一个压缩器） | 表 |
-/// | 拿不到时 | 空转（别的节点在合并） | 跳过这张表（有删除在跑） |
-struct TableDmlLease {
+/// | 作用 | "谁是压缩作业" —— **全程持有** | "这个分片此刻能不能改基文件" —— **每次合并持有** |
+/// | 粒度 | 全局（一个压缩器） | **`(table, shard)`** |
+/// | 拿不到时 | 空转（别的节点在合并） | 跳过这个分片（有 DML 在跑） |
+///
+/// 粒度收到 shard 是设计 §6.1 的原文（评审四 R11）：合并的工作单元就是 `compact_shard`，
+/// 表级互斥会让"同表里另一个分片的 DML"白等几分钟 —— `§158` 把 `§150` 的表级退化收窄回来。
+struct ShardDmlLease {
     catalog: Arc<dyn CatalogOps>,
     purpose: String,
     holder: String,
     epoch: u64,
 }
 
-impl TableDmlLease {
-    /// `Ok(None)` = **别人正持有**（有删除在跑）⇒ 本轮跳过这张表；`Err` = 元数据面出错。
+impl ShardDmlLease {
+    /// `Ok(None)` = **别人正持有**（有 DML 在跑）⇒ 本轮跳过这个分片；`Err` = 元数据面出错。
     async fn acquire(
         compactor: &Compactor,
         table: &str,
+        shard: &str,
     ) -> Result<Option<Self>, LakeError> {
-        let purpose = yuntun_model::meta::dml_lease_purpose(table);
+        let purpose = yuntun_model::meta::dml_shard_lease_purpose(table, shard);
         // holder 带 `-cmp` 后缀：与 DELETE 的持有者（`dml-<uuid>`）不会撞名，
         // 也让"同一压缩器重复取租约"落在状态机的**幂等**分支上（T14.1 的语义）。
         let holder = format!("{}-cmp", compactor.lease_holder);
@@ -509,8 +513,9 @@ impl TableDmlLease {
         if !grant.granted {
             tracing::debug!(
                 table,
+                shard,
                 holder = %holder,
-                "跳过这张表的合并：表级 DML 租约被占用（有删除在跑）"
+                "跳过这个分片的合并：分片 DML 租约被占用（有 DML 在跑）"
             );
             return Ok(None);
         }
@@ -529,7 +534,7 @@ impl TableDmlLease {
             .await
         {
             // 只影响"删除要多等一个 TTL"，不影响这次合并的结果
-            tracing::warn!(error = %e, purpose = %self.purpose, "释放表级 DML 租约失败（等 TTL 即可）");
+            tracing::warn!(error = %e, purpose = %self.purpose, "释放分片 DML 租约失败（等 TTL 即可）");
         }
     }
 }
@@ -1599,6 +1604,120 @@ mod tests {
                     ..Default::default()
                 },
             })
+            .await
+            .unwrap();
+    }
+
+    /// **`F.3d-3`：合并只取"自己那个分片"的锁**（设计 §6.1 / 评审四 R11）。
+    ///
+    /// 两条都要成立，方向相反：
+    ///
+    /// * 本分片被 DML 占着 ⇒ **跳过这个分片**（硬干 = 已删的行被写进新文件 = 复活）；
+    /// * **别的**分片被占着 ⇒ 本分片照做（表级互斥才会被挡住 —— 那正是这一刀要收窄的）。
+    #[tokio::test]
+    async fn compaction_takes_only_its_own_shard_lease() {
+        let catalog: Arc<MemoryCatalog> = Arc::new(MemoryCatalog::new());
+        setup(&catalog).await;
+        let c = compactor(catalog.clone());
+        // s0 写 3 个文件（够触发合并），s1 写 1 个（只用来占锁）
+        for (shard, n) in [("s0", 3usize), ("s1", 1usize)] {
+            for _ in 0..n {
+                let bid = uuid::Uuid::now_v7().to_string();
+                let (path, size, _) = yuntun_format::write_batch(
+                    &c.store,
+                    "t",
+                    shard,
+                    "w1",
+                    &bid,
+                    &batch(),
+                    yuntun_format::DataFormat::Parquet,
+                )
+                .await
+                .unwrap();
+                catalog
+                    .commit_files(CommitFilesRequest {
+                        table: "t".into(),
+                        batch_id: bid.clone(),
+                        client_request_id: None,
+                        client_request_ids: vec![],
+                        shard: shard.into(),
+                        time_window: "w1".into(),
+                        files: vec![FileManifest {
+                            file_path: path,
+                            batch_id: bid.clone(),
+                            file_size: size,
+                            row_count: 3,
+                            shard: shard.into(),
+                            time_window: "w1".into(),
+                            ..Default::default()
+                        }],
+                        schema_version: 1,
+                        row_count: 3,
+                    })
+                    .await
+                    .unwrap();
+            }
+        }
+        let snap = catalog.current_snapshot().await;
+        let s0_files = |catalog: Arc<MemoryCatalog>| async move {
+            catalog
+                .list_visible_files("t", u64::MAX, Some("s0"))
+                .await
+                .unwrap()
+                .len()
+        };
+
+        // ⓪ 本分片被占 ⇒ 跳过（而且**一个文件都没动**）
+        let mine = catalog
+            .acquire_lease(
+                &yuntun_model::meta::dml_shard_lease_purpose("t", "s0"),
+                "someone-else",
+                now_ms(),
+                30_000,
+            )
+            .await
+            .unwrap();
+        assert!(mine.granted);
+        assert!(
+            compact_shard(&c, "t", "s0", snap, 0).await.unwrap().is_none(),
+            "本分片被 DML 占着 ⇒ 必须跳过（硬干会让已删的行复活）"
+        );
+        assert_eq!(s0_files(catalog.clone()).await, 3, "跳过时不许动任何文件");
+        catalog
+            .release_lease(
+                &yuntun_model::meta::dml_shard_lease_purpose("t", "s0"),
+                "someone-else",
+                mine.epoch,
+            )
+            .await
+            .unwrap();
+
+        // ① 别的分片被占 ⇒ 本分片照做
+        let other = catalog
+            .acquire_lease(
+                &yuntun_model::meta::dml_shard_lease_purpose("t", "s1"),
+                "someone-else",
+                now_ms(),
+                30_000,
+            )
+            .await
+            .unwrap();
+        assert!(other.granted);
+        assert!(
+            compact_shard(&c, "t", "s0", snap, 0).await.unwrap().is_some(),
+            "**别的分片**的锁不许挡住本分片的合并（那正是表级互斥的毛病）"
+        );
+        assert_eq!(
+            s0_files(catalog.clone()).await,
+            1,
+            "合并之后 s0 只剩一个（重写产物）"
+        );
+        catalog
+            .release_lease(
+                &yuntun_model::meta::dml_shard_lease_purpose("t", "s1"),
+                "someone-else",
+                other.epoch,
+            )
             .await
             .unwrap();
     }

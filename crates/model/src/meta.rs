@@ -310,16 +310,20 @@ pub struct LeaseEntry {
 /// 两处各写一遍，改一处就静默失配（栅栏失效 = 白写）。
 pub const COMPACTION_LEASE: &str = "compaction";
 
-/// **表级 DML 租约**（`F.3d`）：删除与合并对**同一张表**互斥。
+/// **`(table, shard)` 粒度的 DML 租约用途键**（设计 §6.1）：删除/更新/整表清除与合并
+/// 对**同一个分片**互斥。
 ///
 /// 为什么不复用 `COMPACTION_LEASE`：那把是**压缩作业的全程持有**（`LeaseGate` 拿到就一直续租）
 /// —— 复用它等于"只要压缩循环在跑，DELETE 永远拿不到租约"（实测就是这么炸的，`§150.2`）。
 ///
-/// 为什么粒度取**表**而不是 `(table, shard)`：设计 §6.1 明写"跨 shard DML 也可退化为表级锁
-/// （实现择一，文档化选择）"。DELETE 是短操作，而"按 shard 名排序一次性获取"要在两处
-/// 都带上多把锁的生命周期管理；先取**安全的那一侧**，细粒度另开一刀（`§150.3`）。
-pub fn dml_lease_purpose(table: &str) -> String {
-    format!("dml:{table}")
+/// 为什么粒度必须是 **shard** 而不是表（`§158` 把 `§150` 的表级退化收窄到设计原文）：
+/// 合并的工作单元是 `compact_shard`（分钟级任务），表级互斥会让"同表里**另一个分片**的删除"
+/// 白等几分钟（评审四 R11）—— 而两者其实碰的是不同的文件。
+///
+/// 多 shard 的一次性获取见 `yuntun_catalog::LeaseSet`（**按用途键排序、全或无**，
+/// 评审五 R19：不同顺序的增量获取会死锁）。
+pub fn dml_shard_lease_purpose(table: &str, shard: &str) -> String {
+    format!("dml:{table}:{shard}")
 }
 
 

@@ -486,15 +486,40 @@ async fn delete_refusals_are_explicit() {
         vec![1]
     );
 
-    // 【F.3d】合并正在跑（**表级 DML 租约**被占）时，DELETE **当场拒绝** ——
+    // 【F.3d-3】合并正在改**同一个分片**时，DELETE **当场拒绝** ——
     // 两者必须在同一份基文件上串行：合并会消费 DV，交错会让已删的行复活（或把 DV 挂到墓碑上）。
-    let dml_purpose = yuntun_model::meta::dml_lease_purpose("public.t");
+    //
+    // 粒度是 **`(table, shard)`**（设计 §6.1/评审四 R11），所以这里顺带验两条：
+    // ① 占住**本表这个分片**的租约 ⇒ DELETE 拒绝；② 占住**另一个分片**的租约 ⇒ 不影响它。
+    // 先强制落盘：DML 现在**先 flush 再取分片锁**（见 `execute_delete` 的 ⓪），
+    // 所以"表里此刻有哪些分片"这个前提要在 flush 之后看
+    lakehouse
+        .ingestor
+        .force_flush("public.t")
+        .await
+        .expect("强制落盘应当成功");
+    let snap = lakehouse.catalog.current_snapshot().await;
+    let files = lakehouse
+        .catalog
+        .list_visible_files("public.t", snap, None)
+        .await
+        .unwrap();
+    let file = files.first().expect("前提：表里得有已提交文件（上面刚 flush 过）").clone();
+    let dml_purpose = yuntun_model::meta::dml_shard_lease_purpose("public.t", &file.shard);
     let held = lakehouse
         .catalog
         .acquire_lease(&dml_purpose, "someone-else", yuntun_ingest::now_ms(), 30_000)
         .await
         .unwrap();
     assert!(held.granted, "前提：这把租约现在被占着");
+    // 别的分片不受影响（这正是细粒度的意义：表级互斥会让它们白等几分钟）
+    let other_purpose = yuntun_model::meta::dml_shard_lease_purpose("public.t", "s-other");
+    let other = lakehouse
+        .catalog
+        .acquire_lease(&other_purpose, "someone-else", yuntun_ingest::now_ms(), 30_000)
+        .await
+        .unwrap();
+    assert!(other.granted, "另一个分片的锁必须还能拿到（否则就是表级互斥）");
     let msg = match lakehouse
         .sql
         .execute("DELETE FROM t WHERE v = 1", &mut session)
@@ -504,8 +529,8 @@ async fn delete_refusals_are_explicit() {
         Ok(_) => panic!("合并在跑时 DELETE 不许成功"),
     };
     assert!(
-        msg.contains("合并") && msg.contains("租约"),
-        "拒绝必须点名「和谁冲突」：{msg}"
+        msg.contains("合并") && msg.contains("租约") && msg.contains(&file.shard),
+        "拒绝必须点名「和谁冲突、在哪个分片」：{msg}"
     );
     // 归还租约之后又能删了（拒绝只是"此刻不行"，不是"永久不行"）
     assert!(
@@ -515,6 +540,13 @@ async fn delete_refusals_are_explicit() {
             .await
             .unwrap(),
         "归还必须成功（代次取自刚才那次授予）"
+    );
+    assert!(
+        lakehouse
+            .catalog
+            .release_lease(&other_purpose, "someone-else", other.epoch)
+            .await
+            .unwrap()
     );
     assert_eq!(
         execute_update(&mut client, "DELETE FROM t WHERE v = 1").await,

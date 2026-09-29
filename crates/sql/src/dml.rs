@@ -44,6 +44,7 @@ use sqlparser::ast::{
 };
 use uuid::Uuid;
 
+use yuntun_catalog::LeaseSet;
 use yuntun_model::dv::{DeletionEntry, DvBitmap, dv_object_path};
 use yuntun_model::ops::qualified_name;
 use yuntun_model::meta::FileManifest;
@@ -56,14 +57,18 @@ use crate::{RawOutcome, SqlEngine, SqlError, session::SessionCtx};
 impl SqlEngine {
     /// `DELETE FROM t WHERE …`（见模块文档的六步）。
     ///
-    /// 外层只做一件事：**先把表级 DML 租约拿到手**（与合并互斥，设计 §6.1）——
+    /// 外层做两件事：**先让在途数据落盘**，再**把涉及的分片租约拿到手**（与合并互斥，设计 §6.1）——
     /// 删除的"定位 → 写位图 → 登记"必须相对**同一份基文件**成立：
     ///
     /// * 合并先跑、删除后跑 ⇒ 删除的位图锚在**已经转墓碑**的旧文件名上（惰性，删不掉东西）；
     /// * 删除先跑、合并后跑 ⇒ 合并在读基文件时**看不到**这份位图 ⇒ **已删的行被写进新文件**（复活）。
     ///
-    /// 两个方向都不能放任 ⇒ 两边用**同一把表级租约**（`yuntun_model::meta::dml_lease_purpose`）。
-    /// 拿不到就**当场拒绝**（不排队）：DELETE 是短操作，让调用方重试比在这里阻塞好。
+    /// 两个方向都不能放任 ⇒ 两边用**同一组 `(table, shard)` 租约**
+    /// （`yuntun_model::meta::dml_shard_lease_purpose`，设计 §6.1）。
+    /// 拿不到就**当场拒绝**（不排队）：DML 是短操作，让调用方重试比在这里阻塞好。
+    ///
+    /// 粒度为什么是 shard 而不是表（`§158`）：合并的工作单元是 `compact_shard`，
+    /// 表级互斥会让"同表里另一个分片的 DML"白等几分钟（评审四 R11）—— 而两者碰的是不同文件。
     ///
     /// （表名解析两次是刻意的：外壳要表名才能取租约，本体要表名才能干活；`parse_delete_target` 是纯函数。）
     pub(crate) async fn execute_delete(
@@ -73,16 +78,92 @@ impl SqlEngine {
     ) -> Result<RawOutcome, SqlError> {
         self.check_write()?;
         let table = parse_delete_target(del, session)?;
-        let lease = DmlLease::acquire(self.catalog.clone(), &table).await?;
+        // ⓪ **在途数据先落盘**，再求分片、再取锁（顺序不能换！）：
+        //    在途数据此刻不属于任何文件 ⇒ ① 它扫不到（**漏删**）② 它所在的分片**还不存在**，
+        //    于是"先取锁后 flush"必然在 flush 造出新分片时报"分片集合变了"（实测就是这么炸的）。
+        //    flush 之后文件集合才稳定，分片集合才有意义。
+        let flushed = self
+            .ingest_side()?
+            .force_flush(&table)
+            .await
+            .map_err(SqlError::from_lake)?;
+        if flushed.chunks > 0 {
+            tracing::debug!(
+                table = %table,
+                chunks = flushed.chunks,
+                rows = flushed.rows,
+                "DML：先把在途数据落盘（否则会漏删刚插入的行 / 分片集合也不完整）"
+            );
+        }
+        // ① 租约：**`(table, shard)` 粒度**（设计 §6.1/评审四 R11）——
+        //    只锁"这次要改的那几个分片"，而不是整张表：合并的工作单元是 `compact_shard`
+        //    （分钟级），表级互斥会让"同表里另一个分片的删除"白等几分钟。
+        //    **按用途键排序、全或无**（评审五 R19）：两个并发 DML 以不同顺序增量取锁会死锁。
+        let shards = self.visible_shards(&table).await?;
+        let holder = format!("dml-{}", Uuid::now_v7());
+        let leases = LeaseSet::acquire(
+            self.catalog.clone(),
+            &table,
+            &shards,
+            &holder,
+            DML_LEASE_TTL_MS,
+            yuntun_ingest::now_ms(),
+        )
+        .await
+        .map_err(SqlError::from_lake)?;
         // **无 `WHERE` ⇒ 整表清除**（设计 §7）：走**文件级下线**，不生成任何 DV。
-        // 分流放在这里（拿到租约之后）：两条路的外部纪律是同一把租约，只是内部形态不同。
+        // 分流放在这里（拿到租约之后）：两条路的外部纪律是同一组租约，只是内部形态不同。
         let out = if del.selection.is_none() {
-            self.execute_purge(&table).await
+            self.execute_purge(&table, &shards).await
         } else {
-            self.execute_delete_inner(del, session).await
+            self.execute_delete_inner(del, session, &shards).await
         };
-        lease.release().await;
+        leases.release().await;
         out
+    }
+
+    /// 表在**此刻**可见文件上的分片集合（去重升序）—— DML 取租约的输入。
+    ///
+    /// 为什么先列一次文件：DML 只碰"此刻存在的文件"，所以只需要它们的分片的锁。
+    /// ⚠️ 这只是**第一次**列（用来取锁）；真正干活前会**再列一次**并核对
+    /// （`ensure_shards_held`）—— 两次之间新冒出来的分片不在我的锁覆盖内，
+    /// 那种情况宁可报错让调用方重试，也不要在"不确定的基础"上删。
+    async fn visible_shards(&self, table: &str) -> Result<Vec<String>, SqlError> {
+        let snapshot = self.catalog.current_snapshot().await;
+        let mut shards: Vec<String> = self
+            .catalog
+            .list_visible_files(table, snapshot, None)
+            .await
+            .map_err(SqlError::from_lake)?
+            .into_iter()
+            .map(|f| f.shard)
+            .collect();
+        shards.sort();
+        shards.dedup();
+        Ok(shards)
+    }
+
+    /// 核对"我打算动的文件所在的分片都在我的租约覆盖内"。
+    ///
+    /// 取锁用的是"第一次列出来的分片集合"，而列完之后到干活之间数据面还可能变化
+    /// （flush 会往**新分片**写文件）。新分片的锁我没有 ⇒ 一旦合并去改它，
+    /// 我登记的 DV 就会锚在一个已经被改掉的文件上（惰性失效 = **静默少删**）。
+    /// 这里让它**响亮失败**：DML 是短操作，重试即可（与"拿不到锁就当场拒绝"同一条纪律）。
+    fn ensure_shards_held(
+        &self,
+        table: &str,
+        held: &[String],
+        files: &[yuntun_model::meta::FileManifest],
+    ) -> Result<(), SqlError> {
+        if let Some(f) = files.iter().find(|f| !held.contains(&f.shard)) {
+            return Err(SqlError::Unsupported(format!(
+                "表 {table} 在取租约之后出现了新分片 `{}`（文件 {}）：它的锁不在我手上 —— \
+                 现在动手会让删除向量锚在一个可能被合并改掉的文件上（登记了也读不到 = \
+                 静默少删）。请重试（DML 是短操作）",
+                f.shard, f.file_path
+            )));
+        }
+        Ok(())
     }
 
     /// **整表清除**（`F.3f`，设计 §7 的"无 `WHERE` 全表删"）。
@@ -103,13 +184,13 @@ impl SqlEngine {
     /// ③ `purge_table_files`：文件级下线 + 悬挂 DV 同步 revoke（**同一个快照号**）
     /// ```
     ///
-    /// 并发：与合并互斥（外层已持表级 DML 租约）—— 否则合并会读到 purge 之前的基文件、
+    /// 并发：与合并互斥（外层已持各分片 DML 租约）—— 否则合并会读到 purge 之前的基文件、
     /// 把那些行写进新文件（**复活**）。
     ///
     /// 幂等键（`purge_id`）**每次执行都新生成**：SQL 语句没有"请求 id"这个概念，
     /// 同一个 id 只用于**重放**（`replay_wal_dml`）—— 于是"用户再执行一次 `DELETE FROM t`"
     /// 是**一次新的清除**（`DELETE` 本就该如此），而"重放同一条 WAL 记录"是空操作。
-    async fn execute_purge(&self, table: &str) -> Result<RawOutcome, SqlError> {
+    async fn execute_purge(&self, table: &str, held_shards: &[String]) -> Result<RawOutcome, SqlError> {
         // 表必须存在（与带 WHERE 那条路一致：不存在的表报 `NotFound`，而不是"清了个空"）
         if self
             .catalog
@@ -131,6 +212,16 @@ impl SqlEngine {
                 "整表清除：先把在途数据落盘（否则刚落盘的那批会「删不掉」）"
             );
         }
+        // **持锁之后再列一次**：整表清除会下线"此刻可见的全部文件"，所以它必须确认
+        // 这些文件的分片**都在我手上的锁里**（否则合并可能正在重写其中之一 ——
+        // 那些行会被写进新文件 ⇒ 清除之后它们**复活**）
+        let snapshot = self.catalog.current_snapshot().await;
+        let files = self
+            .catalog
+            .list_visible_files(table, snapshot, None)
+            .await
+            .map_err(SqlError::from_lake)?;
+        self.ensure_shards_held(table, held_shards, &files)?;
         let purge_id = format!("purge-{}", Uuid::now_v7());
         let epoch = ingest.chunks().liveness(table).epoch;
         // ② WAL（权威）：purge 只改目录 ⇒ 少了这条记录，内存元数据形态重启后整表复活
@@ -176,6 +267,7 @@ impl SqlEngine {
         &self,
         del: &Delete,
         session: &SessionCtx,
+        held_shards: &[String],
     ) -> Result<RawOutcome, SqlError> {
         self.check_write()?;
         // ① 语句形态：本刀只认单表 + 可选 WHERE（其余形态明确拒绝，别猜用户想要什么）
@@ -198,16 +290,8 @@ impl SqlEngine {
         let ingest = self.ingest_side()?.clone();
         let store = ingest.store.clone();
 
-        // ② 在途数据先落盘（否则刚插的行扫不到 ⇒ 落盘后复活）
-        let flushed = ingest.force_flush(&table).await.map_err(SqlError::from_lake)?;
-        if flushed.chunks > 0 {
-            tracing::debug!(
-                table = %table,
-                chunks = flushed.chunks,
-                rows = flushed.rows,
-                "DELETE：先把在途数据落盘（否则会漏删刚插入的行）"
-            );
-        }
+        // （在途数据的落盘在外层、**取分片锁之前**做掉了 —— 见 `execute_delete` 的 ⓪）
+        let _ = &ingest;
 
         // ③ 定位：逐文件求谓词，命中行的**文件内行号**
         let snapshot = self.catalog.current_snapshot().await;
@@ -216,6 +300,8 @@ impl SqlEngine {
             .list_visible_files(&table, snapshot, None)
             .await
             .map_err(SqlError::from_lake)?;
+        // **持锁之后再列一次**：核对分片覆盖（见 `ensure_shards_held` 的理由）
+        self.ensure_shards_held(&table, held_shards, &files)?;
         // 已生效的 DV：新位图里**不该重复记**已删过的行（否则 `card`/受影响行数虚高）
         let existing = self.existing_bitmaps(&table, snapshot).await?;
 
@@ -336,62 +422,10 @@ impl SqlEngine {
     }
 }
 
-/// DELETE 期间持有的**表级 DML 租约**（与合并互斥）。
-///
-/// ⚠️ **粒度是表**（不是 `(table, shard)`）：设计 §6.1 允许"退化为表级锁"，见
-/// `yuntun_model::meta::dml_lease_purpose` 的注释 —— 细粒度另开一刀（`§150.3`）。
-/// 现在的取舍：**宁可粗一点，也不要交错**。
-struct DmlLease {
-    catalog: std::sync::Arc<dyn yuntun_catalog::CatalogOps>,
-    purpose: String,
-    holder: String,
-    epoch: u64,
-}
-
-/// 租约时长：DELETE 是短操作（定位 + 写几个小对象 + 一次目录提交）；进程死掉时靠 TTL 释放。
+/// DML 租约的时长：DELETE/UPDATE/整表清除都是短操作（定位 + 写几个小对象 + 一次目录提交）；
+/// 进程死掉时靠 TTL 释放。租约本身（一组、`(table, shard)` 粒度、排序全或无）在
+/// `yuntun_catalog::LeaseSet` 里。
 const DML_LEASE_TTL_MS: u64 = 30_000;
-
-impl DmlLease {
-    async fn acquire(
-        catalog: std::sync::Arc<dyn yuntun_catalog::CatalogOps>,
-        table: &str,
-    ) -> Result<Self, SqlError> {
-        let purpose = yuntun_model::meta::dml_lease_purpose(table);
-        let holder = format!("dml-{}", Uuid::now_v7());
-        let grant = catalog
-            .acquire_lease(
-                &purpose,
-                &holder,
-                yuntun_ingest::now_ms(),
-                DML_LEASE_TTL_MS,
-            )
-            .await
-            .map_err(SqlError::from_lake)?;
-        if !grant.granted {
-            return Err(SqlError::Unsupported(format!(
-                "另一处正在对表 {table} 做合并（表级 DML 租约被占用）：删除要等它结束再试 —— \
-                 两者必须在同一份基文件上串行（合并会消费删除向量，设计 §6.1）"
-            )));
-        }
-        Ok(Self {
-            catalog,
-            purpose,
-            holder,
-            epoch: grant.epoch,
-        })
-    }
-
-    /// 归还（best-effort）：还失败也只影响"接手方要不要等 TTL"，不影响这次删除的结果。
-    async fn release(self) {
-        if let Err(e) = self
-            .catalog
-            .release_lease(&self.purpose, &self.holder, self.epoch)
-            .await
-        {
-            tracing::warn!(error = %e, "释放删除租约失败（等待 TTL 过期即可）");
-        }
-    }
-}
 
 /// 解析 `DELETE` 的目标表（本刀只认单表、无 JOIN）。
 fn parse_delete_target(del: &Delete, session: &SessionCtx) -> Result<String, SqlError> {
@@ -445,7 +479,7 @@ impl SqlEngine {
     /// # 七步（顺序即正确性）
     ///
     /// ```text
-    /// ① 表级 DML 租约（与合并互斥：合并会重写基文件并消费删除向量）
+    /// ① 各分片 DML 租约（与合并互斥：合并会重写基文件并消费删除向量）
     /// ② 强制 flush（在途数据先落盘 —— 否则刚插的行改不到）
     /// ③ 逐文件：一次扫描同时拿"命中行号"与"这些行的新值"（`locate_and_project`）
     ///    ＋ 扣掉**已删**的行（它们对用户不可见，改它们 = 复活）
@@ -485,24 +519,40 @@ impl SqlEngine {
 
         let ingest = self.ingest_side()?.clone();
         let store = ingest.store.clone();
-        // ① 与合并互斥（同一把表级租约 —— 与 DELETE 共用）
-        let lease = DmlLease::acquire(self.catalog.clone(), &table).await?;
+        // ⓪ 在途数据先落盘（同 DELETE：分片集合要在 flush **之后**求才有意义）
+        let flushed = ingest.force_flush(&table).await.map_err(SqlError::from_lake)?;
+        if flushed.chunks > 0 {
+            tracing::debug!(
+                table = %table,
+                chunks = flushed.chunks,
+                rows = flushed.rows,
+                "UPDATE：先把在途数据落盘（否则刚插入的行改不到）"
+            );
+        }
+        // ① 与合并互斥：**`(table, shard)` 粒度**的一组租约（与 DELETE 共用 `LeaseSet`，
+        //    排序全或无 —— 设计 §6.1 / 评审四 R11 / 评审五 R19）
+        let held_shards = self.visible_shards(&table).await?;
+        let holder = format!("dml-{}", Uuid::now_v7());
+        let leases = LeaseSet::acquire(
+            self.catalog.clone(),
+            &table,
+            &held_shards,
+            &holder,
+            DML_LEASE_TTL_MS,
+            yuntun_ingest::now_ms(),
+        )
+        .await
+        .map_err(SqlError::from_lake)?;
         let result = async {
-            // ② 在途数据先落盘
-            let flushed = ingest.force_flush(&table).await.map_err(SqlError::from_lake)?;
-            if flushed.chunks > 0 {
-                tracing::debug!(
-                    table = %table, chunks = flushed.chunks, rows = flushed.rows,
-                    "UPDATE：先把在途数据落盘（否则刚插入的行改不到）"
-                );
-            }
-
+            // （在途数据的落盘在外层、**取分片锁之前**做掉了）
             let snapshot = self.catalog.current_snapshot().await;
             let files = self
                 .catalog
                 .list_visible_files(&table, snapshot, None)
                 .await
                 .map_err(SqlError::from_lake)?;
+            // **持锁之后再列一次**：核对分片覆盖（理由见 `ensure_shards_held`）
+            self.ensure_shards_held(&table, &held_shards, &files)?;
             // **已删的行不许被改**（它们对用户不可见；改它们等于把删除的行"更新回来"）
             let existing = self.existing_bitmaps(&table, snapshot).await?;
 
@@ -667,7 +717,7 @@ impl SqlEngine {
             Ok(RawOutcome::Affected(affected))
         }
         .await;
-        lease.release().await;
+        leases.release().await;
         result
     }
 }

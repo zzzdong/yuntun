@@ -23,8 +23,11 @@ use yuntun_model::ops::{
 };
 use yuntun_model::schema::SchemaChangeKind;
 
+/// DML 租约的**一组**（`(table, shard)` 粒度、排序全或无）—— `F.3d-3`，设计 §6.1。
+pub mod lease;
 pub mod state;
 
+pub use lease::LeaseSet;
 pub use state::CatalogState;
 
 /// `purge_table_files` 的结果（`F.3f`，设计 §7）。
