@@ -47,8 +47,9 @@ use uuid::Uuid;
 use yuntun_model::dv::{DeletionEntry, DvBitmap, dv_object_path};
 use yuntun_model::ops::qualified_name;
 use yuntun_model::meta::FileManifest;
-use yuntun_model::wal_record::{DeletePayload, FileDeletion, NewFilePayload, Record,
-    UpdatePayload};
+use yuntun_model::wal_record::{
+    DeletePayload, FileDeletion, NewFilePayload, PurgePayload, Record, UpdatePayload,
+};
 
 use crate::{RawOutcome, SqlEngine, SqlError, session::SessionCtx};
 
@@ -73,9 +74,101 @@ impl SqlEngine {
         self.check_write()?;
         let table = parse_delete_target(del, session)?;
         let lease = DmlLease::acquire(self.catalog.clone(), &table).await?;
-        let out = self.execute_delete_inner(del, session).await;
+        // **无 `WHERE` ⇒ 整表清除**（设计 §7）：走**文件级下线**，不生成任何 DV。
+        // 分流放在这里（拿到租约之后）：两条路的外部纪律是同一把租约，只是内部形态不同。
+        let out = if del.selection.is_none() {
+            self.execute_purge(&table).await
+        } else {
+            self.execute_delete_inner(del, session).await
+        };
         lease.release().await;
         out
+    }
+
+    /// **整表清除**（`F.3f`，设计 §7 的"无 `WHERE` 全表删"）。
+    ///
+    /// # 为什么它不该退化成"给每一行标 DV"
+    ///
+    /// 设计 §7 的原话是"**文件级与行级分属两层，非第二形态**"。整表删若逐行标 DV，
+    /// 代价是位图大小 = 行数（十亿行的表就是十亿位的位图），而且之后还要靠合并一行行重写；
+    /// 文件级下线是**目录里改几个字段**：文件整体标墓碑，读侧立刻看不到。
+    ///
+    /// # 三步（顺序即正确性）
+    ///
+    /// ```text
+    /// ① 强制 flush：在途数据先落成文件 —— 否则它们不属于任何文件，purge 之后
+    ///    攒批落盘 = **刚删掉的数据又回来了**（这一步是本刀最容易踩的）
+    /// ② WAL append（一条 `PurgePayload`）：purge 只改目录、**数据对象一个不动**
+    ///    ⇒ "重启后表是空的"从对象存储**推不出来**，只能靠这条记录重放
+    /// ③ `purge_table_files`：文件级下线 + 悬挂 DV 同步 revoke（**同一个快照号**）
+    /// ```
+    ///
+    /// 并发：与合并互斥（外层已持表级 DML 租约）—— 否则合并会读到 purge 之前的基文件、
+    /// 把那些行写进新文件（**复活**）。
+    ///
+    /// 幂等键（`purge_id`）**每次执行都新生成**：SQL 语句没有"请求 id"这个概念，
+    /// 同一个 id 只用于**重放**（`replay_wal_dml`）—— 于是"用户再执行一次 `DELETE FROM t`"
+    /// 是**一次新的清除**（`DELETE` 本就该如此），而"重放同一条 WAL 记录"是空操作。
+    async fn execute_purge(&self, table: &str) -> Result<RawOutcome, SqlError> {
+        // 表必须存在（与带 WHERE 那条路一致：不存在的表报 `NotFound`，而不是"清了个空"）
+        if self
+            .catalog
+            .table_schema(table)
+            .await
+            .map_err(SqlError::from_lake)?
+            .is_none()
+        {
+            return Err(SqlError::NotFound(table.to_string()));
+        }
+        let ingest = self.ingest_side()?.clone();
+        // ① 在途数据先落盘
+        let flushed = ingest.force_flush(table).await.map_err(SqlError::from_lake)?;
+        if flushed.chunks > 0 {
+            tracing::debug!(
+                table = %table,
+                chunks = flushed.chunks,
+                rows = flushed.rows,
+                "整表清除：先把在途数据落盘（否则刚落盘的那批会「删不掉」）"
+            );
+        }
+        let purge_id = format!("purge-{}", Uuid::now_v7());
+        let epoch = ingest.chunks().liveness(table).epoch;
+        // ② WAL（权威）：purge 只改目录 ⇒ 少了这条记录，内存元数据形态重启后整表复活
+        ingest
+            .wal
+            .append(Record::Purge(PurgePayload {
+                table: table.to_string(),
+                purge_id: purge_id.clone(),
+                schema_epoch: epoch,
+            }))
+            .await
+            .map_err(SqlError::from_lake)?;
+        // ③ 目录：文件级下线 + 悬挂 DV 同步 revoke（一个 op、一个快照）
+        let out = self
+            .catalog
+            .purge_table_files(table, &purge_id)
+            .await
+            .map_err(|e| {
+                SqlError::from_lake(yuntun_model::error::LakeError::Other(format!(
+                    "整表清除已写入 WAL（purge_id={purge_id}）但没进目录：{e} —— \
+                     重启后 `replay_wal_dml` 会把它收敛进来，**不要再清一次**"
+                )))
+            })?;
+        self.query
+            .catalog()
+            .refresh(&self.catalog)
+            .await
+            .map_err(|e| SqlError::Internal(e.to_string()))?;
+        tracing::info!(
+            table = %table,
+            purge_id = %purge_id,
+            files = out.files,
+            revoked = out.revoked,
+            rows = out.rows,
+            snapshot = out.snapshot,
+            "整表清除完成（文件级下线，未生成删除向量）"
+        );
+        Ok(RawOutcome::Affected(out.rows as i64))
     }
 
     /// 六步本体（见模块文档）。
@@ -87,11 +180,11 @@ impl SqlEngine {
         self.check_write()?;
         // ① 语句形态：本刀只认单表 + 可选 WHERE（其余形态明确拒绝，别猜用户想要什么）
         let table = parse_delete_target(del, session)?;
+        // 无 `WHERE` 在**外层**就分流去 `execute_purge`（整表清除，设计 §7）：
+        // 走到这里的一定带谓词 —— 这条断言把"两层分流"钉在一起，加了新入口也不会漏
         let Some(predicate) = del.selection.as_ref() else {
-            return Err(SqlError::Unsupported(
-                "无 WHERE 的全表删未接线（设计 §7 定的口径是**文件级下线** purge_table_files + \
-                 撤销悬挂 DV，不生成删除向量）—— 现在请用带 WHERE 的删除，或 DROP TABLE 重建"
-                    .into(),
+            return Err(SqlError::Internal(
+                "无 WHERE 的 DELETE 必须走 execute_purge（内层不该收到它）".into(),
             ));
         };
         let Some((schema, _version)) = self

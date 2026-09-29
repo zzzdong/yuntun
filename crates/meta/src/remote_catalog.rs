@@ -982,6 +982,36 @@ impl CatalogOps for RemoteCatalog {
         Ok(r.affected as usize)
     }
 
+    /// **整表清除**（`F.3f`）：走 raft（`PurgeFiles`）。
+    ///
+    /// 三个数（文件数/撤销数/行数）由状态机算出来随 `ApplyOutcome.result` 过线 ——
+    /// 客户端**猜不出来**（它看不到"状态机 apply 那一刻的可见文件集"）。
+    async fn purge_table_files(
+        &self,
+        table: &str,
+        purge_id: &str,
+    ) -> Result<yuntun_catalog::PurgeOutcome, LakeError> {
+        let r = self
+            .propose(pb::Op {
+                now_ms: now_ms(),
+                kind: Some(pb::op::Kind::PurgeFiles(pb::PurgeFilesOp {
+                    table: table.to_string(),
+                    purge_id: purge_id.to_string(),
+                })),
+            })
+            .await?;
+        self.refresh_best_effort().await;
+        // 用 UFCS 解码：这里不额外引 `prost::Message` 进作用域（避免与既有导入打架）
+        let detail = <pb::PurgeFilesResult as prost::Message>::decode(&*r.result)
+            .unwrap_or_default();
+        Ok(yuntun_catalog::PurgeOutcome {
+            snapshot: self.cached(|c| c.snapshot),
+            files: detail.files as usize,
+            revoked: detail.revoked as usize,
+            rows: if detail.rows != 0 { detail.rows } else { r.affected },
+        })
+    }
+
     async fn drop_shard(&self, table: &str, shard: &str) -> Result<u64, LakeError> {
         let r = self
             .propose(pb::Op {

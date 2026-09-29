@@ -242,6 +242,19 @@ pub struct SnapshotDeletionEntry {
     pub entry: Option<crate::dv::DeletionEntry>,
 }
 
+/// 快照里的一条**整表清除**记录（键 = `purge_id`，值 = 它生效的快照号）。
+///
+/// **为什么要进快照**：`purge_table_files` 的语义是"下线**此刻**全部可见文件"，
+/// 所以它的正确性依赖"同一 id 只生效一次"。这份记忆丢了，重放一条旧 purge
+/// 就会把 purge 之后新写入的数据一起清掉（**静默丢数据**）—— 比少几个文件糟得多。
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct SnapshotPurgeEntry {
+    #[prost(string, tag = "1")]
+    pub purge_id: String,
+    #[prost(uint64, tag = "2")]
+    pub applied_at: u64,
+}
+
 /// 快照里的一条幂等记录（键 = `client_request_id`）。
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct SnapshotIdempotencyEntry {
@@ -330,6 +343,9 @@ pub struct CatalogStateSnapshot {
     /// **删除向量事件**（`F.3`，`delta-dml-design §3.2`）：丢一份 = 已删的行复活。
     #[prost(message, repeated, tag = "15")]
     pub deletions: Vec<SnapshotDeletionEntry>,
+    /// **整表清除的幂等记忆**（`F.3f`）：丢一份 = 重放旧 purge 会清掉新数据。
+    #[prost(message, repeated, tag = "16")]
+    pub purges: Vec<SnapshotPurgeEntry>,
 }
 
 // ---------------------------------------------------------------- 载荷编解码

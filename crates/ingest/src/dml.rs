@@ -16,7 +16,10 @@
 //! * **幂等**：`dv_id` 相同 ⇒ 目录侧按 `(dv_id, file_path)` 去重（重放两遍不写两份）；
 //! * **`UPDATE` 也走这里**（`F.3e-2`）：`UpdatePayload` 的两半（删除向量 + 新行文件清单）
 //!   由**一条 `apply_update`** 重建 —— 重放也必须保持"原子可见"：
-//!   分两次调用就会在两个快照上落下两半，读侧照样能撞见中间态（少数据 / 重复计数）。
+//!   分两次调用就会在两个快照上落下两半，读侧照样能撞见中间态（少数据 / 重复计数）；
+//! * **整表清除也走这里**（`F.3f`）：purge 只改目录（数据对象一个不动）⇒
+//!   "重启后表是空的"**推不出来**，只能靠这条记录重放。重放按 `purge_id` 幂等 ——
+//!   否则重放一条旧 purge 会把 purge 之后新写入的数据一起清掉（静默丢数据）。
 //! * **世代校验**：`DeletePayload.schema_epoch` 与"该 seq 点上该表的世代"不符 ⇒
 //!   **跳过并告警**（`DROP` → 同名重建之后，旧世代的删除不得挂到新表上，`plan.md` M0 ⑥）。
 
@@ -39,6 +42,8 @@ pub struct ReplayDmlStats {
     pub entries: usize,
     /// 重建的**新行文件**条数（`UPDATE` 的产物两半中的另一半 —— `F.3e-2`）
     pub new_files: usize,
+    /// 重建的**整表清除**条数（`F.3f`）
+    pub purged: usize,
 }
 
 /// **重放 WAL 里的 DELETE**（四段启动顺序的第 ③ 段，`delta-dml-design §1.1`）。
@@ -68,6 +73,7 @@ pub async fn replay_wal_dml(
         let (table, want_epoch, what) = match &rec {
             Record::Delete(p) => (p.table.clone(), p.schema_epoch, "DELETE"),
             Record::Update(p) => (p.table.clone(), p.schema_epoch, "UPDATE"),
+            Record::Purge(p) => (p.table.clone(), p.schema_epoch, "PURGE"),
             _ => continue,
         };
         let (alive, epoch) = liveness_at(&timeline, seq, &table);
@@ -159,6 +165,23 @@ pub async fn replay_wal_dml(
                 stats.entries += n_dv;
                 stats.new_files += n_files;
             }
+            Record::Purge(p) => {
+                // **一条 op、一个快照**：文件级下线 + 悬挂 DV 同步 revoke（状态机里做）。
+                // 幂等靠 `purge_id`（状态机记着）—— 这条**必须**成立：重放一条旧 purge
+                // 若再生效，会把 purge 之后新写入的数据一起清掉（静默丢数据）。
+                let out = catalog.purge_table_files(&table, &p.purge_id).await?;
+                stats.applied += 1;
+                stats.purged += 1;
+                tracing::info!(
+                    seq,
+                    table = %table,
+                    purge_id = %p.purge_id,
+                    files = out.files,
+                    revoked = out.revoked,
+                    rows = out.rows,
+                    "重放整表清除"
+                );
+            }
             _ => continue,
         }
     }
@@ -168,6 +191,7 @@ pub async fn replay_wal_dml(
             skipped = stats.skipped,
             entries = stats.entries,
             new_files = stats.new_files,
+            purged = stats.purged,
             "replay_wal_dml done"
         );
     }

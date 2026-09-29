@@ -76,6 +76,12 @@ pub enum StateOp {
         upd_id: String,
         now_ms: u64,
     },
+    /// `F.3f`：**整表清除**（设计 §7 的"无 `WHERE` 全表删"）—— 文件级下线 + 同步 revoke。
+    PurgeFiles {
+        table: String,
+        purge_id: String,
+        now_ms: u64,
+    },
     /// `F.3d`：撤销锚定在某文件上的删除向量（合并已把那些行物理重写掉）。
     RevokeDeletions {
         file_path: String,
@@ -163,7 +169,8 @@ impl StateOp {
             | StateOp::SweepInFlight { now_ms, .. }
             | StateOp::ApplyDeletions { now_ms, .. }
             | StateOp::RevokeDeletions { now_ms, .. }
-            | StateOp::Update { now_ms, .. } => *now_ms,
+            | StateOp::Update { now_ms, .. }
+            | StateOp::PurgeFiles { now_ms, .. } => *now_ms,
         }
     }
 }
@@ -301,6 +308,11 @@ pub fn decode_op(op: &pb::Op) -> Result<StateOp, MetaError> {
                 .filter_map(|e| e.manifest.as_ref().map(manifest_from_proto_pub))
                 .collect(),
             upd_id: u.upd_id.clone(),
+            now_ms,
+        },
+        pb::op::Kind::PurgeFiles(p) => StateOp::PurgeFiles {
+            table: p.table.clone(),
+            purge_id: p.purge_id.clone(),
             now_ms,
         },
         pb::op::Kind::ApplyDeletions(a) => StateOp::ApplyDeletions {
@@ -885,6 +897,37 @@ pub fn apply(state: &mut CatalogState, op: &StateOp) -> Result<ApplyOutcome, Met
             } else {
                 Ok(ApplyOutcome::one())
             }
+        }
+        StateOp::PurgeFiles {
+            table, purge_id, ..
+        } => {
+            // 幂等由 `CatalogState::purge_table_files` 保证（同一个 id ⇒ 空操作）。
+            // 这一条**必须**成立：语义是"下线此刻可见文件"，重放一条旧 purge 若再生效
+            // 就会把 purge 之后新写入的数据一起清掉（静默丢数据）。
+            let out = state
+                .purge_table_files(table, purge_id)
+                .map_err(MetaError::from_lake)?;
+            if out.files == 0 && out.revoked == 0 {
+                // 无事可做（幂等命中 / 空表）：仍然 `accepted=true` 但要**报行数 0**，
+                // 好让调用方分得清"空操作"与"清掉了东西"
+                return Ok(ApplyOutcome::new(true, 0).with_result(
+                    pb::PurgeFilesResult {
+                        files: 0,
+                        revoked: 0,
+                        rows: 0,
+                    }
+                    .encode_to_vec(),
+                ));
+            }
+            // 精确计数**跟着提交一起过线**（客户端猜不出来）
+            Ok(ApplyOutcome::with_count(out.rows).with_result(
+                pb::PurgeFilesResult {
+                    files: out.files as u64,
+                    revoked: out.revoked as u64,
+                    rows: out.rows,
+                }
+                .encode_to_vec(),
+            ))
         }
         StateOp::RevokeDeletions { file_path, at, .. } => {
             // 撤销是"置 `revoked_at`"，不是删行（历史快照还要能回答"当时为什么少几行"）

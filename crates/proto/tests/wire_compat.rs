@@ -359,10 +359,15 @@ fn propose_request_roundtrips_for_every_op_variant() {
             }],
             upd_id: "upd-1".into(),
         }),
+        // `F.3f`：整表清除（设计 §7 的"无 `WHERE` 全表删"）
+        op::Kind::PurgeFiles(PurgeFilesOp {
+            table: "public.cpu".into(),
+            purge_id: "purge-1".into(),
+        }),
     ];
     assert_eq!(
         variants.len(),
-        12,
+        13,
         "分支数变了：请把新分支加进来，并更新 meta.proto 的迁移进度表"
     );
     for kind in variants {

@@ -343,7 +343,10 @@ async fn sql_dml_ddl_end_to_end() {
 
     // ⑧ 明确拒绝不支持语句
     expect_do_get_error(&mut client, "UPDATE audit_events SET cost = 1").await;
-    expect_do_get_error(&mut client, "DELETE FROM audit_events").await;
+    // 无 `WHERE` 的**全表删现在支持了**（`F.3f`：设计 §7 的文件级下线 —— 只标墓碑、
+    // 不生成删除向量；端到端见 `sql_purge_e2e.rs`）。这里换一个**仍然不支持**的形状，
+    // 好让"明确拒绝"这条检查还有分量（也免得把后面依赖数据的断言清空）。
+    expect_do_get_error(&mut client, "DELETE FROM audit_events USING s WHERE 1 = 1").await;
     expect_do_get_error(&mut client, "CREATE TABLE t AS SELECT 1").await;
 
     // ============ 崩溃重启（S1.6/S1.7 验收：SQL 写入数据 + DDL 均可恢复）============

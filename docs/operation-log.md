@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§156，2026-09-29**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§157，2026-09-29**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -10044,4 +10044,79 @@ DataFusion 在"零行"时返回的是**零个批次**（不是"一个空批次"�
   ④ 数据文件一个不少（"回收"不许变成丢数据）；
 - `compaction` 单测：两条件的四象限（活+引用=保护 / 活+无引用=孤儿 / 死+引用=孤儿 /
   数据与索引只看自己的 `batch_id`）；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **5/5**。\n
+---
+
+## 157. **`F.3f`：`purge_table_files` —— 无 `WHERE` 的全表删**（2026-09-29）
+
+设计 §7 对"`WHERE` 命中全部行"与"无 `WHERE`"分了**两层**：
+
+> | `WHERE` 命中全部行 | 统一走 DV，由 compaction 收敛（行级口径） |
+> | 无 WHERE（全表删） | **先 force-flush** → **`purge_table_files`** 文件级下线 + 同步 revoke 悬挂
+>   DV（R14）+ 持该表全部 shard 的 lease；**不生成 DV**——文件级与行级分属两层，非第二形态 |
+
+这一刀把后一层落地：`DELETE FROM t`（没有 `WHERE`）走**文件级下线**。
+
+### 157.0 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `CatalogState::purge_table_files` + `purged` 记忆 | **一个快照**：此刻可见的文件全部标墓碑（`deleted_at = next`）+ 悬挂 DV 同步 `revoke`（同一个 `next`）；按 `purge_id` 幂等；**空表也记 id**；返回 `PurgeOutcome { snapshot, files, revoked, rows }` |
+| `model::snapshot` | `SnapshotPurgeEntry`（**tag 16**）：幂等记忆必须能过快照 —— 丢了就"重放旧 purge 吃掉新数据" |
+| `CatalogOps::purge_table_files` + `PurgeOutcome` | 三处实现：`MemoryCatalog` 直落状态机；`RemoteCatalog` 走 raft 并用 `ApplyOutcome.result` 回填三个数（客户端**猜不出来**）；测试包装委托 |
+| proto | `PurgeFilesOp`（**tag 21**）+ `PurgeFilesResult`；迁移进度表加一行；`wire_compat` 分支数 12 → **13** |
+| `model::wal_record` | `PurgePayload`（**type 8**）+ `Record::Purge`；`batch.rs` 不进批次状态机 |
+| `ingest::dml` | `replay_wal_dml` 处理 purge（世代闸门 + 幂等由状态机保证）+ `stats.purged` |
+| `sql::dml` | 无 `WHERE` **在拿到租约之后分流**到 `execute_purge`：表存在性 → 强制 flush → WAL → `purge_table_files` → 刷缓存 |
+| 用例 | state 4 条 + 重放 2 条 + 端到端 1 条（6 个环节）+ **两条旧用例的期望更新**（见 §157.3） |
+
+### 157.1 四个决定
+
+1. **不生成 DV**（设计原话）。整表删若逐行标 DV：位图大小 = 行数（十亿行 = 十亿位的位图），
+   而且之后还要靠合并一行行重写；文件级下线是**目录里改几个字段**（文件整体标墓碑，读侧立刻看不到）。
+   `rows` 也不是"逐行算"出来的 —— 是 `Σ(row_count − 生效中 DV 的 card)`。
+2. **必须进 WAL**（设计 §7 的表里没点名这条，但结论是推出来的）：purge **只改目录**，
+   数据对象**一个都不动** ⇒ "重启后表是空的"从对象存储**推不出来** ⇒
+   少了这条记录，内存元数据形态重启后**整表复活**（用户以为删了）。
+   记录里**不带文件清单**：重放语义是"下线**此刻**可见文件"，而重放是**按 WAL 顺序**做的，
+   "此刻"就是这条记录在那个位置上的世界（带清单反而多一个错源）。
+3. **`purge_id` 幂等 + 空表也记 id**：语义是"下线**此刻**可见文件" ⇒ 重放一条旧 purge
+   （嵌入式形态下面录里已经有 purge 之后写入的文件）会**吃掉新数据**（静默丢数据）。
+   所以幂等记忆要进快照（tag 16），而且**空表也要记** —— 否则同一个 id 会**延迟生效**
+   （等新数据落进来才删，那是更糟的语义）。
+   配套：SQL 层**每次执行都新生成** `purge_id` ⇒ "用户再执行一次 `DELETE FROM t`"是一次
+   **新的**清除（`DELETE` 本该如此），而"重放同一条 WAL 记录"是**空操作**。
+4. **受影响行数 = 用户原本看得见的行数**（扣掉被 DV 藏起来的行）—— 与行级删同一口径：
+   先 `DELETE FROM t WHERE v = 3`（1 行）再 `DELETE FROM t` 应报 **4** 而不是 5。
+
+### 157.2 边界
+
+1. **与合并互斥**靠**同一把表级 DML 租约**（外层已持）：否则合并会读到 purge 之前的基文件、
+   把那些行写进新文件（**复活**）；
+2. 只 `bump_manifest_ver`（**不推 `schema_ver`**）：这是"文件的事实"变化，增量通道
+   （`files_since`）本来就带墓碑 ⇒ 读侧能收敛，不必付全量重建的代价。
+   ⚠️ 但**同步 revoke** 会触发一次全量缓存重建（`revoke_deletions_for_file` 的既有语义，
+   `§146`）—— purge 罕见，代价可接受，记在这里免得日后被当成"多余的抖动"；
+3. `DROP TABLE` 仍走 `drop_table`（连表定义一起删）；purge 只清数据、**表还在**（可以继续写入
+   —— 用例专门验了这条，因为"删表之后表变成黑洞"是很容易写出来的坏实现）；
+4. **未做**：`DELETE … ORDER BY / LIMIT` 形态（sqlparser 有这两个字段，本刀未接，
+   仍按"形状不支持"拒绝）；租约细粒度 `F.3d-3`。
+
+### 157.3 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **512 passed / 0 failed / 0 ignored**；
+- `sql_purge_e2e`（1 条，6 个环节）：① 先 `DELETE WHERE v = 3`（1 行）再 `DELETE FROM t`
+  ⇒ **4**（口径）② 快照只 +1 ③ **文件级下线** + 悬挂 DV 在**同一个快照号** revoke +
+  清除**之前**的快照两样都还在（快照隔离）④ **清除之后写入的数据活着**（表不是黑洞）
+  ⑤ 空表再删 = 0 行且**不推版本号** ⑥ `ReadOnly` / `NotFound` + **重启之后仍然空**
+  （且重启后写入照样生效）；
+- `replay_wal_dml`（+2）：一条 purge 从 WAL 重建；**重放同一条记录绝不吃掉它之后写入的数据**
+  （本刀的核心防线）；旧世代整条跳过；
+- `catalog` state 单测（+4）：一个快照 + **对照组**（另一张表的文件一行不动）+ revoke 同号 +
+  幂等/新数据活着 + 空表记 id；
+- **两条旧用例的期望更新**（刻意的）：`sql_delete_e2e` 的"拒绝清单"里有 `DELETE FROM t`、
+  `sql_dml_e2e` 的"⑧ 明确拒绝"里有 `DELETE FROM audit_events` —— 这两个拒绝是**被这一刀
+  故意去掉的**。前者移出清单（并写明它去哪了），后者换成一个**仍然不支持**的形状
+  （`DELETE … USING`），好让"明确拒绝"这条检查还有分量（也免得把后面依赖数据的断言清空）。
+  ⇒ **"改了行为就要去找断言它的地方"**，不然全量绿是假的；
 - `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **5/5**。

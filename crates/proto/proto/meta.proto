@@ -37,6 +37,7 @@
 // | `RecordInFlight` / `SweepInFlight` | ✅（T14.3：孤儿 GC 唯一能问的权威） |
 // | `ApplyDeletions` / `RevokeDeletions` | ✅（`F.3c-3`：删除向量 —— 必须走 raft，见下） |
 // | `Update` | ✅（`F.7` 决策 5：删除向量 + 新行**一条 op** —— 原子可见，见下） |
+// | `PurgeFiles` | ✅（`F.3f`：设计 §7 的"无 `WHERE` 全表删" —— 文件级下线 + 同步 revoke） |
 //
 // 纪律的另一半在 `wire_compat.rs`：那里有一条断言分支数的用例，加分支必须同时更新它。
 
@@ -130,6 +131,11 @@ message Op {
     // 就会落在**两个快照**上，读侧必然能撞见中间态 —— 而两种中间态都是静默错
     //（少数据 / **重复计数**）。状态机给两者分配**同一个快照号**，原子性就在那里。
     UpdateOp update = 20;
+    // **整表清除**（设计 §7 的"无 `WHERE` 全表删"，`F.3f`）：**文件级下线**，不生成 DV。
+    //
+    // 文件级与行级分属两层（设计 §7 原话"非第二形态"）：整表删不需要逐行标记，
+    // 把文件整体标墓碑 + 同步 revoke 悬挂 DV 即可（同一个快照号）。
+    PurgeFilesOp purge_files = 21;
   }
 }
 
@@ -575,6 +581,25 @@ message UpdateOp {
   repeated FileEntry new_files = 2;
   // 幂等键（设计 §4.2 的 `upd_id`）：客户端可提供，用于重试去重与重放对账
   string upd_id = 3;
+}
+
+// **整表清除**（`F.3f`，设计 §7）：此刻**可见**的全部文件下线 + 悬挂 DV 同步 revoke。
+message PurgeFilesOp {
+  string table = 1;
+  // 幂等键：**同一个 id 生效过就是空操作**。这条不是"优化"而是正确性的前提 ——
+  // 语义是"下线此刻全部可见文件"，若在嵌入式形态重放一条旧 purge（目录里已经有
+  // purge 之后新写入的文件），会把**新数据**一起清掉（静默丢数据）。
+  string purge_id = 2;
+}
+
+// `PurgeFilesOp` 的结果字节（`ApplyOutcome.result`）：文件数/撤销数/下线行数。
+//
+// 为什么不能只靠 `affected`：客户端要能把"这次 purge 到底做了什么"回填给调用方，
+// 而猜出来的数在并发下一定是错的（`§81`）。
+message PurgeFilesResult {
+  uint64 files = 1;
+  uint64 revoked = 2;
+  uint64 rows = 3;
 }
 
 // 撤销锚定在某文件上的删除向量（`F.3d`）。

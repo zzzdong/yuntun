@@ -27,6 +27,20 @@ pub mod state;
 
 pub use state::CatalogState;
 
+/// `purge_table_files` 的结果（`F.3f`，设计 §7）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PurgeOutcome {
+    /// 本次 purge 生效的快照号（幂等命中 ⇒ **首次**生效的那个号）
+    pub snapshot: u64,
+    /// 下线的文件数
+    pub files: usize,
+    /// 同步撤销的删除向量数
+    pub revoked: usize,
+    /// 下线的、**用户原本看得见**的行数（`DELETE` 的 `Affected` 用它：
+    /// 已被 DV 隐藏的行不算 —— 与行级删除的口径一致）
+    pub rows: u64,
+}
+
 /// Catalog 操作契约（详细设计 §3.3）。
 /// 阶段 1：同一 trait 由 `GrpcCatalogClient` 实现。
 #[async_trait::async_trait]
@@ -119,6 +133,18 @@ pub trait CatalogOps: Send + Sync {
     /// 返回**全量**（不过快照过滤）：GC 问的是"这个对象还有没有人引用"，
     /// 与"哪个快照看得见它"是两件事 —— 已撤销但还没被回收的 DV 仍要算被引用。
     async fn dv_object_paths(&self) -> Result<Vec<String>, LakeError>;
+
+    // ---- 整表清除（F.3f）----
+    /// **整表清除**（设计 §7 的"无 `WHERE` 全表删"）：此刻**可见**的全部文件下线
+    /// + 悬挂 DV 在**同一个快照**同步 revoke；**不生成 DV**（文件级与行级分属两层）。
+    ///
+    /// `purge_id` 是幂等键：**同一个 id 生效过就是空操作**。这是正确性前提而非优化 ——
+    /// 语义是"下线此刻可见文件"，重放一条旧 purge 会把新写入的数据一起清掉。
+    async fn purge_table_files(
+        &self,
+        table: &str,
+        purge_id: &str,
+    ) -> Result<PurgeOutcome, LakeError>;
 
     // ---- 删除 ----
     /// L1 分片移除：整 shard 的文件标记 deleted_at（§6.3）
@@ -418,6 +444,14 @@ impl CatalogOps for MemoryCatalog {
             .into_iter()
             .map(|d| d.store_path)
             .collect())
+    }
+
+    async fn purge_table_files(
+        &self,
+        table: &str,
+        purge_id: &str,
+    ) -> Result<PurgeOutcome, LakeError> {
+        self.state.write().unwrap().purge_table_files(table, purge_id)
     }
 
     async fn drop_shard(&self, table: &str, shard: &str) -> Result<u64, LakeError> {

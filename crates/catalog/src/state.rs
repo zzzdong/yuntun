@@ -36,6 +36,7 @@ use yuntun_model::ops::{
     CommitFilesRequest, CommitFilesResponse, CreateTableRequest, EvolveSchemaRequest,
     EvolveSchemaResponse, ManifestDelta, DEFAULT_SCHEMA,
 };
+use crate::PurgeOutcome;
 use yuntun_model::dv::DeletionEntry;
 use yuntun_model::schema::apply_change;
 
@@ -43,8 +44,8 @@ use crate::normalize_table;
 use yuntun_model::error::SnapshotError;
 use yuntun_model::snapshot::{
     CatalogStateSnapshot, SnapshotDeletionEntry, SnapshotFileEntry, SnapshotIdempotencyEntry,
-    SnapshotInFlightEntry, SnapshotSchemaEntry, SnapshotTableEntry, SnapshotTableVerEntry,
-    SNAPSHOT_FORMAT_VERSION,
+    SnapshotInFlightEntry, SnapshotPurgeEntry, SnapshotSchemaEntry, SnapshotTableEntry,
+    SnapshotTableVerEntry, SNAPSHOT_FORMAT_VERSION,
 };
 
 /// Catalog 的全部可变状态。
@@ -98,6 +99,12 @@ pub struct CatalogState {
     /// 或先到的把后来的判成重复）⇒ 另一个文件里的行会"已删却还查得到"。
     /// （`§148` 在写 DML 重放时撞出来的；`§146` 的单文件用例当时盖住了它。）
     deletions: BTreeMap<(String, String), DeletionEntry>,
+    /// **整表清除的幂等记忆**（`F.3f`）：`purge_id` → 它生效的快照号。
+    ///
+    /// 语义是"下线**此刻**全部可见文件" ⇒ 必须保证**同一个 id 只生效一次**：
+    /// 嵌入式形态重放一条旧 purge（目录里已有 purge 之后新写的文件）会清掉**新数据**
+    /// （静默丢数据）。所以这条记忆和 DV 一样必须进快照（`SnapshotPurgeEntry`）。
+    purged: BTreeMap<String, u64>,
     /// 结构变更计数（表 / schema / schema 演进）—— 缓存**全量重建**的触发器（S2-5）
     schema_ver: u64,
     /// 文件清单变更计数 —— 缓存**增量刷新**的触发器（S2-5）
@@ -586,6 +593,100 @@ impl CatalogState {
     }
 
     // ---------------------------------------------------------------- 删除向量（F.3）
+
+    // ---------------------------------------------------------------- 整表清除（F.3f）
+
+    /// **整表清除**（`purge_table_files`，设计 §7 的"无 `WHERE` 全表删"）。
+    ///
+    /// 三层语义，各对应一个失败形态：
+    ///
+    /// 1. **文件级下线**：此刻**可见**的全部文件标墓碑（`deleted_at = 下一个快照`）——
+    ///    **不生成任何 DV**（设计 §7 原话："文件级与行级分属两层，非第二形态"）；
+    /// 2. **同步 revoke 悬挂 DV**（设计 §7 / R14）：那些文件上的删除向量在**同一个快照**
+    ///    置 `revoked_at` —— 文件都没了，"生效中"的 DV 只会让老快照与旧清单打架；
+    /// 3. **按 `purge_id` 幂等**：同一个 id 生效过 ⇒ **空操作**（返回首次生效的快照号）。
+    ///    这条不是优化：语义是"下线**此刻**可见文件"，嵌入式形态重放一条旧 purge
+    ///    会把 purge 之后新写入的数据**一起清掉**（静默丢数据）。
+    ///
+    /// **空表也记 id**：否则同一个 id 会在"新数据落进来之后"才生效 = 延迟生效的删除
+    /// （比空操作糟得多）。
+    ///
+    /// 只 `bump_manifest_ver`（不推 `schema_ver`）：这是**文件的事实**变化，
+    /// 增量通道（`files_since`）本来就带墓碑，读侧能收敛 —— 不必付全量重建的代价。
+    pub fn purge_table_files(
+        &mut self,
+        table: &str,
+        purge_id: &str,
+    ) -> Result<PurgeOutcome, LakeError> {
+        if purge_id.is_empty() {
+            return Err(LakeError::Other("整表清除缺 purge_id".into()));
+        }
+        let key = normalize_table(table);
+        // 幂等：同一个 id 已经生效过 ⇒ 原样返回**首次**的结果（不推快照号）
+        if let Some(snap) = self.purged.get(purge_id) {
+            return Ok(PurgeOutcome {
+                snapshot: *snap,
+                ..Default::default()
+            });
+        }
+        // 生效中的 DV（按文件归拢）：用来算"用户原本看得见的行数"
+        let mut hidden: BTreeMap<String, u64> = BTreeMap::new();
+        for d in self.deletions.values() {
+            if normalize_table(&d.table) == key && d.revoked_at == 0 {
+                *hidden.entry(d.file_path.clone()).or_insert(0) += u64::from(d.card);
+            }
+        }
+        let victims: Vec<String> = self
+            .files
+            .values()
+            .filter(|f| normalize_table(&f.table) == key && f.deleted_at == 0)
+            .map(|f| f.batch_id.clone())
+            .collect();
+        if victims.is_empty() {
+            // 没有可见文件：**仍然把 id 记下**（否则会"延迟生效"）
+            let snap = self.snapshot_version;
+            self.purged.insert(purge_id.to_string(), snap);
+            return Ok(PurgeOutcome {
+                snapshot: snap,
+                ..Default::default()
+            });
+        }
+        let next = self.next_snapshot();
+        let mut rows = 0u64;
+        for batch_id in &victims {
+            if let Some(f) = self.files.get(batch_id) {
+                let hid = hidden.get(&f.file_path).copied().unwrap_or(0);
+                rows += f.row_count.saturating_sub(hid);
+            }
+        }
+        for f in self.files.values_mut() {
+            if victims.contains(&f.batch_id) {
+                f.deleted_at = next;
+            }
+        }
+        // 同步 revoke：**同一个 `next`** —— "文件消失"与"DV 失效"落在同一个快照上
+        let mut revoked = 0usize;
+        for d in self.deletions.values_mut() {
+            if normalize_table(&d.table) == key && d.revoked_at == 0 {
+                d.revoked_at = next;
+                revoked += 1;
+            }
+        }
+        self.purged.insert(purge_id.to_string(), next);
+        self.bump_manifest_ver(&key);
+        self.last_applied += 1;
+        Ok(PurgeOutcome {
+            snapshot: next,
+            files: victims.len(),
+            revoked,
+            rows,
+        })
+    }
+
+    /// 目录里记着多少条整表清除（诊断/测试用；也用来证明"空表也记 id"）。
+    pub fn purge_count(&self) -> usize {
+        self.purged.len()
+    }
 
     /// **登记一批删除向量**（`delta-dml-design §3.3` 的 `apply_deletions`）。
     ///
@@ -1092,6 +1193,14 @@ impl CatalogState {
                     entry: Some(v.clone()),
                 })
                 .collect(),
+            purges: self
+                .purged
+                .iter()
+                .map(|(k, v)| SnapshotPurgeEntry {
+                    purge_id: k.clone(),
+                    applied_at: *v,
+                })
+                .collect(),
         }
     }
 
@@ -1237,6 +1346,20 @@ impl CatalogState {
                 )));
             }
         }
+        let mut purged: BTreeMap<String, u64> = BTreeMap::new();
+        for e in &msg.purges {
+            if e.purge_id.is_empty() {
+                return Err(SnapshotError::InvalidState(
+                    "整表清除记录缺 purge_id".into(),
+                ));
+            }
+            if purged.insert(e.purge_id.clone(), e.applied_at).is_some() {
+                return Err(SnapshotError::InvalidState(format!(
+                    "整表清除 {} 重复",
+                    e.purge_id
+                )));
+            }
+        }
         Ok(Self {
             tables,
             namespaces,
@@ -1247,6 +1370,7 @@ impl CatalogState {
             leases,
             in_flight,
             deletions,
+            purged,
             snapshot_version: msg.revision,
             last_applied: msg.last_applied,
             schema_ver: msg.schema_ver,
@@ -1903,6 +2027,10 @@ mod snapshot_tests {
         cases.push(("deletions", s));
 
         let mut s = rich_state();
+        s.purge_table_files("public.cpu", "purge-x").unwrap();
+        cases.push(("purged", s));
+
+        let mut s = rich_state();
         s.record_idempotency(IdempotencyRecord {
             client_request_id: "kz".into(),
             batch_id: "b1".into(),
@@ -1935,6 +2063,121 @@ mod snapshot_tests {
                 "维度 `{name}` 变了但快照字节没变 → 快照漏了这个字段（换主/重启后会静默回退）"
             );
         }
+    }
+
+    /// 整表清除：**一个快照**把此刻可见的文件全下线，旧快照仍看得见（快照隔离）。
+    #[test]
+    fn purge_takes_the_whole_table_down_in_one_snapshot() {
+        let mut s = rich_state();
+        // 对照组：另一张表也有文件（用来看"清除有没有误伤别的表"）
+        s.create_table(create_table_req("disk"), 1_100).unwrap();
+        s.commit_files(commit_req("public.disk", "b-disk", &[]), 1_101)
+            .unwrap();
+        let other_visible = s.list_visible_files("public.disk", u64::MAX, None).len();
+        let before = s.snapshot_version;
+        let files = s.list_visible_files("public.cpu", u64::MAX, None);
+        let total: u64 = files.iter().map(|f| f.row_count).sum();
+        assert!(!files.is_empty(), "前提：rich_state 得有一个已提交文件");
+
+        let out = s.purge_table_files("public.cpu", "purge-1").unwrap();
+        assert_eq!(out.files, files.len(), "此刻可见的文件全部下线");
+        assert_eq!(out.rows, total, "受影响行数 = 下线文件里的可见行数");
+        assert_eq!(out.snapshot, before + 1, "**一次整表清除只推一个快照号**");
+        assert_eq!(s.snapshot_version, out.snapshot);
+        assert_eq!(s.purge_count(), 1);
+
+        assert!(
+            s.list_visible_files("public.cpu", out.snapshot, None).is_empty(),
+            "清除之后，新快照看不到任何文件"
+        );
+        assert_eq!(
+            s.list_visible_files("public.cpu", before, None).len(),
+            files.len(),
+            "**旧快照仍然看得见**（快照隔离：清除之前开始的查询不受影响）"
+        );
+        // 别的表**一行都不许动**（清除只按表）
+        assert_eq!(
+            other_visible, 1,
+            "对照组的表必须仍有它的文件（清除是按表的，不许误伤）"
+        );
+    }
+
+    /// 整表清除**同步 revoke 悬挂 DV**（设计 §7/R14）：文件都没了，"生效中"的 DV 只会
+    /// 让老快照与旧清单打架 —— 而且受影响行数要**扣掉**被 DV 藏起来的行（与行级删一致）。
+    #[test]
+    fn purge_revokes_hanging_deletions_at_the_same_snapshot() {
+        let mut s = rich_state();
+        let file = s.list_visible_files("public.cpu", u64::MAX, None)[0].file_path.clone();
+        let rows = s.list_visible_files("public.cpu", u64::MAX, None)[0].row_count;
+        let mut dv = dv_entry("dv-1", "public.cpu", &file);
+        dv.card = 3;
+        s.apply_deletions(vec![dv]).unwrap();
+
+        let out = s.purge_table_files("public.cpu", "purge-1").unwrap();
+        assert_eq!(out.revoked, 1, "悬挂的 DV 在同一次操作里被撤销");
+        assert_eq!(out.rows, rows - 3, "受影响行数扣掉被 DV 藏起来的行（口径与行级删一致）");
+        assert!(
+            s.list_deletions("public.cpu", out.snapshot).is_empty(),
+            "撤销之后不再生效"
+        );
+        assert_eq!(
+            s.list_deletions("public.cpu", out.snapshot - 1).len(),
+            1,
+            "撤销**之前**的快照仍应看到它（历史可回答）"
+        );
+        assert_eq!(
+            s.all_deletions()[0].revoked_at,
+            out.snapshot,
+            "revoke 与文件下线**同一个快照号**（同一个事实）"
+        );
+    }
+
+    /// 幂等键 `purge_id`：同一个 id 只生效一次 —— **后来写入的数据绝不能被它吃掉**。
+    #[test]
+    fn purge_is_idempotent_by_id_and_never_eats_later_data() {
+        let mut s = rich_state();
+        let first = s.purge_table_files("public.cpu", "p1").unwrap();
+        assert!(first.files > 0);
+
+        // 清除之后又写进来一个文件（新数据）
+        s.commit_files(commit_req("public.cpu", "b-after", &["k2"]), 2_000)
+            .unwrap();
+        let snap = s.snapshot_version;
+        assert_eq!(s.list_visible_files("public.cpu", u64::MAX, None).len(), 1);
+
+        // 重放同一个 id ⇒ 空操作（**这就是重放安全的那一半**）
+        let again = s.purge_table_files("public.cpu", "p1").unwrap();
+        assert_eq!(again.files, 0, "同一个 id 不该再下线任何文件");
+        assert_eq!(s.snapshot_version, snap, "空操作不推快照号");
+        assert_eq!(
+            s.list_visible_files("public.cpu", u64::MAX, None).len(),
+            1,
+            "**清除之后写入的数据必须活着**（重放旧 purge 吃掉新数据 = 静默丢数据）"
+        );
+
+        // 换一个 id ⇒ 是一次新的清除（用户再执行一次 `DELETE FROM t` 就该是这个语义）
+        let fresh = s.purge_table_files("public.cpu", "p2").unwrap();
+        assert_eq!(fresh.files, 1);
+        assert!(s.list_visible_files("public.cpu", u64::MAX, None).is_empty());
+        assert_eq!(s.purge_count(), 2);
+    }
+
+    /// **空表也要记下 id**：否则同一个 id 会在"新数据落进来之后"才生效 = 延迟生效的删除。
+    #[test]
+    fn purge_of_an_empty_table_records_the_id() {
+        let mut s = CatalogState::new();
+        s.create_table(create_table_req("cpu"), 1_000).unwrap();
+        let snap = s.snapshot_version;
+        let out = s.purge_table_files("public.cpu", "p1").unwrap();
+        assert_eq!(out.files, 0);
+        assert_eq!(out.snapshot, snap, "没有可下线的文件就不该推快照号");
+
+        // 之后数据来了：同一个 id **不许**生效（否则就是"延迟生效的删除"）
+        s.commit_files(commit_req("public.cpu", "b1", &["k1"]), 2_000)
+            .unwrap();
+        let again = s.purge_table_files("public.cpu", "p1").unwrap();
+        assert_eq!(again.files, 0, "同一个 id 只在**那一刻**生效");
+        assert_eq!(s.list_visible_files("public.cpu", u64::MAX, None).len(), 1);
     }
 
     /// DV 事件的**快照维度**：apply 之后立刻生效、旧快照看不到、幂等、撤销后失效。

@@ -128,6 +128,8 @@ pub fn apply_record(state: &mut BatchStateMap, rec: &Record, _seq: u64) {
         // `F.3e-2`：UPDATE 的两半（删除向量 + 新行文件）都**不走**批次状态机 ——
         // 新行不是"攒批中的数据"（它已经是一个已提交文件），由 `replay_wal_dml` 一条 op 重建
         Record::Update(_) => {}
+        // `F.3f`：整表清除不碰批次状态（它按表下线文件），由 `replay_wal_dml` 重建
+        Record::Purge(_) => {}
     }
 }
 

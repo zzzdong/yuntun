@@ -464,8 +464,10 @@ async fn delete_refusals_are_explicit() {
     }
 
     // 形状不支持的一律明确拒绝（本刀的范围写在 `dml` 模块文档里）
+    //
+    // 注意：**无 `WHERE` 的全表删已经支持**（`F.3f`：设计 §7 的文件级下线，见
+    // `sql_purge_e2e.rs`）—— 所以它不在下面这张"拒绝清单"里。
     for sql in [
-        "DELETE FROM t",                        // 无 WHERE：设计 §7 走文件级下线，未接线
         "DELETE t FROM t WHERE v = 1",          // 多表
         "DELETE FROM t USING s WHERE t.v = 1",  // USING
     ] {

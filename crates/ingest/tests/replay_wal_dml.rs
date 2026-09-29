@@ -15,7 +15,8 @@ use std::sync::Arc;
 use yuntun_catalog::{CatalogOps, MemoryCatalog};
 use yuntun_model::dv::DvBitmap;
 use yuntun_model::wal_record::{
-    DeletePayload, DdlPayload, FileDeletion, NewFilePayload, Record, UpdatePayload, ddl_op,
+    DeletePayload, DdlPayload, FileDeletion, NewFilePayload, PurgePayload, Record, UpdatePayload,
+    ddl_op,
 };
 use yuntun_wal::writer::WalWriter;
 
@@ -277,5 +278,136 @@ async fn replay_skips_an_update_from_another_epoch() {
             .unwrap()
             .is_empty(),
         "旧世代的 UPDATE **两半都不许落地**（只落一半就是少数据）"
+    );
+}
+
+/// 提交一个"假文件"（重放用例只关心目录状态，不写对象存储）。
+async fn commit_fake_file(catalog: &Arc<dyn CatalogOps>, batch: &str, rows: u64) {
+    catalog
+        .commit_files(yuntun_model::ops::CommitFilesRequest {
+            table: TABLE.into(),
+            batch_id: batch.into(),
+            client_request_id: None,
+            client_request_ids: vec![],
+            shard: "s0".into(),
+            time_window: "w".into(),
+            files: vec![yuntun_model::meta::FileManifest {
+                file_path: format!("yuntun/public/t/dt=w/shard=s0/{batch}.parquet"),
+                batch_id: batch.into(),
+                row_count: rows,
+                file_size: 128,
+                table: TABLE.into(),
+                shard: "s0".into(),
+                time_window: "w".into(),
+                schema_version: 1,
+                ..Default::default()
+            }],
+            schema_version: 1,
+            row_count: rows,
+        })
+        .await
+        .unwrap();
+}
+
+/// **整表清除的 WAL 重放**（`F.3f`）：文件级下线要能从 WAL 重建，
+/// 而且**重放一条旧 purge 绝不许吃掉它之后写入的数据**（这是本刀唯一的危险点）。
+#[tokio::test]
+async fn replay_applies_a_purge_and_never_eats_later_data() {
+    let guard = yuntun_testkit::TestDir::tmpfs("replay-purge-wal");
+    let wal_dir = guard.path().to_path_buf();
+    let wal = WalWriter::open(yuntun_wal::WalConfig::for_dir(&wal_dir), 0)
+        .await
+        .unwrap();
+    wal.append(Record::Ddl(DdlPayload {
+        op: ddl_op::CREATE_TABLE,
+        table: TABLE.into(),
+        arrow_schema: yuntun_model::meta::serialize_schema(&Arc::new(
+            arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+                "v",
+                arrow::datatypes::DataType::Int64,
+                true,
+            )]),
+        )),
+        default_format: "parquet".into(),
+    }))
+    .await
+    .unwrap();
+    wal.append(Record::Purge(PurgePayload {
+        table: TABLE.into(),
+        purge_id: "purge-1".into(),
+        schema_epoch: 1,
+    }))
+    .await
+    .unwrap();
+
+    let catalog: Arc<dyn CatalogOps> = Arc::new(MemoryCatalog::new());
+    yuntun_ingest::replay_wal_ddl(&catalog, &wal).await.unwrap();
+    // 清除**之前**就存在的数据（重放要把它下线）
+    commit_fake_file(&catalog, "b-before", 5).await;
+
+    let stats = yuntun_ingest::replay_wal_dml(&catalog, &wal).await.unwrap();
+    assert_eq!(stats.purged, 1, "这条 purge 属于当前世代 ⇒ 重放");
+    let snap = catalog.current_snapshot().await;
+    assert!(
+        catalog.list_visible_files(TABLE, snap, None).await.unwrap().is_empty(),
+        "重放之后表里没有可见文件（否则重启后整表复活）"
+    );
+
+    // 清除**之后**写入的数据：再重放一遍（同一条记录）绝不许碰它
+    commit_fake_file(&catalog, "b-after", 3).await;
+    let again = yuntun_ingest::replay_wal_dml(&catalog, &wal).await.unwrap();
+    assert_eq!(again.purged, 1, "记录照旧被处理（幂等在状态机里）");
+    let snap2 = catalog.current_snapshot().await;
+    let files = catalog.list_visible_files(TABLE, snap2, None).await.unwrap();
+    assert_eq!(
+        files.len(),
+        1,
+        "**重放一条旧 purge 把新数据吃掉了** —— 这是静默丢数据，本刀的核心防线"
+    );
+    assert_eq!(files[0].batch_id, "b-after");
+    assert!(snap2 >= snap, "快照号不许倒退");
+}
+
+/// 旧世代的 purge **整条跳过**：不许"下线一张同名重建的新表"。
+#[tokio::test]
+async fn replay_skips_a_purge_from_another_epoch() {
+    let guard = yuntun_testkit::TestDir::tmpfs("replay-purge-stale");
+    let wal_dir = guard.path().to_path_buf();
+    let wal = WalWriter::open(yuntun_wal::WalConfig::for_dir(&wal_dir), 0)
+        .await
+        .unwrap();
+    wal.append(Record::Ddl(DdlPayload {
+        op: ddl_op::CREATE_TABLE,
+        table: TABLE.into(),
+        arrow_schema: yuntun_model::meta::serialize_schema(&Arc::new(
+            arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+                "v",
+                arrow::datatypes::DataType::Int64,
+                true,
+            )]),
+        )),
+        default_format: "parquet".into(),
+    }))
+    .await
+    .unwrap();
+    wal.append(Record::Purge(PurgePayload {
+        table: TABLE.into(),
+        purge_id: "purge-stale".into(),
+        schema_epoch: 99, // 当前世代是 1
+    }))
+    .await
+    .unwrap();
+
+    let catalog: Arc<dyn CatalogOps> = Arc::new(MemoryCatalog::new());
+    yuntun_ingest::replay_wal_ddl(&catalog, &wal).await.unwrap();
+    commit_fake_file(&catalog, "b1", 2).await;
+    let stats = yuntun_ingest::replay_wal_dml(&catalog, &wal).await.unwrap();
+    assert_eq!(stats.purged, 0);
+    assert_eq!(stats.skipped, 1);
+    let snap = catalog.current_snapshot().await;
+    assert_eq!(
+        catalog.list_visible_files(TABLE, snap, None).await.unwrap().len(),
+        1,
+        "旧世代的整表清除不许动新表的数据"
     );
 }

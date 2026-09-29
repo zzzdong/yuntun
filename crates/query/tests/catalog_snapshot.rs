@@ -268,6 +268,13 @@ impl CatalogOps for BrokenCatalog {
     async fn dv_object_paths(&self) -> Result<Vec<String>, yuntun_model::LakeError> {
         self.inner.dv_object_paths().await
     }
+    async fn purge_table_files(
+        &self,
+        table: &str,
+        purge_id: &str,
+    ) -> Result<yuntun_catalog::PurgeOutcome, yuntun_model::LakeError> {
+        self.inner.purge_table_files(table, purge_id).await
+    }
     async fn drop_schema(&self, n: &str) -> Result<(), yuntun_model::LakeError> {
         self.inner.drop_schema(n).await
     }

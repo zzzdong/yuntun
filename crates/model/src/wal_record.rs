@@ -31,6 +31,9 @@ pub enum RecordType {
     /// `F.3e-2`：**UPDATE**（删 + 插）—— 一条记录承载两半，重放重建**一个原子的事实**
     /// （`plan.md` F.7 决策 5；`operation-log §154`）
     Update = 7,
+    /// `F.3f`：**整表清除**（设计 §7 的"无 `WHERE` 全表删"）—— 重放时按 `purge_id` 幂等
+    /// （`operation-log §157`）
+    Purge = 8,
 }
 
 impl RecordType {
@@ -44,6 +47,7 @@ impl RecordType {
             5 => Self::Ddl,
             6 => Self::Delete,
             7 => Self::Update,
+            8 => Self::Purge,
             _ => return None,
         })
     }
@@ -247,6 +251,28 @@ pub struct UpdatePayload {
     pub schema_epoch: u64,
 }
 
+/// type=8 Purge（`F.3f`）：**整表清除**（设计 §7）。
+///
+/// **必须进 WAL**：purge 只改目录（文件标墓碑 + DV revoke），数据对象一个都不动 ——
+/// 于是"重启后表是空的"这件事**不能**从对象存储推出来（对象都在）。少了这条记录，
+/// 内存元数据形态重启后整张表会**原样复活**（用户以为删了）。
+///
+/// 记录里**不带文件清单**：重放的语义是"下线**此刻**可见的全部文件"，
+/// 而重放是**按 WAL 顺序**做的 ⇒ 此刻 = 这条记录在那个位置上的世界 ✓
+/// （清单带进来的话还要处理"清单与目录不一致"，反而多一个错源）。
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct PurgePayload {
+    #[prost(string, tag = "1")]
+    pub table: String,
+    /// 幂等键：**同一个 id 只生效一次**（状态机记着它 —— `SnapshotPurgeEntry`）。
+    /// 这条不是优化：重放一条旧 purge 若再生效，会把 purge 之后新写入的数据一起清掉。
+    #[prost(string, tag = "2")]
+    pub purge_id: String,
+    /// 表世代（与 `ChunkStore::liveness` 同源）：不符就跳过（`DROP` → 同名重建）
+    #[prost(uint64, tag = "3")]
+    pub schema_epoch: u64,
+}
+
 /// WAL Record 枚举。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Record {
@@ -258,6 +284,7 @@ pub enum Record {
     Ddl(DdlPayload),
     Delete(DeletePayload),
     Update(UpdatePayload),
+    Purge(PurgePayload),
 }
 
 impl Record {
@@ -271,6 +298,7 @@ impl Record {
             Record::Ddl(_) => RecordType::Ddl,
             Record::Delete(_) => RecordType::Delete,
             Record::Update(_) => RecordType::Update,
+            Record::Purge(_) => RecordType::Purge,
         }
     }
 
@@ -285,6 +313,8 @@ impl Record {
             Record::Delete(_) => None,
             // `UPDATE` 的新行有自己的 batch_id（不是"某个批次在跑"），所以不属于批次状态机
             Record::Update(_) => None,
+            // 整表清除与批次无关（它按表下线文件）
+            Record::Purge(_) => None,
         }
     }
 
@@ -300,6 +330,7 @@ impl Record {
             Record::Ddl(p) => p.encode_to_vec(),
             Record::Delete(p) => p.encode_to_vec(),
             Record::Update(p) => p.encode_to_vec(),
+            Record::Purge(p) => p.encode_to_vec(),
         }
     }
 
@@ -334,6 +365,9 @@ impl Record {
             ),
             RecordType::Update => Record::Update(
                 UpdatePayload::decode(payload).map_err(|e| WalError::Other(e.to_string()))?,
+            ),
+            RecordType::Purge => Record::Purge(
+                PurgePayload::decode(payload).map_err(|e| WalError::Other(e.to_string()))?,
             ),
         })
     }
@@ -516,6 +550,12 @@ mod tests {
                 table: "t".into(),
                 arrow_schema: vec![9, 9],
                 default_format: "parquet".into(),
+            }),
+            // `F.3f`：整表清除（一条记录，不带文件清单）
+            Record::Purge(PurgePayload {
+                table: "public.t".into(),
+                purge_id: "purge-1".into(),
+                schema_epoch: 6,
             }),
             // `F.3e-2`：UPDATE（删 + 插一条记录）
             Record::Update(UpdatePayload {
