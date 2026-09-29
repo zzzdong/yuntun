@@ -28,6 +28,9 @@ pub enum RecordType {
     Ddl = 5,
     /// `F.3`：**DELETE**（行位删除向量）—— 启动重放重建 `DeletionEntry`（`delta-dml-design §1.1` ③）
     Delete = 6,
+    /// `F.3e-2`：**UPDATE**（删 + 插）—— 一条记录承载两半，重放重建**一个原子的事实**
+    /// （`plan.md` F.7 决策 5；`operation-log §154`）
+    Update = 7,
 }
 
 impl RecordType {
@@ -40,6 +43,7 @@ impl RecordType {
             4 => Self::BatchAbort,
             5 => Self::Ddl,
             6 => Self::Delete,
+            7 => Self::Update,
             _ => return None,
         })
     }
@@ -196,6 +200,53 @@ pub struct FileDeletion {
     pub bitmap: Vec<u8>,
 }
 
+/// `UPDATE` 的一个**新行文件**（`UpdatePayload` 的产物部分）。
+///
+/// 为什么文件清单要进 WAL：`UPDATE` 的新行**不走 `Data` 攒批那条路**
+/// （`plan.md` F.7 决策 5 的代价 —— 只有"先有文件"才能与删除向量在**同一个快照**上生效），
+/// 所以这条记录是文件存在的唯一凭据。丢了它，重放之后就只剩"删除" ⇒ **数据少了一半**。
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct NewFilePayload {
+    #[prost(string, tag = "1")]
+    pub file_path: String,
+    #[prost(string, tag = "2")]
+    pub batch_id: String,
+    #[prost(uint64, tag = "3")]
+    pub row_count: u64,
+    #[prost(uint64, tag = "4")]
+    pub file_size: u64,
+    /// 继承**源文件**的 shard / time_window：新行不是"另一个分片的数据"，
+    /// 只是老行的新值（`drop_shard` 与按分片读的语义因此不变）
+    #[prost(string, tag = "5")]
+    pub shard: String,
+    #[prost(string, tag = "6")]
+    pub time_window: String,
+    #[prost(uint64, tag = "7")]
+    pub schema_version: u64,
+}
+
+/// type=7 Update（`F.3e-2`）：**删 + 插在同一条记录里**。
+///
+/// 记录的"一条"对应目录侧的"**一条 op**"（`UpdateOp`）—— 两半共用一个快照号，
+/// 于是读侧看不到"删了没插"（少数据）或"插了没删"（重复计数）的中间态。
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct UpdatePayload {
+    #[prost(string, tag = "1")]
+    pub table: String,
+    /// 幂等 id（= 这次 UPDATE 的请求 id）：既是 `dv_id`，也是重放的对账键
+    #[prost(string, tag = "2")]
+    pub upd_id: String,
+    /// 被命中的行（按文件标记删除）
+    #[prost(message, repeated, tag = "3")]
+    pub deletions: Vec<FileDeletion>,
+    /// UPDATE 产生的新行（**每个源文件一个产物**，继承它的 shard/time_window）
+    #[prost(message, repeated, tag = "4")]
+    pub new_files: Vec<NewFilePayload>,
+    /// 表世代（与 `ChunkStore::liveness` 同源）：重放时校验失败就跳过
+    #[prost(uint64, tag = "5")]
+    pub schema_epoch: u64,
+}
+
 /// WAL Record 枚举。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Record {
@@ -206,6 +257,7 @@ pub enum Record {
     BatchAbort(BatchAbortPayload),
     Ddl(DdlPayload),
     Delete(DeletePayload),
+    Update(UpdatePayload),
 }
 
 impl Record {
@@ -218,6 +270,7 @@ impl Record {
             Record::BatchAbort(_) => RecordType::BatchAbort,
             Record::Ddl(_) => RecordType::Ddl,
             Record::Delete(_) => RecordType::Delete,
+            Record::Update(_) => RecordType::Update,
         }
     }
 
@@ -230,6 +283,8 @@ impl Record {
             Record::Data(_) => None,
             Record::Ddl(_) => None,
             Record::Delete(_) => None,
+            // `UPDATE` 的新行有自己的 batch_id（不是"某个批次在跑"），所以不属于批次状态机
+            Record::Update(_) => None,
         }
     }
 
@@ -244,6 +299,7 @@ impl Record {
             Record::BatchAbort(p) => p.encode_to_vec(),
             Record::Ddl(p) => p.encode_to_vec(),
             Record::Delete(p) => p.encode_to_vec(),
+            Record::Update(p) => p.encode_to_vec(),
         }
     }
 
@@ -275,6 +331,9 @@ impl Record {
             ),
             RecordType::Delete => Record::Delete(
                 DeletePayload::decode(payload).map_err(|e| WalError::Other(e.to_string()))?,
+            ),
+            RecordType::Update => Record::Update(
+                UpdatePayload::decode(payload).map_err(|e| WalError::Other(e.to_string()))?,
             ),
         })
     }
@@ -342,6 +401,42 @@ mod tests {
         let buf = h.encode();
         assert_eq!(buf.len(), FILE_HEADER_SIZE);
         assert_eq!(FileHeader::decode(&buf).unwrap(), h);
+    }
+
+    /// `F.3e-2`：`UPDATE` 记录的**两半都得原样过线**。
+    ///
+    /// 半边丢了都是灾难：丢 `deletions` = 旧值还在（重复计数，读侧会看到两行）；
+    /// 丢 `new_files` = 新行没了（**少数据**）。所以逐字段断言，而不是只比 `record_type`。
+    #[test]
+    fn update_payload_carries_both_halves() {
+        let payload = UpdatePayload {
+            table: "public.t".into(),
+            upd_id: "upd-9".into(),
+            deletions: vec![FileDeletion {
+                file_path: "p/a.parquet".into(),
+                batch_id: "b-a".into(),
+                bitmap: crate::dv::DvBitmap::from_positions([0, 7, 9]).to_bytes(),
+            }],
+            new_files: vec![NewFilePayload {
+                file_path: "p/n.parquet".into(),
+                batch_id: "b-n".into(),
+                row_count: 3,
+                file_size: 4096,
+                shard: "s1".into(),
+                time_window: "w2".into(),
+                schema_version: 7,
+            }],
+            schema_epoch: 11,
+        };
+        let bytes = Record::Update(payload.clone()).encode_payload();
+        let back = Record::decode(RecordType::Update as u8, &bytes).unwrap();
+        let Record::Update(back) = back else {
+            panic!("类型串了：{back:?}");
+        };
+        assert_eq!(back, payload);
+        let dv = crate::dv::DvBitmap::from_bytes(&back.deletions[0].bitmap).unwrap();
+        assert_eq!(dv.card(), 3, "删除那半（位图）必须原样过线");
+        assert_eq!(back.new_files[0].row_count, 3, "新行那半（清单）也必须原样过线");
     }
 
     /// `F.3`：DELETE 记录里的位图**过线之后仍解得出**（帧带 CRC，坏一字节就该拒绝）。
@@ -421,6 +516,26 @@ mod tests {
                 table: "t".into(),
                 arrow_schema: vec![9, 9],
                 default_format: "parquet".into(),
+            }),
+            // `F.3e-2`：UPDATE（删 + 插一条记录）
+            Record::Update(UpdatePayload {
+                table: "public.t".into(),
+                upd_id: "upd-1".into(),
+                deletions: vec![FileDeletion {
+                    file_path: "p/a.parquet".into(),
+                    batch_id: "b1".into(),
+                    bitmap: crate::dv::DvBitmap::from_positions([1, 4]).to_bytes(),
+                }],
+                new_files: vec![NewFilePayload {
+                    file_path: "p/upd-1.parquet".into(),
+                    batch_id: "b-upd".into(),
+                    row_count: 2,
+                    file_size: 999,
+                    shard: "s0".into(),
+                    time_window: "w".into(),
+                    schema_version: 3,
+                }],
+                schema_epoch: 5,
             }),
             // `F.3`：DELETE（位图内联；跨逻辑 shard 合并成一条）
             Record::Delete(DeletePayload {

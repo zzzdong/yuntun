@@ -522,6 +522,8 @@ impl SqlEngine {
         match stmt {
             // `F.3`：`DELETE FROM t WHERE …`（写侧前端，见 `dml` 模块文档的六步顺序）
             Statement::Delete(delete) => self.execute_delete(&delete, session).await,
+            // `F.3e-2`：`UPDATE t SET … WHERE …` —— 删 + 插**一个 op**（原子可见，见 `dml` 模块文档）
+            Statement::Update(update) => self.execute_update(&update, session).await,
             Statement::Query(q) => {
                 // 只读查询 → DataFusion（非限定表名按会话 schema 解析，G2 + 多 schema）
                 let text = q.to_string();

@@ -49,6 +49,22 @@ pub struct LocatedRows {
     pub rows: u64,
 }
 
+/// 定位 + **投影**的结果（`F.3e-2`）：命中行号 **+** 这些行的新值。
+#[derive(Debug, Clone, Default)]
+pub struct ProjectedRows {
+    /// 命中行的**文件内行号**（升序、去重）—— 与 [`LocatedRows`] 同一个口径
+    pub positions: Vec<u32>,
+    /// 这个文件实际有多少行（与清单里的 `row_count` 对不上 ⇒ 调用方必须报错）
+    pub rows: u64,
+    /// 命中行的**新值**（列 = 调用方给的投影列表；`UPDATE` 用它写产物文件）。
+    ///
+    /// **契约**：`batch` 的第 `i` 行 ↔ `positions[i]`。这条对齐不是"碰巧"：
+    /// 查询结果先按行号**排序**再去掉行号列（见 [`locate_and_project`]）——
+    /// 少了这一步，DataFusion 的输出顺序就没有保证，而"把 A 行的新值写到 B 行的位置"
+    /// 是本仓最不能接受的那类静默错。
+    pub batch: Option<RecordBatch>,
+}
+
 /// 在 `path` 指的文件上求 `predicate_sql`，返回命中行号。
 ///
 /// `schema` 是**表**的 schema（列名解析按它；文件里的列顺序/多寡不影响谓词语义）。
@@ -59,25 +75,137 @@ pub async fn locate_matching_rows(
     schema: &SchemaRef,
     predicate_sql: &str,
 ) -> Result<LocatedRows, DataFusionError> {
+    let (with_idx, rows) = read_with_row_idx(store, path, fmt).await?;
+    if with_idx.is_empty() {
+        return Ok(LocatedRows::default());
+    }
+    let out = run_locate_sql(
+        path,
+        schema,
+        with_idx,
+        &format!("\"{ROW_IDX_COLUMN}\""),
+        predicate_sql,
+    )
+    .await?;
+    Ok(LocatedRows {
+        positions: positions_of(&out, path)?,
+        rows,
+    })
+}
+
+/// **定位 + 投影**（`F.3e-2`）：一次扫描同时拿到"命中哪些行"与"这些行的新值"。
+///
+/// `projection_sql` 是 SELECT 列表（例如 `"v" + 100 AS "v", "c" AS "c"`），
+/// 由调用方按**表 schema** 生成（`UPDATE` 里 = SET 过的列用表达式、其余列原样）。
+///
+/// 为什么一次做完而不是两次（先定位再取值）：数据文件不可变，两次读**不会**错位，
+/// 但一次读少扫一遍文件（大文件上就是少一次全列 IO），而且"删哪些行"与"这些行的新值"
+/// 在代码上出自**同一个读取点** —— 这种"两半同源"的形状本身就是个护栏。
+pub async fn locate_and_project(
+    store: &Arc<dyn ObjectStore>,
+    path: &str,
+    fmt: yuntun_format::DataFormat,
+    schema: &SchemaRef,
+    predicate_sql: &str,
+    projection_sql: &str,
+) -> Result<ProjectedRows, DataFusionError> {
+    let (with_idx, rows) = read_with_row_idx(store, path, fmt).await?;
+    if with_idx.is_empty() {
+        return Ok(ProjectedRows {
+            rows,
+            ..Default::default()
+        });
+    }
+    let out = run_locate_sql(
+        path,
+        schema,
+        with_idx,
+        &format!("\"{ROW_IDX_COLUMN}\", {projection_sql}"),
+        predicate_sql,
+    )
+    .await?;
+    // ⚠️ 一行都没命中时 DataFusion 会返回**零个批次**（不是"一个空批次"）——
+    // 这里必须先挡住，否则下面的 `out[0]` 直接索引越界（`§154` 的用例撞到过：
+    // `UPDATE … WHERE v = 999`）。同时它也是"没命中就什么都不做"的正常路径。
+    if out.is_empty() {
+        return Ok(ProjectedRows {
+            rows,
+            ..Default::default()
+        });
+    }
+    // 把多批次并成一个，再**按行号排序**：`positions[i]` 与结果第 `i` 行从此一一对应
+    // （DataFusion 不保证输出顺序，不显式排序就等于把"哪一行的新值"交给实现细节）
+    let schema_with_idx = out[0].schema();
+    let all = arrow::compute::concat_batches(&schema_with_idx, &out).map_err(|e| {
+        DataFusionError::Execution(format!("投影结果合并失败（文件 {path}）：{e}"))
+    })?;
+    let idx = all
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "投影结果的行号列不是 UInt32（文件 {path}）：{:?}",
+                all.column(0).data_type()
+            ))
+        })?
+        .clone();
+    let order = arrow::compute::sort_to_indices(&idx, None, None).map_err(|e| {
+        DataFusionError::Execution(format!("投影结果排序失败（文件 {path}）：{e}"))
+    })?;
+    let sorted = arrow::compute::take_record_batch(&all, &order).map_err(|e| {
+        DataFusionError::Execution(format!("投影结果重排失败（文件 {path}）：{e}"))
+    })?;
+    let positions: Vec<u32> = sorted
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .unwrap()
+        .iter()
+        .flatten()
+        .collect();
+    // 去掉行号列（列序与 schema 都保留调用方给的那套）
+    let keep: Vec<usize> = (1..sorted.num_columns()).collect();
+    let batch = sorted.project(&keep).map_err(|e| {
+        DataFusionError::Execution(format!("投影结果取列失败（文件 {path}）：{e}"))
+    })?;
+    Ok(ProjectedRows {
+        positions,
+        rows,
+        batch: Some(batch),
+    })
+}
+
+/// 读文件 + 补行号列（文件内、0 起、跨批次连续 —— 这就是 DV 的口径）。
+async fn read_with_row_idx(
+    store: &Arc<dyn ObjectStore>,
+    path: &str,
+    fmt: yuntun_format::DataFormat,
+) -> Result<(Vec<RecordBatch>, u64), DataFusionError> {
     let batches = yuntun_format::read_batch(store, path, fmt)
         .await
         .map_err(|e| {
             DataFusionError::Execution(format!(
                 "定位扫描读不了文件 {path}：{e} —— 拒绝「跳过这个文件」\
-                 （那样它里面该删的行会被漏掉）"
+                （那样它里面该删的行会被漏掉）"
             ))
         })?;
-
-    // ① 补行号列（文件内、0 起、跨批次连续 —— 这就是 DV 的口径）
     let mut rows: u64 = 0;
     let mut with_idx: Vec<RecordBatch> = Vec::with_capacity(batches.len());
     for b in &batches {
         let n = b.num_rows();
-        let mut fields: Vec<Field> = b.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
+        let mut fields: Vec<Field> = b
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
         let mut cols: Vec<Arc<dyn Array>> = b.columns().to_vec();
         fields.push(Field::new(ROW_IDX_COLUMN, DataType::UInt32, false));
         cols.push(Arc::new(UInt32Array::from(
-            (rows..rows + n as u64).map(|i| i as u32).collect::<Vec<u32>>(),
+            (rows..rows + n as u64)
+                .map(|i| i as u32)
+                .collect::<Vec<u32>>(),
         )));
         with_idx.push(
             RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).map_err(|e| {
@@ -86,18 +214,24 @@ pub async fn locate_matching_rows(
         );
         rows += n as u64;
     }
-    if with_idx.is_empty() {
-        return Ok(LocatedRows::default());
-    }
+    Ok((with_idx, rows))
+}
 
-    // ② 交给 DataFusion 求谓词（**用查询那条语义**，不另写求值器）
+/// 内存表 + 一次 SQL（**用查询那条语义**求谓词与投影，不另写求值器）。
+async fn run_locate_sql(
+    path: &str,
+    schema: &SchemaRef,
+    with_idx: Vec<RecordBatch>,
+    select_list: &str,
+    predicate_sql: &str,
+) -> Result<Vec<RecordBatch>, DataFusionError> {
     let table_schema = with_idx[0].schema();
     let ctx = SessionContext::new();
     let mem = datafusion::datasource::memory::MemTable::try_new(table_schema, vec![with_idx])
         .map_err(|e| DataFusionError::Execution(format!("定位扫描建内存表失败：{e}")))?;
     ctx.register_table("__yuntun_locate", Arc::new(mem))
         .map_err(|e| DataFusionError::Execution(format!("定位扫描注册内存表失败：{e}")))?;
-    let sql = format!("SELECT \"{ROW_IDX_COLUMN}\" FROM __yuntun_locate WHERE {predicate_sql}");
+    let sql = format!("SELECT {select_list} FROM __yuntun_locate WHERE {predicate_sql}");
     // 规划与执行**都要**带上"这是谓词的问题"的上下文：列名写错在规划期就报，
     // 类型/运行期错误在执行期报 —— 两处都不许让调用方看到一个裸的 DF 错误
     let nth = |e: DataFusionError| {
@@ -107,16 +241,19 @@ pub async fn locate_matching_rows(
         ))
     };
     let df = ctx.sql(&sql).await.map_err(nth)?;
-    let out = df.collect().await.map_err(|e| {
+    df.collect().await.map_err(|e| {
         // 谓词本身出错（列名写错 / 类型不匹配）**必须报错**：猜一个"空结果"就是"什么都没删"
         DataFusionError::Execution(format!(
             "定位扫描求谓词失败（文件 {path}）：{e}；表 schema = {:?}",
             schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
         ))
-    })?;
+    })
+}
 
+/// 从结果集第 0 列取行号（升序去重）。
+fn positions_of(out: &[RecordBatch], path: &str) -> Result<Vec<u32>, DataFusionError> {
     let mut positions: Vec<u32> = Vec::new();
-    for b in &out {
+    for b in out {
         let col = b
             .column(0)
             .as_any()
@@ -131,7 +268,7 @@ pub async fn locate_matching_rows(
     }
     positions.sort_unstable();
     positions.dedup();
-    Ok(LocatedRows { positions, rows })
+    Ok(positions)
 }
 
 #[cfg(test)]
@@ -192,6 +329,85 @@ mod tests {
         .unwrap();
         assert!(got.positions.is_empty());
         assert_eq!(got.rows, 3);
+    }
+
+    /// **定位 + 投影**：命中行号与这些行的新值必须来自同一次扫描，且逐行对得上。
+    #[tokio::test]
+    async fn locate_and_project_returns_positions_and_new_values() {
+        let (store, path) = write_file(vec![10, 20, 30, 40, 50]).await;
+        let got = locate_and_project(
+            &store,
+            &path,
+            yuntun_format::DataFormat::Parquet,
+            &schema(),
+            "v >= 30",
+            "\"v\" + 1000 AS \"v\"",
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.rows, 5);
+        assert_eq!(
+            got.positions,
+            vec![2, 3, 4],
+            "命中的是第 2/3/4 行（与 locate 同一口径）"
+        );
+        let b = got.batch.expect("有命中就必然有结果批次");
+        assert_eq!(b.schema().fields().len(), 1, "投影只留新值列");
+        assert_eq!(
+            b.num_rows(),
+            got.positions.len(),
+            "**契约**：结果行数必须等于命中行数（否则对齐无从谈起）"
+        );
+        let c = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        let vals: Vec<i64> = (0..c.len()).map(|i| c.value(i)).collect();
+        assert_eq!(vals, vec![1030, 1040, 1050], "新值 = 原值 + 1000（SET 的效果）");
+    }
+
+    /// **一行都没命中** ⇒ 空结果（而不是 panic）。
+    ///
+    /// 这条盯的是一个真实撞到过的形态：DataFusion 在"零行"时返回**零个批次**，
+    /// 而"取第一个批次拿 schema"的写法会直接索引越界（`§154` 修）。
+    #[tokio::test]
+    async fn no_match_yields_no_batch_instead_of_panicking() {
+        let (store, path) = write_file(vec![1, 2, 3]).await;
+        let got = locate_and_project(
+            &store,
+            &path,
+            yuntun_format::DataFormat::Parquet,
+            &schema(),
+            "v > 100",
+            "\"v\" + 1 AS \"v\"",
+        )
+        .await
+        .unwrap();
+        assert!(got.positions.is_empty());
+        assert!(got.batch.is_none(), "没命中就没有结果批次（调用方据此什么都不做）");
+        assert_eq!(got.rows, 3, "文件行数照样要报出来");
+    }
+
+    /// 投影写错（列不存在）⇒ **报错**（与谓词同一条纪律：不许猜一个"空结果"）。
+    #[tokio::test]
+    async fn a_broken_projection_is_an_error() {
+        let (store, path) = write_file(vec![1, 2, 3]).await;
+        let e = locate_and_project(
+            &store,
+            &path,
+            yuntun_format::DataFormat::Parquet,
+            &schema(),
+            "v > 0",
+            "no_such_column AS \"v\"",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("谓词"),
+            "投影出错也要点名（同一个 SQL 里出的问题）：{e}"
+        );
     }
 
     /// 谓词写错（列不存在）⇒ **报错**，不许悄悄返回"空结果"（那等于"什么都没删"还报成功）。

@@ -125,6 +125,9 @@ pub fn apply_record(state: &mut BatchStateMap, rec: &Record, _seq: u64) {
         // `F.3`：DELETE 同理 —— 批次状态机管的是"数据怎么落盘"，
         // 删除由启动重放的 `replay_wal_dml` 直接重建 `DeletionEntry`（另一条线）
         Record::Delete(_) => {}
+        // `F.3e-2`：UPDATE 的两半（删除向量 + 新行文件）都**不走**批次状态机 ——
+        // 新行不是"攒批中的数据"（它已经是一个已提交文件），由 `replay_wal_dml` 一条 op 重建
+        Record::Update(_) => {}
     }
 }
 

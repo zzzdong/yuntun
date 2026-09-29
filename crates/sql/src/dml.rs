@@ -33,15 +33,22 @@
 //!   `ORDER BY` / `LIMIT` 一律**明确拒绝**（没实现就说没实现）；
 //! * **无 `WHERE` 的全表删不做**：设计 §7 定的口径是走**文件级下线**（`purge_table_files`）
 //!   且"不生成 DV"，那条通路还没接线 ⇒ 这里明确拒绝并指向 `F.3d`；
-//! * **`UPDATE` 不做**（设计 M3：DELETE + INSERT 一个 op 承载）。
+//! * **`UPDATE` 的可见性口径**（`plan.md` F.7 决策 5，用户裁决）：**一个 op 承载、原子可见** ——
+//!   两半（删除向量 + 新行文件）由 `CatalogOps::apply_update` 给**同一个快照号**，
+//!   读侧看不到"删了没插"（少数据）或"插了没删"（重复计数）的中间态。
+//!   代价：新行**不走 `Data` 攒批**，而是在 op 之前先落成一个文件（每个源文件一个产物）。
 
 use arrow::datatypes::SchemaRef;
-use sqlparser::ast::{Delete, Expr, FromTable, TableFactor};
+use sqlparser::ast::{
+    Assignment, AssignmentTarget, Delete, Expr, FromTable, TableFactor, Update,
+};
 use uuid::Uuid;
 
 use yuntun_model::dv::{DeletionEntry, DvBitmap, dv_object_path};
 use yuntun_model::ops::qualified_name;
-use yuntun_model::wal_record::{DeletePayload, FileDeletion, Record};
+use yuntun_model::meta::FileManifest;
+use yuntun_model::wal_record::{DeletePayload, FileDeletion, NewFilePayload, Record,
+    UpdatePayload};
 
 use crate::{RawOutcome, SqlEngine, SqlError, session::SessionCtx};
 
@@ -337,6 +344,368 @@ fn parse_delete_target(del: &Delete, session: &SessionCtx) -> Result<String, Sql
     // 归一化为全限定名（目录里一律是全限定）
     let (ns, bare) = yuntun_model::ops::split_qualified(&qualified);
     Ok(qualified_name(if ns.is_empty() { session.schema() } else { ns }, bare))
+}
+
+impl SqlEngine {
+    /// `UPDATE t SET … WHERE …`（`F.3e-2`）。
+    ///
+    /// # 七步（顺序即正确性）
+    ///
+    /// ```text
+    /// ① 表级 DML 租约（与合并互斥：合并会重写基文件并消费删除向量）
+    /// ② 强制 flush（在途数据先落盘 —— 否则刚插的行改不到）
+    /// ③ 逐文件：一次扫描同时拿"命中行号"与"这些行的新值"（`locate_and_project`）
+    ///    ＋ 扣掉**已删**的行（它们对用户不可见，改它们 = 复活）
+    /// ④ 新行写成一个文件（每个源文件一个产物，继承它的 shard / time_window）
+    /// ⑤ 位图写对象存储（先对象）
+    /// ⑥ WAL append（**一条** `UpdatePayload`：删 + 插两半）
+    /// ⑦ `apply_update` —— 两半**同一个快照号**（这就是"原子可见"）
+    /// ```
+    ///
+    /// 为什么两半要进**一条** op：`plan.md` F.7 决策 5 定的是"读侧不可能看到中间态"。
+    /// 分两步（先 `apply_deletions` 再 `commit_files`）必然落在两个快照上 ——
+    /// 中间态要么少数据、要么**重复计数**，两种都是静默错。
+    pub(crate) async fn execute_update(
+        &self,
+        upd: &Update,
+        session: &SessionCtx,
+    ) -> Result<RawOutcome, SqlError> {
+        self.check_write()?;
+        let table = parse_update_target(upd, session)?;
+        let Some((schema, schema_version)) = self
+            .catalog
+            .table_schema(&table)
+            .await
+            .map_err(SqlError::from_lake)?
+        else {
+            return Err(SqlError::NotFound(table));
+        };
+        let Some(predicate) = upd.selection.as_ref() else {
+            return Err(SqlError::Unsupported(
+                "无 WHERE 的全表 UPDATE 未支持：它等于把整表重写一遍（设计 §7 只定了「全表删」\
+                 走文件级下线）。请带谓词分批改，或 CREATE TABLE AS SELECT 重建"
+                    .into(),
+            ));
+        };
+        let sets = parse_assignments(&upd.assignments, &schema)?;
+        let projection = projection_sql(&schema, &sets);
+
+        let ingest = self.ingest_side()?.clone();
+        let store = ingest.store.clone();
+        // ① 与合并互斥（同一把表级租约 —— 与 DELETE 共用）
+        let lease = DmlLease::acquire(self.catalog.clone(), &table).await?;
+        let result = async {
+            // ② 在途数据先落盘
+            let flushed = ingest.force_flush(&table).await.map_err(SqlError::from_lake)?;
+            if flushed.chunks > 0 {
+                tracing::debug!(
+                    table = %table, chunks = flushed.chunks, rows = flushed.rows,
+                    "UPDATE：先把在途数据落盘（否则刚插入的行改不到）"
+                );
+            }
+
+            let snapshot = self.catalog.current_snapshot().await;
+            let files = self
+                .catalog
+                .list_visible_files(&table, snapshot, None)
+                .await
+                .map_err(SqlError::from_lake)?;
+            // **已删的行不许被改**（它们对用户不可见；改它们等于把删除的行"更新回来"）
+            let existing = self.existing_bitmaps(&table, snapshot).await?;
+
+            let upd_id = format!("upd-{}", Uuid::now_v7());
+            let mut deletions: Vec<FileDeletion> = Vec::new();
+            let mut entries: Vec<DeletionEntry> = Vec::new();
+            let mut new_files: Vec<NewFilePayload> = Vec::new();
+            let mut manifests: Vec<FileManifest> = Vec::new();
+            let mut affected: i64 = 0;
+
+            for f in &files {
+                let fmt = match f.file_path.rsplit('.').next() {
+                    Some("parquet") => yuntun_format::DataFormat::Parquet,
+                    Some("vortex") => yuntun_format::DataFormat::Vortex,
+                    other => {
+                        return Err(SqlError::Unsupported(format!(
+                            "文件 {} 的格式不认识（{other:?}）：UPDATE 需要按行号定位",
+                            f.file_path
+                        )));
+                    }
+                };
+                // ③ 一次扫描拿两半
+                let got = yuntun_query::locate::locate_and_project(
+                    &store,
+                    &f.file_path,
+                    fmt,
+                    &schema,
+                    &predicate.to_string(),
+                    &projection,
+                )
+                .await
+                .map_err(|e| SqlError::Internal(e.to_string()))?;
+                if f.row_count != 0 && f.row_count != got.rows {
+                    return Err(SqlError::Internal(format!(
+                        "文件 {} 的行数与清单不符：清单记 {}、文件里 {} ⇒ 拒绝按「文件内行号」做更新",
+                        f.file_path, f.row_count, got.rows
+                    )));
+                }
+                let Some(batch) = got.batch else { continue };
+
+                // 扣掉已删的行（positions 与 batch **逐行对齐**，见 `ProjectedRows` 的契约）
+                let (positions, batch) = drop_already_deleted(
+                    got.positions,
+                    batch,
+                    existing.get(&f.file_path),
+                    &f.file_path,
+                )?;
+                if positions.is_empty() {
+                    continue;
+                }
+                affected += positions.len() as i64;
+
+                // ④ 新行写成一个文件（继承源文件的 shard / time_window）
+                let new_batch_id = Uuid::now_v7().to_string();
+                let new_time_window = if f.time_window.is_empty() {
+                    "w"
+                } else {
+                    f.time_window.as_str()
+                };
+                let new_shard = if f.shard.is_empty() { "s0" } else { f.shard.as_str() };
+                let (new_path, new_size, new_rows) = yuntun_format::write_batch(
+                    &store,
+                    &table,
+                    new_shard,
+                    new_time_window,
+                    &new_batch_id,
+                    &batch,
+                    fmt,
+                )
+                .await
+                .map_err(SqlError::from_lake)?;
+
+                // ⑤ 位图写对象（**先对象**，崩溃只留孤儿）
+                let dv = DvBitmap::from_positions(positions.iter().copied());
+                let bytes = dv.to_bytes();
+                let store_path = dv_object_path(&f.file_path, &upd_id);
+                yuntun_store::put_bytes(store.as_ref(), &store_path, bytes.clone())
+                    .await
+                    .map_err(SqlError::from_lake)?;
+
+                deletions.push(FileDeletion {
+                    file_path: f.file_path.clone(),
+                    batch_id: f.batch_id.clone(),
+                    bitmap: bytes,
+                });
+                entries.push(DeletionEntry {
+                    dv_id: upd_id.clone(),
+                    table: table.clone(),
+                    file_path: f.file_path.clone(),
+                    batch_id: f.batch_id.clone(),
+                    applied_at: 0, // 由目录分配（两半**共用一个**快照号）
+                    revoked_at: 0,
+                    card: dv.card() as u32,
+                    store_path,
+                });
+                new_files.push(NewFilePayload {
+                    file_path: new_path.clone(),
+                    batch_id: new_batch_id.clone(),
+                    row_count: new_rows,
+                    file_size: new_size,
+                    shard: new_shard.into(),
+                    time_window: new_time_window.into(),
+                    schema_version,
+                });
+                manifests.push(FileManifest {
+                    file_path: new_path,
+                    batch_id: new_batch_id,
+                    row_count: new_rows,
+                    file_size: new_size,
+                    table: table.clone(),
+                    shard: new_shard.into(),
+                    time_window: new_time_window.into(),
+                    schema_version,
+                    ..Default::default()
+                });
+            }
+
+            // 一行都没命中：什么都不发生（不写 WAL、不推快照）
+            if entries.is_empty() {
+                return Ok(RawOutcome::Affected(0));
+            }
+
+            // ⑥ WAL（权威）：一条记录承载两半
+            let epoch = ingest.chunks().liveness(&table).epoch;
+            ingest
+                .wal
+                .append(Record::Update(UpdatePayload {
+                    table: table.clone(),
+                    upd_id: upd_id.clone(),
+                    deletions,
+                    new_files,
+                    schema_epoch: epoch,
+                }))
+                .await
+                .map_err(SqlError::from_lake)?;
+
+            // ⑦ 目录：**一个 op、一个快照号**（原子可见）
+            let file_count = manifests.len();
+            let snap = self
+                .catalog
+                .apply_update(entries, manifests, &upd_id)
+                .await
+                .map_err(|e| {
+                    SqlError::from_lake(yuntun_model::error::LakeError::Other(format!(
+                        "更新已写入 WAL（upd_id={upd_id}）但没进目录：{e} —— \
+                         重启后 `replay_wal_dml` 会把它收敛进来，**不要再改一次**"
+                    )))
+                })?;
+            self.query
+                .catalog()
+                .refresh(&self.catalog)
+                .await
+                .map_err(|e| SqlError::Internal(e.to_string()))?;
+            tracing::info!(
+                table = %table,
+                upd_id = %upd_id,
+                files = file_count,
+                rows = affected,
+                snapshot = snap,
+                "UPDATE applied（两半同一个快照）"
+            );
+            Ok(RawOutcome::Affected(affected))
+        }
+        .await;
+        lease.release().await;
+        result
+    }
+}
+
+/// 解析 `UPDATE` 的目标表（本刀只认单表、无 `FROM`、无 `RETURNING`）。
+fn parse_update_target(upd: &Update, session: &SessionCtx) -> Result<String, SqlError> {
+    if upd.from.is_some() {
+        return Err(SqlError::Unsupported("UPDATE … FROM 未支持".into()));
+    }
+    if upd.returning.is_some() || upd.output.is_some() {
+        return Err(SqlError::Unsupported(
+            "UPDATE … RETURNING/OUTPUT 未支持".into(),
+        ));
+    }
+    if !upd.order_by.is_empty() || upd.limit.is_some() {
+        return Err(SqlError::Unsupported(
+            "UPDATE … ORDER BY / LIMIT 未支持（更新的可见性口径是谓词，不是顺序）".into(),
+        ));
+    }
+    if !upd.table.joins.is_empty() {
+        return Err(SqlError::Unsupported("UPDATE 里的 JOIN 未支持".into()));
+    }
+    let TableFactor::Table { name, .. } = &upd.table.relation else {
+        return Err(SqlError::Unsupported("UPDATE 的目标必须是普通表名".into()));
+    };
+    let qualified = crate::sql::resolve_table_ref(name, session);
+    if qualified.is_empty() {
+        return Err(SqlError::Unsupported("invalid table name in UPDATE".into()));
+    }
+    let (ns, bare) = yuntun_model::ops::split_qualified(&qualified);
+    Ok(qualified_name(
+        if ns.is_empty() { session.schema() } else { ns },
+        bare,
+    ))
+}
+
+/// `SET` 列表 → `(列名, 表达式 SQL)`；形状不对**明确拒绝**（不猜用户想要什么）。
+fn parse_assignments(
+    assignments: &[Assignment],
+    schema: &SchemaRef,
+) -> Result<Vec<(String, String)>, SqlError> {
+    if assignments.is_empty() {
+        return Err(SqlError::Unsupported("UPDATE 必须有 SET 子句".into()));
+    }
+    let mut out: Vec<(String, String)> = Vec::with_capacity(assignments.len());
+    for a in assignments {
+        let AssignmentTarget::ColumnName(name) = &a.target else {
+            return Err(SqlError::Unsupported(
+                "UPDATE … SET (a, b) = … 未支持（只支持逐列赋值）".into(),
+            ));
+        };
+        let parts: Vec<&str> = name
+            .0
+            .iter()
+            .filter_map(|p| p.as_ident())
+            .map(|i| i.value.as_str())
+            .collect();
+        let col = match parts.as_slice() {
+            // 不带表限定的列名；带限定（`t.v`）也接受（单表 UPDATE 下语义相同）
+            [c] | [_, c] => (*c).to_string(),
+            _ => {
+                return Err(SqlError::Unsupported(format!(
+                    "UPDATE 的赋值目标不支持：{name}"
+                )));
+            }
+        };
+        if !schema.fields().iter().any(|f| f.name() == &col) {
+            return Err(SqlError::Unsupported(format!(
+                "表里没有列 {col}（可更新的列：{:?}）",
+                schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
+            )));
+        }
+        if out.iter().any(|(c, _)| *c == col) {
+            // 同一列赋两次：SQL 里第二次会赢，但那多半是写错了 —— 明确拒绝
+            return Err(SqlError::Unsupported(format!("列 {col} 被赋值了两次")));
+        }
+        out.push((col, a.value.to_string()));
+    }
+    Ok(out)
+}
+
+/// 按**表 schema** 的列序生成 SELECT 列表：SET 过的列换表达式、其余列原样。
+///
+/// 列序必须与表 schema 一致：产物的 schema 就是新表的行 schema（写出去的 parquet 要能被读回来）。
+fn projection_sql(schema: &SchemaRef, sets: &[(String, String)]) -> String {
+    schema
+        .fields()
+        .iter()
+        .map(|f| match sets.iter().find(|(c, _)| c == f.name()) {
+            Some((_, expr)) => format!("({expr}) AS \"{}\"", f.name()),
+            None => format!("\"{}\"", f.name()),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// 从"命中行"里扣掉**已经删过**的行：`positions` 与 `batch` 逐行对齐（`ProjectedRows` 的契约），
+/// 所以同一个掩码同时作用于两者。
+///
+/// 为什么必须扣：已删的行对用户**不可见**，如果连它们一起更新，更新后的值会作为**新行**写进产物
+/// —— 等于把删掉的行**更新复活**了（用户没要求、也看不出来）。
+fn drop_already_deleted(
+    positions: Vec<u32>,
+    batch: arrow::record_batch::RecordBatch,
+    existing: Option<&DvBitmap>,
+    file_path: &str,
+) -> Result<(Vec<u32>, arrow::record_batch::RecordBatch), SqlError> {
+    let Some(dv) = existing else {
+        return Ok((positions, batch));
+    };
+    if positions.len() != batch.num_rows() {
+        return Err(SqlError::Internal(format!(
+            "内部不一致：命中行数 {} 与结果批行数 {} 不等（文件 {file_path}）—— \
+             两半不对齐就无法安全地扣掉已删行",
+            positions.len(),
+            batch.num_rows()
+        )));
+    }
+    let keep: arrow::array::BooleanArray = positions
+        .iter()
+        .map(|p| !dv.contains(*p))
+        .collect();
+    let kept_positions: Vec<u32> = positions
+        .iter()
+        .zip(keep.iter())
+        .filter(|(_, k)| k.unwrap_or(false))
+        .map(|(p, _)| *p)
+        .collect();
+    let kept_batch = arrow::compute::filter_record_batch(&batch, &keep)
+        .map_err(|e| SqlError::Internal(format!("扣掉已删行失败（{file_path}）：{e}")))?;
+    Ok((kept_positions, kept_batch))
 }
 
 /// 在一个文件上定位命中行（`yuntun_query::locate`），并在写位图前把口径核对清楚。

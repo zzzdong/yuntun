@@ -14,6 +14,9 @@
 //! # 幂等与世代
 //!
 //! * **幂等**：`dv_id` 相同 ⇒ 目录侧按 `(dv_id, file_path)` 去重（重放两遍不写两份）；
+//! * **`UPDATE` 也走这里**（`F.3e-2`）：`UpdatePayload` 的两半（删除向量 + 新行文件清单）
+//!   由**一条 `apply_update`** 重建 —— 重放也必须保持"原子可见"：
+//!   分两次调用就会在两个快照上落下两半，读侧照样能撞见中间态（少数据 / 重复计数）。
 //! * **世代校验**：`DeletePayload.schema_epoch` 与"该 seq 点上该表的世代"不符 ⇒
 //!   **跳过并告警**（`DROP` → 同名重建之后，旧世代的删除不得挂到新表上，`plan.md` M0 ⑥）。
 
@@ -34,6 +37,8 @@ pub struct ReplayDmlStats {
     pub skipped: usize,
     /// 重建的 `DeletionEntry` 条数（一条记录可覆盖多个文件）
     pub entries: usize,
+    /// 重建的**新行文件**条数（`UPDATE` 的产物两半中的另一半 —— `F.3e-2`）
+    pub new_files: usize,
 }
 
 /// **重放 WAL 里的 DELETE**（四段启动顺序的第 ③ 段，`delta-dml-design §1.1`）。
@@ -59,63 +64,128 @@ pub async fn replay_wal_dml(
 
     let mut stats = ReplayDmlStats::default();
     for (seq, rec) in records {
-        let Record::Delete(p) = rec else { continue };
-        let (alive, epoch) = liveness_at(&timeline, seq, &p.table);
+        // 两类 DML 记录都表达"某张表某个世代的事实" ⇒ 走同一道世代校验
+        let (table, want_epoch, what) = match &rec {
+            Record::Delete(p) => (p.table.clone(), p.schema_epoch, "DELETE"),
+            Record::Update(p) => (p.table.clone(), p.schema_epoch, "UPDATE"),
+            _ => continue,
+        };
+        let (alive, epoch) = liveness_at(&timeline, seq, &table);
         // `schema_epoch == 0` = 老记录（本字段出现之前）：不校验（兼容），仍然重放
-        if !alive || (p.schema_epoch != 0 && epoch != p.schema_epoch) {
+        if !alive || (want_epoch != 0 && epoch != want_epoch) {
             stats.skipped += 1;
             tracing::warn!(
                 seq,
-                table = %p.table,
-                dv_id = %p.dv_id,
-                want_epoch = p.schema_epoch,
+                table = %table,
+                what,
+                want_epoch,
                 got_epoch = epoch,
                 alive,
-                "WAL 里的 DELETE 属于别的世代（或表已不在）：跳过 —— 不把旧世代的删除挂到新表上"
+                "WAL 里的 DML 属于别的世代（或表已不在）：跳过 —— 不把旧世代的事实挂到新表上"
             );
             continue;
         }
-        // ② 重建条目（一次 DELETE 的全部文件**同一批**提交 ⇒ 单快照原子）
-        let mut entries = Vec::with_capacity(p.deletions.len());
-        for fd in &p.deletions {
-            let dv = DvBitmap::from_bytes(&fd.bitmap).map_err(|e| {
-                LakeError::Other(format!(
-                    "重放 DELETE（dv_id={}）时位图解不开：{e} —— \
-                     带着损坏的删除向量对外服务 = 已删的行复活，拒绝继续",
-                    p.dv_id
-                ))
-            })?;
-            if dv.is_empty() {
-                continue;
+        match rec {
+            Record::Delete(p) => {
+                // ② 重建条目（一次 DELETE 的全部文件**同一批**提交 ⇒ 单快照原子）
+                let mut entries = Vec::with_capacity(p.deletions.len());
+                for fd in &p.deletions {
+                    let dv = decode_bitmap(fd, "DELETE", &p.dv_id)?;
+                    if dv.is_empty() {
+                        continue;
+                    }
+                    entries.push(DeletionEntry {
+                        dv_id: p.dv_id.clone(),
+                        table: table.clone(),
+                        file_path: fd.file_path.clone(),
+                        batch_id: fd.batch_id.clone(),
+                        applied_at: 0, // 由目录分配（本次批量的同一个快照号）
+                        revoked_at: 0,
+                        card: dv.card() as u32,
+                        store_path: dv_object_path(&fd.file_path, &p.dv_id),
+                    });
+                }
+                if entries.is_empty() {
+                    continue;
+                }
+                let n = entries.len();
+                catalog.apply_deletions(entries).await?;
+                stats.applied += 1;
+                stats.entries += n;
             }
-            entries.push(DeletionEntry {
-                dv_id: p.dv_id.clone(),
-                table: p.table.clone(),
-                file_path: fd.file_path.clone(),
-                batch_id: fd.batch_id.clone(),
-                applied_at: 0, // 由目录分配（本次批量的同一个快照号）
-                revoked_at: 0,
-                card: dv.card() as u32,
-                store_path: dv_object_path(&fd.file_path, &p.dv_id),
-            });
+            Record::Update(p) => {
+                // ① 两半一起重建、**一次提交**（`apply_update` 给两半同一个快照号）——
+                //    这正是 `F.7` 决策 5 要的"重放之后仍然原子"
+                let mut entries = Vec::with_capacity(p.deletions.len());
+                for fd in &p.deletions {
+                    let dv = decode_bitmap(fd, "UPDATE", &p.upd_id)?;
+                    if dv.is_empty() {
+                        continue;
+                    }
+                    entries.push(DeletionEntry {
+                        dv_id: p.upd_id.clone(),
+                        table: table.clone(),
+                        file_path: fd.file_path.clone(),
+                        batch_id: fd.batch_id.clone(),
+                        applied_at: 0,
+                        revoked_at: 0,
+                        card: dv.card() as u32,
+                        store_path: dv_object_path(&fd.file_path, &p.upd_id),
+                    });
+                }
+                let files: Vec<yuntun_model::meta::FileManifest> = p
+                    .new_files
+                    .iter()
+                    .map(|nf| yuntun_model::meta::FileManifest {
+                        file_path: nf.file_path.clone(),
+                        batch_id: nf.batch_id.clone(),
+                        row_count: nf.row_count,
+                        file_size: nf.file_size,
+                        table: table.clone(),
+                        shard: nf.shard.clone(),
+                        time_window: nf.time_window.clone(),
+                        schema_version: nf.schema_version,
+                        // 状态机在 `apply_update` 里补 `valid_from`/`status`（同一个快照号）
+                        ..Default::default()
+                    })
+                    .collect();
+                if entries.is_empty() && files.is_empty() {
+                    continue;
+                }
+                let n_dv = entries.len();
+                let n_files = files.len();
+                catalog.apply_update(entries, files, &p.upd_id).await?;
+                stats.applied += 1;
+                stats.entries += n_dv;
+                stats.new_files += n_files;
+            }
+            _ => continue,
         }
-        if entries.is_empty() {
-            continue;
-        }
-        let n = entries.len();
-        catalog.apply_deletions(entries).await?;
-        stats.applied += 1;
-        stats.entries += n;
     }
     if stats.applied > 0 || stats.skipped > 0 {
         tracing::info!(
             applied = stats.applied,
             skipped = stats.skipped,
             entries = stats.entries,
+            new_files = stats.new_files,
             "replay_wal_dml done"
         );
     }
     Ok(stats)
+}
+
+/// 解一份内联位图；解不开**直接报错**（带着损坏的删除向量对外服务 = 已删的行复活）。
+fn decode_bitmap(
+    fd: &yuntun_model::wal_record::FileDeletion,
+    what: &str,
+    id: &str,
+) -> Result<DvBitmap, LakeError> {
+    DvBitmap::from_bytes(&fd.bitmap).map_err(|e| {
+        LakeError::Other(format!(
+            "重放 {what}（id={id}）时位图解不开：{e} —— \
+             带着损坏的删除向量对外服务 = 已删的行复活，拒绝继续"
+        ))
+    })
 }
 
 /// 在 DDL 时间线上求：位置 `seq`（含）之前，表 `table` 的 (存活, 世代)。

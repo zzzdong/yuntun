@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§153，2026-09-27**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§154，2026-09-29**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -9845,4 +9845,84 @@ peeling 构造写错的后果是"多剪一个组" ⇒ **静默少数据**，而"
   `apply_update` 结果逐项一致（含 DV 的 `deletions_now/deletions_old` 对拍）、快照号一致、
   原子性判据成立、重放不推版本；
 - `wire_compat`：`oneof kind` 分支数 11 → 12；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **5/5**。\n
+---
+
+## 154. **F.3e-2：`UPDATE t SET … WHERE …` 落地**（2026-09-29）
+
+`§153` 把"一个 op 承载、原子可见"落成了目录能力（`UpdateOp` + `CatalogState::apply_update`），
+这一刀把**SQL 前端**与**WAL**接上：`UPDATE` 真的能改了，而且改得**原子**
+（读侧看不到"删了没插"或"插了没删"的中间态）。
+
+### 154.0 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `model::wal_record` | `UpdatePayload`（**type 7**）+ `NewFilePayload`（新行文件清单）+ `Record::Update` 各分支 + 两条用例（两半**逐字段**过线） |
+| `model::batch` | `Record::Update` 不进批次状态机（新行不是"攒批中的数据"：它已经是一个已提交文件） |
+| `ingest::dml` | `replay_wal_dml` 处理 `Update`：两半由**一条 `apply_update`** 重建（重放也必须原子）+ `ReplayDmlStats.new_files` + 2 条用例（原子重建 / 旧世代整条跳过） |
+| `query::locate` | `locate_and_project`（**一次扫描**同时拿"命中行号"与"这些行的新值"）+ `ProjectedRows`（**逐行对齐是契约**）+ 3 条用例 |
+| `sql::dml` | `execute_update`（**七步**）+ `parse_update_target` / `parse_assignments` / `projection_sql` / `drop_already_deleted` |
+| `sql` 分流 | `Statement::Update` 进 `execute_update` |
+| `server/tests/sql_update_e2e.rs`（新） | 4 条端到端（见 §154.4） |
+
+### 154.1 三个决定
+
+1. **七步顺序**（与 DELETE 同源，多一步"写文件"）：
+   `① 表级 DML 租约（与合并互斥）→ ② force flush → ③ 逐文件定位+投影 → ④ 新行写成文件
+   → ⑤ 位图写对象 → ⑥ WAL（一条 `UpdatePayload`）→ ⑦ apply_update → 刷缓存`。
+   最要紧的两条顺序理由与 DELETE 相同：**对象先于 WAL**（崩溃只留孤儿对象）、
+   **WAL 先于目录**（目录没落时重启靠重放收敛，错误消息明说"不要再改一次"）。
+2. **一次扫描拿两半，且显式按行号排序**。`ProjectedRows` 的契约是
+   "`batch` 第 `i` 行 ↔ `positions[i]`"——**不排序就等于把"哪一行的新值"交给 DataFusion 的
+   输出顺序**，而错位的后果是把 A 行的新值写到 B 行的位置（静默错，最难发现的那种）。
+   排序是显式的一步（`sort_to_indices` + `take`），不是"碰巧一致"。
+3. **已删的行必须被扣掉**（`drop_already_deleted`）。这是 `UPDATE` **特有**的坑：
+   DELETE 把已删行再标记一遍无害（位图 OR），而 `UPDATE` 会把这些行的**新值**当新行写进产物
+   —— 等于把删掉的行**更新复活**（用户没要求、也看不出来）。所以定位结果要减去"已生效的 DV"，
+   且因为两半逐行对齐，**同一个掩码**同时作用于行号与新值。
+
+### 154.2 本刀修掉的一个真 bug
+
+`locate_and_project` 里 `out[0].schema()` 在**零命中**时直接索引越界 panic ——
+DataFusion 在"零行"时返回的是**零个批次**（不是"一个空批次"）。
+由 e2e 的 `UPDATE t SET v = 0 WHERE v = 999`（"没命中就什么都不做"这条正常路径）撞出来；
+已加护栏 + 单测 `no_match_yields_no_batch_instead_of_panicking`。
+这类"正常业务路径上的 panic"值得单独记一笔：它不会被 happy-path 用例发现。
+
+### 154.3 边界
+
+1. **无 `WHERE` 的全表 UPDATE** 明确拒绝（它等于整表重写；设计 §7 只定了"全表删"走文件级下线）；
+2. `UPDATE … FROM` / `RETURNING` / `OUTPUT` / `ORDER BY` / `LIMIT` / `JOIN` / 元组赋值
+   （`SET (a, b) = …`）/ 同一列赋两次 —— 一律明确拒绝；
+3. **缺列文件上 UPDATE 会报错**：schema 演进后的旧文件缺新列，这里**不像** `flush::align_batch`
+   那样补 NULL（那是写入侧的职责）⇒ 那些文件上的 `UPDATE` 会响亮失败。
+   **台账 `D-13`**（待做：定位前按当前 schema 对齐，或明确跳过缺列文件并告警）；
+4. **每个源文件一个产物**：宽 `UPDATE` 会碎文件（合并迟早收掉，`F.3d`）；
+   产物继承源文件的 `shard` / `time_window` —— 所以 `drop_shard` 与按分片读的语义不变；
+5. `statistics()` 仍未接（同 `§147.3`，不影响正确性）；
+6. **默认（`embedded`）形态也能 `UPDATE`**：`apply_update` 走 `§151` 接好的 metanode op 通道
+   （不像 DELETE 当年那样需要单独的接线刀）。
+
+### 154.4 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **500 passed / 0 failed / 0 ignored**（本刀 +12）；
+- `sql_update_e2e`（4 条）：
+  ① **旧值没了、新值在、谓词外的行逐行不变**（10 行 ⇒ 4..10 + 101/102/103）；
+    快照号只 +1（先等数据落成文件，免得把 `force_flush` 那一次算进来）+
+    **产物 `valid_from` == 删除向量 `applied_at`**（同号 = 原子）+
+    **旧快照两半都不可见** + 命中 0 行时**不留版本痕迹**；
+  ② **已删的行不会被更新复活**（删 `v=2` 后更新 `v<=3` ⇒ 只改 1 和 3，`102` 不许出现）；
+  ③ **重启后仍生效**（`[meta] mode="memory"`：全靠 WAL 重放；且重放之后两半**仍然同号**）；
+  ④ **拒绝形状**（无 WHERE / `FROM` / 表达式引用不存在的列 / 同列两次 / `RETURNING`）+ 只读形态
+    `ReadOnly`，且拒绝**不留副作用**；
+- `replay_wal_dml`（+2）：`UPDATE` 两半由一条 op 重建（同号）、完全重复不推版本、
+  旧世代整条跳过（**不许只落一半**）；
+- `query::locate`（+3）：定位+投影逐行对上、零命中不 panic、投影写错即报错；
 - `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **5/5**。
+
+> **`F.3` 到此完整**：`§146`（表达层/目录）→ `§147`（读侧生效）→ `§148`（写侧机械）→
+> `§149`（SQL `DELETE`）→ `§150`（compaction 消费 DV）→ `§151`（远端目录/默认形态）→
+> `§152`（DV 触发合并）→ `§153`（原子 op）→ `§154`（SQL `UPDATE`）。
+> 剩余：`F.3d-3`（租约细粒度）、`F.3d-4`（孤儿 DV 回收）、`D-13`（缺列文件上的 UPDATE）、
+> 无 `WHERE` 的全表删（`purge_table_files`）。
