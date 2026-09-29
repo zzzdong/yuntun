@@ -107,6 +107,19 @@ pub trait CatalogOps: Send + Sync {
         at: u64,
     ) -> Result<usize, LakeError>;
 
+    /// **目录里被事件引用**的删除向量对象路径（GC 的"被引用"集合，`F.3d-4` / `§156`）。
+    ///
+    /// 为什么需要它：删除向量的 GC 判据**两条缺一不可** ——
+    ///
+    /// 1. 它**锚定**的数据文件仍在保护集（否则那份 DV 再也没人会读）；
+    /// 2. 目录里有**事件引用**它（否则它就是"对象写了、WAL/目录没落地"的孤儿 ——
+    ///    永远没人会读它，而条件 1 却永远为真 ⇒ **只判 1 会让它永不回收**）。
+    ///
+    /// 数据文件/索引只需要条件 1（它们自己就是那个 `batch_id`）。
+    /// 返回**全量**（不过快照过滤）：GC 问的是"这个对象还有没有人引用"，
+    /// 与"哪个快照看得见它"是两件事 —— 已撤销但还没被回收的 DV 仍要算被引用。
+    async fn dv_object_paths(&self) -> Result<Vec<String>, LakeError>;
+
     // ---- 删除 ----
     /// L1 分片移除：整 shard 的文件标记 deleted_at（§6.3）
     async fn drop_shard(&self, table: &str, shard: &str) -> Result<u64, LakeError>;
@@ -394,6 +407,17 @@ impl CatalogOps for MemoryCatalog {
             .write()
             .unwrap()
             .revoke_deletions_for_file(file_path, at))
+    }
+
+    async fn dv_object_paths(&self) -> Result<Vec<String>, LakeError> {
+        Ok(self
+            .state
+            .read()
+            .unwrap()
+            .all_deletions()
+            .into_iter()
+            .map(|d| d.store_path)
+            .collect())
     }
 
     async fn drop_shard(&self, table: &str, shard: &str) -> Result<u64, LakeError> {

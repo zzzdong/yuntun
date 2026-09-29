@@ -2281,6 +2281,141 @@ async fn orphan_cleanup_spares_known_and_inflight_files() {
     shutdown.cancel();
 }
 
+/// **`F.3d-4`（`§156`）：删除向量的孤儿清理 —— "两个条件缺一不可"**。
+///
+/// 删除向量与数据文件的判据**不一样**：数据文件只看"自己的 `batch_id` 在不在保护集"，
+/// 而删除向量还要"**目录里有事件引用它**"。少判后者会漏掉一类**永不回收**的垃圾：
+/// 崩溃在"对象已写、`apply_*` 未落地"时，锚定的数据文件还活着 ⇒ 每轮都被当成"已知"放过。
+///
+/// 三条都要成立，缺一条就是错（方向还各不相同）：
+///
+/// * **活着的 DV 绝不能被删** —— 删了它标记的行就**复活**（`§150` 的原始理由）；
+/// * **幽灵 DV 必须被回收** —— 否则空间只增不减（本条是本刀新增的判据）；
+/// * **锚定文件没了的 DV 必须被回收** —— 它再也没人会读。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn orphan_cleanup_reclaims_unreferenced_deletion_vectors() {
+    let _gate = CHAOS_GATE.lock().await;
+    let wal_dir = tmpdir("wal-dv-orphan");
+    let store_root = tmpdir("store-dv-orphan");
+    let setup = build(&wal_dir, &store_root, &[("dvorph", schema(), false)]).await;
+    let shutdown = CancellationToken::new();
+    let _acc = setup.ingestor.clone().spawn_accumulator(shutdown.clone());
+
+    // 一个真文件（删除向量要锚在它上面）
+    ingest_into(&setup, "dvorph", "s0", 400).await;
+    assert_eq!(wait_visible_rows(&setup, "public.dvorph", "s0", 3).await, 3);
+
+    let store = yuntun_store::create_store(&yuntun_store::StoreConfig::Local {
+        root: store_root.to_string_lossy().to_string(),
+    })
+    .unwrap();
+    let catalog: Arc<dyn CatalogOps> = setup.catalog.clone();
+    let snap = catalog.current_snapshot().await;
+    let files = catalog
+        .list_visible_files("public.dvorph", snap, None)
+        .await
+        .unwrap();
+    let anchor = files
+        .iter()
+        .find(|f| f.file_path.ends_with(".parquet"))
+        .expect("应有一个已提交的 parquet 文件")
+        .clone();
+
+    // ① 活着的 DV：对象 + **目录事件**（两个条件都满足）
+    let live_path = yuntun_model::dv::dv_object_path(&anchor.file_path, "dv-live");
+    let bitmap = yuntun_model::dv::DvBitmap::from_positions([0u32]);
+    yuntun_store::put_bytes(store.as_ref(), &live_path, bitmap.to_bytes())
+        .await
+        .unwrap();
+    catalog
+        .apply_deletions(vec![yuntun_model::dv::DeletionEntry {
+            dv_id: "dv-live".into(),
+            table: "public.dvorph".into(),
+            file_path: anchor.file_path.clone(),
+            batch_id: anchor.batch_id.clone(),
+            applied_at: 0,
+            revoked_at: 0,
+            card: 1,
+            store_path: live_path.clone(),
+        }])
+        .await
+        .unwrap();
+
+    // ② 幽灵 DV：锚定**同一个活文件**，但目录里没有事件（崩溃在"对象已写、apply 未落地"）
+    let ghost_path = yuntun_model::dv::dv_object_path(&anchor.file_path, "dv-ghost");
+    yuntun_store::put_bytes(store.as_ref(), &ghost_path, bitmap.to_bytes())
+        .await
+        .unwrap();
+
+    // ③ 锚定文件根本不存在的 DV（引用与否都救不了它）
+    let gone_path = yuntun_model::dv::dv_object_path(
+        "yuntun/public/dvorph/dt=w/shard=s0/nonexistent.parquet",
+        "dv-x",
+    );
+    yuntun_store::put_bytes(store.as_ref(), &gone_path, bitmap.to_bytes())
+        .await
+        .unwrap();
+
+    // grace=0 的清理：幽灵与被锚定丢失的两个 DV 回收，活着的 DV 与数据文件一个不少
+    let cleanup_shutdown = CancellationToken::new();
+    let cleaner = yuntun_compaction::spawn_orphan_cleanup_with_interval(
+        store.clone(),
+        catalog.clone(),
+        "yuntun/".to_string(),
+        Duration::ZERO,
+        Duration::from_millis(20),
+        cleanup_shutdown.clone(),
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let objs = yuntun_format::list_objects(&store, "yuntun/").await.unwrap();
+        let has = |p: &str| objs.iter().any(|(x, _)| x == p);
+        if !has(&ghost_path) && !has(&gone_path) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "孤儿删除向量未被回收：ghost={} gone={}",
+            has(&ghost_path),
+            has(&gone_path)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let objs = yuntun_format::list_objects(&store, "yuntun/").await.unwrap();
+    assert!(
+        objs.iter().any(|(p, _)| p == &live_path),
+        "**活着的 DV 被当成孤儿删掉了** —— 它标记的行会复活；剩余对象: {objs:?}"
+    );
+    for f in &files {
+        assert!(
+            objs.iter().any(|(p, _)| p == &f.file_path),
+            "误删数据文件（这是丢数据）：{}",
+            f.file_path
+        );
+    }
+    // 活 DV 的**内容**没被动过，而且它仍然生效
+    let bytes = yuntun_store::get_bytes(store.as_ref(), &live_path)
+        .await
+        .unwrap();
+    assert_eq!(
+        yuntun_model::dv::DvBitmap::from_bytes(&bytes).unwrap().card(),
+        1,
+        "被保护不等于可以先损坏：位图必须逐字节还是原来那份"
+    );
+    assert_eq!(
+        catalog
+            .list_deletions("public.dvorph", snap + 10)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "活着的删除向量仍然登记在册（读侧拿得到）"
+    );
+    cleanup_shutdown.cancel();
+    let _ = cleaner.await;
+    shutdown.cancel();
+}
+
 // ---------------------------------------------------------------- 幂等键集合（S3-5）
 
 /// 造一个 N 行的批次（真实 payload 无关，只关心行数与键）。

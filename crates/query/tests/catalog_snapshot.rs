@@ -265,6 +265,9 @@ impl CatalogOps for BrokenCatalog {
     ) -> Result<usize, yuntun_model::LakeError> {
         self.inner.revoke_deletions_for_file(file_path, at).await
     }
+    async fn dv_object_paths(&self) -> Result<Vec<String>, yuntun_model::LakeError> {
+        self.inner.dv_object_paths().await
+    }
     async fn drop_schema(&self, n: &str) -> Result<(), yuntun_model::LakeError> {
         self.inner.drop_schema(n).await
     }

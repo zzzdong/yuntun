@@ -951,6 +951,17 @@ impl CatalogOps for RemoteCatalog {
         Ok(self.cached(|c| c.snapshot))
     }
 
+    /// GC 用的"被引用"集合：**从本地缓存读**（同 `list_deletions` 的理由 —— GC 每轮都问，
+    /// 不能每轮都过一次网络）。
+    ///
+    /// ⚠️ 缓存是**上一次 prefetch** 的快照 ⇒ 可能有"刚 apply、还没下发"的 DV 不在集合里。
+    /// 这由**静置期**兜住：一个对象要先被观察成孤儿**超过 `grace`**（默认 1 小时）才会删，
+    /// 下一次 prefetch 早就把它带下来了。反方向（集合里多出已撤销的）是**保守方向**（少删）✓。
+    async fn dv_object_paths(&self) -> Result<Vec<String>, LakeError> {
+        self.refresh().await?;
+        Ok(self.cached(|c| c.deletions.values().map(|d| d.store_path.clone()).collect()))
+    }
+
     /// **撤销**锚定在某文件上的删除向量（`F.3d`：合并已把那些行物理重写掉）。
     async fn revoke_deletions_for_file(
         &self,

@@ -548,12 +548,39 @@ pub fn reconciliation_key(path: &str) -> Option<String> {
     yuntun_format::extract_batch_id(path)
 }
 
+/// 一个 S3 对象是否**在保护集里**（`§156`：两类对象的判据**不同**）。
+///
+/// * **数据文件 / 索引**：一个条件 —— 对账键（= 它自己的 `batch_id`）在 `known_batch_ids` 里；
+/// * **删除向量**：**两个条件缺一不可** ——
+///   1. 它锚定的数据文件还在保护集（否则那份 DV 再也没人会读）；
+///   2. 目录里有事件**引用**它（`referenced_dv_objects`）。
+///
+/// 第 2 条是 `§150` 之后新暴露的洞：那时为了不误删活着的 DV，把对账键改成"锚定的数据文件"，
+/// 于是"**对象写了、`apply_*` 没落地**"的孤儿（设计 §7 明说这种要回收）因为锚定文件活着，
+/// 每轮都被当成"已知"放过 ⇒ **永不回收**（空间只增不减）。
+/// 两条合起来的语义很直白：**没人会读的对象才是垃圾** —— 前提文件在（否则读不到）
+/// 且目录认它（否则没人去找它）。
+pub fn is_object_protected(
+    path: &str,
+    known_batch_ids: &HashSet<String>,
+    referenced_dv_objects: &HashSet<String>,
+) -> bool {
+    let Some(bid) = reconciliation_key(path) else {
+        return false;
+    };
+    if !known_batch_ids.contains(&bid) {
+        return false;
+    }
+    yuntun_format::dv_anchor_batch_id(path).is_none() || referenced_dv_objects.contains(path)
+}
+
 /// 孤儿文件判定（§9.1 / §12.2.1）：
-/// - S3 有、Meta 无 batch_id → 孤儿（崩溃于写 S3 后、CommitFiles 前）
+/// - S3 有、Meta 无（或**没人引用**，见 [`is_object_protected`]）→ 孤儿
 /// - S3 无、Meta 有 → 数据丢失，告警（人工介入）
 pub fn classify_orphans(
     s3_paths: HashSet<String>,
     known_batch_ids: &HashSet<String>,
+    referenced_dv_objects: &HashSet<String>,
     last_modified_ms: u64,
     grace: Duration,
 ) -> Vec<String> {
@@ -562,10 +589,7 @@ pub fn classify_orphans(
     let _ = (last_modified_ms, grace);
     s3_paths
         .into_iter()
-        .filter(|p| match reconciliation_key(p) {
-            Some(id) => !known_batch_ids.contains(&id),
-            None => true,
-        })
+        .filter(|p| !is_object_protected(p, known_batch_ids, referenced_dv_objects))
         .collect()
 }
 
@@ -650,6 +674,15 @@ pub fn spawn_orphan_cleanup_with_interval(
                     continue;
                 }
             };
+            // 删除向量还要"被事件引用"（`§156`）——同一把安全闸：拿不到就整轮不删。
+            // 拿不到时的后果与上面**方向相反**：不是误删而是"这一轮留着不回收"，安全。
+            let referenced_dv: HashSet<String> = match catalog.dv_object_paths().await {
+                Ok(paths) => paths.into_iter().collect(),
+                Err(e) => {
+                    tracing::error!(error = %e, "orphan cleanup: dv_object_paths failed, skip this round");
+                    continue;
+                }
+            };
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
@@ -661,7 +694,7 @@ pub fn spawn_orphan_cleanup_with_interval(
                     continue;
                 };
                 current.insert(bid.clone());
-                if known.contains(&bid) {
+                if is_object_protected(path, &known, &referenced_dv) {
                     first_seen.remove(&bid);
                     continue;
                 }
@@ -769,27 +802,46 @@ pub async fn list_s3_files(
 mod tests {
     use super::*;
 
-    /// **孤儿 GC 不许误删活着的删除向量**：对账键必须落在它锚定的数据文件上。
+    /// **删除向量的孤儿判定是"两个条件"**（`§156`）：只判锚定文件会漏掉一类永不回收的垃圾。
     #[test]
-    fn orphan_reconciliation_protects_live_deletion_vectors() {
+    fn deletion_vectors_need_both_the_anchor_and_an_event() {
         let known: HashSet<String> = ["b7".to_string()].into_iter().collect();
+        let dv_live = "yuntun/public/t/dt=w/shard=s0/dv/b7.parquet/dv-1.bin".to_string();
+        let dv_orphan = "yuntun/public/t/dt=w/shard=s0/dv/b7.parquet/dv-ghost.bin".to_string();
+        let dv_gone = "yuntun/public/t/dt=w/shard=s0/dv/gone.parquet/dv-2.bin".to_string();
+        // 目录里只有 `dv-1` 被事件引用
+        let referenced: HashSet<String> = [dv_live.clone()].into_iter().collect();
         let paths: HashSet<String> = [
             "yuntun/public/t/dt=w/shard=s0/b7.parquet".to_string(),
             "yuntun/public/t/dt=w/shard=s0/b7.idx".to_string(),
-            // DV 锚定 b7 ⇒ 必须**被保护**（不能因为 `dv-1` 不在 known 里就删）
-            "yuntun/public/t/dt=w/shard=s0/dv/b7.parquet/dv-1.bin".to_string(),
-            // DV 锚定的数据文件已经不在了 ⇒ 它才是孤儿
-            "yuntun/public/t/dt=w/shard=s0/dv/gone.parquet/dv-2.bin".to_string(),
+            dv_live.clone(),
+            dv_orphan.clone(),
+            dv_gone.clone(),
         ]
         .into_iter()
         .collect();
-        let mut orphans = classify_orphans(paths, &known, 0, Duration::from_secs(0));
+        let mut orphans = classify_orphans(paths, &known, &referenced, 0, Duration::from_secs(0));
         orphans.sort();
+        let mut want = vec![dv_gone.clone(), dv_orphan.clone()];
+        want.sort();
         assert_eq!(
             orphans,
-            vec!["yuntun/public/t/dt=w/shard=s0/dv/gone.parquet/dv-2.bin".to_string()],
-            "活着的 DV 与其数据文件一样受保护；只有锚定对象已消失的 DV 才是孤儿"
+            want,
+            "① 锚定文件活着 **且** 目录认它 ⇒ 保护（dv-1）；\
+             ② 锚定文件活着但**没人引用** ⇒ 孤儿（dv-ghost：对象写了、apply 没落地）；\
+             ③ 锚定文件没了 ⇒ 孤儿（dv-2，引用不救它）"
         );
+        // 数据文件/索引只看"自己的 batch_id"（不受"被引用集合"影响）
+        assert!(is_object_protected(
+            "yuntun/public/t/dt=w/shard=s0/b7.parquet",
+            &known,
+            &HashSet::new()
+        ));
+        assert!(is_object_protected(
+            "yuntun/public/t/dt=w/shard=s0/b7.idx",
+            &known,
+            &HashSet::new()
+        ));
     }
 
     #[test]
@@ -1651,7 +1703,7 @@ mod tests {
         );
         let mut known = HashSet::new();
         known.insert("018f0000-0000-7000-8000-000000000002".to_string());
-        let orphans = classify_orphans(s3, &known, 0, Duration::from_secs(3600));
+        let orphans = classify_orphans(s3, &known, &HashSet::new(), 0, Duration::from_secs(3600));
         assert_eq!(orphans.len(), 1);
         assert!(orphans[0].contains("000000000001"));
     }
