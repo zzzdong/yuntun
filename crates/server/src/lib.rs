@@ -33,6 +33,16 @@ pub struct Lakehouse {
     /// **必须持有**：它的 `Drop` 会停 raft 线程。丢掉它 = 后台线程失控
     /// （测试里表现为"进程退不干净"）。
     _meta: Option<yuntun_meta::MetaNode>,
+    /// 嵌入式 metanode 的 **loopback gRPC 服务任务**（`F.3` 后的装配缺口修，`§159`）。
+    ///
+    /// **为什么必须能被 join**：这个任务持有 `NodeHandle`，而 `NodeHandle` 里有一份
+    /// `FjallStorage` 克隆 ⇒ **fjall 的目录锁**由它持有。任务不停，锁就不放
+    /// （台账 `D-11` 的现场：`FjallError: Locked`，看起来像"没落盘"，其实是锁没放）。
+    /// 所以它随 `shutdown` 退出，并在 [`Self::spawn_background`] 里交给调用方 join ——
+    /// join 之后锁才**确定**释放，"同一进程内重启"才成为可测的事。
+    ///
+    /// `Mutex<Option<..>>`：`spawn_background(&self)` 需要把它**取出来**交出去。
+    meta_grpc: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// SQL 处理层（W-4：MySQL wire 端口与 FlightServer 各自持有句柄；
     /// 引擎无状态，仅 write_policy 为实例级配置）
     pub sql: Arc<SqlEngine>,
@@ -218,7 +228,15 @@ impl Lakehouse {
 /// 并打 warn（重启即新集群）。生产请在配置里显式给（`standalone` 的默认路径是 `./data/meta`）。
 async fn build_embedded_catalog(
     cfg: &Config,
-) -> Result<(Arc<dyn CatalogOps>, yuntun_meta::MetaNode), yuntun_model::error::LakeError> {
+    shutdown: &CancellationToken,
+) -> Result<
+    (
+        Arc<dyn CatalogOps>,
+        yuntun_meta::MetaNode,
+        tokio::task::JoinHandle<()>,
+    ),
+    yuntun_model::error::LakeError,
+> {
     use std::collections::HashMap;
 
     let dir = match &cfg.meta.dir {
@@ -259,10 +277,21 @@ async fn build_embedded_catalog(
         yuntun_model::error::LakeError::Io(format!("取监听地址失败：{e}"))
     })?;
     let served = node.handle();
-    tokio::spawn(async move {
-        // 服务错误在这里只能打日志：`serve` 只在监听器层面失败（进程退出前一直运行）
-        if let Err(e) = yuntun_meta::serve(served, listener).await {
-            eprintln!("[meta] 嵌入式 gRPC 服务退出：{e}");
+    // ⚠️ 这个任务**持有 `NodeHandle`（其中含一份 `FjallStorage`）⇒ 它持有 fjall 的目录锁**。
+    // 所以它必须：① 随 `shutdown` 退出 ② 把 `JoinHandle` 交出去让调用方能 join
+    //（否则"同一进程内重启"永远是 `FjallError: Locked` —— 台账 `D-11`）。
+    let sd = shutdown.clone();
+    let meta_grpc = tokio::spawn(async move {
+        tokio::select! {
+            r = yuntun_meta::serve(served, listener) => {
+                // 服务错误在这里只能打日志：`serve` 只在监听器层面失败
+                if let Err(e) = r {
+                    eprintln!("[meta] 嵌入式 gRPC 服务退出：{e}");
+                }
+            }
+            _ = sd.cancelled() => {
+                tracing::info!("嵌入式 metanode 的 gRPC 服务随 shutdown 退出（释放目录句柄）");
+            }
         }
     });
 
@@ -270,7 +299,7 @@ async fn build_embedded_catalog(
         yuntun_model::error::LakeError::Other(format!("连嵌入式 metanode 失败：{e}"))
     })?;
     tracing::info!(dir = %dir.display(), addr = %addr, "catalog 装配为 embedded metanode（1 节点 raft + loopback gRPC）");
-    Ok((Arc::new(remote), node))
+    Ok((Arc::new(remote), node, meta_grpc))
 }
 
 /// 同 build，但注入外部 shutdown（standalone 主循环使用）。
@@ -317,14 +346,17 @@ async fn build_embedded_catalog(
         //    |---|---|---|
         //    | `memory`（回滚点） | 进程内内存实现 | 重启即空，靠 WAL 的 DDL 重放重建 |
         //    | `embedded`（默认） | 进程内 **1 节点 metanode**（raft + fjall）+ loopback gRPC | **落盘**，重启仍在 |
-        let (catalog, meta_node): (Arc<dyn CatalogOps>, Option<yuntun_meta::MetaNode>) =
-            match cfg.meta.mode {
-                config::MetaMode::Memory => (Arc::new(MemoryCatalog::new()), None),
-                config::MetaMode::Embedded => {
-                    let (c, node) = Self::build_embedded_catalog(cfg).await?;
-                    (c, Some(node))
-                }
-            };
+        let (catalog, meta_node, meta_grpc): (
+            Arc<dyn CatalogOps>,
+            Option<yuntun_meta::MetaNode>,
+            Option<tokio::task::JoinHandle<()>>,
+        ) = match cfg.meta.mode {
+            config::MetaMode::Memory => (Arc::new(MemoryCatalog::new()), None, None),
+            config::MetaMode::Embedded => {
+                let (c, node, grpc) = Self::build_embedded_catalog(cfg, &shutdown).await?;
+                (c, Some(node), Some(grpc))
+            }
+        };
 
         // ② ObjectStore
         let store_cfg = match &cfg.store {
@@ -491,6 +523,7 @@ async fn build_embedded_catalog(
         Ok(Self {
             catalog,
             _meta: meta_node,
+            meta_grpc: std::sync::Mutex::new(meta_grpc),
             ingestor,
             query,
             sql,
@@ -505,6 +538,15 @@ async fn build_embedded_catalog(
     /// 启动全部后台任务（缓存刷新 / 攒批 / WAL 监控 / Compaction）。
     pub fn spawn_background(&self, cfg: &Config) -> Vec<tokio::task::JoinHandle<()>> {
         let mut handles = Vec::new();
+
+        // 嵌入式 metanode 的 loopback gRPC 服务任务（`memory` 形态没有）。
+        //
+        // **它是"能不能在同一进程内重启"的关键**：任务持有 `NodeHandle`（含 `FjallStorage`）
+        // ⇒ 它不停，fjall 的目录锁就不放（`D-11`）。放进这个列表 = 调用方原有的
+        // "cancel + join 全部后台任务"配方**自动**覆盖它（`§159`）。
+        if let Some(h) = self.meta_grpc.lock().unwrap().take() {
+            handles.push(h);
+        }
 
         // Query 缓存刷新（TTL 30s，§11 [query]）
         handles.push(self.query.spawn_refresh(

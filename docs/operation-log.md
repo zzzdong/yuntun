@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§158，2026-09-29**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§159，2026-09-29**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -10182,4 +10182,74 @@ DataFusion 在"零行"时返回的是**零个批次**（不是"一个空批次"�
 - `catalog`（1 条）：锚定已下线文件的 DV 被拒（消息点名"静默不生效的删除"）+ 找不到清单时放行；
 - `sql_delete_e2e`（既有用例扩了断言）：本分片被占 ⇒ DELETE 拒绝且**点名分片**；
   另一分片的锁 ⇒ **不影响**本次删除；归还之后又能删；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **5/5**。\n
+---
+
+## 159. **台账 `D-11` 闭环：默认（`embedded`）形态的重启持久性有端到端证据**（2026-09-29）
+
+`D-11` 的原文是"缺端到端用例"：`memory` 形态的重启有证据（靠数据 WAL 重放），
+而**默认形态**（目录落 fjall）只有结构性证据。做同进程重启却撞上 `FjallError: Locked`，
+当时的记录把它归成"`MetaNode::drop` 之后锁也不释放"。
+
+**这一刀把根因找到了，它不是 `Drop`，而是装配层少停了一个任务**：
+
+> `build_embedded_catalog` 里 `tokio::spawn` 的 **metanode loopback gRPC 服务任务**持有
+> `NodeHandle`，而 `NodeHandle` 里有一份 `FjallStorage` 克隆 ⇒ **fjall 的目录锁由它持有**。
+> 那个任务谁也 join 不到、也不看 shutdown 令牌 ⇒ 进程内**永不释放**。
+> `MetaNode::drop` 其实一直在正确工作（发 `Stop` + join raft 线程）—— 只是它不代表锁被放掉。
+
+于是现象被误诊成"fjall 没落盘"，而现场的那个"看到 `Locked` 就重试 5 秒"的兜底
+把缺陷**藏了**起来（这也解释了为什么它"重试也无效"）。
+
+### 159.0 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `server::build_embedded_catalog` | gRPC 服务任务改成 `tokio::select!`（serve vs `shutdown.cancelled()`），并把 `JoinHandle` 返回出去 |
+| `server::Lakehouse` | 新增 `meta_grpc: Mutex<Option<JoinHandle<()>>>`（`memory` 形态为 `None`）；[`spawn_background`] 把它**交给调用方** |
+| `server/tests/sql_delete_e2e.rs` | **删掉"看到 `Locked` 就重试 5 秒"的兜底**（它把 `D-11` 藏起来过），改回"一次成功" |
+| `server/tests/embedded_restart_e2e.rs`（新） | 默认形态的**同进程重启**端到端（见 §159.2） |
+
+### 159.1 三个决定
+
+1. **兜底删掉，而不是留着**。那个重试循环的注释写的是"看到它说明上一次的锁还没放，不是失败"——
+   而事实相反：它是**真缺陷**的信号。留着兜底会让"锁残留"永远绿着（本仓最烦的那种绿）。
+   现在装配层把任务交出来 ⇒ 调用方原有的"cancel + join 全部后台任务"配方**自动**覆盖它，
+   用例正面断言"重开一次成功"。
+2. **证据来源要钉死**：第二次运行**之前把数据 WAL 目录挪走** —— 否则"重启后删除还在"
+   也可能是 `replay_wal_dml` 重放出来的（那是 `memory` 形态已经在验的那条路），
+   而本用例要证的是**落盘**（fjall 里的目录状态）。挪走之后，那个状态只可能来自 fjall。
+3. **停机配方写进用例**（`cancel → join 全部后台任务 → drop`）。它是**产品语义**的一部分
+   （谁停、按什么顺序停），不是测试的私有技巧：注释里写清"为什么 join 而不是 sleep"
+   （任务各自握着目录句柄，没结束 ⇒ 锁还在）。
+
+### 159.2 用例守什么
+
+`embedded_restart_e2e::embedded_mode_persists_dml_across_an_in_process_restart`：
+
+- 第一次运行：建表 → 插 4 行 → `DELETE WHERE v IN (2,4)` → 断言查得到 `[1,3]`
+  **且目录里真有那份删除向量**（`card == 2`）；
+- 优雅停机（配方见上）→ **把数据 WAL 挪走**；
+- 第二次运行：**一次成功**（不许重试兜底）⇒ `SELECT` 仍是 `[1,3]`；
+  删除向量**逐字段**都在（`card` / `table` / `store_path` —— 读侧要拿路径去取位图）；
+- 新实例**继续可用**：再插一行 ⇒ `[1,3,5]`，且被删的 2/4 **不会因为重启而回来**。
+
+### 159.3 边界
+
+1. 修的是**进程内重启**（测试、备份/恢复工具、同机滚动升级用得上）。**进程退出路径本来是对的**
+   （`standalone` 主循环：cancel → join mysql → join bg → `main` 返回 ⇒ `MetaNode::drop` 停线程）；
+2. metanode 的 gRPC 服务随 shutdown 退出 ⇒ **停机时在途的 meta 请求会被丢弃**
+   （客户端看到连接关闭；这是刻意取舍：停机就该停，不该吊着）。需要"排空"的话是另一件事，
+   本刀不做，写在这里免得被当成已覆盖；
+3. 上一条还有个直接后果：**停机后 `NodeHandle` 的读接口不再可用**（任务已经把句柄放掉了）——
+   装配层仍持有 `MetaNode` 与 `RemoteCatalog`，但它们的语义已经"停"了。今天没有调用方在停机后
+   继续读目录（测试也不该），同样记在这里。
+
+### 159.4 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **518 passed / 0 failed / 0 ignored**；
+- `embedded_restart_e2e`（1 条，四段）：第一次运行的状态 → 优雅停机 + 挪走 WAL →
+  **重开一次成功** → 状态与删除向量逐字段都在 + 新实例继续可写；
+- `sql_delete_e2e`（5 条，含默认形态那条）：**去掉重试兜底之后仍全绿** ⇒
+  锁确实是"停任务"停掉的，不是"等出来"的；
 - `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **5/5**。

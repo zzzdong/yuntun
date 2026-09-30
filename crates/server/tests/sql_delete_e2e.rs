@@ -156,20 +156,16 @@ scan_interval_ms = 20
 /// （`MetaNode::drop` 之后锁也没释放，重试 5 秒无效 —— `§151.3`）。
 /// 所以本用例**不做**"同进程重启"；这个助手留着是为了"起第一次"时的时序抖动。
 async fn build_embedded(cfg: &yuntun_server::Config, shutdown: CancellationToken) -> Arc<Lakehouse> {
-    for i in 0..25 {
-        match Lakehouse::build_with_shutdown(cfg, shutdown.clone()).await {
-            Ok(lh) => return Arc::new(lh),
-            Err(e) if format!("{e}").contains("Locked") => {
-                if i == 0 {
-                    // 记一条：看到它说明"上一次的锁还没放"，不是失败
-                    eprintln!("[test] meta 目录仍被上一次运行锁着，重试…");
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-            Err(e) => panic!("起 Lakehouse 失败：{e}"),
-        }
-    }
-    panic!("重试 5 秒仍拿不到 meta 目录（fjall 锁没释放）");
+    // ⚠️ 这里**曾经**有一段"看到 `Locked` 就重试 5 秒"的兜底 —— `§159` 之后删掉了：
+    // 那个 `Locked` 不是"锁还没放"的抖动，而是**装配层真的没停 metanode 的 gRPC 服务任务**
+    // （任务持有 `NodeHandle` ⇒ 持有 fjall 的目录锁，进程内永不释放）。现在任务随 `shutdown`
+    // 退出，且"同进程重启一次成功"由 `embedded_restart_e2e` 正面守着 ——
+    // 留着兜底只会把这类缺陷再藏起来（本仓最烦的那种"绿"）。
+    Arc::new(
+        Lakehouse::build_with_shutdown(cfg, shutdown)
+            .await
+            .expect("起嵌入式 Lakehouse 应当一次成功（`§159` 修掉了目录锁残留）"),
+    )
 }
 
 /// **默认形态**（`[meta] mode = "embedded"`：进程内 1 节点 raft + fjall 落盘）。
