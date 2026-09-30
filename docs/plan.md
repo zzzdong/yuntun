@@ -257,7 +257,7 @@ chunk_max_resident_secs > max_flush_delay_secs + flush_phase_spread_secs
 
 **本阶段未做（明确留待）**：相位分散量级定案（P0）、spill 复用（P2）、
 `chunk::ColumnStats` 尚未接入 query 的块级跳过（阶段 3/4）、
-内存/WAL 积压三项指标未接观测（`refactor.md` S1-11）。
+~~内存/WAL 积压三项指标未接观测（`refactor.md` S1-11）~~（**已接**：`T6.12` + HTTP 导出 `§160`）。
 
 
 ---
@@ -445,7 +445,7 @@ SQL `INSERT` 返回成功时数据仅落 WAL（与 Flight DoPut 语义一致）�
 |---|---|---|---|
 | 故障刻画（chaos 11 场景） | 仅 3 场景（并发崩溃 / kill -9 等） | 未刻画就上 raft：故障组合指数级放大（`refactor.md §3` 明确"不要跳过"） | 阶段 2 |
 | 基线压测 | ✅ **已入库** | `chaos/examples/bench_baseline.rs`（T8）+ `operation-log §32/§33/§35` 数据表：提交时刻分布/带宽、峰值提交数、`seal→committed`、文件数·天、单文件行数、**seal 原因分布与封口水位**、内存水位曲线、RowGroup 数。**仍缺**：真多节点（跨进程/跨机）CommitFiles 瞬时并发、真实 S3 PUT 绝对延迟、**组级剪枝收益** | 阶段 2（剩余部分） |
-| 观测指标（S1-11） | 未接 | 内存水位 / WAL 积压 / 背压水位三项不可见 → 压力问题只能复现不能定位 | 阶段 2 |
+| 观测指标（S1-11） | ✅ **已接**（`T6.12`，2026-09-17；**HTTP 导出 `§160`，2026-09-30**） | `Lakehouse::metrics()` + 周期日志 + `[metrics]` HTTP（`/metrics` Prometheus 文本、`/metrics.json`、`/healthz`）。⚠️ 本行曾长期写「未接」而同一文件的 `T6.12` 行早已是 ✅ —— 台账 `D-15`（`§160` 闭环） | ✅ 完成 |
 | 文档同步（ADR-10 等） | 未修订 | ADR 原文与实现不一致，下一位实现者会按原文改回**违例实现** | 阶段 2 末 |
 
 ### 5.2 接缝现状（哪些抽象已到位、哪些是旁路）
@@ -487,7 +487,7 @@ SQL `INSERT` 返回成功时数据仅落 WAL（与 Flight DoPut 语义一致）�
 | ID | 内容 | 说明 | 为什么现在做 |
 |---|---|---|---|
 | T6.1–6.11 | Chaos 11 场景（v1.0 §5.2 全表沿用） | 含并发崩溃、`synced_seq` 验证、Batch 超时、磁盘水位 | 阶段 3 前置：`refactor.md §3` 明文"不要跳过"。**✅ 11/11 全部在 chaos 层有真实磁盘 + 跨重启 + 并发的证据**（`operation-log §31`）。过程中抓出**五个**真缺陷、**全部已修**：幂等键不生效（§27 ✅）、恢复重复文件（§28.2 ✅）、WAL 撕裂不可自愈（§29.1 ✅）、监控 abort 不同步视图（§30 ✅）、提交窗口重复计数（§28.1 ✅，读侧栅栏见 §99）。**下一步 = T8 基线压测 + P0 定案**（相位分散量级 / `max_flush_delay` / `rows_threshold`）+ ADR-10 修订 |
-| T6.12 | **S1-11 观测三项指标** ✅ **已完成（2026-09-17）** | `Lakehouse::metrics()` + 周期打点：chunk 内存水位 / **WAL 积压记录数** / 背压水位 + Catalog 版本与增量统计（可序列化，HTTP 导出待阶段 2 尾） | 没有它，R-7（内存越限）只能复现不能定位 |
+| T6.12 | **S1-11 观测三项指标** ✅ **已完成（2026-09-17）** | `Lakehouse::metrics()` + 周期打点：chunk 内存水位 / **WAL 积压记录数** / 背压水位 + Catalog 版本与增量统计（可序列化）＋ **HTTP 导出已补**（`§160`：`/metrics` / `/metrics.json` / `/healthz`） | 没有它，R-7（内存越限）只能复现不能定位 |
 | T6.13 | **P0 定案**（v2.1 新增） | 用 T8 数据定 `flush_phase_spread_secs` / `max_flush_delay_secs` / `rows_threshold`，并**正式修订 ADR-10** | §2.2；未定案就不该改默认值。**进度 3/3 ✅**：①相位分散+宽限期 ✅ 定案（30s/0）、③持久化上界口径 ✅（= 窗口关闭 + md + spread）、②`rows_threshold` ✅ 定案（保持，§35 实测定性）；ADR-10 已按定量表述改写 |
 | T6.14 | **chunk 压力与恢复专项**（v2.1 新增） | 触发 spill 的写入压力；spill 读回失败降级；大基数 `GROUP BY` 挤压 chunk 区（验证硬分区）；崩溃后 spill 清理 | S1 的"真实压力曲线"缺口。**已落地**：崩溃后 spill 清理（`ChunkStore::purge_leftover_spills` + `server/tests/private_dir_gate.rs`）、**硬分区两层验证**（`§131`：零件级两个账本各自触顶/拒绝/释放 + 整机级查询池 1 MiB 下优雅失败）；**未做**：真实压力曲线、spill 读回失败降级（需注入点） |
 | T6.15 | TTL 分片移除 + segment 清理闸门（R21） | 阶段 0 遗留 | 影响 WAL 磁盘占用（与 §2.2 的 P2 联动） |
