@@ -262,6 +262,8 @@ mod tests {
                 full_reloads: 20,
                 delta_tables: 21,
                 last_error: None,
+                freshness_checks: 23,
+                lazy_refreshes: 24,
             },
             query: QueryMetrics {
                 reserved_bytes: Some(22),
@@ -301,7 +303,7 @@ mod tests {
                 checked += 1;
             }
         }
-        assert!(checked >= 22, "字段数不对（{checked}）—— 判据本身要跟着字段增长");
+        assert!(checked >= 24, "字段数不对（{checked}）—— 判据本身要跟着字段增长");
     }
 
     /// 数值要**对得上**（不是"有没有这一行"就算过）。

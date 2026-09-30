@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§162，2026-09-30**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§163，2026-09-30**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -10443,4 +10443,74 @@ DataFusion 在"零行"时返回的是**零个批次**（不是"一个空批次"�
   "全归档口径"下会传 1 段做对照，证明"0"来自过滤而不是别的毛病）；② 混段 ⇒ 上传 1 段，
   拉回后 **`durable` 表的数据逐条读得回**，且**共段的 `best_effort` 数据也在**（正面断言代价）；
 - `wal_archive_durable` / `wal_archive_e2e`（既有）在 `all_tables = true` 下仍全绿 ⇒ **老行为没变**；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **7/7**。\n
+---
+
+## 163. **`S2-10` 收口：读路径的按需保鲜（`ensure_fresh`）**（2026-09-30）
+
+### 163.0 先说一个发现：S2-10 的机制**早就落地了**
+
+`refactor.md` 把 `S2-10`（「`cache_ttl_secs` 降级为兜底：不再作为主要失效手段」）列在
+「S2 收尾（残余）· 待办」里 —— 但读代码后发现**机制已经在**（`§26` 之后就一直在）：
+
+```text
+spawn_cache_refresh：poll = min(200ms, ttl)
+  ├─ 启动立即刷一次
+  ├─ version()（schema_ver / manifest_ver / shard_version）变了 ⇒ 立即刷
+  └─ 都没变 ⇒ 只有距上次刷新 >= ttl 才刷（**这就是"兜底"**）
+```
+
+也就是说 `cache_ttl_secs` **不是**主要失效手段、`version()` 才是 —— `S2-10` 的目标已达成，
+那行"待办"是漂移（台账 `D-19`）。但顺着这条线去核，**撞到了一个真缺口**：
+
+> **读路径（查询入口）自己不做保鲜**：后台刷新循环是个**任务** —— 进程刚起来时它还没被调度到，
+> 或者装配层（测试、嵌入式用法）根本没起它。那段时间里查询拿**冷缓存**去计划，
+> 报 `table not found`。实测撞到两次：`§157`（purge 用例）与 `§160`（指标用例），
+> 当时都是**自己显式 `refresh` 才过的** —— 而我还顺手写下了"后台刷新的 TTL 是 30s"
+> 这类**错误注释**（错的：拍子是 200ms）。这一刀把缺口补上，并把那些注释改成真话。
+
+### 163.1 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `query::LocalCatalog::ensure_fresh`（新） | 读路径入口的"确保不落后于版本"：冷缓存必刷 → 节流（默认 200ms，一次本地读，零 RPC）→ 版本没变则零开销返回 → 变了则**单飞**刷一次；**失败不阻断读** |
+| `query::LocalCatalog` | 三个新字段（`freshness_min_interval` / `last_freshness_check` / `refresh_gate`）+ 两个计数（`freshness_checks` / `lazy_refreshes`）+ `set_freshness_check_interval`（测试用 0 ⇒ 确定、无 sleep） |
+| `query::QueryEngine::session_with_partial` | 建会话前调一次 `ensure_fresh` —— **会话是所有读路径的必经点**（`sql*` / `sql_stream*` / `schema_of*` 都从它出发） |
+| `server::CatalogMetrics` | 把两个新计数接进指标（Prometheus 文本与 JSON 导出**自动带上** —— `§160` 的"从 JSON 生成"那份设计在这里回报） |
+| 三个既有用例 | `embedded_restart_e2e` / `sql_purge_e2e` **删掉**"重启后显式刷缓存"那段 ⇒ 它们从此**顺带成为按需保鲜的证据**（更强）；`metrics_http_e2e` 的注释同改 |
+| 用例 | `catalog_snapshot`（+4：冷缓存必刷 / 节流零开销 / 版本变更被看见 / 没接线不 panic）+ `server/tests/cache_lazy_refresh_e2e.rs`（1 条，**刻意不起后台任务**、全程无 sleep） |
+
+### 163.2 五个决定
+
+1. **为什么读路径也要问版本**：后台刷新是**任务**，不是**保证**。进程刚起来的瞬间、或装配层
+   没起它时，读路径不该跟着瞎 —— "查询自己保证缓存不落后"是**语义**，不是优化。
+2. **节流 200ms**：远端 `version()` 是**一次 RPC**（`RemoteCatalog::version` → prefetch）。
+   不节流就等于把查询 QPS 直接放大到元数据面。取 200ms（与后台循环同拍）⇒
+   "有人在读的时候不会比后台更滞后"，代价有界（≤5 次/秒）。
+3. **冷缓存不看节流**（正确性优先）：从没刷过 ⇒ 必刷。这条是"刚起来就能查"的关键。
+4. **失败不阻断读**：与后台循环同一条纪律（刷新失败不清空旧快照、也不报错）。
+   真正"必须刷新才能给出正确结果"的场景是 **STALE 处置**（`refresh_now`）—— 那里仍然
+   **响亮失败**。两条路径的分工写在这里：读入口的保鲜是**尽力而为**，STALE 是**必须**。
+5. **单飞**（`refresh_gate`）：并发查询同时发现"版本变了"时只让一个真去刷，其余等它刷完
+   再确认一次 —— 否则一次 DDL 之后的一波查询会把同一次变更刷 N 遍。
+
+### 163.3 边界
+
+1. **仍然是轮询 + 版本比较，不是 watch/推送**（ADR-6 的演进方向里有 watch，但今天没有推送通道；
+   节流之后代价已经很有限）。要做推送是另一件事，别把它当成"顺手"；
+2. 读路径的保鲜**不替代** STALE 处置（后者盯的是"数据引用的文件不在快照里"，见 `stale_retry.rs`）；
+3. `cache_ttl_secs` 的角色**没有变**（它一直就是兜底）；本刀没有改它的默认值，
+   也没有把它删掉 —— 它是"版本计数万一漏推"的最后一道网。
+
+### 163.4 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **531 passed / 0 failed / 0 ignored**（本刀 +5）；
+- `catalog_snapshot`（+4）：冷缓存必刷（绕缓存建表 ⇒ `ensure_fresh` 之后可见）｜节流窗口内
+  **连版本都不问**（`freshness_checks` 不变的硬判据）｜版本变更（绕缓存 DDL）必须被看见｜
+  没接线 `CatalogOps` 时不 panic、不刷新；
+- `cache_lazy_refresh_e2e`（1 条，四段、**无 sleep**）：**刻意不起 `spawn_background`**
+  ⇒ 缓存只可能靠读路径自己保鲜：① 绕缓存建表后 `SELECT count(*)` 成功（以前 `table not found`）
+  ② 按需刷了 1 次、只问了 1 次版本（冷缓存不看节流）③ 紧接着的第二个查询**不再问版本**（节流）
+  ④ 绕缓存 `ADD COLUMN` 后 `SELECT c` 成功、且**缓存里的 schema 确有新列**（版本变更被看见）；
+- `embedded_restart_e2e` / `sql_purge_e2e` 删掉显式刷新后仍全绿 ⇒ 它们以前那两步是**多余**的；
 - `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **7/7**。

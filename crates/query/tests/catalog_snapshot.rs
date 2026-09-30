@@ -378,3 +378,95 @@ impl CatalogOps for BrokenCatalog {
         self.inner.known_batch_ids().await
     }
 }
+
+// ---------------------------------------------------------------- 读路径按需保鲜（`§163`）
+
+/// **冷缓存必刷**：`ensure_fresh` 必须把"从没刷过"的缓存填上。
+///
+/// 这条盯的是实测撞到过两次的形态（`§157`/`§160` 的用例都得自己显式 `refresh` 才过）：
+/// 后台刷新任务是**另一个任务**，它还没被调度到时（进程刚起来、或装配层根本没起它），
+/// 查询会拿空缓存去计划 ⇒ `table not found`。
+#[tokio::test]
+async fn ensure_fresh_fills_a_cold_cache() {
+    let cat = Arc::new(MemoryCatalog::new());
+    let local = Arc::new(LocalCatalog::new());
+    local.set_catalog_ops(catalog_ref(&cat));
+    local.set_freshness_check_interval(std::time::Duration::ZERO);
+
+    // 建表**绕过缓存**（直接走目录句柄）：这正是"缓存冷、目录已经有"的形状
+    make_table(&cat, "t").await;
+    assert!(
+        local.snapshot().get("public.t").is_none(),
+        "前提：缓存还没刷过（所以它不认识这张表）"
+    );
+
+    local.ensure_fresh().await;
+    assert!(
+        local.snapshot().get("public.t").is_some(),
+        "冷缓存必须被按需刷上（否则查询报 table not found）"
+    );
+    assert_eq!(local.stats().lazy_refreshes, 1);
+    let _ = cat;
+}
+
+/// **版本没变 ⇒ 零开销**：节流窗口内不重复问版本，也不刷新。
+#[tokio::test]
+async fn ensure_fresh_is_throttled_when_within_the_window() {
+    let cat = Arc::new(MemoryCatalog::new());
+    let local = Arc::new(LocalCatalog::new());
+    local.set_catalog_ops(catalog_ref(&cat));
+    local.set_freshness_check_interval(std::time::Duration::ZERO);
+    make_table(&cat, "t").await;
+
+    local.ensure_fresh().await; // 冷 ⇒ 刷
+    assert_eq!(local.stats().refreshes, 1);
+
+    // 窗口很大 ⇒ 第二次连版本都不问
+    local.set_freshness_check_interval(std::time::Duration::from_secs(3600));
+    let before = local.stats();
+    local.ensure_fresh().await;
+    let after = local.stats();
+    assert_eq!(
+        after.refreshes, before.refreshes,
+        "节流窗口内不许刷新（远端 version() 是一次 RPC，读路径不能每查询都问）"
+    );
+    assert_eq!(
+        after.freshness_checks, before.freshness_checks,
+        "节流窗口内连版本都不问（这条是'零开销'的硬判据）"
+    );
+}
+
+/// **版本变了 ⇒ 刷**：绕过缓存改目录（DDL），下一次 `ensure_fresh` 必须看见。
+#[tokio::test]
+async fn ensure_fresh_picks_up_a_version_change() {
+    let cat = Arc::new(MemoryCatalog::new());
+    let local = Arc::new(LocalCatalog::new());
+    local.set_catalog_ops(catalog_ref(&cat));
+    local.set_freshness_check_interval(std::time::Duration::ZERO);
+    make_table(&cat, "t1").await;
+    local.ensure_fresh().await;
+    assert!(local.snapshot().get("public.t1").is_some());
+
+    // 绕过缓存建第二张表（版本推进）
+    make_table(&cat, "t2").await;
+    assert!(
+        local.snapshot().get("public.t2").is_none(),
+        "前提：缓存还不知道 t2"
+    );
+    local.ensure_fresh().await;
+    assert!(
+        local.snapshot().get("public.t2").is_some(),
+        "版本变了就必须刷（否则缓存永远落后于元数据）"
+    );
+    assert!(local.stats().lazy_refreshes >= 2);
+}
+
+/// **没接线 `CatalogOps` 时不 panic、不报错**：读路径的保鲜是尽力而为。
+#[tokio::test]
+async fn ensure_fresh_is_a_noop_without_ops() {
+    let local = LocalCatalog::new();
+    local.set_freshness_check_interval(std::time::Duration::ZERO);
+    local.ensure_fresh().await; // 不许 panic
+    assert_eq!(local.stats().refreshes, 0, "没接线就无从刷新");
+    assert_eq!(local.snapshot().table_count(), 0);
+}

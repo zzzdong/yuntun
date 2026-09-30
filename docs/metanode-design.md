@@ -84,7 +84,7 @@ R2 已经把"访问形态"按远程形态定义好了（`operation-log §26`）�
 | 路径 | 走向 | 一致性 |
 |---|---|---|
 | 写入（`commit_files` / DDL / `commit_compaction`） | datanode → `Propose(op)` → raft 提交 → SM apply → 返回（revision, 结果） | **线性化**：propose 返回即已提交 |
-| 读（查询规划用的 schema/manifest） | datanode 本地 `LocalCatalog`（**不每次打 metanode**） | **陈旧窗口 ≤ `cache_ttl`（默认 30s）**，由版本驱动刷新收敛 |
+| 读（查询规划用的 schema/manifest） | datanode 本地 `LocalCatalog`（**不每次打 metanode**） | **陈旧窗口 ≈ 版本轮询拍子 + 一次 RPC（默认 200ms 量级）** —— 后台循环每 `min(200ms, cache_ttl)` 比一次 `version()`，读路径入口再按需保鲜一次（`§163`）；`cache_ttl`（30s）只是**兜底** |
 | 刷新 | `Prefetch`（版本号）→ 无变化零开销；有变化 → `Delta` | 单调：版本只增 |
 | 幂等预筛 | 本地 `LocalCatalog` 的键集合（快路径）→ 未命中再 `Propose` | 权威在 SM；本地只是**加速**（§5.4） |
 
@@ -196,7 +196,7 @@ impl CatalogState { pub fn apply(&mut self, revision: u64, op: &CatalogOp) -> Op
 
 ### 4.7 D7：读一致性的对外声明（必须写进文档与 `metrics`）
 
-- 查询侧读的是**本地缓存**（`cache_ttl` 默认 30s，版本驱动刷新）；
+- 查询侧读的是**本地缓存**（**版本驱动刷新**，200ms 量级；`cache_ttl` 默认 30s 仅兜底，`§163`）；
 - 因此**"写入返回后立刻可查"仍成立**（读己之写靠 chunk 热数据），但**别的节点**可能在 ≤30s 内看不到；
 - 这个窗口必须出现在 README/`status.md` 的对外语义里（**不能再让它只存在于代码注释里**）。
 

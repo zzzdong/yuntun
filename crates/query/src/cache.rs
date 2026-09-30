@@ -168,6 +168,10 @@ pub struct LocalCatalogStats {
     pub snapshot: u64,
     pub version: CatalogVersion,
     pub tables: usize,
+    /// 读路径**按需保鲜**的版本查询次数（`§163`：受节流限制）
+    pub freshness_checks: u64,
+    /// 其中**真的刷了**的次数（对比 `freshness_checks` 能看出"按需刷新值不值"）
+    pub lazy_refreshes: u64,
 }
 
 /// 按**实例**持有的热数据读侧：`instance_id → ShardReader`。
@@ -214,7 +218,19 @@ pub struct LocalCatalog {
     /// —— 正是 `§65.5` 记下的坑。漂移的后果是**查询静默少数据**（名录里有、读不到）
     /// 或按错误的实例集合算归属。
     members: RwLock<BTreeMap<String, Member>>,
-    /// **刷新所需的 `CatalogOps`**（装配层注入），供查询路径上的 STALE 处置使用。
+    /// 读路径**按需保鲜**的节流间隔（`§163`）：两次版本查询之间至少隔这么久。
+    ///
+    /// 为什么必须节流：远端 `version()` 是**一次 RPC**（`RemoteCatalog::version` → prefetch）。
+    /// 后台刷新循环已经每 200ms 问一次；读路径再无限地问，等于把查询 QPS 直接放大到元数据面。
+    /// 取 200ms（与后台循环同拍）⇒ "有人在读的时候不会比后台更滞后"，而代价有界（≤5 次/秒）。
+    freshness_min_interval: RwLock<Duration>,
+    /// 上次问版本的时刻（`None` = 还没问过）
+    last_freshness_check: RwLock<Option<std::time::Instant>>,
+    /// **单飞闸**：并发查询同时发现"版本变了"时，只让一个真去刷，其余等它刷完再看。
+    refresh_gate: tokio::sync::Mutex<()>,
+    freshness_checks: AtomicU64,
+    lazy_refreshes: AtomicU64,
+    /// 刷新所需的 `CatalogOps`（装配层注入），供查询路径上的 STALE 处置使用。
     ///
     /// 为什么由 `LocalCatalog` 自己持有：STALE 的处置是"刷新 manifest → 重试"，而这件事发生在
     /// **查询路径上**，那里只有 `Arc<LocalCatalog>`（`QueryEngine` 拿不到 ops）。
@@ -241,7 +257,74 @@ impl LocalCatalog {
                 "standalone".to_string(),
                 Member::local("standalone"),
             )])),
+            freshness_min_interval: RwLock::new(Duration::from_millis(200)),
+            last_freshness_check: RwLock::new(None),
+            refresh_gate: tokio::sync::Mutex::new(()),
+            freshness_checks: AtomicU64::new(0),
+            lazy_refreshes: AtomicU64::new(0),
             ops: RwLock::new(None),
+        }
+    }
+
+    /// 调读路径的保鲜节流间隔（测试用 `0` = 每次都问）。
+    pub fn set_freshness_check_interval(&self, d: Duration) {
+        *self.freshness_min_interval.write().unwrap() = d;
+    }
+
+    /// **读路径入口的"确保不落后于版本"**（`§163`；`refactor.md` S2-10 的收口）。
+    ///
+    /// # 为什么读路径自己也要问一次
+    ///
+    /// 后台刷新循环（[`spawn_cache_refresh`]）已经是"版本驱动 + TTL 兜底"，
+    /// 但它**是个任务**：进程刚起来时它还没被调度到，或者装配层（测试、嵌入式用法）
+    /// 根本没起它 —— 那段时间里查询会拿到**空缓存**，报 `table not found`。
+    /// 实测撞到过两次（`§157`/`§160` 的用例都是自己显式 `refresh` 才过的）。
+    ///
+    /// # 三条规则（顺序就是代价从低到高）
+    ///
+    /// ```text
+    /// ① 冷缓存（从没刷过）⇒ 必刷，不看节流
+    /// ② 节流：距上次问版本不足 `freshness_min_interval` ⇒ 直接返回（一次本地读，零 RPC）
+    /// ③ 版本没变 ⇒ 什么都不做；变了 ⇒ 单飞刷一次
+    /// ```
+    ///
+    /// **失败不阻断读**（与后台循环同一条纪律：刷新失败不清空旧快照）：
+    /// 真正"必须刷新才能给出正确结果"的场景是 STALE 处置（[`Self::refresh_now`]），
+    /// 那里仍然是**响亮失败**。
+    pub async fn ensure_fresh(&self) {
+        let cold = self.refreshes.load(Ordering::SeqCst) == 0;
+        if !cold {
+            let min = *self.freshness_min_interval.read().unwrap();
+            let due = match *self.last_freshness_check.read().unwrap() {
+                Some(t) => t.elapsed() >= min,
+                None => true,
+            };
+            if !due {
+                return;
+            }
+        }
+        *self.last_freshness_check.write().unwrap() = Some(std::time::Instant::now());
+        self.freshness_checks.fetch_add(1, Ordering::SeqCst);
+        let Some(ops) = self.ops.read().unwrap().clone().map(|h| h.0) else {
+            // 没接线：读路径**不报错**（没接线是装配问题；响亮失败留给 STALE 处置那条路）
+            return;
+        };
+        // 节流过了、缓存也不冷 —— 先问版本（这是"零开销"的那一半：没变就什么都不做）
+        if !cold && ops.version().await == self.snapshot().version {
+            return;
+        }
+        let _gate = self.refresh_gate.lock().await;
+        // 等闸期间别人可能已经刷完了 ⇒ 再确认一次（避免并发查询把同一次变更刷 N 遍）
+        if !cold && ops.version().await == self.snapshot().version {
+            return;
+        }
+        match self.refresh(&ops).await {
+            Ok(_) => {
+                self.lazy_refreshes.fetch_add(1, Ordering::SeqCst);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "读路径按需刷新失败（用旧快照继续，后台循环会重试）");
+            }
         }
     }
 
@@ -342,6 +425,8 @@ impl LocalCatalog {
             snapshot: snap.snapshot,
             version: snap.version,
             tables: snap.table_count(),
+            freshness_checks: self.freshness_checks.load(Ordering::SeqCst),
+            lazy_refreshes: self.lazy_refreshes.load(Ordering::SeqCst),
         }
     }
 

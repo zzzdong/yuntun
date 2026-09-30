@@ -354,12 +354,7 @@ async fn purge_deletes_the_whole_table_and_never_eats_later_writes() {
     );
     let _bg = lakehouse.spawn_background(&cfg);
     let mut client = serve(&lakehouse, shutdown.clone()).await;
-    lakehouse
-        .query
-        .catalog()
-        .refresh(&(lakehouse.catalog.clone()))
-        .await
-        .unwrap();
+    // （重启后的第一次查询**不需要**显式刷缓存：读路径自己会保鲜，`§163`）
     assert!(
         col_v(&mut client, "SELECT v FROM t ORDER BY v").await.is_empty(),
         "**重启之后表仍然是空的**（整表清除只改目录 ⇒ 必须靠 WAL 重放，见 `PurgePayload` 的文档）"

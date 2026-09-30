@@ -241,6 +241,10 @@ impl QueryEngine {
         schema: &str,
         partial: std::sync::Arc<PartialSink>,
     ) -> Result<SessionContext, DataFusionError> {
+        // **读路径的按需保鲜**（`§163`）：会话是所有查询的必经点，缓存不落后于版本才建会话。
+        // 冷缓存必刷（否则"进程刚起来 / 装配层没起后台任务"时查询会报 table not found），
+        // 其余情况按节流问一次版本、没变则零开销返回。失败不阻断读（见 `ensure_fresh` 的文档）。
+        self.catalog.ensure_fresh().await;
         let config = datafusion::prelude::SessionConfig::new()
             .with_information_schema(true)
             // G2（sql-access-design §四）：非限定表名 `FROM t` 解析到默认

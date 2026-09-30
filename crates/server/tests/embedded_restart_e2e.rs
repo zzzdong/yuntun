@@ -72,8 +72,8 @@ async fn col_v(lakehouse: &Lakehouse, session: &mut SessionCtx, sql: &str) -> Ve
     }
 }
 
-/// 同 `col_v`，但**失败返回 `None`**：轮询时"冷缓存里还没有这张表"是正常中间态
-/// （查询缓存的刷新 TTL 是 30s；写路径会主动刷，重启后的第一次读不一定有）。
+/// 同 `col_v`，但**失败返回 `None`**：轮询时"缓存里还没有这张表"是正常中间态
+/// （写路径会主动刷；冷缓存的兜底是读路径的按需保鲜，见 `§163`）。
 async fn col_v_opt(
     lakehouse: &Lakehouse,
     session: &mut SessionCtx,
@@ -199,15 +199,8 @@ async fn embedded_mode_persists_dml_across_an_in_process_restart() {
              fjall 的目录锁此时已经释放 —— 不许用「看到 Locked 就重试」把锁残留藏起来",
         );
     let bg = lakehouse.spawn_background(&cfg);
-    // 重启后的第一次查询：**显式刷一次缓存**（与 `§154`/`§157` 的重启用例同款做法）——
-    // 后台刷新的 TTL 是 30s，而这里要的是"新进程一上来就能读到落盘的状态"。
-    lakehouse
-        .query
-        .catalog()
-        .refresh(&(lakehouse.catalog.clone()))
-        .await
-        .expect("重启后刷新查询缓存");
-
+    // 重启后的第一次查询**不需要**显式刷缓存：读路径自己会保鲜（`§163`）——
+    // 这条用例因此顺带成了"新进程一上来就读得到落盘状态"的证据。
     assert_eq!(
         col_v(&lakehouse, &mut session, "SELECT v FROM t ORDER BY v").await,
         vec![1, 3],

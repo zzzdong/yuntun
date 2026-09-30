@@ -1320,7 +1320,7 @@ min_files = 5
 interval_secs = 60
 
 [query]
-cache_ttl_secs = 30                 # LocalCatalogCache TTL（版本驱动之外的兜底）
+cache_ttl_secs = 30                 # LocalCatalogCache TTL：**只是兜底**（主要失效由版本驱动；读路径入口还有按需保鲜，§163）
 partial = false
 hot_read_budget_secs = 2            # 热读（未落盘数据）的等待预算
 

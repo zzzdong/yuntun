@@ -77,7 +77,7 @@ S0 收尾 ──► S1 chunk ──► S2 catalog ──► S3 metanode ──�
 | **S1 chunk 层** | ✅ **已完成 2026-09-15** | 落地 crate `yuntun-chunk`；189 tests / 0 failed；对照审查与 5 处回改见 `docs/operation-log.md §25` |
 | S1 收尾（残余） | 待办 | S1-11 观测指标、spill 复用、相位分散量级定案（P0，见 `plan.md §2.2`） |
 | **S2 Catalog 访问形态** | ✅ **已完成 2026-09-17**（7/8，余 S2-8 随 R3） | 版本分组 / 增量 delta / 不可变快照 / 抽象补位（`operation-log §26`） |
-| S2 收尾（残余） | 待办 | S2-8 本地缓存持久化（R3 后）、S2-10 TTL 降级为纯兜底 |
+| S2 收尾（残余） | 待办 | S2-8 本地缓存持久化（R3 后）；~~S2-10 TTL 降级为纯兜底~~ ✅ **早已落地**（`§163` 核实：`spawn_cache_refresh` 一直是版本驱动 + TTL 兜底），同刀补上**读路径的按需保鲜** |
 | S3 … S6 | 未开始 | 见 `status.md §6`（P0 ② 与真多节点压测是前置） |
 
 ---
@@ -195,7 +195,7 @@ S0 收尾 ──► S1 chunk ──► S2 catalog ──► S3 metanode ──�
    文件数无关；否则"增量刷新"每次仍要克隆全表文件清单，等于没做。
 2. **增量接口必须能报"消失的表"**：删表若只靠 schema_ver 兜底，一旦调用方漏判就会留着过期缓存。
 | S2-9 | **flush jitter 重构** | 随机 jitter → 确定性相位偏移：`sealed_at + max_flush_delay + hash(instance,key) % flush_phase_spread`。**机制部分已在 S1 落地**；剩余的是 ~~spread 量级定案~~ / ~~ADR-10 原文正式修订~~ —— **两者都已完成**（T8 定案 `md=0`/`spread=30s` + ADR-10 v12 修订，`operation-log §32`；`plan.md §2.3-1` 已标 ✅） |
-| S2-10 | `cache_ttl_secs` 降级为兜底 | 不再作为主要失效手段 |
+| S2-10 | `cache_ttl_secs` 降级为兜底 | 不再作为主要失效手段。✅ **已达成**（`spawn_cache_refresh` 的 `poll = min(200ms, ttl)` + 启动即刷 + `version()` 变即刷）；`§163` 再补**读路径按需保鲜**（冷缓存/后台任务未起时不再报 `table not found`） |
 
 ### 5.2 关键陷阱
 
@@ -342,7 +342,7 @@ S0 收尾 ──► S1 chunk ──► S2 catalog ──► S3 metanode ──�
 | — | **新增 `max_flush_delay_secs`**（默认 30s） | seal → flush 宽限期（**不是**持久化上界本身） |
 | `flush_jitter_secs = 60` | **移除随机 jitter**（已落地） | 改为确定性相位偏移 `hash(instance, key) % flush_phase_spread_secs`；⚠️ **spread 量级是 P0 决策**：5s 会把 ADR-10 的 60s 分散面收窄 12 倍 |
 | — | **新增 `flush_phase_spread_secs`**（默认 5s） | 相位分散上限；与 `max_flush_delay` / `chunk_max_resident` 存在不变量，见 §4.2-5 |
-| `cache_ttl_secs = 30` | 降级为兜底 | 主要失效改由 watch + 版本号驱动 |
+| `cache_ttl_secs = 30` | ✅ 降级为兜底（已是实现口径） | 主要失效由**版本号驱动**（`§163`：后台循环 + 读路径按需保鲜）；watch/推送仍是方向，未做 |
 | `disk_high_watermark = 0.80` | 保留 | 与背压阶梯 95% 联动 |
 | `segment_max_mb = 64` | 保留 | WAL 回收点由 flush 成功决定 |
 | `min_files = 5` / `interval_secs = 60` | 保留，重要性上升 | 无归属写入下 compaction 是唯一合并手段 |

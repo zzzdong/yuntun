@@ -119,6 +119,10 @@ pub struct CatalogMetrics {
     pub delta_tables: u64,
     /// 最近一次刷新失败原因（None = 健康；刷新失败会保留旧快照）
     pub last_error: Option<String>,
+    /// 读路径按需保鲜的版本查询次数（受节流限制，`§163`）
+    pub freshness_checks: u64,
+    /// 其中真的刷了的次数（对比上一个数能看出"按需刷新值不值"）
+    pub lazy_refreshes: u64,
 }
 
 /// query 执行区指标。
@@ -199,6 +203,8 @@ pub async fn collect_metrics(
                 full_reloads: stats.full_reloads,
                 delta_tables: stats.delta_tables,
                 last_error: query.catalog().last_error(),
+                freshness_checks: stats.freshness_checks,
+                lazy_refreshes: stats.lazy_refreshes,
             }
         },
         query: QueryMetrics {
