@@ -32,6 +32,10 @@
 //! chunk_max_resident_secs = 60        # 强制 seal+flush，防慢写入流撑爆 WAL（S1-9）
 //! flush_phase_spread_secs = 30        # 确定性相位偏移上限（替代随机 jitter，S2-9；T8 定案）
 //!
+//! [metrics]
+//! enabled = false                     # 指标 HTTP 导出（T6.12）；默认关：它会绑端口
+//! listen = "127.0.0.1:9091"           # GET /metrics（Prometheus 文本）、/metrics.json、/healthz
+//!
 //! [compaction]
 //! min_files = 5
 //!
@@ -368,6 +372,34 @@ pub struct Config {
     pub compaction: CompactionSection,
     pub query: QuerySection,
     pub sql: SqlSection,
+    /// 指标 HTTP 导出（`T6.12`）。`#[serde(default)]`：老配置没有 `[metrics]` 段照样能读
+    /// （与 `[meta]` 同一条理由：加一个必填段等于把所有既有部署一次性打挂）。
+    #[serde(default)]
+    pub metrics: MetricsSection,
+}
+
+/// 指标 HTTP 服务（`T6.12` 的"HTTP 导出"，`operation-log §160`）。
+///
+/// **默认关**（`enabled = false`）：它会**绑定一个端口**，而"默认开"意味着每个进程
+/// （含测试夹具、同机多实例）都去抢同一个端口 —— 端口怎么分配是部署决定，不该由默认值决定。
+///
+/// 端点只有三个（模块文档里写了协议面的取舍）：
+/// `GET /metrics`（Prometheus 文本）、`GET /metrics.json`、`GET /healthz`（liveness）。
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct MetricsSection {
+    /// 关闭则不监听（默认 `false`）
+    pub enabled: bool,
+    /// 被占用时**启动即报错**（不静默降级；与 `[sql.mysql]` 同一条纪律）
+    pub listen: String,
+}
+
+impl Default for MetricsSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: "127.0.0.1:9091".into(),
+        }
+    }
 }
 
 impl Default for Config {
@@ -384,6 +416,7 @@ impl Default for Config {
             compaction: CompactionSection::default(),
             query: QuerySection::default(),
             sql: SqlSection::default(),
+            metrics: MetricsSection::default(),
         }
     }
 }

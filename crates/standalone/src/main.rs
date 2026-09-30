@@ -79,6 +79,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ---- MySQL wire（:3306，配置 [sql.mysql]；bind 失败即启动报错）----
     let mysql = yuntun_server::spawn_mysql(&lakehouse, &cfg.sql.mysql).await?;
 
+    // ---- 指标 HTTP（[metrics]；默认关，bind 失败即启动报错）----
+    let metrics = yuntun_server::spawn_metrics(&lakehouse, &cfg.metrics).await?;
+
     // ---- Flight gRPC（阻塞至 shutdown）----
     let listen = cfg.server.listen.clone();
     yuntun_server::serve_flight(&lakehouse, &listen).await?;
@@ -87,6 +90,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     shutdown.cancel();
     if let Some(h) = mysql {
         let _ = h.await;
+    }
+    if let Some((addr, h)) = metrics {
+        // 与 mysql 同款：**能 join 的任务都要 join**（`§159` 的教训）
+        let _ = h.await;
+        tracing::info!(%addr, "metrics http stopped");
     }
     for h in bg {
         let _ = h.await;

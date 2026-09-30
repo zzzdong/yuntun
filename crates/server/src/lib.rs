@@ -4,9 +4,12 @@
 //! + Compactor + WAL 超时监控，并启动 Arrow Flight gRPC 服务。
 
 pub mod config;
+/// 指标 HTTP 导出（`T6.12` 的那一格）：`/metrics`、`/metrics.json`、`/healthz`。
+pub mod metrics_http;
 pub mod flight;
 
 pub use config::Config;
+pub use metrics_http::{prometheus_text, spawn_metrics};
 pub use flight::FlightServer;
 
 use std::sync::Arc;
@@ -76,6 +79,11 @@ pub struct ChunkMetrics {
     /// 背压水位（比例）
     pub pressure_ratio: f64,
     pub pressure: String,
+    /// 背压等级的**数值码**（`§160`）：`0` 正常 / `1` Soft / `2` Hard / `3` Reject。
+    ///
+    /// 为什么另给一个数：Prometheus 装不下字符串，而"背压到哪一档"正是要建告警规则的那一项
+    /// （`pressure` 字符串仍留给 JSON 与日志 —— 人读它，机器读这个码）。
+    pub pressure_code: u64,
     /// 因内存水位跳过相位分散而提前 flush 的累计次数。
     ///
     /// > 0 = **ADR-10 的削峰正在让位**（文件数与窗口的对应关系仍在，但提交时刻不再均匀分散）。
@@ -163,6 +171,12 @@ pub async fn collect_metrics(
             budget_bytes: ledger.limit(),
             pressure_ratio: ledger.ratio(),
             pressure: format!("{:?}", cs.pressure),
+            pressure_code: match cs.pressure {
+                yuntun_chunk::budget::Pressure::Normal => 0,
+                yuntun_chunk::budget::Pressure::Soft => 1,
+                yuntun_chunk::budget::Pressure::Hard => 2,
+                yuntun_chunk::budget::Pressure::Reject => 3,
+            },
             phase_yielded_flushes: cs.phase_yielded_flushes,
         },
         wal: WalMetrics {
