@@ -194,7 +194,7 @@ S0 收尾 ──► S1 chunk ──► S2 catalog ──► S3 metanode ──�
 1. **快照必须真的不可变**：`CatalogSnapshot.tables` 用 `Arc<CachedTable>`，写时复制的代价与
    文件数无关；否则"增量刷新"每次仍要克隆全表文件清单，等于没做。
 2. **增量接口必须能报"消失的表"**：删表若只靠 schema_ver 兜底，一旦调用方漏判就会留着过期缓存。
-| S2-9 | **flush jitter 重构** | 随机 jitter → 确定性相位偏移：`sealed_at + max_flush_delay + hash(instance,key) % flush_phase_spread`。**机制部分已在 S1 落地**；剩余的是 **spread 量级定案**（5s 会把 ADR-10 的 60s 分散面收窄 12 倍，属 P0 实测决策，见 `plan.md §2.2`）+ **ADR-10 原文正式修订**（`plan.md §2.3-1`） |
+| S2-9 | **flush jitter 重构** | 随机 jitter → 确定性相位偏移：`sealed_at + max_flush_delay + hash(instance,key) % flush_phase_spread`。**机制部分已在 S1 落地**；剩余的是 ~~spread 量级定案~~ / ~~ADR-10 原文正式修订~~ —— **两者都已完成**（T8 定案 `md=0`/`spread=30s` + ADR-10 v12 修订，`operation-log §32`；`plan.md §2.3-1` 已标 ✅） |
 | S2-10 | `cache_ttl_secs` 降级为兜底 | 不再作为主要失效手段 |
 
 ### 5.2 关键陷阱

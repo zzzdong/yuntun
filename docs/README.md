@@ -7,7 +7,7 @@
 | 我想…… | 读 |
 |---|---|
 | 知道**今天实际能做到什么 / 还缺什么 / 下一步做什么** | [`status.md`](status.md) ← **现状唯一入口** |
-| 知道**某个结论的证据**、某个实现与原设计的**偏差及原因** | [`operation-log.md`](operation-log.md)（§1–§160，按时间） |
+| 知道**某个结论的证据**、某个实现与原设计的**偏差及原因** | [`operation-log.md`](operation-log.md)（§1–§161，按时间） |
 | 知道**任务怎么排、里程碑与准出门槛** | [`plan.md`](plan.md)（阶段 WBS / M1–M6 / 风险登记） |
 | 知道**架构为什么这样设计**、有哪些 ADR | [`architecture.md`](architecture.md)（12 个 ADR + 域设计） |
 | 知道**模块边界、接口契约、数据结构、状态机、配置项** | [`design.md`](design.md) |
@@ -46,7 +46,20 @@ status.md（现状） + operation-log.md（证据）        ← 最高
 | 发现与设计不符（无论改哪边） | `operation-log`（偏差与理由）+ 回改设计文档对应段落 |
 | 架构级决策（ADR） | 新增或**正式修订** ADR（版本演进写明"谁被谁取代、为什么"），并在 `status.md §7` 标注 |
 
-## 4. 文档维护的硬规则
+## 4. 已知限制（当前口径，别按设计意图读）
+
+> 这一节只放**与设计意图不同**的现状。设计与 ADR 写的是目标，这里是**今天真实的界**。
+
+| 项 | 现状 | 依据 |
+|---|---|---|
+| `best_effort`（默认）的 **RPO** | **窗口关闭 + `max_flush_delay_secs` + `flush_phase_spread_secs`**，默认 **≤ 90s**；延迟到达的批次可能再多一个窗口 | `architecture.md §4 ADR-9` 的现状注；量级见 `operation-log §32` |
+| `durable` 的 **RPO** | 不是 ≈0，而是**归档间隔 + 一次上传时延**（默认 `archive_interval_secs = 1` ⇒ 秒级） | `architecture.md §4 ADR-9`；`operation-log §125` |
+| `durable` 的**粒度** | 归档开关是**节点级**（`[wal] archive_prefix`）：开了就归档全部表。表级 `durability` 字段已存在但**尚未参与判定**（台账 `D-16`） | `architecture.md §4 ADR-9` 现状注 |
+| 客户端**软路由** | 未实现、当前不计划：落点由部署显式给定（contact point 模型） | `architecture.md §4 ADR-10`；`operation-log §100` |
+| "每窗口每 shard ≤1 文件" | **不是硬不变量**：仅当"窗口内数据量 ≤ `bytes_threshold`"时成立 | `architecture.md §4 ADR-10`；`operation-log §35` |
+| 指标 | 已有 HTTP 导出（`[metrics]`：`/metrics`、`/metrics.json`、`/healthz`），**默认关** | `operation-log §160` |
+
+## 5. 文档维护的硬规则
 
 1. **就地升版本，不新建平行文档**。只有"新维度"才新开文件（`status.md` 就是新增的现状维度）。
 2. **版本号三处一致**：头部声明 / 正文版本演进 / 文末落款（`architecture.md` 曾出现头部 v10、正文 v12、文末 v11）。

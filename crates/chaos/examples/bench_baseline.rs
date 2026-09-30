@@ -497,7 +497,8 @@ async fn main() {
         );
     }
 
-    // 每 (shard, window) 的文件数：ADR-10 承诺"每窗口每 shard ≤1 文件"（小文件控制的根）。
+    // 每 (shard, window) 的文件数：ADR-10 的**目标**"每窗口每 shard ≤1 文件"（小文件控制的根）。
+    // ⚠️ 它不是硬不变量：仅当"窗口内数据量 ≤ `bytes_threshold`"时成立（ADR-10 的现状注 / `§35`）。
     // >1 说明该 (shard,窗口) 被拆成了多个文件 —— 必须查清是被什么触发的。
     let mut per_key: std::collections::BTreeMap<(String, String), usize> = Default::default();
     for f in &files {

@@ -390,3 +390,153 @@ fn plan_md_version_is_consistent() {
         "`docs/plan.md` 版本号不一致：头部 v{h} / 落款 v{t}\n→ 统一成同一个版本（改哪一处都行，别让它两说）"
     );
 }
+
+// ---------------------------------------------------------------- ADR 类（§161）
+
+/// **ADR-10 的定案数值必须与配置默认值一致**（`operation-log §161`）。
+///
+/// 为什么值得钉：ADR-10 的两个量（`max_flush_delay` / `phase_spread`）是**实测定案**的
+/// （T8 基线，`§32`），而它们在代码里就是两个默认值。`README §4` 的硬规则写着
+/// "改默认值必须附实测" —— 这条判据让它变成**能跑红**的：谁改了默认值而没动 ADR，
+/// 就会在这里被拦住（反过来也一样）。
+///
+/// 只核对格式明确的两处：ADR-10 定案表里的 `| `max_flush_delay` | **0**（原 30） |`
+/// 与 `| `phase_spread` | **30s**（原 5） |`，以及 `config.rs` 里那两个字段的字面默认值。
+#[test]
+fn adr10_decided_numbers_match_the_config_defaults() {
+    let root = repo_root();
+    let arch = docs_file(&root, "architecture.md");
+    let cfg = read(&root.join("crates/server/src/config.rs"));
+
+    // ADR-10 的定案表（`§161` 之后这两行的格式是稳定的）
+    let adr_md = arch
+        .lines()
+        .find(|l| l.contains("| `max_flush_delay` |"))
+        .unwrap_or_else(|| {
+            panic!(
+                "architecture.md 里找不到 ADR-10 的 `max_flush_delay` 定案行 —— \
+                 若改了表格格式，请同步这条判据"
+            )
+        });
+    let adr_spread = arch
+        .lines()
+        .find(|l| l.contains("| `phase_spread` |"))
+        .unwrap_or_else(|| {
+            panic!("architecture.md 里找不到 ADR-10 的 `phase_spread` 定案行")
+        });
+
+    // `config.rs` 的默认值：字段名 → 默认值那一行
+    let pick = |field: &str| -> String {
+        let mut out = None;
+        for (i, l) in cfg.lines().enumerate() {
+            if l.trim_start().starts_with(&format!("pub {field}:")) {
+                // 往后找第一行 `xxx: 数字,`（Default 实现里）
+                for l2 in cfg.lines().skip(i) {
+                    let t = l2.trim();
+                    if let Some(rest) = t.strip_prefix(&format!("{field}:")) {
+                        out = Some(rest.trim().trim_end_matches(',').to_string());
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+        out.unwrap_or_else(|| panic!("config.rs 里找不到字段 {field} 的默认值"))
+    };
+
+    // ADR 表里 `**0**` / `**30s**` ⇒ 数字
+    let num = |line: &str| -> u64 {
+        let mut best: Option<u64> = None;
+        for cell in line.split('|') {
+            let c = cell.trim().trim_matches('*');
+            let digits: String = c.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+            if !digits.is_empty() {
+                let v: u64 = digits.parse().unwrap();
+                best = Some(match best {
+                    Some(b) if b >= v => b,
+                    _ => v,
+                });
+            }
+        }
+        best.unwrap_or_else(|| panic!("这一行里没有数字：{line}"))
+    };
+
+    let md = pick("max_flush_delay_secs").parse::<u64>().unwrap();
+    let spread = pick("flush_phase_spread_secs").parse::<u64>().unwrap();
+    // 定案表里的值是"定案值"（加粗那个），行里还有"（原 30）"这种历史值 ⇒
+    // 取**加粗**那一格：`**0**` / `**30s**`
+    let bold = |line: &str| -> u64 {
+        let cell = line
+            .split('|')
+            .find(|c| c.contains("**"))
+            .unwrap_or_else(|| panic!("找不到加粗的定案格：{line}"));
+        // 落在 `**数字` 上
+        let after = cell.split("**").nth(1).unwrap_or_default();
+        let digits: String = after.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+        digits
+            .parse()
+            .unwrap_or_else(|_| panic!("加粗格里不是数字：{cell}"))
+    };
+    assert_eq!(
+        bold(adr_md),
+        md,
+        "ADR-10 的 `max_flush_delay` 定案值与 `IngestSection.max_flush_delay_secs` 的默认值不一致：\n  ADR: {}  ({})", bold(adr_md), adr_md
+    );
+    assert_eq!(
+        bold(adr_spread),
+        spread,
+        "ADR-10 的 `phase_spread` 定案值与 `IngestSection.flush_phase_spread_secs` 的默认值不一致：\n  ADR: {}  ({})", bold(adr_spread), adr_spread
+    );
+    let _ = num; // 保留给日后更复杂的表格解析
+}
+
+/// **`design.md §11` 的配置清单里的每个键，都必须在解析器里真的存在**（`operation-log §161`）。
+///
+/// 为什么值得钉：`§11` 曾经列着 `[gc]` / `multipart_threshold` / `idle_timeout` 这类
+/// **从未实现**的键 —— 照着设计文档写配置会**启动失败**，而"文档里的配置清单不能用"
+/// 是自查最难发现的一类漂移（要正好去写那份配置才会撞上）。
+#[test]
+fn design_md_config_keys_exist_in_the_parser() {
+    let root = repo_root();
+    let design = docs_file(&root, "design.md");
+    let cfg = read(&root.join("crates/server/src/config.rs"));
+
+    // 取 `## 十一、配置项清单` 之后第一个 ```toml 块
+    let start = design
+        .find("## 十一、配置项清单")
+        .expect("design.md 里找不到 `## 十一、配置项清单`");
+    let rest = &design[start..];
+    let block_start = rest.find("```toml").expect("§11 里应有 toml 代码块") + "```toml".len();
+    let block_end = rest[block_start..]
+        .find("```")
+        .expect("§11 的 toml 代码块没有结束")
+        + block_start;
+    let block = &rest[block_start..block_end];
+
+    // 收集键名：`key = value`（跳过注释与段名）
+    let mut checked = 0usize;
+    for (i, line) in block.lines().enumerate() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') || t.starts_with('[') {
+            continue;
+        }
+        let Some((key, _)) = t.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            continue;
+        }
+        assert!(
+            cfg.contains(key),
+            "design.md §11（第 {i} 行起）写了配置键 `{key}`，但 `crates/server/src/config.rs` \
+             里根本没有它 —— 照着这份清单写配置会直接启动失败。\n\
+             要么删掉这一行，要么先在 `config.rs` 里加字段。"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 20,
+        "§11 的配置清单里只解析出 {checked} 个键 —— 清单或被删空、或格式变了，请同步这条判据"
+    );
+}

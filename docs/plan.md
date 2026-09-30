@@ -226,9 +226,10 @@ chunk_max_resident_secs > max_flush_delay_secs + flush_phase_spread_secs
 | 1 | ~~**ADR-10 正式修订**~~ ✅ **已完成**（v12）：锚点 `seal_time`、确定性相位、量级 `md=0`/`spread=30s` + 定案实测表；并明确"每窗口每 shard ≤1 文件"不是硬不变量（阈值触发/延迟到达会破） | `architecture.md` §4 + `design.md` §5.3/§11 | ✅ 已完成 |
 | 2 | ~~crate 图补 `yuntun-chunk`~~ ✅ 已完成（`architecture.md` §3.2 已补 crate 列表 + 依赖方向） | `architecture.md` §3.2 | ✅ |
 | 3 | ~~**节点私有状态清单**~~ ✅ 已完成（ADR-3 处补了 WAL 目录 + spill 目录表，并写明"其余一切可重建"） | `architecture.md` §4 ADR-3 | ✅ |
-| 4 | **ADR-9 / README 已知限制**：`best_effort` 的 RPO 口径 = "窗口关闭 + `max_flush_delay` + `spread`"（默认 ≤90s；实测见 `operation-log §32`），并加限定语"延迟到达的批次可能再多一个窗口" | `architecture.md` §4 / README | 阶段 2 |
+| 4 | ~~**ADR-9 / README 已知限制**：`best_effort` 的 RPO 口径 = "窗口关闭 + `max_flush_delay` + `spread`"（默认 ≤90s；实测见 `operation-log §32`），并加限定语"延迟到达的批次可能再多一个窗口"~~ ✅ **已完成**（`§161`：ADR-9 补现状注，含 `durable` 的真实 RPO = 归档间隔、以及"表级 `durability` 未接线"= 台账 `D-16`；README 新增「已知限制」节） | `architecture.md` §4 / README | ✅ 已完成 |
+
 | 5 | ~~`architecture-with-chunk.md` §5.3 补限定语"seal 触发是窗口对齐的"~~ ✅ 已完成（顺便标了量级定案与与 `architecture.md` v12 的关系） | `architecture-with-chunk.md` | ✅ |
-| 6 | ~~详细设计 §11 配置清单同步~~ ✅ `[ingest]` 段已改（含删除 `flush_jitter_seconds`）；**欠**：`[chunk]` 段与 `idle_timeout` 待整段重写 | `design.md` §11 | 部分完成 |
+| 6 | ~~详细设计 §11 配置清单同步~~ ✅ **整段重写完成**（`§161`）：以 `config.rs` 头部模板为准，补齐 `[server]/[meta]/[chunk]/[sql]/[metrics]`，删掉从未实现或早已改名的键（`[gc]`/`[schema]`/`multipart_threshold`/`idle_timeout`…）并**逐条说明为什么删**；另加一条判据（§11 里的键必须在解析器里存在） | `design.md` §11 | ✅ 已完成 |
 
 ### 2.4 阶段 1.5 WBS：数据平面地基（chunk 层）—— ✅ 已完成
 
@@ -446,7 +447,7 @@ SQL `INSERT` 返回成功时数据仅落 WAL（与 Flight DoPut 语义一致）�
 | 故障刻画（chaos 11 场景） | 仅 3 场景（并发崩溃 / kill -9 等） | 未刻画就上 raft：故障组合指数级放大（`refactor.md §3` 明确"不要跳过"） | 阶段 2 |
 | 基线压测 | ✅ **已入库** | `chaos/examples/bench_baseline.rs`（T8）+ `operation-log §32/§33/§35` 数据表：提交时刻分布/带宽、峰值提交数、`seal→committed`、文件数·天、单文件行数、**seal 原因分布与封口水位**、内存水位曲线、RowGroup 数。**仍缺**：真多节点（跨进程/跨机）CommitFiles 瞬时并发、真实 S3 PUT 绝对延迟、**组级剪枝收益** | 阶段 2（剩余部分） |
 | 观测指标（S1-11） | ✅ **已接**（`T6.12`，2026-09-17；**HTTP 导出 `§160`，2026-09-30**） | `Lakehouse::metrics()` + 周期日志 + `[metrics]` HTTP（`/metrics` Prometheus 文本、`/metrics.json`、`/healthz`）。⚠️ 本行曾长期写「未接」而同一文件的 `T6.12` 行早已是 ✅ —— 台账 `D-15`（`§160` 闭环） | ✅ 完成 |
-| 文档同步（ADR-10 等） | 未修订 | ADR 原文与实现不一致，下一位实现者会按原文改回**违例实现** | 阶段 2 末 |
+| 文档同步（ADR-10 等） | ✅ **已完成**（`§161`，2026-09-30） | ADR-10 于 2026-09-18 修订（`§32`）；**ADR-9 的 RPO 口径**与 `design.md §11` 配置清单、README 的「已知限制」在 `§161` 补齐；并加**两条判据**（ADR-10 的定案数值 ↔ 配置默认值、`design.md §11` 的键 ↔ 解析器）。⚠️ 本行曾长期写"未修订"，而同一文件的 `§2.3` 清单早已把 ADR-10 标 ✅ —— 台账 `D-17`（同刀闭环） | ✅ 完成 |
 
 ### 5.2 接缝现状（哪些抽象已到位、哪些是旁路）
 

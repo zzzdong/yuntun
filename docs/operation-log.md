@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§160，2026-09-30**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§161，2026-09-30**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -10315,4 +10315,70 @@ DataFusion 在"零行"时返回的是**零个批次**（不是"一个空批次"�
 - `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **5/5**。
 - ⚠️ **本刀的第一次提交漏带了 `plan.md` 的三处改动**（同步脚本里那段有语法错误，整段没执行，
   而 `D-15` 已经声称闭环 ⇒ 文档会撒谎）。用一条跟进的 docs 提交补齐 —— 记在这里，
-  因为"脚本报错所以那一段没跑"正是"改了行为/文档之后**要去看它到底改没改**"的一个实例。
+  因为"脚本报错所以那一段没跑"正是"改了行为/文档之后**要去看它到底改没改**"的一个实例。\n
+---
+
+## 161. **文档同步审计：ADR-9 的 RPO 口径 + ADR-10 的 stale 声称 + `design.md §11` 配置清单**（2026-09-30）
+
+范围是 `plan.md §2.3` 那张"文档同步项"清单自己给的：
+**#4（ADR-9 / README 已知限制）未做**、**#6（详细设计 §11 配置清单）部分完成**，
+另有一条**与 `§2.3` 冲突的声称**：`plan.md §5.1` 那行写着"文档同步（ADR-10 等）| **未修订**"，
+而 `§2.3-1` 早已把 ADR-10 标 ✅ ⇒ 台账 `D-17`（本刀闭环）。
+
+### 161.0 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `architecture.md §4 ADR-9` | 补**现状注**：`best_effort` 的真实 RPO = 窗口关闭 + `max_flush_delay` + `phase_spread`（默认 ≤90s，延迟到达多一个窗口）；**`durable` 的 RPO 不是 ≈0，而是归档间隔 + 一次上传时延**（默认 1s）；并写明**表级 `durability` 尚未参与归档判定**（台账 `D-16`） |
+| `design.md §11` | **整段重写**配置清单：以 `config.rs` 头部模板为准，补齐 `[server]/[meta]/[storage]/[chunk]/[sql]/[metrics]`，删掉 10 个"从未实现或早已改名"的键并**逐条说明为什么删** |
+| `README.md` | 新增 **§4 已知限制**（RPO 口径、`durable` 粒度与 RPO、软路由未做、"≤1 文件/窗口"的前提、指标默认关），把"设计意图"与"今天的界"分开 |
+| stale 声称三处 | `plan.md §5.1` 行（"未修订" ⇒ ✅ + `D-17`）、`plan.md §2.3 #4/#6` 状态、`refactor.md` 的 S2-9 行、`crates/chaos/examples/bench_baseline.rs` 的"ADR-10 **承诺**"注释（改为"目标，且**有前提**"） |
+| 判据 2 条（`testkit/tests/docs_consistency.rs`） | 见 §161.3 |
+
+### 161.1 三件实质发现（不只是措辞）
+
+1. **`durable` 的 RPO 不是 ≈0**。归档是**周期性**的（`[wal] archive_interval_secs` 默认 **1 秒**，
+   连同一次上传时延），所以 RPO 的下界由**归档间隔**决定。写"≈0"的两种坏后果都真实存在：
+   下一位实现者去追一个做不到的指标，或者**把间隔调大而不觉得违约**。
+   （`config.rs` 那段字段注释本来就写着"它直接决定 RPO 的界"—— 是 ADR 落后于代码。）
+2. **表级 `durability` 未接线**（台账 `D-16`）。ADR-9 定的是**表级**配置，
+   字段（`IngestConfig.durability`，`0=best_effort 1=durable`）也一直在、随表落盘；
+   但今天**归档开关是节点级的**（`[wal] archive_prefix` 给了就归档**全部**表）。
+   ⇒ 现在"开 `durable`"的实际粒度是**整个节点**。这条**不是文档问题**，是代码缺口：
+   本刀只把它写进 ADR 的现状注 + 入台账，接线另排一刀。
+3. **`design.md §11` 的清单曾"不能用"**：里面列着 `[gc] orphan_delay`、`[schema] default_policy`、
+   `multipart_threshold`、`target_file_size`、`schema_snapshot_lock`、`idle_timeout`、
+   `segment_max_size`、`segment_max_age`（还拼错过）、`group_commit_window` 等
+   **从未实现或早已改名**的键 —— 照着它写配置会**直接启动失败**。
+   这类漂移最难自查（要正好去写那份配置才会撞上），所以顺带加了一条判据（§161.3）。
+
+### 161.2 `best_effort` 的 RPO 为什么"可算"
+
+它以前只活在 `§32` 的实测里（"上界 `seal→committed` 31.4s"），而 ADR 只写"秒级（攒批窗口）"。
+今天可写成一个**闭式**：`窗口关闭`（≤60s，取决于写入落在窗口内哪个位置）
+`+ max_flush_delay_secs`（0）`+ flush_phase_spread_secs`（30）⇒ **默认 ≤ 90s**；
+**延迟到达的批次可能再多一个窗口**（`§32.4` 的离群提交）。
+
+### 161.3 两条新判据（把"还会漂"的两处变成能跑红）
+
+1. `adr10_decided_numbers_match_the_config_defaults`：ADR-10 定案表里的
+   `max_flush_delay`（0）与 `phase_spread`（30s）↔ `IngestSection` 的默认值。
+   `README §4` 的硬规则写着"改默认值必须附实测" —— 这条判据让它**能跑红**。
+2. `design_md_config_keys_exist_in_the_parser`：`design.md §11` 的 toml 块里**每个键**
+   都必须在 `config.rs` 里存在。失败信息直接说"照着这份清单写配置会直接启动失败"。
+
+两条都只钉**格式明确**的字符串（定案表的加粗格、§11 的 toml 块），不猜自然语言。
+
+### 161.4 边界
+
+1. **不新建平行文档**（`README §4` 硬规则 1）：ADR-9 就地补现状注、`§11` 就地重写；
+2. **未做**：`[gc]` 那一类**设计项本身的落地**（不是文档问题，且都不在阶段 2 的清单里）；
+   表级 `durability` 的接线（台账 `D-16`，另排）；
+3. `design.md §11` 里 `[store] type = "s3"` 的字段以 `StoreSection` 为准（本刀在清单里
+   只列了 `bucket/endpoint/access_key_id/secret_access_key/allow_http` 这几个已在用的）。
+
+### 161.5 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **523 passed / 0 failed / 0 ignored**（本刀 +2：两条新判据）；
+- `docs_consistency` → **7/7**（原 5 条 + 新增 2 条）；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**。

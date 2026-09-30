@@ -1261,56 +1261,88 @@ pub enum LakeError {
 
 ## 十一、配置项清单
 
+> **本清单以 `crates/server/src/config.rs` 头部的模板为准**（那是解析器的权威，改字段先改它）。
+> `operation-log §161`（2026-09-30）把这一段**整段重写**过一次：此前它列着若干**从未实现**
+> 或**早已改名**的键（`[gc]`、`[schema]`、`[ingest.idempotency]`、`multipart_threshold`、
+> `target_file_size`、`schema_snapshot_lock`、`idle_timeout`、`segment_max_size`、`group_commit_window`、
+> 拼错的 `segment_max_age`）—— 照着它写配置会**直接启动失败**，而"设计文档里的配置清单不能用"
+> 是本仓最难自查的那类漂移。要加键：先改 `config.rs`，再回来加这一行。
+
 ```toml
-# lakehouse.toml
+# yuntun.toml（standalone：`yuntun --config yuntun.toml`）
 
-[wal]
-dir = "/var/lib/ingestor/wal"
-segment_max_size = "64MB"
-segment_max_age = "1h"
-group_commit_window = "1ms"       # 组提交窗口
-group_commit_max_batch = 1024
-batch_timeout = "30m"             # 【v11】批次超时 → BatchAbort
-disk_high_watermark = 0.80        # 【v11】磁盘保护水位
+[server]
+listen = "0.0.0.0:50051"
+shards = 1                          # MVP 单 shard；多 shard 在阶段 3（ShardMapper）
 
-[ingest]
-default_format = "vortex"          # vortex | parquet（回退开关）
-rows_threshold = 500000            # seal 触发（S1-10；对低吞吐表不触发，文件由窗口驱动）
-bytes_threshold_mb = 128           # seal 触发（内存口径）
-time_threshold_secs = 5            # 最短驻留地板（不是 seal 时刻）
-max_flush_delay_secs = 0           # 【v12/T8】seal → flush 宽限期（0 = 封口即到期）
-flush_phase_spread_secs = 30       # 【v12/T8】确定性相位分散上限（替代 v8 的随机 jitter）
-# flush_jitter_seconds 已在 S1 实现中删除（随机 jitter 让持久化上界不可预测）
-
-[ingest.idempotency]
-ttl = "24h"
-require_by_default = true          # 【v9】表模板可覆盖
-
-[schema]
-default_policy = "evolve"          # evolve | strict | permissive
+[meta]
+mode = "embedded"                   # embedded（默认：进程内 1 节点 raft + fjall）| memory（测试）
+listen = "127.0.0.1:50551"          # embedded 形态的 loopback gRPC 端口
+dir = "./data/meta"                 # 省略 → 进程内临时目录（重启即新集群，会 warn）
 
 [store]
-type = "s3"                        # s3 | local | mock（测试）
-bucket = "soc-lake"
-endpoint = "http://minio:9000"
-multipart_threshold = "8MB"
+type = "local"                      # local | memory | s3
+root = "./data/store"               # type = "local"
+# type = "s3" 时：bucket / endpoint / access_key_id / secret_access_key / allow_http
+
+[wal]
+dir = "./data/wal"                  # 节点私有状态之一（另一个是 spill 目录，见架构 ADR-3）
+segment_max_mb = 64
+batch_timeout_secs = 1800           # 【v11】批次超时 → BatchAbort
+disk_high_watermark = 0.8           # 【v11】磁盘保护水位
+archive_prefix = ""                 # ADR-9 的 durable 档：给了它才把 WAL 段归档到共享存储（§125）
+archive_interval_secs = 1           # **它直接决定 RPO 的界**（连同一次上传时延；见 §4 ADR-9 现状注）
+
+[chunk]
+spill_dir = "./data/spill"          # 必须本地磁盘（架构 §2.5）
+instance_id = "standalone"
+mem_budget_mb = 512                 # chunk 区（架构 §2.8 硬分区之一）
+query_mem_budget_mb = 512           # query 执行区（另一块，超限直接报错）
+soft_pct = 60                       # 背压阶梯（架构 §2.7）
+hard_pct = 80
+reject_pct = 95
+metrics_log_interval_secs = 30      # 指标周期打点（0 = 关闭，T6.12）
+
+[ingest]
+default_format = "parquet"          # parquet | vortex（回退开关）
+rows_threshold = 500000             # seal 触发：让 RowGroup 一次成型（S1-10）
+bytes_threshold_mb = 128            # seal 触发：字节阈值（内存口径）
+time_threshold_secs = 5             # 最短驻留地板（seal 时刻由**窗口关闭**决定，ADR-10）
+max_flush_delay_secs = 0            # 【v12/T8】seal → flush 宽限期（0 = 封口即到期）
+chunk_max_resident_secs = 60        # 强制 seal+flush，防慢写入流撑爆 WAL（S1-9）
+flush_phase_spread_secs = 30        # 【v12/T8】确定性相位偏移上限（替代 v8 的随机 jitter，S2-9）
+scan_interval_ms = 20               # 攒批线程扫描周期
+idempotency_ttl_hours = 24          # 【v9】幂等键 TTL（表模板可覆盖 require_idempotency_key）
 
 [compaction]
-enabled = true
-interval = "1h"
-min_files = 10
-target_file_size = "512MB"
-schema_snapshot_lock = true        # 【v9】启动时锁定 schema 版本
-
-[gc]
-orphan_delay = "24h"               # 孤儿文件延迟清理
-physical_delete_delay = "24h"      # deleted_at 后物理删除窗口
+min_files = 5
+interval_secs = 60
 
 [query]
-cache_ttl = "30s"                  # LocalCatalogCache TTL
+cache_ttl_secs = 30                 # LocalCatalogCache TTL（版本驱动之外的兜底）
+partial = false
+hot_read_budget_secs = 2            # 热读（未落盘数据）的等待预算
+
+[sql]
+[sql.mysql]
+enabled = true
+listen = "0.0.0.0:3306"
+auth = "trust"                      # trust | native_password（users 非空时自动切换；今天只实现 trust）
+# users = [{ name = "root", password = "..." }]
+
+[metrics]
+enabled = false                     # 指标 HTTP 导出（T6.12）；默认关：它会绑端口
+listen = "127.0.0.1:9091"           # GET /metrics（Prometheus 文本）、/metrics.json、/healthz
 ```
 
----
+**被删掉的键（以及为什么）**：`flush_jitter_seconds`（随机 jitter 让持久化上界不可预测，S1 就删了）、
+`segment_max_size`/`segment_max_age`/`group_commit_window`/`group_commit_max_batch`（WAL 的真实键见上；
+组提交是**实现内部**行为，不是配置）、`idle_timeout`（从未实现）、
+`[gc] orphan_delay`/`physical_delete_delay`（孤儿清理的真实旋钮在 `compaction` 侧，
+且"物理删除窗口"今天由静置期承担 —— 见 `architecture §4.6`）、
+`[schema] default_policy`（schema 变更策略在 SQL 层按语句判定，没有这个开关）、
+`multipart_threshold`/`target_file_size`/`schema_snapshot_lock`（均为**未实现**的设计项；
+要加得先在设计与 ADR 里定案）。
 
 ## 十二、测试策略
 
