@@ -1292,6 +1292,7 @@ batch_timeout_secs = 1800           # 【v11】批次超时 → BatchAbort
 disk_high_watermark = 0.8           # 【v11】磁盘保护水位
 archive_prefix = ""                 # ADR-9 的 durable 档：给了它才把 WAL 段归档到共享存储（§125）
 archive_interval_secs = 1           # **它直接决定 RPO 的界**（连同一次上传时延；见 §4 ADR-9 现状注）
+archive_all_tables = true           # ADR-9：true = 全归档（默认，老行为）；false = 只归档 durable 表（§162）
 
 [chunk]
 spill_dir = "./data/spill"          # 必须本地磁盘（架构 §2.5）

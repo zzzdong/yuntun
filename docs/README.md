@@ -7,7 +7,7 @@
 | 我想…… | 读 |
 |---|---|
 | 知道**今天实际能做到什么 / 还缺什么 / 下一步做什么** | [`status.md`](status.md) ← **现状唯一入口** |
-| 知道**某个结论的证据**、某个实现与原设计的**偏差及原因** | [`operation-log.md`](operation-log.md)（§1–§161，按时间） |
+| 知道**某个结论的证据**、某个实现与原设计的**偏差及原因** | [`operation-log.md`](operation-log.md)（§1–§162，按时间） |
 | 知道**任务怎么排、里程碑与准出门槛** | [`plan.md`](plan.md)（阶段 WBS / M1–M6 / 风险登记） |
 | 知道**架构为什么这样设计**、有哪些 ADR | [`architecture.md`](architecture.md)（12 个 ADR + 域设计） |
 | 知道**模块边界、接口契约、数据结构、状态机、配置项** | [`design.md`](design.md) |
@@ -54,7 +54,7 @@ status.md（现状） + operation-log.md（证据）        ← 最高
 |---|---|---|
 | `best_effort`（默认）的 **RPO** | **窗口关闭 + `max_flush_delay_secs` + `flush_phase_spread_secs`**，默认 **≤ 90s**；延迟到达的批次可能再多一个窗口 | `architecture.md §4 ADR-9` 的现状注；量级见 `operation-log §32` |
 | `durable` 的 **RPO** | 不是 ≈0，而是**归档间隔 + 一次上传时延**（默认 `archive_interval_secs = 1` ⇒ 秒级） | `architecture.md §4 ADR-9`；`operation-log §125` |
-| `durable` 的**粒度** | 归档开关是**节点级**（`[wal] archive_prefix`）：开了就归档全部表。表级 `durability` 字段已存在但**尚未参与判定**（台账 `D-16`） | `architecture.md §4 ADR-9` 现状注 |
+| `durable` 的**粒度** | `[wal] archive_all_tables`：`true`（**默认**）= 全归档（老行为）｜`false` = 按表（只有出现过 `durable` 表数据的**段**才归档）。⚠️ 粒度是**段**：共段时邻居的数据一起进归档 | `architecture.md §4 ADR-9` 现状注；`operation-log §162` |
 | 客户端**软路由** | 未实现、当前不计划：落点由部署显式给定（contact point 模型） | `architecture.md §4 ADR-10`；`operation-log §100` |
 | "每窗口每 shard ≤1 文件" | **不是硬不变量**：仅当"窗口内数据量 ≤ `bytes_threshold`"时成立 | `architecture.md §4 ADR-10`；`operation-log §35` |
 | 指标 | 已有 HTTP 导出（`[metrics]`：`/metrics`、`/metrics.json`、`/healthz`），**默认关** | `operation-log §160` |

@@ -12,6 +12,7 @@
 //!
 //! [wal]
 //! dir = "./data/wal"
+//! archive_all_tables = true          # ADR-9：true = 全归档（老行为）；false = 只归档 durable 表
 //!
 //! [chunk]
 //! spill_dir = "./data/spill"          # 必须本地磁盘（架构 §2.5）
@@ -108,6 +109,12 @@ pub struct WalSection {
     pub archive_prefix: Option<String>,
     /// 归档间隔（秒，默认 1）。**它直接决定 RPO 的界**（连同一次上传时延）。
     pub archive_interval_secs: u64,
+    /// **归档所有表**（默认 `true` = 老行为，`§162`）。
+    ///
+    /// `false` = 按 ADR-9 的表级模型：只有"段里出现过 `durable` 表的数据"的段才归档。
+    /// 默认 `true` 是刻意的（不静默改变既有部署的 RPO）。⚠️ 粒度是**段**，
+    /// 所以 `durable` 表与别的表共段时，同段数据也会被归档 —— 见 `wal_archive.rs` 的模块文档。
+    pub archive_all_tables: bool,
 }
 
 impl Default for WalSection {
@@ -119,6 +126,7 @@ impl Default for WalSection {
             disk_high_watermark: 0.80,
             archive_prefix: None,
             archive_interval_secs: 1,
+            archive_all_tables: true,
         }
     }
 }
@@ -514,6 +522,7 @@ impl Config {
             prefix: p.clone(),
             instance_id: self.chunk.instance_id.clone(),
             interval: std::time::Duration::from_secs(self.wal.archive_interval_secs.max(1)),
+            all_tables: self.wal.archive_all_tables,
         })
     }
 }

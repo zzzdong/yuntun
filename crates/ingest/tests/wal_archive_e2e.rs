@@ -37,6 +37,8 @@ fn archive_cfg() -> ArchiveConfig {
         prefix: "wal-archive".into(),
         instance_id: "inst-1".into(),
         interval: std::time::Duration::from_secs(1),
+        // 老行为：段全归档（`§162` 的 `all_tables` 默认值就是这个）
+        all_tables: true,
     }
 }
 
@@ -140,7 +142,7 @@ async fn durable_batch_becomes_visible_after_total_disk_loss() {
 
     // 归档一轮（机制：可注入间隔；生产里是后台循环）
     let mut uploaded = std::collections::HashMap::new();
-    let up = archive_once(&archive_cfg(), &wal_dir, 0, store.as_ref(), &mut uploaded)
+    let up = archive_once(&archive_cfg(), &wal_dir, 0, store.as_ref(), &mut uploaded, None)
         .await
         .expect("归档");
     assert!(up >= 1, "归档应当传了 {up} 个段");

@@ -609,6 +609,8 @@ async fn build_embedded_catalog(
                 wal_cfg.dir.clone(),
                 0,
                 self.store.clone(),
+                // 按表归档（`§162`）要用它解析 `durable` 表；`all_tables = true` 时用不到（传了也不查）
+                Some(self.catalog.clone()),
                 self.shutdown.clone(),
             ));
         }

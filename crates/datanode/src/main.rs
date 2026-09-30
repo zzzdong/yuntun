@@ -379,6 +379,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     prefix: p.clone(),
                     instance_id: args.instance_id.clone(),
                     interval: std::time::Duration::from_secs(args.wal_archive_interval_secs.max(1)),
+                    // datanode 侧暂时保持**全归档**（老行为）：按表口径的开关先在 standalone
+                    // 落地（`§162`），datanode 要多一个 CLI 参数 —— 记在 §162.3 的边界里。
+                    all_tables: true,
                 });
         if let Some(ac) = &archive_cfg {
             match yuntun_ingest::restore(ac, &wal_root, 0, store.as_ref()).await {
@@ -462,7 +465,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 "WAL 归档已启用（durable）：RPO ≤ 间隔 + 一次上传"
             );
             let _archiver =
-                yuntun_ingest::spawn_archiver(ac, wal_root.clone(), 0, store.clone(), shutdown.clone());
+                yuntun_ingest::spawn_archiver(
+                    ac,
+                    wal_root.clone(),
+                    0,
+                    store.clone(),
+                    // datanode 侧暂不按表（`all_tables: true`）⇒ 不需要目录句柄（`§162.3`）
+                    None,
+                    shutdown.clone(),
+                );
         }
 
         // **压缩 + 孤儿 GC 角色**（数据进程的第二职能，`--compaction` 打开）。

@@ -66,6 +66,8 @@ fn cfg() -> ArchiveConfig {
         prefix: "wal-archive".into(),
         instance_id: "inst-1".into(),
         interval: Duration::from_secs(1),
+        // 老行为：段全归档（`§162` 的 `all_tables` 默认值就是这个）
+        all_tables: true,
     }
 }
 
@@ -93,7 +95,7 @@ async fn write_and_maybe_archive(
         return 0;
     }
     let mut uploaded = HashMap::new();
-    archive_once(&cfg(), wal_dir, 0, archive.as_ref(), &mut uploaded)
+    archive_once(&cfg(), wal_dir, 0, archive.as_ref(), &mut uploaded, None)
         .await
         .expect("归档一轮")
 }

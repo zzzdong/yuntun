@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§161，2026-09-30**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§162，2026-09-30**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -10381,4 +10381,66 @@ DataFusion 在"零行"时返回的是**零个批次**（不是"一个空批次"�
 
 - `cargo test --workspace --no-fail-fast -j 4` → **523 passed / 0 failed / 0 ignored**（本刀 +2：两条新判据）；
 - `docs_consistency` → **7/7**（原 5 条 + 新增 2 条）；
-- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**。
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**。\n
+---
+
+## 162. **台账 `D-16` 闭环：表级 `durability` 接线（按表归档）**（2026-09-30）
+
+`§161` 把 ADR-9 的口径写对时记下一条：ADR-9 定的是**表级**持久性，而归档开关是**节点级**的
+（`[wal] archive_prefix` 给了就归档全部表）—— 字段 `IngestConfig.durability` 一直在、随表落盘，
+却**从未被读**。这一刀把它接上。
+
+### 162.0 先说清交付了什么、没交付什么
+
+| | |
+|---|---|
+| ✅ **交付** | 一张 `durable` 表的数据**一定**被归档（哪怕节点默认不归档）；只有 `best_effort` 表独处一段时**不归档**（省钱的那一半）；**默认行为不变** |
+| ❌ **没交付** | **按记录**过滤（"只归档 durable 表的数据，同段邻居一个字节都不带"）。粒度是**段**：共段时同段别的表的数据也会被归档 |
+| 为什么 | WAL 记录帧是 `length \| crc \| type \| payload`，**seq 由 `header.first_seq` + 位置推导**（`segment.rs::decode_with_stop`）⇒ 把某几条记录过滤掉再编码会让它之后**所有**记录的 seq 位移，而 `BatchPending.wal_seq_start/end` 记的是**原 seq 区间** ⇒ 恢复时吸收错记录（**静默产出错数据**，比"少省钱"糟得多） |
+
+要真正做到按记录过滤，得先改 WAL 格式（记录自带 seq）或按表分段 —— 台账 `D-18`。
+
+### 162.1 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `ArchiveConfig` | 加 `all_tables: bool`（**默认 `true` = 老行为**） |
+| `wal_archive::segment_is_archived`（新） | 段级判定：段里出现过 `durable` 表的 `Data`/`BatchPending` ⇒ 归档；否则不归档；**读不了/解不开 ⇒ 归档**（保守） |
+| `wal_archive::archive_once` | 加 `durable: Option<&HashSet<String>>`（`None` = 全归档） |
+| `wal_archive::spawn_archiver` / `durable_tables` | 后台循环每轮解析一次"哪些表是 durable"（`list_tables` → `ingest_config.durability == 1`）；**解析失败 ⇒ 本轮全归档**（宁可多传） |
+| `[wal] archive_all_tables` | 配置开关（默认 `true`）+ 头部模板 + `archive_config()` 映射；`server` 侧把 `catalog` 句柄传给归档器；`datanode` 暂保持全归档（见 §162.3） |
+| 用例 | 单测 1 条（段级判定真值表，含"读不了 ⇒ 归档"）、e2e 2 条（省钱的一半 / 不能丢数据的一半 + 共租代价）、两个既有归档用例（`all_tables = true`）**仍然全绿 = 老行为没变** |
+
+### 162.2 四个决定
+
+1. **默认 `all_tables = true`**（不静默改老行为）。既有部署只要配了 `archive_prefix` 就是全归档；
+   默认改 `false` 会**静默**把那些表的 RPO 从"秒级可救"变成"丢盘即丢" —— 那是部署方
+   没同意过的语义变化。要 ADR-9 的成本模型，显式设 `false`（README §4 的「已知限制」会写）。
+2. **判定只看 `Data` / `BatchPending`**：它们是"带数据 / 带账目"的两类，而且都带 `table`。
+   `BatchS3Written / Committed / Abort` 只带 `batch_id`（判不出表），但它们很小、且丢了能被
+   `Pending` 的恢复通路重做 ⇒ 不进判定 —— 于是也**不会**因为"判不出来"而把整段误判成要归档。
+3. **判不出来就归档**（段读不了 / 目录拿不到 / 解析失败 ⇒ 全归档）：**成本 > 数据**这条取舍
+   写死在两处（`segment_is_archived` 的 `Err` 分支与 archiver 的 `warn` 分支）。方向与
+   `§156` 的"孤儿 GC 宁可留垃圾"同源。
+4. **只改了 `wal_archive.rs`，`restore` 一行没动**。因为它走的是 `§125` 那条
+   "**拉回来再走既有恢复通路**"：按表归档的收益与代价全都落在"传不传"这一格上 ——
+   这正是当初选"拉回"而不是"流式重放"的回报（`§125` 的赌注兑现在这里）。
+
+### 162.3 边界
+
+1. **粒度是段**（见 §162.0）：`durable` 表与别的表共段时，同段数据一起进归档；
+2. **不保证"某张 durable 表的数据只在归档里"**（只说"一定在"，不说"只有它"）；
+3. `datanode` 侧暂保持全归档（要多一个 CLI 参数；`§162.1` 的注释指向服务端的开关）；
+4. 表级 `durability` 的**其他语义**（读侧重建、`durability` 变更的迁移）不在本刀：
+   `restore` 之后走的是既有恢复通路，不需要按表分支。
+
+### 162.4 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **526 passed / 0 failed / 0 ignored**（本刀 +3：1 条段级判定单测 + 2 条按表归档 e2e）；
+- `wal_archive`（单测 1 条）：段级判定真值表 —— durable 段 / 混段 / 只有 Pending 的 durable 段 ⇒ 归档；
+  只有 `best_effort` ⇒ 不归档；**读不了的路径 ⇒ 归档**（保守方向也钉住了）；
+- `wal_archive_by_table`（e2e 2 条）：① 只有 `best_effort` ⇒ 上传 **0** 段（并用同一份数据在
+  "全归档口径"下会传 1 段做对照，证明"0"来自过滤而不是别的毛病）；② 混段 ⇒ 上传 1 段，
+  拉回后 **`durable` 表的数据逐条读得回**，且**共段的 `best_effort` 数据也在**（正面断言代价）；
+- `wal_archive_durable` / `wal_archive_e2e`（既有）在 `all_tables = true` 下仍全绿 ⇒ **老行为没变**；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **7/7**。
