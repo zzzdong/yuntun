@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§164，2026-10-09**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§165，2026-10-09**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -10574,4 +10574,54 @@ spawn_cache_refresh：poll = min(200ms, ttl)
 - `cargo clippy --workspace --all-targets` → 本仓 **0**；判据 **7/7**。
 - ⚠️ 一条**全量并发抖动**（与本刀改动无因果关系，但如实记）：`chaos::disk_watermark_aborts_oldest_batch_then_releases_segments`
   在 `-j 4` 全量里偶发一次（`Pending`），**单跑两次皆 17/17 全绿**、且第二次全量干净 ⇒ 性质同
-  `status.md §4` 已登记的"chaos 与其余 test binary 并行争 CPU/IO"的已知 flaky。
+  `status.md §4` 已登记的"chaos 与其余 test binary 并行争 CPU/IO"的已知 flaky。\n
+---
+
+## 165. **podman 真集群复验：smoke + soak 全绿**（2026-10-09）
+
+> 用户要求"用 podman 跑多节点来验证"。这不是新功能 —— rig（`tests/cluster.sh`）在 `§108`/`§112` 就
+> 有了；本刀是**照现状真跑一遍**，把"我们声称的多节点"兑现成**今天的证据**（`status.md §4` 的
+> "容器化多节点（需 podman）"那一行此前写的是"需要 podman 才能跑"，没写"最近一次跑是什么结果"）。
+
+### 165.1 环境与结论
+
+| 项 | 结果 |
+|---|---|
+| podman | **6.1.2**（宿主） |
+| `tests/cluster.sh smoke` | ✅ **EXIT=0**（三容器真集群 → 真断网 → 多数派仍写 → 接回**必须收敛**） |
+| `tests/cluster.sh soak 3 5` | ✅ **EXIT=0**（3 轮"冻住 follower 期间写 5 条" + 1 次真断网，**全部收敛**） |
+
+smoke 的关键证据（逐行）：
+
+```text
+③ 健康态：找出 leader + 写一条（幂等键 k1）      ⇒ accepted=true   manifest_ver=1
+④ 断掉 mn3（podman network disconnect）
+   多数派（1+2）仍写                            ⇒ accepted=true   manifest_ver=2
+   同一幂等键再写一次                            ⇒ accepted=false  manifest_ver=2  ← 幂等生效
+⑤ 把 mn3 接回 ⇒ 三方收敛（last=4）
+   再写 k3 ⇒ true / 重复 ⇒ false                ⇒ manifest_ver=3
+   收敛（last=6）
+```
+
+soak 的关键证据：第 1/2/3 轮各"冻住 mn2 期间写 5 条" ⇒ 分别收敛到 `last=6 / 11 / 16`，
+最后一次真断网后收敛到 `last=17`。
+
+### 165.2 顺带记一次**构建**上的坑（不是产品问题，但会挡住后来者）
+
+第一次跑在 `① 编 metanode + meta_probe` 阶段失败：`could not write output to …rcgu.o:
+No such file or directory`（`arrow-row` / `arrow-csv` / `tonic` 等一起红）。
+**根因是并发**：那时宿主上还有 cargo 在跑（release 与 debug 各自持有 target 锁、互相踩构建目录），
+不是盘满（`/home` 余 76G）。**单独重跑 1m34s 全绿** ⇒ 记一条纪律：
+**这个 rig 要在没有别的 cargo 在跑的时候跑**（`tests/cluster.sh build` 是 release 构建，与 `cargo test` 争 target）。
+
+### 165.3 边界（这次**没有**验到的）
+
+1. rig 只覆盖 **metanode**（控制面）：三节点 raft。
+   **数据面多 datanode** 目前只有"宿主多进程 + 共享 `--cold-root`"的形态
+   （`scripts/s3_multinode_smoke.sh`、`§37` 的 `bench_multi.sh`），**还没有 podman rig**；
+2. 真云 S3 / 跨机 / 跨可用区仍未验（与 `status.md §5.2` 同一条缺口）；
+3. 没跑 `lossy` / `netem`（有损与延迟链路）⇒ 部署包线（对称延迟 1.5s 就反复选举）仍是**上次**的实测，
+   本轮不重新声称。
+
+> 数据面多 datanode 的 podman rig 是 `§166` 起（分布式任务共同作业）的**证据底座** ——
+> 要验"多节点分领任务"，先得有一个能起 N 个 datanode 容器的 rig。
