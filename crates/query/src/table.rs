@@ -52,6 +52,7 @@ use crate::cache::CatalogSnapshot;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::datasource::object_store::ObjectStoreUrl;
+
 use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::physical_plan::limit::GlobalLimitExec;
@@ -111,6 +112,10 @@ enum SourceOutcome {
 
 
 /// 一张 yuntun 表的 DataFusion 视图（**绑定在某个不可变 Catalog 快照上**）。
+/// vortex 文件的扩展名（与 `yuntun_format::DataFormat::Vortex::ext()` 同一份事实；
+/// 这里只做**读侧分流**的字符串判据 —— 写侧仍以 `DataFormat` 为准）。
+pub(crate) const VORTEX_EXT: &str = ".vortex";
+
 #[derive(Debug)]
 pub struct YuntunTableProvider {
     /// 规划期取一次的 Catalog 快照：schema / 文件清单 / 可见性边界都取自它
@@ -137,6 +142,79 @@ pub struct YuntunTableProvider {
 }
 
 impl YuntunTableProvider {
+    /// 读一个 **vortex** 文件并应用它的删除向量（`§164`）。
+    ///
+    /// 三段，顺序不能换：
+    ///
+    /// 1. **解码**：`yuntun_format::decode_batch`（与写侧同一个 crate ⇒ 编码/解码必然同代）；
+    /// 2. **对齐**：`align_batch` 到**表 schema** —— 与 parquet 那条路**同一个函数**（`§155`），
+    ///    两条格式对同一批行必须给出同一答案；
+    /// 3. **删除向量**：按 `keep_ranges` 切片 —— parquet 那条路是把 `RowSelection` 交给读取器，
+    ///    **语义必须一致**：不做这一步 ⇒ "vortex 表上的 DELETE 查得到已删行"（静默错）。
+    ///
+    /// ⚠️ 边界：**整文件解码**（vortex 这条读路径没有 row-group 级跳读，只有清单 min/max 的
+    /// **文件级**剪枝）。读多少由文件大小决定，不影响"读到什么"。
+    async fn read_vortex_file(
+        &self,
+        f: &FileManifest,
+        dvs: &HashMap<String, DvBitmap>,
+    ) -> Result<Vec<arrow::record_batch::RecordBatch>, datafusion::error::DataFusionError> {
+        // 读字节走 store 层那个公共便捷函数（与别处同一条路，不在这里另写一份 `get`）
+        let bytes =
+            yuntun_store::get_bytes(self.store.as_ref(), &f.file_path)
+                .await
+                .map_err(|e| {
+                    datafusion::error::DataFusionError::Execution(format!(
+                        "vortex 读取（文件 {}）：{e}",
+                        f.file_path
+                    ))
+                })?;
+        let decoded = yuntun_format::decode_batch(&bytes, yuntun_format::DataFormat::Vortex)
+            .map_err(|e| {
+                datafusion::error::DataFusionError::Execution(format!(
+                    "vortex 解码（文件 {}）：{e}",
+                    f.file_path
+                ))
+            })?;
+
+        let mut batches = Vec::with_capacity(decoded.len());
+        for b in decoded {
+            batches.push(yuntun_model::arrow_util::align_batch(&b, &self.schema).map_err(
+                |e| {
+                    datafusion::error::DataFusionError::Execution(format!(
+                        "vortex 对齐（文件 {}）：{e}",
+                        f.file_path
+                    ))
+                },
+            )?);
+        }
+
+        let Some(dv) = dvs.get(&f.file_path) else {
+            return Ok(batches);
+        };
+        let ranges = dv.keep_ranges(f.row_count).map_err(|e| {
+            datafusion::error::DataFusionError::Execution(format!(
+                "{}（vortex 文件 {}）",
+                e, f.file_path
+            ))
+        })?;
+        if batches.is_empty() {
+            return Ok(Vec::new());
+        }
+        let empty = arrow::record_batch::RecordBatch::new_empty(self.schema.clone());
+        let all = arrow::compute::concat_batches(&self.schema, &batches).unwrap_or(empty);
+        let mut out = Vec::with_capacity(ranges.len());
+        for r in ranges {
+            let len = r.end.saturating_sub(r.start);
+            if len == 0 {
+                continue;
+            }
+            out.push(all.slice(r.start, len));
+        }
+        Ok(out)
+    }
+
+
     pub fn new(
         snapshot: Arc<CatalogSnapshot>,
         ident: impl Into<String>,
@@ -498,7 +576,40 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
         // ⚠️ **全被剪掉**时不能塞一个空的 `FileGroup`（扫描器会报错）⇒ 直接跳过这一支；
         // 下面第 ③ 支会给一个空的执行计划，语义正好（没有数据）。
         if !kept.is_empty() {
-            let mut files: Vec<PartitionedFile> = kept
+            // 【ADR-1｜Vortex 默认】`.vortex` 与 `.parquet` **分流**（`§164`）：
+            // `ParquetSource` 只认 parquet，vortex 文件由**我们自己的解码**喂进内存执行
+            // （扩展示意：路径以 `.vortex` 结尾）。分流而非"混在一个文件组里"是必须的 ——
+            // 混在一起会让 vortex 文件被当成 parquet 打开 ⇒ 要么报错、要么**静默少数据**。
+            // 删除向量两个格式都要（vortex 上不做 = 已删行查得到 = 静默错）⇒ 先取
+            let dvs = self.file_deletions(&kept).await?;
+            let (vortex_kept, rest): (Vec<&FileManifest>, Vec<&FileManifest>) = kept
+                .iter()
+                .partition(|f| f.file_path.ends_with(VORTEX_EXT));
+
+            // --- vortex 支：自解码 + 自应用删除向量 ---
+            for f in &vortex_kept {
+                let batches = self.read_vortex_file(f, &dvs).await?;
+                if batches.is_empty() {
+                    continue;
+                }
+                // 投影交给 `MemorySourceConfig`（与"热数据"那一支同款做法）：
+                // vortex 这条读路径**没有** row-group 级跳读 ⇒ 整文件解码（边界，见模块文档）
+                inputs.push(
+                    MemorySourceConfig::try_new_exec(
+                        &[batches],
+                        schema.clone(),
+                        projection.cloned(),
+                    )
+                    .map_err(|e| {
+                        datafusion::error::DataFusionError::Execution(format!(
+                            "vortex plan（文件 {}）：{e}",
+                            f.file_path
+                        ))
+                    })?,
+                );
+            }
+
+            let mut files: Vec<PartitionedFile> = rest
                 .iter()
                 .map(|f| PartitionedFile::new(f.file_path.clone(), f.file_size))
                 .collect();
@@ -507,8 +618,7 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
             // 「已提交但尚未 compaction 的删除」在读侧立即生效（设计 §5.2 的"读到即不可见"）。
             //
             // 位置：放在文件级剪枝**之后**、索引/扫描**之前** —— 与设计 §5.4 要求的次序一致。
-            let dvs = self.file_deletions(&kept).await?;
-            for (pf, f) in files.iter_mut().zip(kept.iter()) {
+            for (pf, f) in files.iter_mut().zip(rest.iter()) {
                 let Some(dv) = dvs.get(&f.file_path) else {
                     continue;
                 };
@@ -535,9 +645,11 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
             // 有索引 + 有谓词才去取索引（没谓词就没有依据，连索引都不必读）。
             // 没挂上 plan 的文件原样全读 —— 失败/拿不准都走这条路（见 `group_plans`）。
             // **带 DV 的文件一个索引都不取**（两个扩展互斥 + 行号对齐，见 `group_plans`）。
-            if self.index_pruning && !filters.is_empty() {
-                let plans = self.group_plans(&kept, filters, &dvs).await;
-                for ((pf, f), plan) in files.iter_mut().zip(kept.iter()).zip(plans) {
+            // 索引是按 **parquet 行组**对齐生成的（`F.4`）⇒ 只对 parquet 有意义；
+            // 拿它去剪 vortex 会把"第 n 组"解释成别的东西（**剪错 = 静默少数据**）⇒ 不剪。
+            if self.index_pruning && !filters.is_empty() && !rest.is_empty() {
+                let plans = self.group_plans(&rest, filters, &dvs).await;
+                for ((pf, f), plan) in files.iter_mut().zip(rest.iter()).zip(plans) {
                     if dvs.contains_key(&f.file_path) {
                         continue;
                     }
@@ -547,21 +659,23 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
                 }
             }
 
-            let source: Arc<dyn FileSource> = Arc::new(ParquetSource::new(
-                datafusion_datasource::table_schema::TableSchemaBuilder::new(schema.clone())
-                    .build(),
-            ));
+            if !files.is_empty() {
+                let source: Arc<dyn FileSource> = Arc::new(ParquetSource::new(
+                    datafusion_datasource::table_schema::TableSchemaBuilder::new(schema.clone())
+                        .build(),
+                ));
 
-            let mut builder = FileScanConfigBuilder::new(self.store_url.clone(), source)
-                .with_file_group(FileGroup::new(files));
-            if let Some(p) = projection {
-                builder = builder
-                    .with_projection_indices(Some(p.clone()))
-                    .map_err(|e| {
-                        datafusion::error::DataFusionError::Execution(format!("projection: {e}"))
-                    })?;
+                let mut builder = FileScanConfigBuilder::new(self.store_url.clone(), source)
+                    .with_file_group(FileGroup::new(files));
+                if let Some(p) = projection {
+                    builder = builder
+                        .with_projection_indices(Some(p.clone()))
+                        .map_err(|e| {
+                            datafusion::error::DataFusionError::Execution(format!("projection: {e}"))
+                        })?;
+                }
+                inputs.push(DataSourceExec::from_data_source(builder.build()));
             }
-            inputs.push(DataSourceExec::from_data_source(builder.build()));
         }
 
         // ③ 空表：给一个空的内存执行（保持 schema / 投影语义）

@@ -1305,7 +1305,7 @@ reject_pct = 95
 metrics_log_interval_secs = 30      # 指标周期打点（0 = 关闭，T6.12）
 
 [ingest]
-default_format = "parquet"          # parquet | vortex（回退开关）
+default_format = "vortex"           # vortex | parquet（`§164`：vortex 已是默认；parquet 为回退/兼容）
 rows_threshold = 500000             # seal 触发：让 RowGroup 一次成型（S1-10）
 bytes_threshold_mb = 128            # seal 触发：字节阈值（内存口径）
 time_threshold_secs = 5             # 最短驻留地板（seal 时刻由**窗口关闭**决定，ADR-10）

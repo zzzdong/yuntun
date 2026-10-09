@@ -248,7 +248,15 @@ async fn compact_shard_inner(
     let mut consumed = 0usize;
     for f in &files {
         let fb =
-            yuntun_format::read_batch(&compactor.store, &f.file_path, compactor.format).await?;
+            // `§164`：**按文件自己的格式读** —— 表里可能同时有 parquet 与 vortex
+            // （表可以从旧格式迁过来，或某段时间配成另一格式）；用 `compactor.format`
+            // 去读另一类文件 ⇒ "Corrupt footer"（读不了）或更糟的读错。
+            yuntun_format::read_batch(
+                &compactor.store,
+                &f.file_path,
+                yuntun_format::DataFormat::from_path(&f.file_path),
+            )
+            .await?;
         match dvs.get(&f.file_path) {
             None => batches.extend(fb),
             Some(dv) => {
@@ -298,6 +306,17 @@ async fn compact_shard_inner(
         .record_in_flight(&new_batch_id, now_ms())
         .await?;
 
+    // 产物格式（`§164`）：**输入格式一致就沿用**（合并不该顺手做"格式迁移" ——
+    // 那会静默改变既有部署的存储形态与体积）；输入混合时才回退到 `compactor.format`。
+    let out_format = {
+        let mut it = files.iter().map(|f| yuntun_format::DataFormat::from_path(&f.file_path));
+        let first = it.next().unwrap_or(compactor.format);
+        if it.all(|f| f == first) {
+            first
+        } else {
+            compactor.format
+        }
+    };
     let (new_path, new_size, _rows) = yuntun_format::write_batch(
         &compactor.store,
         table,
@@ -305,7 +324,7 @@ async fn compact_shard_inner(
         files[0].time_window.as_str(),
         &new_batch_id,
         &merged,
-        compactor.format,
+        out_format,
     )
     .await?;
 

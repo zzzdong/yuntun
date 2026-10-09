@@ -85,7 +85,8 @@ pub struct IngestorConfig {
 impl Default for IngestorConfig {
     fn default() -> Self {
         Self {
-            default_format: yuntun_format::DataFormat::Parquet,
+            // `§164`：默认 Vortex（ADR-1 主格式）；未编进 vortex 时写入会**响亮失败**
+            default_format: yuntun_format::DataFormat::Vortex,
             instance_id: "standalone".into(),
             spill_dir: PathBuf::from("./data/spill"),
             rows_threshold: 500_000,

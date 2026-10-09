@@ -27,6 +27,22 @@ pub enum DataFormat {
 }
 
 impl DataFormat {
+    /// 由**文件路径**判格式（`§164`）。
+    ///
+    /// 为什么必须有一个"从路径反推格式"的入口：写入的格式是**文件自己的属性**
+    /// （表可以从 parquet 迁到 vortex，同一张表里两类文件可以并存），
+    /// 而任何"按配置的格式去读"的写法都会在遇到另一类文件时**读不了或读错**。
+    /// 判据只能是路径 —— 这是写侧 `ext()` 写下的那份事实的读侧对应物。
+    ///
+    /// 认不出的扩展名 ⇒ **parquet**（历史文件都是它），不猜、不报错。
+    pub fn from_path(path: &str) -> Self {
+        if path.ends_with(&format!(".{}", Self::Vortex.ext())) {
+            Self::Vortex
+        } else {
+            Self::Parquet
+        }
+    }
+
     pub fn ext(&self) -> &'static str {
         match self {
             DataFormat::Vortex => "vortex",
@@ -197,6 +213,15 @@ where
 /// 逐次 CPU 轨迹开关（`YUNTUN_FORMAT_TRACE=1`）。
 fn trace_on() -> bool {
     std::env::var("YUNTUN_FORMAT_TRACE").is_ok()
+}
+
+/// **这个二进制里有没有编进 Vortex**（`§164`）。
+///
+/// 用途：启动自检 —— 配置写了 `default_format = "vortex"` 而二进制是
+/// `--no-default-features` 编出来的 ⇒ **现在就说清楚**，而不是等第一次写入才失败
+/// （那时已经有一批用户在等一个永远写不进去的表）。
+pub const fn vortex_enabled() -> bool {
+    cfg!(feature = "vortex")
 }
 
 /// 编码 RecordBatch。
@@ -660,6 +685,8 @@ mod tests {
         assert_eq!(batches[0].schema().field(1).name(), "user");
     }
 
+    /// **feature 关闭**时：写 vortex 必须**响亮失败**（ADR-1 的 FormatSwitch 纪律）。
+    #[cfg(not(feature = "vortex"))]
     #[tokio::test]
     async fn vortex_disabled_falls_back_to_error() {
         let store: Arc<dyn object_store::ObjectStore> =
@@ -676,5 +703,44 @@ mod tests {
         )
         .await;
         assert!(res.is_err(), "vortex 未启用时应显式报错（ADR-1）");
+        assert!(
+            !vortex_enabled(),
+            "未启用时 `vortex_enabled()` 必须为 false（启动自检靠它）"
+        );
+    }
+
+    /// **feature 打开**（`§164` 起是默认）时：写读必须**往返成功**，
+    /// 且产物扩展名与 `from_path` 的判定一致（否则别处按路径判格式会判错）。
+    #[cfg(feature = "vortex")]
+    #[tokio::test]
+    async fn vortex_enabled_round_trips_and_is_recognized_by_path() {
+        assert!(vortex_enabled());
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let batch = sample_batch();
+        let (path, size, rows) = write_batch(
+            &store,
+            "tbl",
+            "s0",
+            "w",
+            "018f0000-0000-7000-8000-000000000000",
+            &batch,
+            DataFormat::Vortex,
+        )
+        .await
+        .unwrap();
+        assert!(path.ends_with(".vortex"), "产物扩展名必须是 .vortex：{path}");
+        assert_eq!(
+            DataFormat::from_path(&path),
+            DataFormat::Vortex,
+            "读侧按路径判格式必须认出它（compaction/查询都靠这条）"
+        );
+        assert!(size > 0);
+        assert_eq!(rows, 3);
+        let batches = read_batch(&store, &path, DataFormat::Vortex)
+            .await
+            .unwrap();
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 3, "vortex 往返行数必须一致");
     }
 }

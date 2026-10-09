@@ -41,7 +41,8 @@ pub async fn replay_wal_ddl(
                     schema,
                     partition_cols: vec![],
                     default_format: if p.default_format.is_empty() {
-                        "parquet".to_string()
+                        // 与 `IngestorConfig::default()` 同一口径（`§164`：Vortex 默认）
+                        yuntun_format::DataFormat::Vortex.ext().to_string()
                     } else {
                         p.default_format.clone()
                     },

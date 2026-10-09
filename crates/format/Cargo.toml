@@ -6,10 +6,11 @@ license.workspace = true
 rust-version.workspace = true
 
 # ADR-1: Vortex 主格式 + Parquet 回退（FormatSwitch）。
-# Vortex API 仍在演进，依赖通过 `vortex` feature 显式开启（并锁定 Git Commit），
-# 默认使用 Parquet 回退路径，保证阶段 0 始终可用。
+# `§164`：**Vortex 已是默认**（feature 默认开）—— Parquet 退为"回退 / 兼容既有部署"的格式。
+# 仍然保留 feature 开关：`--no-default-features` 可编出不带 vortex 的二进制
+# （那时 `default_format = "vortex"` 会在**启动自检**里就报出来，见 `Config::warnings`）。
 [features]
-default = []
+default = ["vortex"]
 # `§133`：**不再锁 Git commit**（ADR-1 原方案）⇒ 改用 **crates.io 的 0.86**。
 # 理由很硬：0.84/0.85 用 arrow **58**，只有 **0.86** 用 arrow **59.2+**、
 # 才与 datafusion 55 同代（`§130` 实测：`cargo add vortex` 会被 MSRV 逼着退到 0.84 ⇒ 两代 arrow）。

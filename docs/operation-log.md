@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§163，2026-09-30**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§164，2026-10-09**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -10513,4 +10513,65 @@ spawn_cache_refresh：poll = min(200ms, ttl)
   ② 按需刷了 1 次、只问了 1 次版本（冷缓存不看节流）③ 紧接着的第二个查询**不再问版本**（节流）
   ④ 绕缓存 `ADD COLUMN` 后 `SELECT c` 成功、且**缓存里的 schema 确有新列**（版本变更被看见）；
 - `embedded_restart_e2e` / `sql_purge_e2e` 删掉显式刷新后仍全绿 ⇒ 它们以前那两步是**多余**的；
-- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **7/7**。
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **7/7**。\n
+---
+
+## 164. **ADR-1 真正落地：Vortex 成为默认格式**（台账 `D-8` 决策）（2026-10-09）
+
+### 164.0 决策与它带着的代价
+
+用户拍板：**采用 Vortex 默认**。这不是"把默认值改一下" —— ADR-1 从立项起就写着
+"Vortex 主格式 + Parquet 回退"，而 `§140` 的实测又把代价摆到了桌面上：
+**Vortex 是 Parquet 的 3.5–4.5 倍体积**（递增整数 23800/6680、随机串 63348/14000，且已是压缩后的默认配置）。
+决策是**在知道这个数字的前提下**做的；代价照实记在这里，不粉饰：
+
+| 代价 | 量级 / 现状 |
+|---|---|
+| 存储体积 | **3.5–4.5×**（`§140` 实测）⇒ 冷存储成本与冷读 IO 同步放大 |
+| 读侧剪枝 | vortex 这条读路径**只有文件级剪枝**（清单 min/max），**没有 row-group 级跳读** ⇒ 整文件解码（`F.4` 的 `.idx` 是按 parquet 行组对齐的，对它不适用） |
+
+### 164.1 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `query::table`（**关键**） | 新增 `.vortex` 的**读路径**：按扩展名与 parquet **分流** ⇒ vortex 走我们自己的解码（`yuntun_format::decode_batch`）+ `align_batch` 到表 schema（与 parquet **同一个函数**）+ 按 `keep_ranges` **自己切片**应用删除向量 ⇒ 灌进 `MemorySourceConfig` |
+| `format::DataFormat::from_path` | 新增"由路径判格式"的唯一入口（认不出 ⇒ parquet） |
+| `compaction` | **读改为按文件自己的格式**（原来用 `compactor.format` 一把梭）；产物格式 = 输入一致则沿用，混合才回退到 `compactor.format` |
+| 默认翻转 | `yuntun-format` 的 `vortex` feature **默认开**；`[ingest] default_format` 默认 `"vortex"`；`IngestorConfig::default()` / WAL DDL 重放的兜底 / `yuntun.toml.example` 同步 |
+| 启动自检 | `format::vortex_enabled()` + `Config::warnings()`：配了 vortex 但二进制没编进来 ⇒ **启动就说清楚**，而不是等第一次写入才失败 |
+| 用例 | `server/tests/vortex_default_e2e.rs`（3 条：默认 vortex 走完 写→读→删→改 / 显式 parquet 仍全通 / 自检不该误响）；`format` 的 vortex 用例按 feature 分叉（开启 ⇒ 往返 + `from_path` 认得出；关闭 ⇒ 仍要响亮失败）；chaos 的孤儿回收用例不再假设 parquet |
+
+### 164.2 三个决定（都是"先保证不错，再谈特性"）
+
+1. **先补读路径，再翻转默认**。翻转之前，vortex 文件在查询侧是
+   "挂了也没人认"（`query::table` 只有 parquet 读路径，代码注释里明写着）⇒ 直接改默认
+   就是"**写进去、查不到**" —— 这正是本仓最忌的**静默事故**。读路径不落地，默认就翻不得。
+2. **读必须按文件自己的格式**。翻转后全量立刻撞到：`compaction_during_query_keeps_counts_monotonic`
+   报 `Parquet error: Invalid Parquet file. Corrupt footer` —— 根因是**合并拿自己配置的格式去读**，
+   遇到另一类文件就是读不了（或更糟：读错）。格式是**文件的属性**（一张表里两类文件可以并存），
+   不是"本次合并的配置" ⇒ 加了 `from_path`，读侧一律按路径判。
+3. **合并产物沿用输入格式**，不顺手做"格式迁移"。输入一致 ⇒ 产物同格式；混合 ⇒ 才用 `compactor.format`。
+   理由：合并是后台作业，它不该**静默**改变既有部署的存储形态与体积 —— 要迁移应该是显式的一刀。
+
+### 164.3 边界（写清楚，别让下一个人以为都齐了）
+
+1. **vortex 读路径整文件解码**：没有 row-group 级跳读，也没有流式解码 ⇒ 单文件的内存与 IO 上界
+   未被刻画（与 `§88.6` 的"冷读无预算"是同一个缺口的两面）⇒ 已开台账 **`D-20`**；
+2. **行组级索引（`.idx`）只对 parquet 生效**：索引循环显式只对非 vortex 文件跑
+   （拿 parquet 的组号去剪 vortex = **剪错 = 静默少数据**）；
+3. **MSRV 实际是 1.95**（`vortex 0.86` 的下界，见 `§133`）—— `status.md` 此前写 1.94 是漂移，本刀改正；
+4. `--no-default-features` 仍可编出不带 vortex 的二进制（那时启动自检会点名）。
+
+### 164.4 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **536 passed / 0 failed / 0 ignored**（本刀 +5）；
+- `vortex_default_e2e`（3 条）：默认配置的产物**全是 `.vortex`**、写进去的三行读得到、
+  `DELETE` 后查不到（DV 在 vortex 上生效）、`UPDATE` 的新值读得到；显式 `parquet` 再走一遍**同样全通**
+  （回退格式没被这次改默认带走）；
+- `format`：开启 ⇒ 往返行数一致 + 产物 `.vortex` + `from_path` 认得出；关闭 ⇒ 仍**响亮失败**；
+- chaos **17/17**（含"孤儿 DV 回收"，它原本硬编码找 `.parquet`，已改成找"数据文件"）；
+  compaction 与 datanode 的合并用例在"按文件自己的格式读"修好后全绿；
+- `cargo clippy --workspace --all-targets` → 本仓 **0**；判据 **7/7**。
+- ⚠️ 一条**全量并发抖动**（与本刀改动无因果关系，但如实记）：`chaos::disk_watermark_aborts_oldest_batch_then_releases_segments`
+  在 `-j 4` 全量里偶发一次（`Pending`），**单跑两次皆 17/17 全绿**、且第二次全量干净 ⇒ 性质同
+  `status.md §4` 已登记的"chaos 与其余 test binary 并行争 CPU/IO"的已知 flaky。

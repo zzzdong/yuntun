@@ -25,7 +25,7 @@
 //! metrics_log_interval_secs = 30     # 指标周期打点（0 = 关闭，T6.12）
 //!
 //! [ingest]
-//! default_format = "parquet"
+//! default_format = "vortex"
 //! rows_threshold = 500000             # seal 触发：让 RowGroup 一次成型（S1-10）
 //! bytes_threshold_mb = 128            # seal 触发：字节阈值
 //! time_threshold_secs = 5             # 最短驻留地板（seal 时刻由窗口关闭决定，ADR-10）
@@ -157,7 +157,8 @@ pub struct IngestSection {
 impl Default for IngestSection {
     fn default() -> Self {
         Self {
-            default_format: "parquet".into(),
+            // `§164`：ADR-1 的"Vortex 主格式"**正式成为默认**；parquet 仍是回退/兼容格式
+            default_format: "vortex".into(),
             rows_threshold: 500_000,
             bytes_threshold_mb: 128,
             time_threshold_secs: 5,
@@ -462,6 +463,17 @@ impl Config {
                 self.ingest.max_flush_delay_secs, self.ingest.flush_phase_spread_secs
             ));
         }
+        // `§164`：**默认格式与二进制能力必须一致** —— 配了 vortex 却没编进来 ⇒ 启动就说清楚
+        if yuntun_format::DataFormat::parse(&self.ingest.default_format)
+            == yuntun_format::DataFormat::Vortex
+            && !yuntun_format::vortex_enabled()
+        {
+            out.push(format!(
+                "[ingest] default_format = \"{}\" 但本二进制**没有**编进 vortex（--no-default-features）；\
+                 写入会**响亮失败**。要么用默认特性重编，要么把 default_format 改成 \"parquet\"",
+                self.ingest.default_format
+            ));
+        }
         if self.ingest.rows_threshold == 0 && self.ingest.bytes_threshold_mb == 0 {
             out.push(
                 "[ingest] rows_threshold 与 bytes_threshold_mb 同时为 0：seal 只能靠窗口关闭"
@@ -549,7 +561,7 @@ batch_timeout_secs = 60
 
 [ingest]
 rows_threshold = 100
-default_format = "parquet"
+default_format = "vortex"
 
 [compaction]
 min_files = 3

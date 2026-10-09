@@ -225,7 +225,14 @@ client → （仅依赖 arrow-flight，可独立编译，不依赖 server）
 
 ### ADR-1：DataFusion 查询内核，Vortex 主 / Parquet 辅
 
-**代价**：Vortex 是文件格式非表格式，无 ACID、无行级删除；小批量（<1000 行）写入比 Parquet 慢 20–30×；库 API 在演进 → **锁定 Git Commit Hash** + Feature Flag 回退。
+**代价**：Vortex 是文件格式非表格式，无 ACID、无行级删除；小批量（<1000 行）写入比 Parquet 慢 20–30×；库 API 在演进 → ~~锁定 Git Commit Hash~~（`§133` 起改用 crates.io `0.86`）+ Feature Flag 回退。
+
+> ✅ **2026-10-09（`§164`，用户拍板 `D-8`）：Vortex 已正式成为默认格式** ——
+> `[ingest] default_format = "vortex"`、`yuntun-format` 的 `vortex` feature 默认开；
+> Parquet 退为"回退 / 兼容既有部署"的格式（两种格式可并存，读侧**按文件自身格式**）。
+> **代价照实记**：① **体积是 Parquet 的 3.5–4.5 倍**（`§140` 实测，已是压缩后配置）；
+> ② vortex 这条读路径**没有 row-group 级剪枝**（整文件解码，`F.4` 的 `.idx` 只对 parquet 生效）
+> ⇒ 已开台账 `D-20`。**落地的硬前提是先补读路径**（否则"写进去、查不到"= 静默事故）。
 
 ### ADR-2：不引入分布式 WAL
 

@@ -58,8 +58,8 @@ metrics_log_interval_secs = 30
 
 [ingest]
 # ADR-1 FormatSwitch：vortex 需编译期 --features vortex 并锁定 Git Commit；
-# 当前默认 parquet 回退路径
-default_format = "parquet"
+# `§164`：默认 vortex（ADR-1 主格式）；parquet 仍是回退/兼容既有部署的格式
+default_format = "vortex"
 
 # ---- seal 触发（架构 §2.2 / §5.4 / ADR-10）----
 # 行数阈值：让 RowGroup 一次成型（S1-10 建议 50–100 万行量级）

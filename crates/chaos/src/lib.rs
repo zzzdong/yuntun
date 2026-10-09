@@ -2317,8 +2317,10 @@ async fn orphan_cleanup_reclaims_unreferenced_deletion_vectors() {
         .unwrap();
     let anchor = files
         .iter()
-        .find(|f| f.file_path.ends_with(".parquet"))
-        .expect("应有一个已提交的 parquet 文件")
+        // `§164`：默认格式已是 vortex ⇒ 这里只该找"一个已提交的**数据**文件"，
+        // 不假设它是 parquet（本用例验的是"孤儿 DV 回收"，与文件格式无关）
+        .find(|f| !f.file_path.ends_with(".idx"))
+        .expect("应有一个已提交的数据文件")
         .clone();
 
     // ① 活着的 DV：对象 + **目录事件**（两个条件都满足）
