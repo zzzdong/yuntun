@@ -256,8 +256,9 @@ chunk_max_resident_secs > max_flush_delay_secs + flush_phase_spread_secs
 `write_then_read`（读己之写 latency + 零已提交文件）、`hot_shard_reader`（远端 `ShardReader`
 可替换）、`m0a_recommit`、chaos 3 场景全绿。
 
-**本阶段未做（明确留待）**：相位分散量级定案（P0）、spill 复用（P2）、
-`chunk::ColumnStats` 尚未接入 query 的块级跳过（阶段 3/4）、
+**本阶段未做（明确留待）**：~~相位分散量级定案（P0）~~ ✅ **已定案**（`md=0`/`spread=30s`，`§32`）、
+spill 复用（P2，**仍未做**）、~~`chunk::ColumnStats` 尚未接入 query 的块级跳过~~ ✅ **已落地**
+（`F.4` 行组级索引，`§145`：随 flush 生成 `.idx`，读时经 `ParquetAccessPlan` 跳过整组）、
 ~~内存/WAL 积压三项指标未接观测（`refactor.md` S1-11）~~（**已接**：`T6.12` + HTTP 导出 `§160`）。
 
 
@@ -421,26 +422,27 @@ SQL `INSERT` 返回成功时数据仅落 WAL（与 Flight DoPut 语义一致）�
 | 文件全局唯一命名（`batch_id` = UUIDv7） | ✅ | 已满足 refactor.md 的 S4-5（本文 R4-5）要求，无需事后改名 |
 | Manifest 预留 `partition_key` / `source_instance` | ✅ | `model/src/meta.rs`（tag 14/15） |
 
-**B. 控制平面（Catalog / Meta）—— ❌ 未开始（真瓶颈）**
+**B. 控制平面（Catalog / Meta）—— ✅ 已落地**（2026-10-11 审计；本组此前一直写"❌ 未开始"，与 §7 的 R2/R3 全部 ✅ **自相矛盾** ⇒ 台账 `D-24`）
 
-| 能力 | 现状 | 阻塞点 | 归属 |
-|---|---|---|---|
-| Catalog 抽象 | `CatalogOps`（15 方法）**是好缝**，ingest/query/sql/flight 全走它 | — | — |
-| Catalog 访问形态 | `LocalCatalogCache` 每 200ms **全量拉取**（`list_tables` + 逐表 `list_visible_files`） | 换共享 metanode 即 O(表×文件) 风暴；且 `schema_ver`/`manifest_ver` 未分离 | R2 |
-| Catalog 持久化 | `MemoryCatalog` 纯内存；重启靠**本地 WAL 重放 DDL** 重建 | 分离后 WAL 在 datanode、Catalog 在 metanode → 必须 raft snapshot | R3 |
-| Compaction 走抽象 | `Compactor.catalog: Arc<MemoryCatalog>`，`commit_compaction` 是**固有方法不在 trait** | 具体类型旁路：Catalog 转 gRPC 时编译不过 | **R2 必做** |
-| 孤儿清理走抽象 | `spawn_orphan_cleanup(catalog: Arc<MemoryCatalog>)` | 同上 | **R2 必做** |
+| 能力 | 现状 | 证据 |
+|---|---|---|
+| Catalog 抽象 | `CatalogOps`（抽象 trait），ingest/query/sql/flight/compaction 全走它 | `crates/catalog/src/lib.rs`；`§52` 清掉接缝上的具体类型 |
+| Catalog 访问形态 | **版本驱动 + 增量 delta + 不可变快照**；`RemoteCatalog` 预取缓存；读路径**按需保鲜** | `§26`（S2）/ `§163` |
+| Catalog 持久化 | 权威在 **metanode/raft**（fjall 落盘 + 自实现 `Storage` + 快照安装）；standalone 默认 embedded | `§43`–`§50`、`§56` |
+| Compaction 走抽象 | `Compactor.catalog: Arc<dyn CatalogOps>`，`commit_compaction` 在 trait 里 | `§166`（并新增 `lease_purpose` 栅栏） |
+| 孤儿清理走抽象 | `spawn_orphan_cleanup(catalog: Arc<dyn CatalogOps>)`，且加了 `gc` 租约 | `§166`/`§167` |
 
-**C. 分布式语义—— ❌ 未开始**
+**C. 分布式语义—— ✅ 已落地**（2026-10-11 审计；此前写"❌ 未开始" ⇒ 台账 `D-24`）
 
-| 能力 | 现状 | 不做的后果 | 归属 |
-|---|---|---|---|
-| 冷热边界**按实例**切分 | `source_instance` **只写不读**（全仓库无消费点，已核） | 多 datanode 各自 flush 后查询无法判断"该实例 flush 到哪" → **同一批数据读两次**（静默重复计数） | R4 |
-| 查询 fanout + 块级剪枝 | 单节点 scan；`chunk::ColumnStats` 已算出**但未接入跳过** | 无分布式查询能力；单节点也浪费了块级剪枝 | R5 |
-| Compaction 全局化 | 单进程后台任务、**无租约** | 两个执行者重复合并同一批文件 → 悬挂文件 / 快照异常 | R6 |
-| 孤儿 GC 多写者安全 | 进程内 `first_seen` map + 1h 静置；按 S3 ↔ Meta 对账 | 把别家"刚上传未提交"的文件当孤儿删除 → **数据丢失** | R6 |
+| 能力 | 现状 | 证据 |
+|---|---|---|
+| 冷热边界**按实例**切分 | 热读器按实例持有；水位 + STALE 可识别可重试 | `§65`/`§66`/`§77`/`§78` |
+| 查询 fanout + **行组级剪枝** | 扇出并发化 + 每查询热读预算；`.idx`（min/max + XOR）两级剪枝 | `§88`（fanout）/ `§145`（F.4 索引） |
+| Compaction 全局化 | 全局租约 → `§166` 起改为**按 `(table, shard)` 分领**（多节点可同时合并不同分片）+ epoch 栅栏 + "输入已被合并即拒绝" | `§81`/`§82`/`§166`/`§167` |
+| 孤儿 GC 多写者安全 | `gc` 全局租约 + 在途登记 + 静置期 + **两条件合取**的回收判据 | `§83`/`§84`/`§156`/`§166` |
+| ⚠️ 仍欠 | **冷数据按 datanode 归属与下推**（扇出只盖热数据） | 台账 `D-4` 的第二半 |
 
-**D. 质量与决策—— ❌ 未开始**
+**D. 质量与决策—— ✅ 已落地**（2026-10-11 审计；此前写"❌ 未开始" ⇒ 台账 `D-24`）
 
 | 能力 | 现状 | 阻塞点 | 归属 |
 |---|---|---|---|
@@ -491,7 +493,7 @@ SQL `INSERT` 返回成功时数据仅落 WAL（与 Flight DoPut 语义一致）�
 | T6.12 | **S1-11 观测三项指标** ✅ **已完成（2026-09-17）** | `Lakehouse::metrics()` + 周期打点：chunk 内存水位 / **WAL 积压记录数** / 背压水位 + Catalog 版本与增量统计（可序列化）＋ **HTTP 导出已补**（`§160`：`/metrics` / `/metrics.json` / `/healthz`） | 没有它，R-7（内存越限）只能复现不能定位 |
 | T6.13 | **P0 定案**（v2.1 新增） | 用 T8 数据定 `flush_phase_spread_secs` / `max_flush_delay_secs` / `rows_threshold`，并**正式修订 ADR-10** | §2.2；未定案就不该改默认值。**进度 3/3 ✅**：①相位分散+宽限期 ✅ 定案（30s/0）、③持久化上界口径 ✅（= 窗口关闭 + md + spread）、②`rows_threshold` ✅ 定案（保持，§35 实测定性）；ADR-10 已按定量表述改写 |
 | T6.14 | **chunk 压力与恢复专项**（v2.1 新增） | 触发 spill 的写入压力；spill 读回失败降级；大基数 `GROUP BY` 挤压 chunk 区（验证硬分区）；崩溃后 spill 清理 | S1 的"真实压力曲线"缺口。**已落地**：崩溃后 spill 清理（`ChunkStore::purge_leftover_spills` + `server/tests/private_dir_gate.rs`）、**硬分区两层验证**（`§131`：零件级两个账本各自触顶/拒绝/释放 + 整机级查询池 1 MiB 下优雅失败）；**未做**：真实压力曲线、spill 读回失败降级（需注入点） |
-| T6.15 | TTL 分片移除 + segment 清理闸门（R21） | 阶段 0 遗留 | 影响 WAL 磁盘占用（与 §2.2 的 P2 联动） |
+| T6.15 | TTL 分片移除 + segment 清理闸门（R21） | ⚠️ **仍未做**（阶段 0 遗留）：WAL 的 segment 清理闸门与"分片 TTL 到期即移除"都还没有；现有的是 **WAL 超时监控**（`spawn_timeout_monitor`，`§127`）与段归档（`§125`） | 影响 WAL 磁盘占用（与 §2.2 的 P2 联动） |
 | T7.x | SQL 写入路径专项 Chaos | Flight SQL / INSERT × 崩溃点组合 | 验证与 DoPut 同等持久性 |
 | T8.x | 压测与基线入库 | 吞吐 / P99 / 内存曲线 / **CommitFiles 瞬时并发** / 文件数·天 | P0 的证据来源。**✅ 已入库**：`bench_baseline`（提交时刻分布 + 峰值并发 + 文件数·天 + seal→committed）→ `operation-log §32`；**遗留**：~~**R3 后打同一 Meta**~~ ✅ **已量**（`§114`：同机 A/B，内存目录 vs 单节点 raft 元数据；p50 +0.9% 而 **p99 +14.5%**、峰值提交 −32% ⇒ **raft 把突发串行化**）；**剩余**：多节点 raft 与跨机 RTT；原记：**R3 后打同一 Meta 的真并发**（本轮已给本机多进程上界，§37）、真实 S3/MinIO（**本机 SeaweedFS 上：单机读写两向 + 多节点并发写对拍/冷读均已验**，`§101` / `§102` / `scripts/s3_*_smoke.sh`）、跨机、组级剪枝收益、内存曲线时序 |
 | T9.x | Vortex（锁 commit + feature + 对比） | ✅ **codec 已落地**（`§139`：往返逐值相同）；**对比已测**（`§140`）：**Vortex 体积是 Parquet 的 3.5–4.5 倍**（递增整数 23800/6680、随机串 63348/14000，且**已是压缩后**）；**决策（`D-8`，用户拍板）：采用 Vortex 默认** —— ✅ **已落地（`§164`）**：feature 默认开 + 默认格式改 vortex + **先补 `.vortex` 读路径** + 合并按文件自身格式读 + 启动自检。代价（体积 3.5–4.5×、**无 row-group 级剪枝**）已照实记入 `status.md` / ADR-1，后者开台账 **`D-20`** |
@@ -526,7 +528,7 @@ SQL `INSERT` 返回成功时数据仅落 WAL（与 Flight DoPut 语义一致）�
 | T10.5 | watch 后台任务 + manifest delta 接口 | ✅ `version()` 无变化零开销 + `manifest_delta(since)` 只重拉变更表 |
 | T10.6 | 本地缓存持久化（可选降级） | ⏳ 留 R3 后（需序列化格式；先有"刷新失败保留旧快照"的可用性底线） |
 | T10.7 | **抽象 `CommitCompaction` + Compactor/孤儿清理只依赖 `CatalogOps`** | ✅ 已上 trait；`Arc<MemoryCatalog>` 已消除 |
-| T10.8 | proto 启用 tonic-build（同签名演进） | ⏳ 随 R3 一起（与 raft 服务同一批 codegen，单独做无收益） |
+| T10.8 | proto 启用 tonic-build（同签名演进） | ✅ **已落地**：`crates/proto/build.rs` 用 `tonic_prost_build`（R3 期间启用） |
 
 **准出（已达成）**：
 
@@ -615,7 +617,7 @@ standalone 仍可单机运行（同一份装配的裁剪）。
 | T14.1 | 作业全局化：meta 租约独占 | ✅ **两刀已落地**（`§81`/`§82`）：租约进状态机（`LeaseEntry`/`LeaseGrant` + 快照 v2→v3）+ 三个 op（取/续/放，**`ProposeResponse.result` 第一次被用起来**）+ 压缩循环的租约门（拿不到就空转、续租被拒即停手）+ `Status.leases` 可观测；**epoch 栅栏**：`CompactionOp.lease_epoch` 让"被罢黜者的在途提交"被拒（判据用**代次水位**）。**为什么租约进 raft 而心跳绝不**：前者是**授权**、后者是**发现**。**遗留**：分片粒度（`purpose = compaction:{table}:{shard}` 即可，协议不动） |
 | T14.2 | 租约 + 心跳 + 过期接管 | ✅ **接管已落地**（`§81`）：e2e 杀掉持有者 ⇒ 过 TTL 后幸存者接管、`epoch` 推进（2.22s）。保活仍走**续租 op**（每 TTL/3 一次）；"无重复合并"已由 `§82` 的**栅栏**补齐（被罢黜者的在途提交作废）；"复用现有心跳"仍可省一次 raft 写 |
 | T14.3 | **孤儿 GC 的多写者安全** | ✅ **已落地**（`§83`）：**先声明、后上传** —— 写者在上传前登记 `batch_id`（`record_in_flight`，走 raft）、提交时撤销，`known_batch_ids` = **已提交 ∪ 在途** ⇒ 判据从 grace（**时间假设**）变成**结构可见**；写者崩在半路由 TTL 清扫兜底。回归用例 `grace = ZERO` 下"在途不删 + 真孤儿照删"（对照）。**驱动已接线**（`§84`）：挂在 leader 巡检上、只在有过期条目时才提议；**准出专项**（多写者 + GC ⇒ 零误删，含**反证**：退回旧判据 ⇒ 用例双双失败） |
-| T14.4 | 跨节点文件合并（不同 `source_instance` 产出的文件） | — |
+| T14.4 | 跨节点文件合并（不同 `source_instance` 产出的文件） | ✅ **已落地**：跨实例合并（`§86`）；`§167` 起有**多 datanode 容器 rig** 的端到端证据（两节点都合并过 + 行数守恒 + 接管） |
 | T14.5 | 与 `deleted_at` 联动：墓碑期 + 无在途引用才真删 | ✅ **已落地**（`§85`）：`known_batch_ids` 从"全部已知"收窄成"**仍在保护期**"= `protects_at(当前快照)` ∪ 在途 ⇒ 过期的墓碑退出保护集合、可被物理回收；`orphan_grace` 随之明确为**墓碑期时长**（推荐 10–60s）；**wire 零改动**（收窄在状态机内部）。含**镜像反证**（退回旧判据 ⇒ 回收用例变红，而 `§84` 两条仍绿）|
 
 **准出**：多节点持续写入下文件数收敛到稳定区间；compaction 期间查询不受影响；
