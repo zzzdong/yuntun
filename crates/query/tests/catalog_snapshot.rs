@@ -369,9 +369,10 @@ impl CatalogOps for BrokenCatalog {
         old_batch_ids: &[String],
         new_files: Vec<FileManifest>,
         lease_epoch: u64,
+        lease_purpose: &str,
     ) -> Result<u64, yuntun_model::LakeError> {
         self.inner
-            .commit_compaction(old_batch_ids, new_files, lease_epoch)
+            .commit_compaction(old_batch_ids, new_files, lease_epoch, lease_purpose)
             .await
     }
     async fn known_batch_ids(&self) -> Result<Vec<String>, yuntun_model::LakeError> {

@@ -114,11 +114,12 @@ struct LeaseGate {
 }
 
 impl LeaseGate {
-    fn new(compactor: &Compactor) -> Self {
+    /// `§166`：**指定用途键**（分领时每把租约一个键）。
+    fn for_purpose(purpose: String, holder: String, ttl: std::time::Duration) -> Self {
         Self {
-            purpose: compactor.cfg.lease_purpose.clone(),
-            holder: compactor.lease_holder.clone(),
-            ttl_ms: compactor.cfg.lease_ttl.as_millis() as u64,
+            purpose,
+            holder,
+            ttl_ms: ttl.as_millis() as u64,
             epoch: 0,
             expires_at_ms: 0,
         }
@@ -478,15 +479,24 @@ fn apply_deletions(
 /// `valid_from = snapshot+1`，一次原子完成）。实现无关。
 async fn commit_compaction_files(
     compactor: &Compactor,
-    _table: &str,
-    _shard: &str,
+    table: &str,
+    shard: &str,
     old_ids: Vec<String>,
     new_manifest: FileManifest,
     lease_epoch: u64,
 ) -> Result<u64, LakeError> {
     compactor
         .catalog
-        .commit_compaction(&old_ids, vec![new_manifest], lease_epoch)
+        .commit_compaction(
+            &old_ids,
+            vec![new_manifest],
+            lease_epoch,
+            &yuntun_model::meta::compaction_shard_lease_purpose(
+                &compactor.cfg.lease_purpose,
+                table,
+                shard,
+            ),
+        )
         .await
 }
 
@@ -643,6 +653,7 @@ pub fn spawn_orphan_cleanup(
     catalog: Arc<dyn CatalogOps>,
     prefix: String,
     grace: Duration,
+    lease_holder: String,
     shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     spawn_orphan_cleanup_with_interval(
@@ -651,6 +662,7 @@ pub fn spawn_orphan_cleanup(
         prefix,
         grace,
         Duration::from_secs(60),
+        lease_holder,
         shutdown,
     )
 }
@@ -664,24 +676,48 @@ pub fn spawn_orphan_cleanup(
 /// 生产用 60s（见上，`grace` 才是安全边界，间隔只影响回收及时性）；
 /// **测试需要能把它压到毫秒级** —— 否则一条"不误删已知文件"的用例要跑一分钟以上，
 /// 没人会去跑它，等于没有防线。
+/// `lease_holder` = 本节点的**唯一身份**（`§166`）：两个节点用同一个名字会**双双拿到租约**
+/// （`§81` 的老坑：默认值恰好是最危险的值）⇒ 必须由装配层显式给。
 pub fn spawn_orphan_cleanup_with_interval(
     store: Arc<dyn object_store::ObjectStore>,
     catalog: Arc<dyn CatalogOps>,
     prefix: String,
     grace: Duration,
     interval: Duration,
+    lease_holder: String,
     shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // 期限 = 间隔的 3 倍（下限 30s）：一轮扫得比间隔久也不至于被误接管
+        let gc_ttl = interval
+            .period()
+            .saturating_mul(3)
+            .max(std::time::Duration::from_secs(30));
+        // `§166`：孤儿对账是**全局**的（一个对象是不是垃圾要看全集群的清单）⇒ 分片没有意义，
+        // 全局单跑即可。今天多节点会各跑一份（幂等，但白白重复扫一遍全 bucket）⇒ 加一把 `gc` 租约。
+        let mut gate = LeaseGate::for_purpose(
+            yuntun_model::meta::GC_LEASE.to_string(),
+            lease_holder.clone(),
+            // 期限 = 间隔的 3 倍：一轮扫得比间隔久也不至于被误接管（接管后本轮会自己停手）
+            gc_ttl,
+        );
         // batch_id → 首次发现为孤儿的时刻（Unix 毫秒）
         let mut first_seen: std::collections::HashMap<String, u64> =
             std::collections::HashMap::new();
         loop {
             tokio::select! {
-                _ = shutdown.cancelled() => break,
+                _ = shutdown.cancelled() => {
+                    let _ = catalog
+                        .release_lease(yuntun_model::meta::GC_LEASE, &lease_holder, gate.epoch)
+                        .await;
+                    break;
+                }
                 _ = interval.tick() => {}
+            }
+            if !gate.acquire_or_renew(&catalog).await {
+                continue; // 别的节点在清：本轮跳过（重复扫一遍没有收益）
             }
             let objects = match yuntun_format::list_objects(&store, &prefix).await {
                 Ok(o) => o,
@@ -747,6 +783,103 @@ pub fn spawn_orphan_cleanup_with_interval(
 }
 
 /// 启动后台 Compaction 循环（每 interval：逐表逐 shard 检查合并）。
+/// 一轮压缩的账（`§166`：可观测"分领"到底分到了多少）。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RoundStats {
+    /// 预筛后"值得看一看"的分片数
+    pub candidates: usize,
+    /// 真合并了的分片数
+    pub compacted: usize,
+    /// 因为**别的节点正持有**而跳过的分片数（分领的常态，不是错误）
+    pub lease_busy: usize,
+    /// 合并失败的分片数
+    pub failed: usize,
+    /// **输入已被别人合并**（`§166` 的正常竞态：本节点的快照是旧的）—— 不是失败，
+    /// 单独计数，否则"分领很忙"会被误读成"合并老出错"。
+    pub stale: usize,
+}
+
+/// **跑一轮压缩**（`§166`）：按 **`(table, shard)` 分领** —— 每个分片一把租约。
+///
+/// 与旧口径的差别：过去全集群只有**一把全局 `compaction` 租约** ⇒ 同一时刻只有一个节点在合并，
+/// 多 datanode 的算力用不上。现在**分片即锁粒度**：拿不到这个分片的租约就跳过（别的节点在做），
+/// 拿到就合并、做完立刻归还（接手方不必干等 TTL）。不同节点因此可**同时合并不同的分片**。
+///
+/// 预筛是**超集**（"文件数够多"或"这个分片上有 DV"）：真正的触发判定只有一处
+/// （`compact_shard_inner`），把阈值写两遍就会在某一处漏判 —— 而漏判 DV 触发正是
+/// `D-10` 那类"删除成本永不收敛"的形状。
+pub async fn compaction_round(compactor: &Compactor) -> Result<RoundStats, LakeError> {
+    let mut stats = RoundStats::default();
+    let tables = compactor.catalog.list_tables().await?;
+    let snapshot = compactor.catalog.current_snapshot().await;
+    for t in &tables {
+        let files = compactor
+            .catalog
+            .list_visible_files(&t.name, snapshot, None)
+            .await?;
+        if files.is_empty() {
+            continue;
+        }
+        // 这个分片上有没有 DV（**只问目录，不读对象**）—— 供预筛用，判定仍在 `compact_shard` 里
+        let dv_files: std::collections::HashSet<String> = compactor
+            .catalog
+            .list_deletions(&t.name, snapshot)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|d| d.file_path)
+            .collect();
+        let mut by_shard: std::collections::HashMap<&str, Vec<&FileManifest>> =
+            std::collections::HashMap::new();
+        for f in &files {
+            by_shard.entry(f.shard.as_str()).or_default().push(f);
+        }
+        // ⚠️ 分片**按名字排序**遍历：多节点同时跑时大家的顺序一致 ⇒ 抢同一批分片时
+        // 不会出现"两个节点各拿一半又互相等"的抖动（确定性纪律，`§38`）。
+        let mut shards: Vec<&str> = by_shard.keys().copied().collect();
+        shards.sort_unstable();
+        for shard in shards {
+            let group = &by_shard[shard];
+            let has_dv = group.iter().any(|f| dv_files.contains(&f.file_path));
+            if group.len() < compactor.cfg.min_files && !has_dv {
+                continue;
+            }
+            stats.candidates += 1;
+            let purpose = yuntun_model::meta::compaction_shard_lease_purpose(
+                &compactor.cfg.lease_purpose,
+                &t.name,
+                shard,
+            );
+            let mut gate =
+                LeaseGate::for_purpose(purpose.clone(), compactor.lease_holder.clone(), compactor.cfg.lease_ttl);
+            if !gate.acquire_or_renew(&compactor.catalog).await {
+                stats.lease_busy += 1;
+                continue;
+            }
+            match compact_shard(compactor, &t.name, shard, snapshot, gate.epoch).await {
+                Ok(Some(_)) => stats.compacted += 1,
+                Ok(None) => {}
+                Err(e) => {
+                    // "输入已被别人合并"是分领下的**正常竞态**（本轮快照是旧的），不是故障
+                    if e.to_string().contains("compaction conflict") {
+                        stats.stale += 1;
+                        tracing::info!(table = %t.name, shard, "本轮输入已被合并（跳过）");
+                    } else {
+                        stats.failed += 1;
+                        tracing::error!(error = %e, table = %t.name, shard, "compaction failed");
+                    }
+                }
+            }
+            // 做完立刻归还：接手方不必干等 TTL（`§81` 的优雅退出同一条理由）
+            let _ = compactor
+                .catalog
+                .release_lease(&purpose, &compactor.lease_holder, gate.epoch)
+                .await;
+        }
+    }
+    Ok(stats)
+}
+
 pub fn spawn_compaction_loop(
     compactor: Arc<Compactor>,
     shutdown: CancellationToken,
@@ -754,61 +887,22 @@ pub fn spawn_compaction_loop(
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(compactor.cfg.interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut gate = LeaseGate::new(&compactor);
         loop {
             tokio::select! {
-                _ = shutdown.cancelled() => {
-                    // 优雅退出：把租约**还回去** —— 接手方不必干等 TTL（`§81`）。
-                    // 代次为 0（还没持有）时这次调用空转，无副作用。
-                    let _ = compactor
-                        .catalog
-                        .release_lease(
-                            &compactor.cfg.lease_purpose,
-                            &compactor.lease_holder,
-                            gate.epoch,
-                        )
-                        .await;
-                    break;
-                }
+                _ = shutdown.cancelled() => break,
                 _ = interval.tick() => {}
             }
-            // **先拿租约再干活**（T14.1）：拿不到就空转 —— 别的节点在干，重复合并只是浪费。
-            if !gate.acquire_or_renew(&compactor.catalog).await {
-                continue;
-            }
-            let Ok(tables) = compactor.catalog.list_tables().await else {
-                continue;
-            };
-            let snapshot = compactor.catalog.current_snapshot().await;
-            for t in &tables {
-                // MVP：按 shard 聚合文件清单（list_visible_files 无 group-by，
-                // 一次拉全量后内存分组）
-                let files = match compactor
-                    .catalog
-                    .list_visible_files(&t.name, snapshot, None)
-                    .await
-                {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::error!(error = %e, table = %t.name, "list files failed");
-                        continue;
-                    }
-                };
-                let mut by_shard: std::collections::HashMap<&str, Vec<&FileManifest>> =
-                    std::collections::HashMap::new();
-                for f in &files {
-                    by_shard.entry(f.shard.as_str()).or_default().push(f);
-                }
-                for (shard, group) in by_shard {
-                    if group.len() < compactor.cfg.min_files {
-                        continue;
-                    }
-                    if let Err(e) =
-                        compact_shard(&compactor, &t.name, shard, snapshot, gate.epoch).await
-                    {
-                        tracing::error!(error = %e, table = %t.name, shard, "compaction failed");
-                    }
-                }
+            // `§166`：不再抢全局租约 —— 分领由**每分片一把租约**完成（`compaction_round`）。
+            // 每一轮的租约都在分片做完时归还（`release_lease`），所以退出时没有"全局锁"要还。
+            match compaction_round(&compactor).await {
+                Ok(st) => tracing::info!(
+                    candidates = st.candidates,
+                    compacted = st.compacted,
+                    lease_busy = st.lease_busy,
+                    failed = st.failed,
+                    "compaction round"
+                ),
+                Err(e) => tracing::error!(error = %e, "compaction round failed"),
             }
         }
     })
@@ -954,6 +1048,7 @@ mod tests {
             "yuntun/".to_string(),
             Duration::ZERO, // **不靠时间假设**：全靠在途登记
             Duration::from_millis(20),
+            "test-gc".to_string(),
             shutdown.clone(),
         );
 
@@ -1149,6 +1244,7 @@ mod tests {
             "yuntun/".to_string(),
             Duration::ZERO,
             Duration::from_millis(20),
+            "test-gc".to_string(),
             shutdown.clone(),
         );
 
@@ -1250,6 +1346,7 @@ mod tests {
             "yuntun/".to_string(),
             Duration::ZERO,
             Duration::from_millis(20),
+            "test-gc".to_string(),
             shutdown.clone(),
         );
 
@@ -1443,8 +1540,12 @@ mod tests {
         }
 
         // 先立一条租约**水位**（代次 1）：随后用代次 0 提交 ⇒ 必被栅栏拒绝（`§82`）。
+        // `§166`：水位必须立在**这把分片租约**上 —— 栅栏按提交方声明的 purpose 核，
+        // 立在全局 `compaction` 上就核不到（那正是"分片分领后栅栏静默失配"的形状）。
+        let shard_purpose =
+            yuntun_model::meta::compaction_shard_lease_purpose("compaction", "t", "s0");
         catalog
-            .acquire_lease("compaction", "someone-else", 60_000, now_ms())
+            .acquire_lease(&shard_purpose, "someone-else", 60_000, now_ms())
             .await
             .unwrap();
 
@@ -1539,6 +1640,7 @@ mod tests {
             "yuntun/".to_string(),
             Duration::ZERO, // 静置期取 0：**不靠时间假设**，只靠"在途可见"
             Duration::from_millis(20),
+            "test-gc".to_string(),
             shutdown.clone(),
         );
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1577,7 +1679,10 @@ mod tests {
         };
 
         // 持有代次 1 ⇒ 提交通过
-        assert!(cat.commit_compaction(&[], vec![mf("m1")], 1).await.is_ok());
+        assert!(cat
+            .commit_compaction(&[], vec![mf("m1")], 1, "")
+            .await
+            .is_ok());
 
         // 租约过期、被别人接管 ⇒ 代次 2
         let g2 = cat
@@ -1588,13 +1693,13 @@ mod tests {
 
         // **被罢黜者的在途提交（还带着 1）⇒ 必须被拒**（这就是"零重复产出"的保证）
         let e = cat
-            .commit_compaction(&[], vec![mf("m2")], 1)
+            .commit_compaction(&[], vec![mf("m2")], 1, "")
             .await
             .unwrap_err();
         assert!(e.to_string().contains("fenced"), "{e}");
 
         // 新持有者的提交照常
-        assert!(cat.commit_compaction(&[], vec![mf("m3")], 2).await.is_ok());
+        assert!(cat.commit_compaction(&[], vec![mf("m3")], 2, "").await.is_ok());
     }
 
     fn compactor(catalog: Arc<dyn CatalogOps>) -> Compactor {

@@ -326,6 +326,24 @@ pub fn dml_shard_lease_purpose(table: &str, shard: &str) -> String {
     format!("dml:{table}:{shard}")
 }
 
+/// **`(table, shard)` 粒度的压缩租约用途键**（`§166`：多节点**分领**）。
+///
+/// 为什么压缩也要分片：`COMPACTION_LEASE` 是**全局一把** ⇒ 同一时刻全集群只有一个节点在合并，
+/// 多 datanode 的算力用不上（合并是"每个分片各写一份产物"的作业，天然可并行）。
+/// 分片之后：**不同节点可同时合并不同的分片**，同一分片仍由租约保证只有一个持有者。
+///
+/// 前缀沿用 `CompactionConfig::lease_purpose`（默认 `compaction`）⇒ 键形如
+/// `compaction:{table}:{shard}`；它与 `commit_compaction` 的栅栏**必须用同一个构造器**
+/// （栅栏按提交方声明的 purpose 核，`§166`）。
+pub fn compaction_shard_lease_purpose(prefix: &str, table: &str, shard: &str) -> String {
+    format!("{prefix}:{table}:{shard}")
+}
+
+/// 孤儿清理的用途键（`§166`）：对账是**全局**的（一个对象的命运要看全集群的清单），
+/// 分片没有意义 ⇒ 全局单跑，靠它保证同一时刻只有一个节点在删（今天 `spawn_orphan_cleanup`
+/// **没有**租约 ⇒ 多节点各跑一份，虽幂等但白白重复扫一遍全bucket）。
+pub const GC_LEASE: &str = "gc";
+
 
 /// 取租约的结果（`AcquireLease` 的 op 结果；trait 返回值同形状）。
 // `prost::Message` 自带 `Debug`/`Default`，重复 derive 会冲突

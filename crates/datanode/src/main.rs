@@ -172,6 +172,12 @@ struct Args {
     /// grace 只剩"给还在读旧快照的读者一个窗口"。
     #[arg(long, default_value_t = 3600)]
     compaction_gc_grace_secs: u64,
+    /// 孤儿 GC 的作业间隔（秒）。
+    ///
+    /// `§166`：GC 的租约期限 = 本值的 3 倍（下限 30s）⇒ 调它同时决定了"一个节点死后
+    /// 别人多久能接管 GC"。默认 60s；**别把它调得比一轮扫描还短**（会自己追自己）。
+    #[arg(long, default_value_t = 60)]
+    compaction_gc_interval_secs: u64,
     /// 压缩租约的期限（秒）：到期即失效，接手方不必等它点头（`§81`）。
     ///
     /// 短 = 接管快、续租（一次 raft 写）频；长 = 反之。默认 30s 与"巡检/心跳都是秒级"配套。
@@ -496,11 +502,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             });
             let _compaction =
                 yuntun_compaction::spawn_compaction_loop(compactor, shutdown.clone());
-            let _gc = yuntun_compaction::spawn_orphan_cleanup(
+            let _gc = yuntun_compaction::spawn_orphan_cleanup_with_interval(
                 store.clone(),
                 catalog.clone(),
                 "yuntun/".to_string(),
                 Duration::from_secs(args.compaction_gc_grace_secs),
+                Duration::from_secs(args.compaction_gc_interval_secs),
+                // `§166`：持有者 = 本节点实例 id（多节点同名会双双拿到租约）
+                format!("gc-{}", args.instance_id),
                 shutdown.clone(),
             );
             tracing::info!(

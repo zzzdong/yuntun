@@ -2223,6 +2223,7 @@ async fn orphan_cleanup_spares_known_and_inflight_files() {
         "yuntun/".to_string(),
         Duration::ZERO,
         Duration::from_millis(20),
+        "chaos-gc".to_string(),
         cleanup_shutdown.clone(),
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
@@ -2267,6 +2268,7 @@ async fn orphan_cleanup_spares_known_and_inflight_files() {
         "yuntun/".to_string(),
         Duration::from_secs(3600), // 1h 静置期
         Duration::from_millis(20),
+        "chaos-gc".to_string(),
         grace_shutdown.clone(),
     );
     // 跑足够多轮（>> interval），静置期内的文件必须原封不动
@@ -2366,6 +2368,7 @@ async fn orphan_cleanup_reclaims_unreferenced_deletion_vectors() {
         "yuntun/".to_string(),
         Duration::ZERO,
         Duration::from_millis(20),
+        "chaos-gc".to_string(),
         cleanup_shutdown.clone(),
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);

@@ -142,7 +142,8 @@ message Op {
 // 取租约（含**接管**）：空闲、或当前已过期（`Op.now_ms >= expires_at_ms`）⇒ 授予；
 // 同一持有者重复取 ⇒ 代次不变、期限顺延。
 message AcquireLeaseOp {
-  // 用途键：本轮是 `compaction`（分片粒度以后可扩成 `compaction:{table}:{shard}`）
+  // 用途键：`§166` 起压缩按 **`(table, shard)` 分片分领** ⇒ 键形如 `compaction:{table}:{shard}`
+  // （前缀由 `[compaction] lease_purpose` 决定，默认 `compaction`）；GC 用 `gc`（全局单跑）
   string purpose = 1;
   // 申请者 `instance_id`
   string holder  = 2;
@@ -617,6 +618,10 @@ message CompactionOp {
   // 落后于当前租约水位 ⇒ 状态机**拒绝**这次提交：被罢黜的持有者不该再产出合并文件
   // （否则它与新持有者各产一份 —— 浪费，且孤儿 GC 还得收）。无租约时传 0。
   uint64 lease_epoch = 3;
+  // `§166`：**栅栏认哪把租约**。分片分领之后每把租约的用途键是
+  // `compaction:{table}:{shard}`，栅栏必须**按同一把钥匙**核 —— 写死成全局键会使分片租约
+  // 的栅栏**静默失配**（检查的是一把没人持有的锁 ⇒ 等于没有栅栏）。空 ⇒ 回退到全局键。
+  string lease_purpose = 4;
 }
 
 // 幂等记录（认领 / 提交后登记）。

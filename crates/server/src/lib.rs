@@ -644,6 +644,8 @@ async fn build_embedded_catalog(
             self.catalog.clone(),
             "yuntun/".to_string(),
             Duration::from_secs(3600),
+            // `§166`：租约持有者必须是**唯一身份**（两个节点同名会双双拿到租约）
+            format!("gc-{}", self.ingestor.cfg.instance_id),
             self.shutdown.clone(),
         ));
 

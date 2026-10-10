@@ -315,6 +315,8 @@ fn propose_request_roundtrips_for_every_op_variant() {
             new_files: vec![to_manifest(&FileManifest::default())],
             // 非零值：这一条是**逐字段无损**测试，0 会让"忘了搬这个字段"看不出来
             lease_epoch: 7,
+            // `§166`：栅栏认哪把租约（`compaction:{table}:{shard}`）也要逐字段无损
+            lease_purpose: "compaction:public.t:s0".into(),
         }),
         op::Kind::Idempotency(IdempotencyOp {
             record: Some(IdempotencyRecordMsg {

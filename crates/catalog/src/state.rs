@@ -1039,18 +1039,44 @@ impl CatalogState {
         old_batch_ids: &[String],
         new_files: Vec<FileManifest>,
         lease_epoch: u64,
+        lease_purpose: &str,
     ) -> Result<u64, LakeError> {
         // 【栅栏】在途作业的防线：租约已被接管（当前代次更大）时**不许提交** ——
         // 否则被罢黜的持有者仍会产出第二份合并文件（`§81.8` ②）。
         // 判据用**代次水位**（不是"当前有没有持有者"）：释放后水位仍留着，正是为此。
-        // 无租约记录 ⇒ 不设栅栏（进程内直连形态与既有用例照常）。
-        if let Some(lease) = self.leases.get(yuntun_model::meta::COMPACTION_LEASE)
+        //
+        // `§166`：**按提交方声明的那把租约核**（`lease_purpose`）。分片分领之后每把租约的
+        // 用途键是 `compaction:{table}:{shard}` —— 若这里仍只认全局 `compaction`，
+        // 则"分片租约被接管"**查不出来**（那把全局锁根本没人持有）⇒ 栅栏**静默失配**。
+        // 空 ⇒ 回退到全局键（老客户端 / 进程内直连形态照常）。
+        let purpose = if lease_purpose.is_empty() {
+            yuntun_model::meta::COMPACTION_LEASE
+        } else {
+            lease_purpose
+        };
+        if let Some(lease) = self.leases.get(purpose)
             && lease_epoch < lease.epoch
         {
             return Err(LakeError::Other(format!(
-                "compaction fenced: 提交携带的租约代次 {lease_epoch} 落后于当前 {}                     （持有者 {:?}）—— 本次合并作废",
-                lease.epoch, lease.holder
+                "compaction fenced: 提交携带的租约代次 {lease_epoch} 落后于 {} 的当前 {}                     （持有者 {:?}）—— 本次合并作废",
+                purpose, lease.epoch, lease.holder
             )));
+        }
+        // 【冲突】`§166`：**输入必须仍然可见**。分片分领之后，两个节点可以先后拿到同一把
+        // 分片租约 —— 后一个若拿着**旧快照**看到"这批文件还没合并"，就会再产出一份
+        // （同一批输入两份产物 = 行数翻倍；旧口径下这被"全局只有一把锁"顺带挡住了）。
+        //
+        // 判据只能放在这里：只有状态机能在**提交这一刻原子地**知道"这些文件还活着吗"。
+        // 客户端先查再提交是**检查与使用分离**（TOCTOU）—— 那个窗口里对方可能已经提交了。
+        for id in old_batch_ids {
+            if let Some(f) = self.files.get(id)
+                && f.deleted_at != 0
+            {
+                return Err(LakeError::Other(format!(
+                    "compaction conflict: 输入文件 {id} 已在快照 {} 被合并（deleted_at != 0）—— 本次合并作废",
+                    f.deleted_at
+                )));
+            }
         }
         let next = self.next_snapshot();
         // ⚠️ `BTreeSet` 而不是 `HashSet`（纪律 2）：下面的 `bump_manifest_ver` 会**按迭代序分配
@@ -1576,7 +1602,7 @@ mod tests {
             st.commit_files(commit_req("public.mem", "b2", &["k2"]), 1_004)
                 .unwrap();
             st.drop_shard("public.cpu", "s0");
-            st.commit_compaction(&["b2".to_string()], vec![merged_file("public.mem", "m1", 1)], 0)
+            st.commit_compaction(&["b2".to_string()], vec![merged_file("public.mem", "m1", 1)], 0, "")
                 .unwrap();
             st.sweep_expired_idempotency(24 * 3600, 1_010);
             st
@@ -1635,6 +1661,7 @@ mod tests {
                 &["b_b".to_string(), "b_a".to_string()],
                 vec![merged_file("public.aaa", "m", 2)],
                 0,
+                "",
             )
             .unwrap();
             st
@@ -1980,28 +2007,28 @@ mod snapshot_tests {
         };
         // 无租约记录 ⇒ 不设栅栏（进程内直连形态、既有用例照常）
         assert!(s
-            .commit_compaction(&[], vec![mf("m1")], 0)
+            .commit_compaction(&[], vec![mf("m1")], 0, "")
             .is_ok());
 
         // 租约代次 1：携带 1 可提交，携带 0（没有租约的旧代码）被拒
         s.acquire_lease("compaction", "a", 1_000, 1_000);
         assert!(s
-            .commit_compaction(&[], vec![mf("m2")], 1)
+            .commit_compaction(&[], vec![mf("m2")], 1, "")
             .is_ok());
         let e = s
-            .commit_compaction(&[], vec![mf("m3")], 0)
+            .commit_compaction(&[], vec![mf("m3")], 0, "")
             .unwrap_err();
         assert!(e.to_string().contains("fenced"), "{e}");
 
         // **被接管（代次 2）⇒ 旧持有者（1）的在途提交必须被拒** —— 这就是栅栏的全部意义
         s.acquire_lease("compaction", "b", 5_000, 1_000);
         let e = s
-            .commit_compaction(&[], vec![mf("m4")], 1)
+            .commit_compaction(&[], vec![mf("m4")], 1, "")
             .unwrap_err();
         assert!(e.to_string().contains("fenced"), "{e}");
         // 新持有者（2）照常提交
         assert!(s
-            .commit_compaction(&[], vec![mf("m5")], 2)
+            .commit_compaction(&[], vec![mf("m5")], 2, "")
             .is_ok());
     }
 

@@ -1034,6 +1034,7 @@ impl CatalogOps for RemoteCatalog {
         old_batch_ids: &[String],
         new_files: Vec<FileManifest>,
         lease_epoch: u64,
+        lease_purpose: &str,
     ) -> Result<u64, LakeError> {
         self.propose(pb::Op {
             now_ms: now_ms(),
@@ -1041,6 +1042,8 @@ impl CatalogOps for RemoteCatalog {
                 old_batch_ids: old_batch_ids.to_vec(),
                 new_files: new_files.iter().map(op::manifest_to_proto_pub).collect(),
                 lease_epoch,
+                // `§166`：把"这份代次属于哪把租约"一起过线（分片分领后栅栏按它核）
+                lease_purpose: lease_purpose.to_string(),
             })),
         })
         .await?;

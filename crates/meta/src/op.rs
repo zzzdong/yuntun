@@ -93,6 +93,8 @@ pub enum StateOp {
         new_files: Vec<FileManifest>,
         /// 栅栏：干活时持有的租约代次（无租约 = 0）
         lease_epoch: u64,
+        /// `§166`：这份代次属于**哪把租约**（用途键）。空 ⇒ 状态机回退到全局 `compaction`。
+        lease_purpose: String,
         now_ms: u64,
     },
     /// 幂等**认领**（写入前的登记）。
@@ -353,6 +355,7 @@ pub fn decode_op(op: &pb::Op) -> Result<StateOp, MetaError> {
             now_ms,
         },
         pb::op::Kind::Compaction(c) => StateOp::Compaction {
+            lease_purpose: c.lease_purpose.clone(),
             lease_epoch: c.lease_epoch,
             old_batch_ids: c.old_batch_ids.clone(),
             new_files: c.new_files.iter().map(manifest_from_proto).collect(),
@@ -942,11 +945,12 @@ pub fn apply(state: &mut CatalogState, op: &StateOp) -> Result<ApplyOutcome, Met
             old_batch_ids,
             new_files,
             lease_epoch,
+            lease_purpose,
             ..
         } => {
             // 栅栏拒绝 = op **失败**（要让客户端看见"你被接管了"，而不是静默丢弃）
             state
-                .commit_compaction(old_batch_ids, new_files.clone(), *lease_epoch)
+                .commit_compaction(old_batch_ids, new_files.clone(), *lease_epoch, lease_purpose)
                 .map_err(MetaError::from_lake)?;
             // affected = 本次写入的新文件数（调用方按它算"合并产出"）
             Ok(ApplyOutcome::new(true, new_files.len() as u64))
@@ -1314,6 +1318,8 @@ mod tests {
         match decode(
             pb::op::Kind::Compaction(pb::CompactionOp {
                 lease_epoch: 0,
+                // `§166`：栅栏认哪把租约也要过线（分片分领后键是 `compaction:{table}:{shard}`）
+                lease_purpose: "compaction:public.t:s0".into(),
                 old_batch_ids: vec!["b1".into(), "b2".into()],
                 new_files: vec![manifest_to_proto(&f)],
             }),
@@ -1322,9 +1328,14 @@ mod tests {
             StateOp::Compaction {
                 old_batch_ids,
                 new_files,
+                lease_purpose,
                 ..
             } => {
                 assert_eq!(old_batch_ids, vec!["b1".to_string(), "b2".to_string()]);
+                assert_eq!(
+                    lease_purpose, "compaction:public.t:s0",
+                    "租约用途键必须逐字段过线（栅栏按它核）"
+                );
                 assert_eq!(new_files, vec![f], "compaction 的新文件必须逐字段无损");
             }
             other => panic!("解错了分支：{other:?}"),

@@ -150,6 +150,9 @@ impl Proc {
             .arg("1")
             .arg("--compaction-ttl-secs")
             .arg(ttl_secs.to_string())
+            // `§166`：GC 租约的 TTL = 间隔 × 3 ⇒ 间隔调小，"死后被接管"才落在用例的等待窗口里
+            .arg("--compaction-gc-interval-secs")
+            .arg("1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -352,12 +355,16 @@ async fn only_one_compactor_holds_the_lease_and_it_is_taken_over_when_it_dies() 
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    /// 当前压缩租约的持有者（空 = 空闲/无人）
+    /// 当前 **`gc` 租约**的持有者（空 = 空闲/无人）。
+    ///
+    /// `§166` 起压缩租约是**按 `(table, shard)` 分片**且"做完即还" ⇒ 它只在合并那一小段
+    /// 时间里存在，拿它等"谁持有"是抓不住的。而**孤儿对账是全局作业**（一把 `gc` 租约、
+    /// 跨轮持续持有）⇒ 验"同一时刻只有一个持有者 + 死后被接管"应当盯它。
     fn holder(h: &yuntun_meta::NodeHandle) -> Option<String> {
         h.status()
             .leases
             .into_iter()
-            .find(|l| l.purpose == "compaction" && !l.holder.is_empty())
+            .find(|l| l.purpose == yuntun_model::meta::GC_LEASE && !l.holder.is_empty())
             .map(|l| l.holder)
     }
 
@@ -376,16 +383,24 @@ async fn only_one_compactor_holds_the_lease_and_it_is_taken_over_when_it_dies() 
             async move { holder(&h).is_some() }
         },
         Duration::from_secs(30),
-        "有一个 compactor 取得租约",
+        "有一个节点取得 gc 租约",
         &Arc::new(Mutex::new(String::new())),
     )
     .await;
     let first = holder(&h).expect("应当有持有者");
-    assert!(first == "d1" || first == "d2", "持有者必须是本用例的两个节点之一：{first}");
+    // `§166`：持有者是 `gc-{instance_id}`（GC 作业的租约身份）
+    let first_id = first
+        .strip_prefix("gc-")
+        .unwrap_or(&first)
+        .to_string();
+    assert!(
+        first_id == "d1" || first_id == "d2",
+        "持有者必须是本用例的两个节点之一：{first}"
+    );
 
     // ---- 杀掉持有者 ⇒ 另一个在 TTL 之后接管 ----
-    let survivor = if first == "d1" { "d2" } else { "d1" };
-    drop(if first == "d1" { _a } else { _b }); // drop = kill + wait（见 Drop 实现）
+    let survivor = format!("gc-{}", if first_id == "d1" { "d2" } else { "d1" });
+    drop(if first_id == "d1" { _a } else { _b }); // drop = kill + wait（见 Drop 实现）
 
     let hw2 = h.clone();
     let survivor_owned = survivor.to_string();
@@ -406,10 +421,22 @@ async fn only_one_compactor_holds_the_lease_and_it_is_taken_over_when_it_dies() 
         .status()
         .leases
         .into_iter()
-        .find(|l| l.purpose == "compaction")
-        .expect("Status 里应当能看到压缩租约");
+        .find(|l| l.purpose == yuntun_model::meta::GC_LEASE)
+        .expect("Status 里应当能看到 gc 租约");
     assert!(!view.holder.is_empty());
     assert_eq!(view.holder, survivor);
     assert!(view.epoch >= 2, "接管必须推进代次（当前 {}）", view.epoch);
+
+    // `§166`：压缩租约若存在，必须是**分片**的（`compaction:{table}:{shard}`）——
+    // 这正是"多节点可以分领不同分片"的形状；全局一把 `compaction` 就意味着又回到单节点干活。
+    for l in h.status().leases {
+        if l.purpose.starts_with("compaction") {
+            assert!(
+                l.purpose != "compaction",
+                "压缩租约不应当是全局一把（多节点就无法分领）：{:?}",
+                l.purpose
+            );
+        }
+    }
     let _ = pb::LeaseView::default();
 }

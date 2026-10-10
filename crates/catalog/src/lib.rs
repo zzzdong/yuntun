@@ -167,11 +167,14 @@ pub trait CatalogOps: Send + Sync {
     ///
     /// 它是**栅栏**：代次落后于状态机里的租约水位 ⇒ 拒绝（"你已经被接管了"）。
     /// 没有它，被罢黜的持有者仍能在返回途中提交第二份合并产物（`§81.8` ②）。
+    /// `lease_purpose`：`§166` —— 提交方声明"我这份代次属于哪把租约"（分片分领后的
+    /// `compaction:{table}:{shard}`）；空 ⇒ 状态机回退到全局 `compaction` 键。
     async fn commit_compaction(
         &self,
         old_batch_ids: &[String],
         new_files: Vec<FileManifest>,
         lease_epoch: u64,
+        lease_purpose: &str,
     ) -> Result<u64, LakeError>;
 
     /// **此刻仍需保护**的 batch_id（孤儿清理对账基准，§12.2.1 / T14.5）——同上，不得绑具体实现。
@@ -573,11 +576,12 @@ impl CatalogOps for MemoryCatalog {
         old_batch_ids: &[String],
         new_files: Vec<FileManifest>,
         lease_epoch: u64,
+        lease_purpose: &str,
     ) -> Result<u64, LakeError> {
         self.state
             .write()
             .unwrap()
-            .commit_compaction(old_batch_ids, new_files, lease_epoch)
+            .commit_compaction(old_batch_ids, new_files, lease_epoch, lease_purpose)
     }
 
     async fn known_batch_ids(&self) -> Result<Vec<String>, LakeError> {
@@ -758,7 +762,7 @@ mod tests {
             row_count: 3,
             ..Default::default()
         };
-        c.commit_compaction(&["b1".to_string()], vec![new_file], 0)
+        c.commit_compaction(&["b1".to_string()], vec![new_file], 0, "")
             .await
             .unwrap();
         assert!(c.version().await.manifest_ver > v0);
