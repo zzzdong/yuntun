@@ -47,13 +47,20 @@ struct Fx {
     root: String,
 }
 
+impl Drop for Fx {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
 impl Fx {
     async fn new() -> Self {
-        let root = format!(
-            "target/test-compaction-{}-{}.d",
-            std::process::id(),
-            uuid::Uuid::now_v7()
-        );
+        // cargo 给的测试临时根（`CARGO_TARGET_TMPDIR`，在 `target/` 里 ⇒ 不会被提交）。
+        // ⚠️ 早先自己建在 `crates/compaction/target/` 下，**把测试产物提交进了仓库**（`§166` 的
+        // 这次教训）—— 夹具的临时目录必须落在已被忽略的地方，并在 `Drop` 里自己收掉。
+        let base = std::env::var("CARGO_TARGET_TMPDIR")
+            .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().to_string());
+        let root = format!("{base}/dist-{}-{}", std::process::id(), uuid::Uuid::now_v7());
         std::fs::create_dir_all(&root).unwrap();
         let store = yuntun_store::create_store(&yuntun_store::StoreConfig::Local {
             root: root.clone(),
@@ -179,7 +186,6 @@ async fn two_nodes_share_the_work_by_shard() {
     assert_eq!(fx.visible_files("s1").await, 1, "s1 应被合并成 1 个文件");
     assert_eq!(fx.visible_rows("s0").await, 12, "合并前后行数必须守恒");
     assert_eq!(fx.visible_rows("s1").await, 12);
-    let _ = std::fs::remove_dir_all(&fx.root);
 }
 
 /// ② **同一个分片**绝不合并两次：两个节点同时盯上它，只有一个做成了。
