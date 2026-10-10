@@ -3,7 +3,7 @@
 //! # 当前状态：**S3-1 PoC（选型闸门）**
 //!
 //! 本 crate 此刻的内容是 **raft-rs 的可行性验证**，不是生产实现。它的存在要回答
-//! [`docs/metanode-design.md`](../../../docs/metanode-design.md) §4.2 的闸门问题：
+//! [`docs/archive/metanode-design.md`](../../../docs/archive/metanode-design.md) §4.2 的闸门问题：
 //!
 //! > raft-rs 的样板成本（Storage/Ready 循环/传输/快照）是否失控到值得冒
 //! > "openraft 生产验证较少"的风险？

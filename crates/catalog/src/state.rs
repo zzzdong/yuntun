@@ -1,6 +1,6 @@
 //! Catalog 的**纯状态机**（R3 `S3-2`）：只有数据 + 确定性变更。
 //!
-//! 设计文档：[`docs/metanode-design.md`](../../../docs/metanode-design.md) §4.1。
+//! 设计文档：[`docs/archive/metanode-design.md`](../../../docs/archive/metanode-design.md) §4.1。
 //!
 //! # 为什么要有这一层
 //!

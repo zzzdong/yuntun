@@ -78,7 +78,7 @@ fn commit_op(table: &str, batch_id: &str, rows: u64, now: u64) -> pb::Op {
 /// `cargo test --workspace` 下与其余 46 个 test binary 并行争 CPU 时，本进程的
 /// tick/选举循环会被长时间抢占 —— 实测撞过 10s 上限（隔离 0.2s → 全量 10.4s 超时）。
 /// 用例要证明的是"**能不能**靠快照追上"（正确性），不是"多快追上"（延迟属 S3-6 压测），
-/// 所以放宽上限；与 `docs/status.md` 里 chaos 用例放宽到 60s 是同一处理。
+/// 所以放宽上限；与 `docs/archive/status.md` 里 chaos 用例放宽到 60s 是同一处理。
 const T: Duration = Duration::from_secs(60);
 
 fn ops() -> Vec<pb::Op> {

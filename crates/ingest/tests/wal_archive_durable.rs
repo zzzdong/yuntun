@@ -12,7 +12,7 @@
 //!
 //! 验的是**机制**：段进了共享存储 → 丢盘后能拉回 → 拉回的字节**能通过 CRC 被重放**
 //! （记录数 + 载荷逐条相等）。**端到端**（重建之后走 `resume_recovered` 重新提交成可见数据）
-//! 与 datanode 侧接线另有台账项 —— 见 `docs/closeout.md` 的 `D-5`/`D-6`，别把这条当成了那个。
+//! 与 datanode 侧接线另有台账项 —— 见 `docs/archive/closeout.md` 的 `D-5`/`D-6`，别把这条当成了那个。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

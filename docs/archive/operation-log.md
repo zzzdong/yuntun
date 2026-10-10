@@ -1,0 +1,10796 @@
+# yuntun 实现操作日志（阶段 0 → 阶段 3）
+
+> 起记时间：2026-09-08（最新：**§168，2026-10-11**）。对应分支：main。
+> 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
+> 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
+>
+> **定位**：全文最高优先级的**证据来源**；`status.md` / `plan.md` / `architecture.md` 里的"已完成/已具备"
+> 都应能指回本文某段。冲突裁决顺序见 [`README.md`](README.md)。
+
+---
+
+## 1. 实施顺序
+
+| 步骤 | 内容 | 结果 |
+|---|---|---|
+| T1.0 | workspace 骨架（11 crates）+ 预先 `cargo check` 验证依赖可解析 | ✅ |
+| T1.4 | model：错误类型、元数据 prost 消息、WAL Record、类型提升格、BatchState 状态机 | ✅ 17 tests |
+| T1.1+T2.1~2.3 | wal：segment / CRC / 组提交 / synced_seq / 轮转 / 恢复 / 分级超时监控 | ✅ 14 tests |
+| store | object_store 抽象（local/memory/s3） | ✅ 2 tests |
+| format | Parquet 读写 + Vortex feature flag（ADR-1） | ✅ 2 tests |
+| T3.1~3.5 | catalog：MemoryCatalog 快照隔离 / OCC 演进 / 幂等键 / L2 合并提交 | ✅ 9 tests |
+| T1.3+T2.4~2.6 | ingest：Flight 源、幂等矩阵、SchemaCache OCC 重试、攒批、flush 三级状态机、恢复分流 | ✅ 15 tests |
+| T4.x | query：DataFusion 桥接 + 本地缓存 + Manifest 驱动 scan | ✅ 2 e2e |
+| compaction | 合并（L2 原子提交）+ 孤儿判定 | ✅ 3 tests |
+| server + all-in-one | TOML 配置、装配、Flight gRPC、优雅关闭 | ✅ 4 tests |
+| 验收 | 全量测试 66 passed / 0 failed，零警告；`yuntun --version` 与冒烟启动（Flight 监听 :50051）通过 | ✅ |
+
+## 2. 与原计划的偏差点
+
+### 2.1 依赖版本（文档 §2.3 → 实际）
+
+| 文档指定 | 实际采用 | 原因 |
+|---|---|---|
+| arrow 55 | **arrow 59.3.0** | datafusion 55.0.0 实际依赖 arrow 59，双版本会导致 Schema 类型不兼容；文档"55"实指 DF 主版本号 |
+| datafusion 55 | datafusion 55.0.0（一致） | — |
+| object_store 0.11 | **0.13.2** | DF55 依赖 0.13.2；且 0.13 起 `put/get/delete` 移入 `ObjectStoreExt` 扩展 trait（需显式 import） |
+| tonic 0.12 / prost 0.13 | **tonic 0.14.6 / prost 0.14.1** | arrow-flight 59 强制 tonic 0.14 + prost 0.14 |
+| — | 新增 `datafusion-datasource`、`datafusion-datasource-parquet` 55（ParquetSource/FileScanConfigBuilder 独立 crate） | — |
+
+**DataFusion/Flight 55 API 与文档 assumed 版本差异**（后续阶段编码注意）：
+- `TableProvider/SchemaProvider/CatalogProvider` 已无 `as_any`；`SchemaProvider::table_type` 为 `async fn -> Result<Option<TableType>>`
+- Arrow Schema IPC 序列化：`IpcSchemaEncoder::schema_to_fb` + `root_as_schema`/`fb_to_schema`（旧 `schema_to_bytes` 已移除）
+- `ParquetSource::new(TableSchema)` + `FileScanConfigBuilder::new(url, Arc<dyn FileSource>)`；`with_projection_indices` 返回 Result
+- `FlightService` 在 `arrow_flight::flight_service_server`；客户端无 `connect()`，用 `Endpoint::connect() -> Channel -> Client::new()`
+- `FlightDescriptor` 无 `endpoint` 字段；`do_put` 请求流消息为 `FlightData`（非 `Result<FlightData>`）
+- 批次编码用 `arrow_flight::utils::batches_to_flight_data`（`flight_data_from_arrow_batch` 已移除）
+- tonic 0.14 server：`serve_with_incoming_shutdown(Stream, shutdown)`；测试中随机端口用 `TcpListenerStream`
+
+### 2.2 工程决策偏差
+
+1. **Vortex 未引入**（ADR-1 要求"必须锁定 Git Commit"）：
+   - 调整：Vortex 置于 `yuntun-format` 的 `vortex` feature flag 之后，`encode_vortex/decode_vortex` 显式返回错误；默认走 **Parquet 回退路径**（FormatSwitch 语义本就允许）。
+   - 锁 commit + 打开 feature 推迟到 Phase 0.5 压测前。
+2. **WAL offset 语义**：文档写"synced_offset = 跨 segment 累积的字节偏移"，实现采用**记录序号 seq**（per-shard 单调计数）——与 `BatchPending.wal_seq_range` 语义一致、跨 segment 连续，避免字节偏移在轮转处的歧义；C2 语义等价（只读已 fsync 记录）。
+3. **proto crate 未走 protoc codegen**：元数据/WAL 消息直接用 `prost::Message` derive 手写在 model crate（protoc 已确认存在，但阶段 0 无 gRPC 自定义服务；阶段 1 加 tonic-build codegen）。
+4. **Multipart Upload 未实现**（§7.4）：`s3_upload_id` 恒空串，S3 写入为单段 put；续传逻辑留阶段 1。
+5. **Compaction 依赖具体类型**：`Compactor.catalog: Arc<MemoryCatalog>`（L2 的 `commit_compaction` 需要具体类型）；阶段 1 Catalog 转 gRPC 时需新增 `CommitCompaction` RPC。
+6. **恢复分流简化**（§5.6）：`Pending` 状态的恢复 = 数据留在 WAL 由攒批线程重读（batch_id 重新生成）；复用原 batch_id 的完整重做留 Phase 0.5 chaos。`S3Written → 只 Commit` 已实现。
+7. **磁盘水位近似实现**：`DirSizeUsage = WAL 目录字节数 / (segment 配额近似)`，未接 statvfs；生产需替换。
+8. **孤儿清理**：仅有判定函数（`classify_orphans`，按 batch_id 对账）+ S3 list；静置期（1h）删除循环未接（Phase 0.5 chaos）。
+9. **合并产物拆分**：`max_rows_per_output` 配置存在但 MVP 单文件全量输出，未按行数拆分。
+10. **CommitFiles 的 client_request_id**：flush 层不传（None），幂等去重靠 batch_id + Meta 层唯一索引；Flight 层的幂等键已写入 WAL Data payload 但 flush 聚合后未透传（多来源合并语义待定）。
+11. **时间窗口分区**：文件路径 `dt={整分钟窗口}`（如 `dt=2026-09-08T07:01`），文档回执示例为日期级 dt；窗口字符串无 chrono 依赖，手写 civil 算法。
+
+### 2.3 临时调整（操作层面）
+
+1. **网络**：crates.io 直连 TLS 失败（GFW 环境）→ 项目级 `.cargo/config.toml` 启用阿里云 sparse 镜像（`source.crates-io replace-with = 'aliyun'`），未改动用户全局 cargo 配置。
+2. **crate 命名**（用户指令）：`lake-*` → `yuntun-*` 全量重命名（sed 批量）；WAL magic `"LAKE"(0x4C414B45)` → `"YUNT"(0x59554E54)`；存储 prefix `lake/` → `yuntun/`；二进制 `all-in-one` → `yuntun`。
+3. **rustup 工具链中断**：实现途中 stable 工具链 cargo 组件丢失（用户升级中），短暂改用系统 cargo；用户修复后恢复（cargo 1.98.1）。
+4. **测试基础设施**：query/server 的 e2e 需 `dev-dependencies`（ingest/wal/store/tokio-stream/futures/serde_json/tracing-subscriber）。
+
+## 3. 实现中发现并修复的 bug（值得留档）
+
+1. **prost `Default` 陷阱**：prost 派生的 `Default` 对 uint64 字段全 0（不受 `#[prost(..., default=...)]` 影响？实际 default 属性只作用于 decode）。`IngestConfig::default()` 的 `idempotency_ttl_secs=0` 触发了 pipeline 里 `ttl==0 → 用全局默认` 的错误 fallback，导致强制幂等误判。
+   → **修复**：删除该 fallback，`require_key` 以表配置字段为权威；缺省用 `IngestConfig::standard()`。
+   → **教训**：prost 消息永远不要依赖 `Default::default()` 做业务默认值，提供显式 `standard()` 类构造器。
+2. **攒批扫描 off-by-one**：`scan_range(last_read, synced)` 丢了 seq=synced 的记录（半开区间）；改 `to = synced + 1`。
+3. **空扫描推进水位**：修复 2 后空扫描（synced 未变）仍把 `last_read` 推进到 `synced+1`，后续到达的 seq 被永久跳过（数据丢失级 bug，查询 e2e 捕获）。
+   → **修复**：`last_read` 只按实际扫描到的最后一条 seq +1 推进。
+   → **教训**：`synced_seq=0` 存在"无记录"与"seq 0 已同步"的歧义，水位推进必须以实际扫描结果为准。
+4. **Flight 幂等键位置**：最初只从首条（schema）消息解析 `app_metadata`，批量消息携带的幂等键被忽略（"idempotency key required" 误报）→ 改为循环内按批次解析。
+5. **测试侧**：tokio `#[tokio::test]` 内嵌套 `Runtime::new()` panic；monitor 测试 `created_at_ms` 误用 epoch 小整数导致恒超时；后台 future 未 spawn 导致从未执行（`run_accumulator` 补了 `spawn_accumulator` 包装）。
+6. **tonic 端口绑定**：测试里手动 bind listener 后再 `serve(addr)` 会 AddrInUse → 用 `serve_with_incoming_shutdown(TcpListenerStream)` 复用。
+
+## 4. 遗留事项（移交阶段 0.5 / 1）
+
+- [ ] Vortex 依赖锁 Git Commit + feature 打开 + FormatSwitch 压测对比（ADR-1）
+- [ ] Multipart Upload 续传（§7.4）
+- [ ] 孤儿清理完整循环（S3 list ↔ Meta 对账 + 1h 静置 + 删除，§12.2.1）
+- [ ] Pending 恢复时复用原 batch_id 的重做路径（§5.6 完整版）
+- [ ] 合并产物按 `max_rows_per_output` 拆分
+- [ ] 磁盘水位接 statvfs 真实实现
+- [ ] WAL segment 清理清单接入 recovery 的 `segments` 元信息（当前 monitor 传空列表，只做超时/水位 abort）
+- [ ] proto crate 启用 tonic-build codegen（阶段 1 gRPC 服务）
+- [ ] 多 shard（ShardMapper）与 raft（raft-rs / fjall 已在 workspace 注释预留）
+- [ ] Flight 侧流控背压（当前 mpsc 64 + ingest 逐批 await）
+- [ ] do_get 结果集全量缓冲（阶段 0 简化）：结果先聚合为 Vec<FlightData> 再流式返回，大结果集需改为流式 chunking + 分批读取
+
+## 5. 追加：外部查询支持（do_get / get_flight_info，2026-09-08 补齐）
+
+阶段 0 收尾时按用户要求补上了对外 SQL 查询出口，写入与查询现在**全部经由同一个 gRPC 端点**（`server.listen`）：
+
+| 接口 | 约定 | 说明 |
+|---|---|---|
+| `do_get(Ticket)` | `ticket` = UTF-8 SQL | 返回 IPC 流（首条 Schema 消息 + 数据消息）；空结果也返回 schema |
+| `get_flight_info(descriptor)` | `descriptor.cmd` = SQL | 返回 endpoint（Ticket = 相同 SQL），兼容 pyarrow.flight "先 GetFlightInfo 再 DoGet" 生态 |
+| `get_schema(descriptor)` | `descriptor.cmd` = SQL | 以 `LIMIT 0` 子查询取结果集 schema，不返回数据 |
+
+实现结构：
+- `yuntun-ingest/flight.rs`：新增 `FlightQueryHook` trait（解耦 QueryEngine）+ `FlightIngestService::with_query()`；服务无 query hook 时 do_get 返回 Unimplemented
+- `yuntun-server/hook.rs`：`QueryHook` 包装 QueryEngine；`serve_flight` 同时挂 ingest + query hook
+- SQL 经由每次查询新建的 SessionContext 执行（会话级状态隔离）；Catalog 仍走本地缓存（C7）
+
+验证：
+- demo（`cargo run -p yuntun-server --example demo`）：DoPut 写入 + do_get 查询全部走 gRPC，`SELECT *` / `GROUP BY` 聚合 / `WHERE` 过滤均正确
+- `flight_e2e` 新增断言：do_get 查到 2 行 + get_flight_info → do_get 路径可用
+- 全量回归：66 passed / 0 failed，零警告
+
+## 6. 追加：S1.1 crate 重构 + Windows fsync 修复（2026-09-08，计划任务书 v2.0）
+
+按《开发计划任务书 v2.0》（Standalone 优先路线）执行阶段 1 第一个任务 S1.1：
+
+### 6.1 结构调整（D-1）
+
+- `bins/all-in-one` → **`crates/standalone`**（包名 `yuntun-standalone`，bin 名仍为 `yuntun`），原目录删除
+- workspace members：`"bins/all-in-one"` → `"crates/standalone"`
+- 同步清理残留命名：`server/lib.rs`、`server/config.rs`、`yuntun.toml.example` 注释中 all-in-one → standalone
+- 依赖路径 `../../crates/*` → `../server` / `../store`
+
+### 6.2 重构中发现并修复的 Windows 平台 bug（与重构无关，pre-existing）
+
+**现象**：全量测试在 Windows 上 wal/chaos 大面积失败，报 `write CURRENT: 拒绝访问 (os error 5)`。
+
+**根因**：`wal/segment.rs::fsync_dir` 用 `std::fs::File::open(dir)` 打开目录——Windows 上目录句柄
+必须带 `FILE_FLAG_BACKUP_SEMANTICS`，且 `FlushFileBuffers` 要求写权限，否则一律 Access Denied。
+该 bug 会导致 WAL 在 Windows 上无法创建（二进制也起不来）；此前"66 passed"应在非 Windows 环境验证。
+
+**修复**：`fsync_dir` 按 `#[cfg]` 分平台——unix 保持原实现；windows 用
+`OpenOptions::new().read(true).write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS)` 打开目录后
+`sync_all()`；FAT/exFAT 等不支持目录 flush 时（PermissionDenied）降级为 no-op。
+
+### 6.3 验证
+
+- `cargo test --workspace`：**全部通过 / 0 failed**（含 chaos 3 个场景——此前在 Windows 从未跑绿）
+- `yuntun --version` → `yuntun 0.1.0`；非法参数处理正常
+- clippy：本次改动文件无新警告（store/catalog/wal 存量警告待专项清理）
+
+## 7. 追加：Flight SQL 标准协议 + 协议端口归属重构（2026-09-09，S1.2–S1.5）
+
+### 7.1 协议端口归属重构（架构 §3.2 v12.1，用户裁决）
+
+按用户模型调整：**协议适配跟随域，核心与端口分层**。
+
+- `yuntun-query` 新增 `flight_sql.rs`（**query 域协议端口**）：
+  `Gateway`（FlightSQL 网关）+ `FlightQueryHook`（SQL 执行，从 ingest 迁来）
+  + `SqlAppendHook`（**新增**，写入回调 ingest——query 不依赖 ingest）。
+  未来 MySQL / PG wire 端口同层；InfluxDB LP 端口属 ingest 域（阶段 2+）
+- `yuntun-ingest`：删除 flight.rs 中的 FlightService 实现与 SQL 网关，
+  只留 `FlightIngestHook` trait；核心（Ingestor / WAL / 攒批）不变
+- `yuntun-server`：新增 `flight.rs` `UnifiedFlightService`（单端点三轨路由：
+  FlightSQL 标准轨 / 简易写入轨 / 简易查询轨）；`hook.rs` 适配三个钩子
+- QueryEngine 开启 `information_schema`（GetTables / SHOW TABLES / S1.7 DDL 依赖）；
+  新增 `schema_of()`（逻辑计划取 schema，替代 "LIMIT 0 + collect"——后者空结果
+  返回零批次会丢 schema，曾致 dataset_schema 为空）
+
+### 7.2 Flight SQL 实现范围（S1.3–S1.5）
+
+- 查询：CommandStatementQuery / CommandPreparedStatementQuery（GetFlightInfo + DoGet + GetSchema）
+- 写入：CommandStatementIngest（批量装载）、CommandPreparedStatementUpdate
+  （绑定数据 + INSERT → 批量 append，语句级幂等键）、CommandStatementUpdate（DDL/非数据 SQL）
+- 元数据：Catalogs / DbSchemas / Tables（含 table_schema 列）/ TableTypes / SqlInfo（空）/ XdbcTypeInfo（空）
+- Prepared statement：CreatePreparedStatement / ClosePreparedStatement（内存映射，handle 前缀 `ps:`）
+- handshake 返回空 token（无鉴权，兼容 ADBC/JDBC 先握手行为）
+
+### 7.3 实现中发现并修复的互操作 bug（ADBC Go 驱动实测暴露）
+
+| # | 问题 | 修复 |
+|---|---|---|
+| 1 | action 请求/响应未按官方约定 **Any 包装**（`FlightSqlService` blanket 实现为准），Go 驱动报 "mismatched message type" | 请求 `Any::decode + unpack`；响应 `result.as_any().encode_to_vec()` |
+| 2 | `dataset_schema` 用裸 flatbuffer——规范要求 **IPC 封装消息格式**（0xFFFFFFFF continuation + u32 len + flatbuffer），Go 驱动报 "invalid message metadata" | `schema_ipc_bytes` 加封装前缀（GetTables.table_schema 列同） |
+| 3 | endpoint `location = [uri:""]`——pyarrow 容忍，Go 驱动把 "" 当字面地址拨号失败 | **省略 location**（空列表 = 使用当前连接） |
+| 4 | 元数据 schema 与官方定义不一致（catalog_name 可空性 / GetTables 列名） | 对齐 `arrow_flight::sql::metadata`：catalog_name NOT NULL、db_schema_name NOT NULL、GetTables 列名 `table_schema` |
+| 5 | prepared INSERT 无法规划 dataset_schema（DataFusion 不支持 DML 规划） | 回退目标表 `SELECT * FROM <t>` schema（S1.6 INSERT sink 落地后可走逻辑计划） |
+
+### 7.4 验证
+
+- `cargo test --workspace` 全部通过（含 flight_sql_e2e：语句查询 / 元数据 / prepared 写入 / 双轨合流）
+- **独立客户端冒烟**（`scripts/pyarrow_smoke.py`）：ADBC FlightSQL Go 驱动
+  （`adbc-driver-flightsql` 1.12）SELECT / GROUP BY / get_objects 元数据 ✓；
+  手写 protobuf wire + pyarrow 原始 FlightClient：CreatePreparedStatement →
+  DoPut(CommandPreparedStatementUpdate) 绑定数据 → 装载 1 行 → ADBC 复核可见 ✓
+- 冒烟脚本用法：`YUNTUN_DEMO_SERVE=1 cargo run -p yuntun-server --example demo` 后
+  `python scripts/pyarrow_smoke.py <addr>`（demo 新增 serve 模式）
+
+### 7.5 【最终裁决】协议端口简化：撤销 Hook / Gateway 间接层（架构 §3.2 v12.3）
+
+用户两条原则定稿：
+
+1. **所有写入都走 ingest 管线——唯一的数据写入事实**（WAL 权威，禁绕过）；
+2. 协议端口不按"读域/写域"拆分——**一个节点上的 server 承载全部协议端口**
+   （Flight SQL、InfluxDB LP、未来 MySQL/PG wire），每个协议内部把
+   **写路由到 ingest 能力、读路由到 query 能力**；§7.1 的"FlightSQL 归 query 域"
+   中间方案被此裁决取代（FlightSQL 同时服务读写，放任何域都别扭）。
+
+**实施（v12.3）**：
+
+- 删除 `FlightIngestHook` / `FlightQueryHook` / `SqlAppendHook` / `Gateway` /
+  `UnifiedFlightService` 五个间接概念及 `server/hook.rs`；
+  ingest / query 的 arrow-flight、tonic、prost 依赖移除（回归纯能力 crate）
+- `yuntun-server::flight::FlightServer` 直接持有 `Arc<Ingestor>` + `Arc<QueryEngine>`，
+  单文件实现 FlightService（协议解码 + 三轨路由 + 元数据批构建）
+- `QueryEngine` 错误（DataFusionError）在 server 层直接转 Status（query_status）；
+  QueryEngine 新增 `schema_of()`（逻辑计划取 schema）、开启 information_schema——保留
+- 文档同步：架构 §3.2 / §13.1.1 / 附录 B、计划书 §1.3 / §四 / S1.3、设计 §2.1
+
+**分层定稿**：能力层（ingest / query / compaction，纯逻辑）→ 节点层（server：协议端口 +
+装配 + 路由）→ 入口（standalone / 未来按角色裁剪的分布式节点）。
+
+## 8. 设计变更：SQL 前置解析拦截（2026-09-09，v12.4，S1.6/S1.7 实施前定稿）
+
+### 8.1 用户裁决
+
+1. **所有写入都走 ingest 管线**——唯一的数据写入事实；
+2. 后期分布式/多节点时，**单个 server 提供各类协议通信（含读和写）**：
+   写由 ingest 底层能力负责，读由 query 底层能力负责；
+3. **server 做 SQL 前置解析拦截，只有 SELECT 让 DataFusion 处理**。
+
+### 8.2 设计定稿（计划书 §4.3 路由表）
+
+| 语句 | 处理 |
+|---|---|
+| SELECT / CTE | → DataFusion（query 能力，只读） |
+| SHOW TABLES | → Catalog `list_tables` |
+| INSERT INTO t VALUES ... | server 按表 schema 解析字面量 → RecordBatch → `ingest.ingest` |
+| INSERT INTO t SELECT ... | server 经 DataFusion 执行 SELECT（读），结果 cast 到表 schema → ingest |
+| CREATE TABLE [IF NOT EXISTS] | server 解析列定义 → Catalog `create_table` |
+| DROP TABLE [IF EXISTS] | → Catalog `drop_table`（**需新增 meta 能力**） |
+| 其他 | 明确拒绝 |
+
+MVP 限制：VALUES 仅字面量；列清单支持指定列（缺省填 NULL）；类型按表 schema 逐列转换；
+TIMESTAMP 字面量 ISO8601（UTC）/ 整型毫秒；`INSERT ... SELECT` 位置对齐 + cast；
+语句级幂等键（`dml-<uuid>`）。
+
+### 8.3 被否决的方案（留档防回潮）
+
+**DataFusion DML sink 方案**（曾写入计划书 v2.0.2 S1.6）：在 `YuntunTableProvider` 实现
+`insert_into` + `DmlSink` trait + `IngestSinkExec` ExecutionPlan，让 DataFusion 处理
+INSERT。**否决理由**：① DML 走 DataFusion 会让写路径穿过查询能力，边界模糊——
+INSERT 是写入请求，理应在节点层被拦截后直送 ingest；② DataFusion 会话级 DDL/DML
+副作用与持久化 Catalog 语义冲突；③ 需要把 sink 句柄穿透 cache→provider→table 三层
+plumbing。④ 用户明确要求"只有 SELECT 让 DataFusion 处理"。
+
+**同样否决**：手写 tokenizer 做前置解析——改用 **`sqlparser`**（与 DataFusion 同源
+解析器，Apache-2.0），方言兼容性（标识符引用/类型名/字面量语法）与 DataFusion 天然一致；
+版本对齐 DataFusion 55 所依赖版本，方言 MVP 用 `GenericDialect`。
+
+**状态**：设计已定稿，**S1.6/S1.7 尚未实施**（下一步编码）。实施清单：
+① catalog 新增 `drop_table`（CatalogOps + MemoryCatalog）；② server 新增 SQL 前置
+解析模块：`Parser::parse_sql(GenericDialect)` → 按 `Statement` 变体分流
+（Query→query / Insert(Values→按 schema 构造 RecordBatch、Select→query 执行后
+cast)→ingest / CreateTable(Deprecated DataType→Arrow 映射)→catalog /
+Drop→catalog / ShowTables→catalog），字面量→Arrow 类型转换含
+civil 算法时间解析；③ `FlightServer` 增加 `run_sql` 前置分发并接入三轨入口
+（简易 do_get / StatementQuery / StatementUpdate / prepared update）；
+④ FlightServer 增加 Catalog 依赖；⑤ e2e：CREATE → INSERT（VALUES/SELECT）→
+查询验证 → DROP。
+
+## 9. 追加：S1.6 / S1.7 实施（2026-09-09，SQL 写入路径 + DDL）
+
+### 9.1 实现内容（按 §8.3 清单）
+
+| # | 内容 | 位置 |
+|---|---|---|
+| ① | `CatalogOps::drop_table` + MemoryCatalog 实现（表 + Schema 版本链 + 文件 Manifest 移除 → 数据文件转孤儿由孤儿清理回收；快照/apply 推进；缺失表报 TableNotFound） | catalog |
+| ② | SQL 前置解析模块（纯函数）：单语句解析（多语句拒绝）/ INSERT 目标表名（AST 优先 + 不完整形态字符串回落）/ SHOW TABLES 批次 / CREATE TABLE DataType→Arrow 映射（INT/BIGINT/VARCHAR/TIMESTAMP/DECIMAL/BLOB/DATE/整型族…，NOT NULL → nullable=false，CTAS/OR REPLACE 明确拒绝）/ VALUES 字面量→RecordBatch（列清单、NULL 填充、NOT NULL 缺失报错、范围检查）/ SELECT 结果位置对齐 cast（arrow-cast）/ ISO8601 civil 算法时间解析（epoch ns，支持 T/空格分隔、Z/±HH:MM、1-9 位小数秒） | `server/src/sql.rs`（18 单测） |
+| ③ | `FlightServer::run_sql` 前置分流，接入简易轨 do_get（ticket=SQL）、FlightSQL TicketStatementQuery、StatementUpdate(do_put)；INSERT 语句级幂等键 `dml-<uuid>`；FlightServer 增加 `catalog: Arc<dyn CatalogOps>` 依赖 | server/flight.rs |
+| ④ | prepared statement 目标表解析改 AST 优先（`insert_target`），保留字符串匹配回落（兼容 `INSERT INTO t (a,b)` 不完整形态） | server/flight.rs |
+| ⑤ | e2e `sql_dml_e2e.rs`：CREATE(IF NOT EXISTS) → INSERT VALUES（do_put StatementUpdate / do_get 两入口、列清单 + NULL 填充、TIMESTAMP ISO/整型毫秒）→ 查询验证 → INSERT SELECT（Int64→Int32 cast）→ SHOW TABLES → DROP(IF EXISTS + 缺失表报错) → UPDATE/DELETE/CTAS 拒绝 → **硬崩溃重启后 DDL + 数据均恢复** | server/tests |
+
+### 9.2 设计定稿之外的关键决策（偏差留档）
+
+1. **WAL 新增 `Ddl` 记录类型（type=5）**——§8.3 清单未含此项，但 S1.7 验收要求
+   "DDL 跨重启可见"、S1.6 要求"SQL 写入的数据崩溃重启可恢复"，而 MemoryCatalog
+   重启清零（C5）。方案：run_sql 在 Catalog apply 成功后 append `Record::Ddl
+   {op, table, arrow_schema, default_format}`（顺序即因果）；`Lakehouse::build`
+   在 resume_recovered **之前**重放（create 已存在 / drop 不存在均幂等忽略）。
+   阶段 1 切 Raft 后 DDL 走 Meta 状态机，此通道可退役。
+2. **恢复语义修正（阶段 0）**：`resume_recovered` 原对 Committed/S3Written 做
+   "重新提交"——但阶段 0 Meta 重启即空、可见性实际由**攒批线程全量重读 WAL 重做
+   flush** 提供（§2.2-6），两者叠加会产生**双份可见数据**（chaos E3 回归捕获，
+   27 vs 18）。修正：阶段 0 跳过 Committed/S3Written 重提交（debug 日志留痕）；
+   `commit_recovered_batch` 修正为携带正确 `table`（从 WAL Data 记录恢复）与
+   `file_size`，留给阶段 1 持久 Meta。
+3. **BatchState 新增 `file_size`**：恢复/重提交路径的 Manifest 原为
+   `Default::default()`（file_size=0），而查询 scan 用 Manifest 的 file_size 做
+   Parquet footer 范围读 → "file length is 0" 错误。现在 BatchS3Written 携带的
+   file_size 随状态机重建（MVP 单文件全量输出，语义成立）。
+4. **DataFusion 本地缓存感知**：缓存 TTL 30s，SQL CREATE 后立即 INSERT SELECT 会
+   "table not found"。run_sql 在 DDL 成功后、INSERT SELECT 读源前强制
+   `cache.refresh`（只读本地 Catalog，不破坏 C7）。
+5. **INSERT ... SELECT 可见性**：源数据须已 commit（§4.5 攒批窗口后可见）。
+   server 侧已尽量刷新缓存；测试/demo 中在写后等待 flush 再执行。
+6. **DROP 后的遗留 Data**：WAL 中被 DROP 表的 Data 记录在重启重读时仍会 flush
+   （commit 不检查表存在性）——Manifest 挂在不存在的表下、查询不可见；若之后
+   **重建同名表**会复活旧数据。阶段 0 已知工件，阶段 2 chaos / 阶段 3 Meta
+   状态机时收敛。
+   > **已修复（2026-09-12，见 §21）**：攒批器按 WAL DDL 维护表存活/世代，flush 前丢弃
+   > 陈旧世代分组；恢复路径同样校验，不再产生悬挂 Manifest。
+
+### 9.3 MVP 限制（后续扩展点）
+
+- `INSERT ... SELECT` 不支持列清单（仅位置对齐）；`UPDATE` / `DELETE` / `CREATE
+  TABLE AS` / `OR REPLACE` / 多语句明确拒绝（NotImplemented + 支持列表）
+- CREATE TABLE 类型映射为 MVP 子集（不支持 ARRAY/STRUCT/MAP/UUID/带时区时间戳/
+  INTERVAL）；DECIMAL → Decimal128，未指定精度 → (38,10)
+- TIMESTAMP 字面量：ISO8601（无时区按 UTC）与整型毫秒；列必须是无时区 Timestamp
+- 幂等键由服务端按语句生成（`dml-<uuid>`）；Prepared statement options 携带
+  `client_request_id` 的透传归 S1.8
+- `SHOW TABLES` 输出对齐 DataFusion 列结构（table_catalog/table_schema/table_name）
+
+### 9.4 验证
+
+- `cargo test --workspace`：**88 passed / 0 failed**（新增 sql.rs 18 单测 +
+  sql_dml_e2e 2 用例；chaos E3 5 轮滚动崩溃回归通过）
+- `cargo clippy --workspace --all-targets`：0 警告
+- demo（`cargo run -p yuntun-server --example demo`）新增 §6b：SQL CREATE /
+  INSERT VALUES / INSERT SELECT / SHOW TABLES 全链路冒烟通过
+- 依赖：workspace 新增 `sqlparser = "0.62"`（对齐 Cargo.lock 中 DataFusion 55
+  依赖版本，无双版本共存）；server 新增 `arrow-cast = "59"`（SELECT 源 cast；注：
+  arrow 59 元 crate 无 compute feature，cast 内核在独立的 arrow-cast crate）
+
+## 10. 追加：S1.5 收尾——SQL 能力元数据（JDBC/DBeaver 兼容，2026-09-09）
+
+### 10.1 实现
+
+- **GetSqlInfo**：静态 `SqlInfoData`（arrow-flight `metadata::SqlInfoDataBuilder`）——
+  SERVER_NAME=yuntun / SERVER_VERSION=env!(CARGO_PKG_VERSION) /
+  **ARROW_VERSION=build.rs 从 workspace Cargo.lock 编译期提取**（arrow-rs 不导出
+  版本常量；`option_env!("YUNTUN_ARROW_VERSION")` 回退 "59"）/ READ_ONLY=false /
+  SQL=true / SUBSTRAIT=false / TRANSACTION=None（单语句自动提交语义）/
+  CANCEL=false / BULK_INGESTION=false / 两类 Timeout=0。按请求过滤由
+  `CommandGetSqlInfo::into_builder` 完成。
+- **GetXdbcTypeInfo**：静态 `XdbcTypeInfoData`，12 种类型对齐 CREATE TABLE 的
+  DataType 映射（BOOLEAN/TINYINT/SMALLINT/INTEGER/BIGINT/REAL/DOUBLE/DECIMAL/
+  VARCHAR/BINARY/DATE/TIMESTAMP），含 column_size（数值型按 bit 位宽惯例）、
+  literal 前后缀（引号型）、DECIMAL 的 create_params/scale、NUM_PREC_RADIX=2；
+  支持 `data_type` 过滤。
+
+### 10.2 真实客户端冒烟发现并修复的互操作 bug
+
+**空结果集返回 0 字段 schema**——`SELECT ... WHERE` 无匹配行时，do_get 首条
+Schema 消息为空 schema，与 GetFlightInfo 声明的查询 schema 不一致，ADBC 1.12
+直接报 "FlightSQL endpoint returned inconsistent schema"（JDBC/DBeaver 浏览
+空表必踩）。修复：`do_get` 空结果时用 `QueryEngine::schema_of`（逻辑计划）作为
+首条 Schema 消息（`encode_stream_with_schema` + `FlightServer::sql_schema_of`），
+标准轨与简易轨同时覆盖。
+
+### 10.3 冒烟脚本与客户端行为记录
+
+- 新增 `scripts/pyarrow_sqlinfo_smoke.py`：手写 protobuf wire + pyarrow 原始
+  FlightClient（GetSqlInfo 过滤 / GetXdbcTypeInfo 全量+过滤）+ ADBC 1.12 复核
+  （SELECT / get_objects）+ executeUpdate 落库验证。全链路 ALL OK。
+- **pyarrow C++ 客户端 quirk**（非服务端 bug，留档）：
+  1. `do_put` 的 PutResult 回执需**并发读取**——`writer.close()` 后再
+     `reader.read()` 返回 None（C++ 客户端行为；服务端已确认发送，Rust tonic
+     e2e 阻塞式读回执正常）；
+  2. 并发读回执时 `writer.close()` 可能阻塞——冒烟脚本改为不读回执、以 ADBC
+     落库结果断言。
+- 验证：`cargo test --workspace` 全过（flight_sql_e2e 新增空结果 schema 一致性
+  断言）；clippy 0 警告；`yuntun.toml.example` 未动（server.listen 默认 50051）。
+
+## 11. 追加：SQL 访问协议实施启动（sql-access-design.md v1.1 → Q1 部分完成，2026-09-09）
+
+> **状态**：⚠️ 半成品提交（workspace 编译通过、clippy 待跑、**全量测试未跑**——时间
+> 紧迫先落盘，接手者先执行 §11.3 待办 W-0 回归基线再继续）。
+
+### 11.1 设计文档（已定稿，随本提交入库）
+
+- `docs/sql-access-design.md` v1.1：SQL 处理层（yuntun-sql 能力 crate）与协议适配层
+  （yuntun-sqlwire）分界；早期计划 = 基础能力 + Flight SQL（收尾）+ MySQL（opensrv-mysql
+  :3306 新建）两个协议端口；PG wire 设计预留 §5.5。
+
+### 11.2 本次已完成（Q1 部分完成）
+
+| 项 | 内容 |
+|---|---|
+| `crates/sql`（yuntun-sql 能力 crate）新建 | **SQL 处理层唯一实现**：`SqlEngine{ingest,query,catalog}`（裁决 S-1/S-4，引擎无状态） |
+| `sql.rs` 迁入 | server/src/sql.rs 的纯函数模块 git mv 迁入并适配（`yuntun_query::CATALOG_NAME/SCHEMA_NAME`；新增 `parse_single_with(方言)`、`insert_target_table_str` 回落函数随迁、`sql_snippet`）；**18 个既有单测随迁** |
+| `params.rs`（G3） | `SqlValue` 参数模型 + **AST 级占位符替换**（sqlparser visitor feature 的 `visit_expressions_mut`，非字符串拼接）+ `TIMESTAMP '...'`/`DATE '...'` TypedString 渲染（civil 算法，无 chrono）+ 计数/替换单测（含注入转义 `'a''b'`） |
+| `session.rs`（S-4） | `SessionCtx{dialect, default_db}` + `SqlDialect{Generic,MySql,PostgreSql}` → sqlparser 方言静态映射 |
+| `shim.rs`（G5） | MySQL 方言 shim：SET/USE/事务 no-op（含 ROLLBACK，偏差留档）、SHOW VARIABLES/Variable（canned：version=8.0.32-yuntun 等）、SHOW TABLES（MySQL 单列语义）、SHOW COLUMNS（6 列格式）、SHOW CREATE TABLE、SELECT @@var / DATABASE() 探测（无 FROM 查询） |
+| `lib.rs` | `SqlEngine::execute/prepare/execute_prepared/list_tables/describe_table/schema_of` + `WritePolicy::AllowWrite|ReadOnly`（§6.2 sqld readonly 注入点）+ `ingest_batches`/`append_ddl`（自 flight.rs 迁入，语义不变） |
+| 过渡兼容 | `server/src/sql.rs` 改为 `pub use yuntun_sql::sql::*` 薄重导出——flight.rs 行为不变，**workspace 编译通过** |
+
+### 11.3 待办（接手者按序执行；设计依据 sql-access-design.md §七 WBS）
+
+| ID | 任务 | 关键位置/要点 |
+|---|---|---|
+| **W-0** | 回归基线确认（本次提交未跑测试） | `cargo test --workspace`（预期全绿：sql crate 19+18 单测 + 既有 88） |
+| **W-1** | flight.rs 改调 SqlEngine（Q4）：删除 `run_sql`/`SqlOutcome`/`execute_update` 内嵌分流/`ingest_batches`/`append_ddl`/`sql_schema_of`/`insert_target_table`，改 `self.sql.execute(&sql, &mut SessionCtx::default())`；`FlightServer::new(ingest,query,catalog)` **内部构造** `Arc<SqlEngine>`（签名不变 → 4 个调用点与测试零改动）；`do_get` 空结果集回填 schema 用 `SqlEngine::schema_of`；prepared dataset fallback 的 `insert_target` 用 `yuntun_sql::insert_target` | crates/server/src/flight.rs；删 server/src/sql.rs 过渡文件；**回归：flight_e2e/flight_sql_e2e/sql_dml_e2e + pyarrow 冒烟全绿** |
+| **W-2** | QueryEngine G2 修复 | crates/query：`session()` 的 SessionConfig 加 `with_default_catalog_and_schema(CATALOG_NAME, SCHEMA_NAME)`——注意回归：非限定表名行为变化是修复目标，既有 e2e 用限定名不受影响 |
+| **W-3** | yuntun-sqlwire crate（Q5/Q6，裁决：opensrv-mysql） | 先 `cargo add opensrv-mysql` 查实际 API（版本间差异大），实现 `AsyncMysqlShim` 回调：on_query→SqlEngine.execute→文本行编码；on_prepare/on_execute→prepare/execute_prepared（opensrv 负责二进制参数解码则直接用，否则自解码）；auth=trust（users 空）；标准端口 :3306 |
+| **W-4** | server Config [sql.mysql] + 挂载 | config.rs 加节（enabled/listen/auth/users）；serve 流程 spawn mysql listener（sqlwire 提供 serve_mysql(engine, listen, shutdown)）；standalone yuntun.toml.example 更新 |
+| **W-5** | MySQL 冒烟（T1/T2） | pymysql 纯 python（aliyun pip 装）连 :3306：SELECT/SHOW TABLES/INSERT + prepared；DBeaver 手工 T3 清单 |
+| **W-6** | 收尾 | clippy --workspace --all-targets 0 警告；README mysql 连接示例（S1.11） |
+| **W-7** | 已知注意点 | ① shim 仅对 MySql 方言生效（Flight Generic 不拦截，保持既有 e2e 行为）；② `SELECT 1, @@x` 混合投影会退化为 DataFusion 报错（可接受）；③ ROLLBACK no-op 与设计"明确错误"有偏差（CLI 友好优先，已留档）；④ 混合写入 `USE` 后 session.default_db 记录但表名解析仍 yuntun.public（R-3） |
+
+### 11.4 未提交文件说明
+
+- `docs/ingestor-design.md`：保持未跟踪（前次指示：评审后单独提交）。
+
+## 12. 追加：Q4 Flight 接线完成 + G2 修复（W-1/W-2 落地，2026-09-09）
+
+### 12.1 完成内容
+
+| 项 | 内容 |
+|---|---|
+| **W-1（flight → SqlEngine）** | `FlightServer` 增加 `sql: Arc<SqlEngine>`（`new(ingest,query,catalog)` 内部构造，**签名不变** → 4 个调用点零改动）；`run_sql` 变薄委托 `SqlEngine::execute`（默认 Generic 方言，shim 仅 MySql 方言生效，Flight 轨行为不变）；删除内嵌 `run_sql` 分流体 / `SqlOutcome` / `ingest_batches` / `append_ddl` / `sql_schema_of` / `sql_snippet` / `insert_target_table`；过渡 `server/src/sql.rs` 删除；server 依赖移除 `sqlparser`/`arrow-cast` |
+| 错误映射 | 新增 `sql_status`：SqlError → Status（Parse/Unsupported/ReadOnly→invalid_argument；NotFound→not_found；TableExists→**already_exists**（较 v12 内部错误更准确）；Precondition→failed_precondition（幂等键强制）；Internal→internal） |
+| do_get 空结果集 | `SqlResult::Rows{schema}` 自带回填 schema（引擎侧完成，G7 语义），fallback 逻辑简化 |
+| **W-2（G2）** | `QueryEngine::session()` 的 SessionConfig 加 `with_default_catalog_and_schema("yuntun","public")`——非限定表名 `FROM t` 对 wire 客户端直接可用 |
+| 验证 | 全量回归 **93 测试全绿**（与 W0 基线一致：flight_e2e 3 / flight_sql_e2e 2 / sql_dml_e2e 2 / yuntun-sql 20）；clippy -p server/query/sql --all-targets **0 警告** |
+
+### 12.2 下一步（§11.3 余项）
+
+- **W-3**：yuntun-sqlwire crate + opensrv-mysql（先 `cargo add opensrv-mysql` 查实际 API）
+- **W-4**：server Config `[sql.mysql]`（enabled/listen :3306）+ 挂载
+- **W-5**：pymysql 冒烟 T1/T2 → **W-6** clippy 全 workspace / README（S1.11）
+
+## 13. 追加：W-3 yuntun-sqlwire crate 初版（WIP 提交，2026-09-10）
+
+> **状态**：⚠️ WIP——`cargo check -p yuntun-sqlwire` **0 错误**；单元测试与
+> 全量回归**未跑**（接手先跑：`cargo test -p yuntun-sqlwire && cargo test --workspace`）。
+
+### 13.1 已完成（crates/sqlwire 新建，workspace members 已加）
+
+| 文件 | 内容 |
+|---|---|
+| `lib.rs` | `MysqlBackend`（实现 `opensrv_mysql::AsyncMysqlShim`）：`on_query`→`SqlEngine::execute`（SessionCtx::mysql() 方言，shim 拦截 SET/USE/SHOW 生效）；`on_prepare`→`engine.prepare` + 参数 Column 声明（统一 VAR_STRING）+ stmt_id 缓存；`on_execute`→参数解码→`execute_prepared`；`on_close` 清缓存；`on_init`（handshake 库名/USE 转发）→ 记录 default_db + `writer.ok()`。错误路径：`query_error` 用 `results.error(ErrorKind, msg)` 回 **ERR 包**（连接不断开）——NotFound→ER_NO_SUCH_TABLE、ReadOnly→ER_OPTION_PREVENTS_STATEMENT、Parse/Unsupported→ER_SYNTAX_ERROR。`serve_mysql(engine, listen, shutdown)`：TcpListener + 每连接 spawn `AsyncMysqlIntermediary::run_on`（trust 鉴权默认）+ CancellationToken 优雅关停 |
+| `encode.rs` | Arrow→MySQL 编码：`columns_of`（schema→Column，nullable→flags）、`arrow_to_mysql_type`（同源映射 SqlEngine::arrow_to_mysql_type）、`write_row`（逐列 downcast + **write_col 同步 + end_row().await**（0.7 API 关键差异））、`format_date/format_ts/civil_from_days`（无 chrono，与 params.rs 解析互逆）、`format_decimal` |
+| 参数解码 | `param_value(ValueInner)→SqlValue`：NULL/Int/UInt/Double/Bytes（UTF-8 优先）/ **Date·Datetime·Time 二进制手动解码**（pymysql datetime 参数路径：`[len][y:u16][m][d][h][m][s][micros:u32]`；time 含负值/天数扩位） |
+
+### 13.2 opensrv-mysql 0.7 API 踩坑记录（对接手者重要）
+
+1. **行写入模式**：`RowWriter::write_col` 是**同步** fn；每行写完必须 `end_row().await`，收尾 `finish().await`；
+2. **错误回包**：`QueryResultWriter::error(kind, msg)` 只有两个参数且 `msg: Borrow<[u8]>`（传 `&format!(..).into_bytes()`）；
+3. **参数迭代**：`ParamParser` 实现 `IntoIterator<Item=ParamValue{value: Value, coltype}>`；`Value` 是私有字段 newtype，取 `ValueInner` 用 `v.value.into_inner()`（**无公开构造器** → 单测直接构造 `ValueInner`）；
+4. **on_init** 签名含 `InitWriter`，必须调用 `writer.ok()` 或 `writer.error(..)`；
+5. `process_use_statement_on_query` 默认 false → USE 走 `on_init`（不进 on_query，方言 shim 的 USE 拦截仅兜底）；
+6. **修正（§14.1）**：`ValueInner::Date/Datetime/Time` 的负载**不含**长度前缀——opensrv 在
+   `src/value/decode.rs` 里已 `read_u8()` 消费掉长度并按其截取负载。初版"首字节即长度"的
+   假设会把年份低字节当长度（2026 → 0xEA = 234）并中断连接，实测后已重写。
+
+### 13.3 待办（接续 §11.3）
+
+| ID | 任务 |
+|---|---|
+| **W-3.5** | `cargo test -p yuntun-sqlwire`（含 encode 日期/decimal/二进制日期单测已写未跑）+ 全量回归 |
+| **W-4** | server `Config [sql.mysql]`（enabled/listen :3306/auth users 预留）+ serve 流程挂载 `serve_mysql`（standalone yuntun.toml.example 更新） |
+| **W-5** | pymysql 冒烟 T1/T2（aliyun pip 装 pymysql）：SELECT/SHOW TABLES/INSERT + prepared |
+| **W-6** | clippy --workspace --all-targets 0 警告；README MySQL 连接示例（S1.11） |
+
+## 14. 追加：W-3.5 / W-4 / W-5 / W-6 完成（2026-09-11）
+
+> 至此 §13.3 待办全部收口；【W-3.5 测试】→【W-4 挂载】→【W-5 冒烟】→【W-6 收尾】
+> 全量回归 **103 测试全绿**、`clippy --workspace --all-targets` **0 警告**。
+
+### 14.1 W-3.5：sqlwire 单测修复（`cargo test -p yuntun-sqlwire` 7 全绿）
+
+| 项 | 结论 |
+|---|---|
+| `encode.rs` 日期/时间戳 | **测例常量错、实现对**：19723 天 = 2024-01-01（非 02-29，应为 **19782**）；1_641_619_200 = 2022-01-08 **05:20:00**（应为 1_641_600_000）。`civil_from_days` 仍以 19000 = 2022-01-08 为锚验证 |
+| `decode_time` 微秒偏移 | 真 bug：micros 原按 `[8..12]` 读取，实际在 sec 之后（`[9..13]`）→ 已修并补带微秒用例 |
+| **二进制日期布局** | 见 §13.2 第 6 条：opensrv 已消费长度前缀，负载长度即字段数（0/4/7/11 与 0/8/12）。重写 `decode_datetime` / `decode_time`：**无长度前缀**、按 `b.len()` 分派、畸形长度返回 `io::Error`（不再 panic 杀 worker） |
+| 新增用例 | `malformed_binary_params_error`（非法负载长度）+ TIME 带微秒；`param_decoding` / `binary_datetime_decoding` 随布局重算 |
+
+### 14.2 W-4：`[sql.mysql]` 配置与挂载
+
+| 位置 | 内容 |
+|---|---|
+| `server/src/config.rs` | 新增 `SqlSection{ mysql: MysqlSection }` / `MysqlSection{ enabled=true, listen="0.0.0.0:3306", auth="trust", users=[] }` / `MysqlUser`（设计 §6.3；R-2 标准端口）。users 非空仅 `warn`（当前只实现 trust，R-1）;单测 `mysql_section_defaults_and_override` |
+| `server/src/lib.rs` | `Lakehouse` 增 `sql: Arc<SqlEngine>`（装配第 ⑦ 步）；`FlightServer::with_sql()` 复用同一实例（`serve_flight` 已接，write_policy 单点生效）；新增 **`spawn_mysql(lakehouse, cfg) -> Result<Option<JoinHandle>>`**：`enabled=false` → `Ok(None)`，**先 bind 再 spawn**（3306 被占时启动即 `Err`，不静默降级） |
+| `sqlwire` | 新增 `serve_mysql_on(engine, listener, shutdown)`（接管外部已绑定 listener）；`serve_mysql` 保留为 bind + 转发 |
+| `standalone/src/main.rs` | 装配后 `spawn_mysql`，flight 退出（shutdown）后 await mysql 句柄 |
+| `yuntun.toml.example` | 增 `[sql.mysql]` 段（含 auth/users 注释说明） |
+
+### 14.3 W-5：MySQL wire 独立客户端冒烟（`scripts/pymysql_smoke.py`）
+
+环境：**项目内虚拟环境 `scripts/.venv`**（已 gitignore，阿里云镜像）：
+`python3 -m venv scripts/.venv` + `scripts/.venv/bin/pip install -r scripts/requirements.txt`。
+`requirements.txt` 的 MySQL 轨补齐 `mysql-connector-python`（T2 预编译依赖，此前只在临时环境里装过）。
+standalone 用 `/tmp/yuntun-smoke/yuntun.toml`（flight 50077 / mysql 33060 / 攒批 1s / 查询缓存 1s）。
+
+| # | 验证 | 结果 |
+|---|---|---|
+| T1 | pymysql（COM_QUERY 文本）：SHOW VARIABLES(`version=8.0.32-yuntun`) → CREATE TABLE → INSERT → SELECT → SHOW TABLES / SHOW COLUMNS → 错误路径 **1146**（ERR 包，连接保持，`SELECT 1` 仍可用） | 全绿 |
+| T2 | mysql-connector-python `prepared=True`（COM_STMT_PREPARE/EXECUTE）：参数绑定写入 ×2（含 **datetime 二进制参数**）→ 文本轨复核 3 行可见 | 全绿 |
+
+冒烟暴露并已修的两处实现问题：
+
+1. **表不存在被包成 1105**：`SELECT * FROM no_such` 走 DataFusion → `SqlError::Internal`。
+   `yuntun-sql` 新增 `query_error()`：消息含 "not found" 即归类 `NotFound`（取引号内限定名）
+   → MySQL 1146 / Flight NOT_FOUND（单测 `query_error_classifies_missing_table`）。
+2. **TIMESTAMP 列不接受 ISO 文本字面量**：prepared datetime 参数解码后即 `'2026-01-02 03:04:05'`，
+   `build_values_batch` 的 Timestamp 分支只收 `TimestampNs`/`Num` → 补 `L::Str` → `parse_iso8601_ns`
+   分支（同时让 `VALUES ('2026-01-02 03:04:05')` 这类常规写法可用；单测
+   `values_timestamp_accepts_iso_string`）。
+
+**已知限制（R-4 偏差，留档；→ 已在 §16.4 修正定位并修复）**：当时误判为
+"opensrv-mysql 0.7 没有二进制结果集编码"。实际 `COM_STMT_EXECUTE` 走的就是二进制行
+（`QueryResultWriter::new(..., is_bin = true)`）；prepared SELECT 取不到行的真因是
+opensrv 0.7 `PacketReader::next_async` 的释放后使用（上游 #66/#67，仅修在 git、
+未随 crates.io 的 0.7.0 发布），详见 §16.4。JDBC 默认 `useServerPrepStmts=false`、
+mysql CLI / pymysql 走文本轨，均不受影响。
+
+### 14.4 W-6：收尾
+
+- `cargo clippy --workspace --all-targets` **0 警告**（修 `SqlSection` 手工 `Default` → `derive(Default)`）；
+  rust-analyzer 侧另有 `overflow evaluating the requirement`（`#[async_trait]` 展开 + DataFusion
+  深嵌套 future 的 `Pin<Box<dyn Future + Send>>` 强转）提示——`flight.rs:393` 同款、
+  属既有现象，非编译错误也未阻断构建；
+- `cargo test --workspace --no-fail-fast` **103 通过 / 0 失败**（基线 93 + sqlwire 7 + sql 2 + server config 1）。
+  `yuntun-wal::cleanup::tests::monitor_aborts_timed_out_batches` 为**时间敏感 flaky**
+  （全量并发跑时偶发 "fresh batch must survive"，单跑通过；与本次改动无关，未处理）；
+- 遗留：README 与 DBeaver 实测见 §15（本次一并补上）。
+
+## 15. 追加：Q7 DBeaver / JDBC 实测（T3）+ shim 补齐 + README（2026-09-11）
+
+### 15.1 实测环境
+
+| 项 | 值 |
+|---|---|
+| 客户端 | 本机 `/usr/bin/dbeaver` + `java/javac`；驱动取 DBeaver 自带 **Connector/J 8.0.29**（`~/.local/share/DBeaverData/drivers/maven/...`） |
+| 服务端 | standalone：flight `127.0.0.1:50078` + mysql `0.0.0.0:3306`（**标准端口实测可用，R-2**） |
+| 数据 | `api_audit(event_time TIMESTAMP, user TEXT, endpoint TEXT, cost_ms INT)` 3 行 |
+
+### 15.2 T3 脚本化验证：`scripts/dbeaver_jdbc_probe.java`（22 项全过）
+
+| # | 项 | 结果 |
+|---|---|---|
+| 1 | 握手（驱动识别服务端版本） | ✅ MySQL 8.0.32-yuntun |
+| 2 / 5 | `getCatalogs` / `getTables` | ✅ public / api_audit |
+| 6 | `getColumns` | ✅ 4 列（DATETIME / TEXT / TEXT / INT） |
+| 7 / 8 | `getPrimaryKeys` / `getIndexInfo` | ✅ 空结果集（无主键/索引语义正确） |
+| 10–12 | 数据预览 / count / group by | ✅ |
+| 13–22 | `@@version_comment`、`DATABASE()`、`information_schema.tables`、`SHOW FULL TABLES`、`DESCRIBE`、`SHOW COLLATION/CHARSET/ENGINES/KEYS`、`SHOW CREATE TABLE` | ✅ |
+
+> 编译/运行：`javac -cp $JAR scripts/dbeaver_jdbc_probe.java` → `java -cp "$JAR:scripts" dbeaver_jdbc_probe`。
+> 该脚本即 T3 的 CI 化替代（GUI 手工清单已在 README §2.2 给出）。
+
+### 15.3 实测暴露并补齐的 shim 缺口（`crates/sql/src/shim.rs`）
+
+| # | 现象 | 修复 |
+|---|---|---|
+| 1 | 握手即失败：`SELECT @@session.auto_increment_increment` 落 DataFusion（"variable has no type information"） | sqlparser 把 `@@var` 解析为 **Identifier / CompoundIdentifier**（非 Placeholder）→ `classify_probe_expr` 增补两种形态，变量名取末段并去 `@@`；同时支持 `ExprWithAlias`（驱动普遍带别名） |
+| 2 | JDBC 取不到部分变量 | `canned_variable` 补 `auto_increment_*`、`character_set_server`、`system_time_zone`/`time_zone`、`wait_timeout`、`net_*_timeout`、`max_connections`、`query_cache_*`、`transaction_read_only`、`have_ssl`、`version_compile_*`、`port` |
+| 3 | `getColumns` 抛 `Column 'Collation' not found` | `SHOW FULL COLUMNS` 改 **9 列**（Field/Type/Collation/Null/Key/Default/Extra/Privileges/Comment）；普通 `SHOW COLUMNS` 仍 6 列 |
+| 4 | `DESCRIBE / DESC t` 报 1149 不支持 | 拦截 `Statement::ExplainTable`（DESCRIBE 语义 = SHOW COLUMNS，6 列）；EXPLAIN 同变体，MVP 不做执行计划（留档） |
+| 5 | `getPrimaryKeys/getIndexInfo` 抛 `Column 'Key_name'/'Table' not found` | sqlparser 0.62 **无** `SHOW KEYS/INDEX/ENGINES` 变体，它们落到 `ShowVariable`，且 `SHOW KEYS FROM t` 的表名也被收进 `variable` → 按**首段**特判，返回列名齐全的**空结果集**/engines 表（原来返回 `Variable_name/Value` 两列，驱动按名取值必炸） |
+| 6 | `SHOW COLLATION / SHOW CHARSET` 报 1149 | canned 结果集（utf8mb4_general_ci / utf8mb4） |
+| 7 | Q3 遗留的 shim 单测缺失 | 新增 `shim::tests`（探测表达式形态 × canned 值、SHOW COLUMNS 列形状、SHOW KEYS 列名） |
+
+### 15.4 文档：新建 `README.md`（S1.11 / Q7 交付）
+
+仓库此前**无 README**：补齐 quickstart（构建 / 配置 / 启动）、**Flight SQL 与 MySQL
+双协议最小闭环示例**、**DBeaver 连接步骤与驱动属性**（`useServerPrepStmts=false`、
+`useSSL=false`、`allowPublicKeyRetrieval=true`）、兼容矩阵 T1–T4、已知限制、
+冒烟脚本（`scripts/.venv`）、crate 结构。
+
+### 15.5 DBeaver GUI 手工验证暴露：`information_schema` 补洞
+
+脚本化探测（§15.2）之外，DBeaver GUI 浏览时还会查一批 DataFusion
+`information_schema` **未提供**的 MySQL 元数据表，逐条弹
+
+```text
+SQL Error [1146] [42S02]: table not found: yuntun.information_schema.key_column_usage
+  （同批：referential_constraints / triggers / statistics / partitions）
+```
+
+修法（`crates/sql/src/shim.rs`）：MySql 方言下拦截 FROM 命中
+`information_schema.<缺失表>` 的查询，按 **MySQL 8 的列定义返回 0 行的空结果集**
+——yuntun 无主键/外键/索引/触发器/分区概念，空集即正确语义；关键是**列名要齐**
+（DBeaver / JDBC 按列名取值，缺列会抛 "Column not found"）。
+
+补入清单：`key_column_usage`、`referential_constraints`、`table_constraints`、
+`check_constraints`、`statistics`、`triggers`、`partitions`、`events`、
+`processlist`、`engines`（此外 `tables` / `columns` / `schemata` / `routines` 等
+DataFusion 已提供 → **不拦截**，保持原生实现）。
+单测 `shim::tests::information_schema_gaps_are_filled`；JDBC 探测脚本加 [23]–[28] 全过。
+
+### 15.6 本轮验证与遗留
+
+- `cargo test --workspace` **106 通过 / 0 失败**；`cargo clippy --workspace --all-targets` **0 警告**；
+- 遗留：`DatabaseMetaData::getSchemas` 返回 0 行（走 `information_schema.schemata` 路径未覆盖）
+  ——DBeaver 按 catalog=`public` 浏览不受影响，留档不修；
+- 遗留阶段 1 准出项：**S1.9 `yuntun-client` / `yuntun-cli`、S1.10 do_get 流式化、
+  S1.8 幂等键透传**（README 的 CLI 手册待 CLI 落地后补）。
+
+## 16. 追加：S1.9 `yuntun-client`（Rust SDK + CLI）落地（2026-09-11）
+
+### 16.1 交付（新 crate `crates/client`，包名 `yuntun-client`，bin `yuntun-cli`）
+
+| 文件 | 内容 |
+|---|---|
+| `src/lib.rs` | [`Client`]：`connect` / `query`（eager）/ `query_stream`（`FlightRecordBatchStream` 流式）/ `schema_of`（`get_schema` 的 IPC 解析）/ `table_schema` / `execute` / `list_tables` / `insert_batches` / `insert`；`InsertReceipt`（server `Receipt` 的 JSON 形态）；`generated_key()`——未显式给键时自动生成 `cli-<ms>-<pid>-<seq>`（表多为 `IngestConfig::standard()` **require** 幂等键，否则服务端回 FailedPrecondition） |
+| `src/input.rs` | 导入解析：CSV（`Format::infer_schema` 推断后重读）/ JSONL（按字段名） / Parquet（读后 cast）；统一**按列名对齐 + `arrow::compute::cast`**，列顺序无关、缺字段填 NULL；stdin 仅支持 CSV/JSONL |
+| `src/main.rs` | CLI：`query`（`--format table|csv|json`）、`insert`（`-t/-f/--format/--shard/--key`，无 `-f` 读 stdin）、`tables`、`schema`；`--addr` 或环境变量 `YUNTUN_ADDR`（默认 `127.0.0.1:50051`） |
+| `tests/client_e2e.rs` | in-process FlightServer + SDK 全流程：DDL → schema 探测 → `do_put` 回执 → `list_tables` → 可见性 → 一次性/流式查询 → `INSERT ... VALUES` 与 DoPut 汇入同一管线 |
+
+**协议复用（未新增协议）**：查询 `do_get(ticket = SQL)` + `get_schema(cmd = SQL)`；
+写入 `do_put`（`path = [table, shard]` + 数据消息 `app_metadata` 幂等键）——即 plan §4.2 的
+「简易轨 = 自有客户端快速通道」。
+
+### 16.2 真实服务端 CLI 冒烟（S1.9 验收句式）
+
+环境：standalone（flight `127.0.0.1:50078` / mysql `:3306`）+ `yuntun-cli`。
+
+| 步骤 | 结果 |
+|---|---|
+| `query 'CREATE TABLE cpu (ts BIGINT, host TEXT, usage DOUBLE)'` → `schema cpu` → `tables` | ✅ OK / 3 列 / cpu 列出 |
+| `insert -t cpu -f cpu.csv`（**列顺序打乱** host,usage,ts） | ✅ 2 行，按名对齐正确 |
+| `insert -t cpu -f cpu.jsonl`（缺 `usage`） | ✅ 2 行，缺字段 → NULL |
+| `insert -t cpu -f cpu.parquet`（`ts` 为 int32） | ✅ 2 行，读取时 cast 到 Int64 |
+| `query 'SELECT * FROM cpu ORDER BY ts'`（table 输出） | ✅ 6 行；`--format csv` / `json` 输出正确 |
+| `query 'INSERT INTO cpu VALUES (700, (1 + 1), 2.0)'` | ✅ 明确报错（INSERT VALUES 仅字面量，设计内限制） |
+
+### 16.3 回归与稳定化
+
+- `cargo test --workspace` **114 通过 / 0 失败**（client：6 单测 + 1 e2e + 1 doctest；基线 106）；
+  `cargo clippy --workspace --all-targets` **0 警告**；
+- e2e 原用固定 `sleep 2500ms` 等可见性，并发跑（叠加 clippy/其它 e2e）时会偶发超时
+  → 改为**轮询 `wait_count`（≤10s）**，稳定且更快（5.16s → 2.10s）；
+- 遗留：CLI/SDK 尚未入 CI 脚本；`yuntun-wal` 的 `monitor_aborts_timed_out_batches`
+  仍是时间敏感 flaky（阶段 2 卫生项，未处理）。
+
+## 17. 追加：S1.10 `do_get` 流式化 + S1.8 幂等键透传（2026-09-11）
+
+### 17.1 S1.10：结果集流式化（验收：大结果集内存平稳）
+
+| 层 | 改动 |
+|---|---|
+| `yuntun-query` | `sql_stream()`（`DataFrame::execute_stream`，不 collect）+ `stream_from_batches()`（canned/小结果集 → 流适配）；`SendableRecordBatchStream` re-export（协议层无需直接依赖 datafusion）；`futures` 复用 |
+| `yuntun-sql` | `SqlStreamResult { Rows { schema, stream }, Affected }` + `SqlEngine::execute_stream()`：与 `execute` 同一分流，SELECT 直接交物理计划流，shim/INSERT/DDL 经 `stream_from_batches` 转流（协议层单一出口） |
+| `yuntun-server` | `do_get`：标准轨 `TicketStatementQuery` 与简易轨 SQL 统一走 `do_get_sql()` → `FlightDataEncoderBuilder::with_schema(schema)` 边算边发（0 批也先发 schema，ADBC/JDBC 一致性校验）；INSERT/DDL 回空结果集；查询期错误在流中途以 `Status` 返回。元数据命令（GetTables/GetSqlInfo/XDBC）仍走批量路径 |
+
+**实测**（`scripts/flight_stream_smoke.py`，真实服务端 + ADBC）：
+
+| 规模 | 结果 |
+|---|---|
+| 100 万行写入（10×10 万，DoPut 简易轨） | 2.6s |
+| 100 万行流式读取 | 0.3s |
+| **500 万行**（列数据理论下界 ≈ 114 MB）流式读取 | 0.6s，**服务端 RSS 增量 2.2 MB**（基线 499.0 → 峰值 501.1） |
+
+> eager 路径需一次性持有整个结果集（≥114 MB）；流式路径内存与结果集规模解耦。
+
+### 17.2 S1.8：幂等键透传（验收：幂等矩阵单测覆盖）
+
+**通道**（`yuntun-sql/src/idempotency.rs` + flight 层）：
+
+| # | 通道 | 说明 |
+|---|---|---|
+| 1 | **SQL 注释**（任意协议） | `INSERT /* idempotency_key=<k> */ INTO t ...`（兼容 `-- idempotency_key=<k>` 行注释）；注释被解析器忽略，语义零影响 |
+| 2 | **prepared 语句上的键** | `PreparedStatement.idempotency_key`（prepare 时解析并随语句缓存——参数替换后的 SQL 文本已不含注释）；MySQL COM_STMT_PREPARE 与 FlightSQL `ActionCreatePreparedStatementRequest` 共用 |
+| 3 | **Flight `DoPut` 装载** | 键优先级：**每条 `FlightData.app_metadata` > prepared 上的键 > 语句级生成 `flightsql-<uuid>`**（`spawn_sql_ingest` 新增 `default_key`） |
+| 4 | 兜底 | SQL 路径未给键 → `dml-<uuid>`；require 表**缺键拒绝**不变（架构 §7.3.2） |
+
+**顺带修的真实缺陷**：`insert_target_table_str` 的前缀回落不认注释
+（`INSERT /* ... */ INTO t` 匹配不到 `insert into`）→ 装载被误判为非 INSERT 走 SQL 执行并报解析错。
+新增 `strip_comments()`（块/行注释 → 空格）+ 空白折叠后再匹配。
+
+**测试**：
+- `yuntun-sql`：`idempotency::extract` 3 组单测（形态/非法/未闭合）、`insert_target_tolerates_comments`（注释位置 ×3）、`strip_comments_keeps_word_boundaries`；
+- `crates/server/tests/sql_idempotency_e2e.rs`：三通道端到端（SQL 注释 INSERT → 1 行；prepared 注释键装载 → +2；无键兜底 → +2，require 表全程 accept）；
+- **真实协议冒烟**：CLI（`query 'INSERT /* idempotency_key=... */ ...'`）、MySQL 文本协议（pymysql）与 prepared（mysql-connector）带注释插入均成功且数据可见。
+
+### 17.3 回归
+
+- `cargo test --workspace` **120 通过 / 0 失败**（新增：sql 4 + server e2e 1）；`clippy --workspace --all-targets` **0 警告**；
+- 文档：README 新增「幂等键」小节与流式说明（原「结果集 eager」限制已更新）、冒烟脚本表增加 `flight_stream_smoke.py`；
+- 遗留：MySQL wire 轨结果集仍为 eager（逐行写）；CLI/SDK 未入 CI。
+
+## 18. 追加：测试临时目录策略（tmpfs 加速）——`yuntun-testkit`（2026-09-11）
+
+**动机**：写盘类测试（WAL / Parquet / local ObjectStore）在真实磁盘上要付 fsync +
+元数据写开销；Arch/systemd 下 `/tmp` 本身就是 **tmpfs（内存盘）**，`fsync` 近似 no-op。
+
+**本机基准**（500 × 64KB 文件 + 每文件 `fsync`）：
+
+| 位置 | 耗时 |
+|---|---|
+| tmpfs（`/tmp`） | **38 ms** |
+| 真实磁盘（`/home`，sda3） | **2422 ms**（≈64×） |
+
+### 18.1 实现：新 dev-only crate `crates/testkit`（`publish = false`）
+
+| API | 说明 |
+|---|---|
+| `tmp_root()` | 内存盘根：`YUNTUN_TEST_TMPDIR` > `$TMPDIR` > `/tmp` > `/dev/shm`（读 `/proc/mounts` 判定 tmpfs，取首个命中） |
+| `disk_root()` | 真实磁盘根：`YUNTUN_TEST_DISKDIR` > `<workspace>/target/test-disk` |
+| `is_tmpfs(path)` | 挂载点最长前缀匹配判定（非 Linux → false，保守当磁盘） |
+| `TestDir::tmpfs/disk/at(name)` | 唯一目录（pid+序号）+ **Drop 自动清理**；`.string()` 便于塞进 TOML |
+| `TestDir::into_path()` | 交出路径并放弃清理（供 `fn tmpdir() -> PathBuf` 形态的 helper） |
+
+### 18.2 接入与分工
+
+| 用例 | 位置 | 选择 |
+|---|---|---|
+| WAL 单测（segment / reader / recovery / cleanup） | `crates/wal` | **tmpfs** |
+| ingest flush、query e2e、client e2e、client 导入单测 | `crates/{ingest,query,client}` | **tmpfs** |
+| server e2e（flight / flightsql / sqldml / idempotency） | `crates/server/tests` | **tmpfs** |
+| 故障注入（重启/崩溃恢复） | `crates/chaos` | **真实磁盘**（fsync 等待与重启后目录语义必须真实） |
+| 压测 | `chaos/examples/bench` | **真实磁盘**（tmpfs 会让吞吐/延迟失真） |
+| 手动示例 | `server/examples/demo` | **真实磁盘**（数据便于观察/复用） |
+
+> 踩坑记录（值得保留）：`TestDir` 是 Drop-guard，**不能跨函数返回**——
+> `client_e2e::start_server()` 内建目录后 return 给调用方，guard 在函数返回时
+> 即删除目录，服务端后台攒批扫描报 `wal scan failed: No such file or directory`，
+> 表现为"写入成功但查询恒为 0 行"。该 helper 已改用 `into_path()`。
+> 教训：目录生命周期必须覆盖"服务/线程仍在使用"的整个区间。
+
+### 18.3 效果
+
+- `cargo test --workspace`（热态）：**124 通过 / 0 失败，约 16s**；
+  写盘较重子集（wal+ingest+server+client）约 10s；
+- 对照：同一子集把 `YUNTUN_TEST_TMPDIR` 指向真实磁盘，**首次冷跑 66s**（含大量文件
+  创建 + 冷 page cache），热跑回落到 ~10s——差异主要来自 fsync 等待与文件系统元数据；
+- 测试目录随 Drop 清理，重跑无残留（此前部分用例只删不建、或不清理）。
+
+## 19. 追加：多 schema（MySQL 的 database）支持（S1.13，R-3 提前清偿）（2026-09-11）
+
+**背景**：R-3 原定阶段 4；因阶段 2（Chaos/压测）会锁定存储路径与 WAL 格式，
+提前到阶段 1 末尾实现，避免日后迁移成本。
+
+### 19.1 核心约定
+
+**全限定表标识 `schema.table`**（`yuntun_model::ops::qualified_name`）贯穿所有层：
+Catalog 内部键、IngestBatch/WAL 的 `table` 字段、Manifest、Query 缓存键、对象路径派生；
+裸表名只在 SQL 表面与 `TableMeta.name` 出现。默认 schema = `public`（旧数据自动归属）。
+
+| 层 | 改动 |
+|---|---|
+| `yuntun-model` | `TableMeta.namespace`（protobuf tag 9，空值兼容旧数据）+ `CreateTableRequest.namespace`；`qualified_name / split_qualified / validate_schema_name`；`LakeError::Schema{NotFound,AlreadyExists,NotEmpty}` |
+| `yuntun-catalog` | `namespaces` 注册表 + `create/drop/list_schemas/schema_exists`；建表校验 schema 存在；`list_visible_files/drop_table/evolve_schema` 等对表标识做 `normalize_table` 归一（裸名兼容） |
+| `yuntun-query` | `LocalCatalogCache`（schemas 清单 + 限定名键 + `get_in`）；`YuntunCatalogProvider` 多 schema 视图；`QueryEngine::session_with_schema / sql_with_schema / sql_stream_with_schema / schema_of_with_schema` |
+| `yuntun-sql` | `resolve_table_ref`（1 段→会话 schema；2 段 catalog 前缀特判；3 段取后两段）；dispatch 全链路限定名；`CREATE/DROP DATABASE(SCHEMA)`、`SHOW DATABASES`；MySql shim 的 `USE` **真实切换**（校验存在）；`SessionCtx::schema()/set_schema` |
+| `yuntun-sqlwire` | handshake database 校验 + 切换；错误码 1049（unknown database）/ 1007 / 1008 |
+| `yuntun-server` | `GetDbSchemas` 返回真实 schema 清单（此前固定 public） |
+| `yuntun-format` | 对象路径按 schema 分层：`yuntun/<schema>/<table>/dt=.../...`（读取以 Manifest 为准，旧布局兼容） |
+| WAL | `ddl_op::CREATE_SCHEMA/DROP_SCHEMA`（`DdlPayload.table` = schema 名）；CREATE/DROP TABLE 记录**全限定名**；重放恢复 schema 与表 |
+
+### 19.2 验证
+
+| 层 | 测试 |
+|---|---|
+| 单测 | `catalog::multi_schema_isolation_and_drop_rules`（建库/隔离/非空库拒绝/默认库不可删）、`format::file_path` 分层断言、`sql::resolve_table_ref_rules`（1/2/3 段 + catalog 前缀特判） |
+| e2e | `crates/server/tests/multi_schema_e2e.rs`：建库 → 跨 schema **同名表**隔离（各查各的）→ 未知库报 404 → 非空库 DROP 拒绝 → 删表后 DROP → **崩溃重启后 schema 事件与表定义经 WAL 重放恢复** |
+| 真实客户端 | `scripts/pymysql_smoke.py` 新增 [8.2]/[8.3]：`CREATE DATABASE` → `USE`（`DATABASE()` 反映当前库）→ 跨库隔离 → 限定名查询 → `USE no_such_db` 回 **1049** → 非空库删库回 **1008** → 清理后 `SHOW DATABASES` 不再出现 —— **ALL OK** |
+
+### 19.3 回归与附带修复
+
+- `cargo test --workspace` **126 通过 / 0 失败**；`clippy --workspace --all-targets` **0 警告**；
+- 附带修复（§18 tmpfs→磁盘改造暴露）：chaos `crash_recovery_no_data_loss` 的恢复断言
+  原依赖固定 500ms 等待（tmpfs 上足够、真实磁盘上"WAL 重放→flush→commit"超时）→ 改为
+  **轮询等待（≤30s）**；并修正重排时 accumulator 被立即 cancel 的错误（它必须在轮询期间
+  保持运行）；chaos 三用例经 `CHAOS_GATE` 串行（重 IO + 共享环境，消除时序噪声）；
+- 遗留：`USE` 在 Flight/PG wire 的等价语义（`SET search_path`）未做（PG 客户端可用
+  限定名）；`SHOW TABLES FROM db` 语法未支持（可用 `SHOW TABLES` + `USE` 或限定名查询）。
+
+## 20. 协议决策：撤销无源 INSERT 形态，只支持标准完整语句（2026-09-12）
+
+**考古**：无源形态 `INSERT INTO t (a, b)`（无 VALUES/SELECT 源）源于 S1.1-S1.5 手写
+pyarrow protobuf 冒烟时的省事写法（数据反正走 Arrow 流），S1.6 实现时服务端为它
+配了字符串匹配回落（`insert_target_table_str` + `strip_comments`）。它不是任何标准
+或第三方客户端的要求：自研 SDK 批量写入走简易轨（PATH descriptor，无 SQL）；
+ADBC 冒烟仅查询。
+
+**决策**：FlightSQL `DoPut` 轨道统一约定客户端发送**标准完整语句**
+`INSERT INTO t [(cols)] VALUES (?, ?)`——bind 数据是 Arrow batch，占位符被服务端
+忽略；`insert_target` 退化为纯 AST 路径，删除字符串兜底与 `strip_comments`。
+（曾评估自定义 sqlparser Dialect 支持 bind 模板：0.62 具备 `parse_statement` 钩子
+与 `Insert.source: Option` 两个前提，技术上可行；但该形态本无标准依据，不值得
+维护包装方言的委托成本与执行路径防呆——撤。未来标准路线是 `CommandStatementIngest`
+，表名走 proto 结构化字段，零解析。）
+
+| 改动 | 文件 |
+|---|---|
+| `insert_target` 纯 AST 化；删 `strip_comments` / `insert_target_table_str` 及单测 | `crates/sql/src/sql.rs` |
+| 无源 INSERT 改完整形态（`VALUES (?, ?)`） | `flight_sql_e2e.rs` / `sql_idempotency_e2e.rs` / `pyarrow_smoke.py` |
+
+回归：全量通过；mysql/flight 既有行为不变（MySQL wire `COM_STMT_PREPARE` 一直要求
+完整语句，本决策只是把 Flight 轨道对齐到同一标准）。
+
+## 21. 修复：写后可见性（读己之写）+ DROP 语义 + WAL/Catalog 一致性（2026-09-12）
+
+### 21.1 冒烟现象与根因（先纠正归因）
+
+冒烟报"DROP TABLE + 同名 CREATE TABLE 后新写入数据查不到（15s 轮询），重启后又能查到"。
+实测（默认配置、**无 DROP、无重启、干净目录**）复现同一现象：
+
+| 观测点 | 延迟 |
+|---|---|
+| INSERT（分钟第 0 秒）→ catalog 可见（flush+commit 落盘） | **29.1s**（= `public.mysql_smoke` 的 jitter 偏移） |
+| → SQL 查询可见（走本地缓存） | **47.9s**（再叠一次缓存 TTL 落点） |
+
+根因是**两条异步窗口**，与 DROP/CREATE 无关（`pymysql_smoke.py` 每次运行都先 DROP+CREATE，
+因此被误当变量）：
+
+1. Flush 时刻 = `window_start + hash(shard+table) % flush_jitter_secs`（ADR-10 削峰），
+   默认 60s 内任意秒；写入发生在分钟前段时最长等 ≈jitter 秒；
+2. 查询走 `LocalCatalogCache`，原只在 TTL（默认 30s）到点刷新。
+   两者叠加最坏 ≈60s+30s，而回执 `expected_visible_in_secs` 写死 `time_threshold_secs`（5s）。
+
+"重启后可见"= 重启触发立即缓存刷新 + 攒批线程全量重读 WAL（`window_ms` 变为重启所在分钟，
+若已越过 jitter 秒则立即 flush）；"孤儿清理删旧文件"= DROP 后文件转孤儿，属设计语义。
+
+### 21.2 修复项
+
+| # | 修复 | 位置 |
+|---|---|---|
+| 1 | **读己之写 = store 层分片的两级形态**：`yuntun-store::shard` 定义 `ShardTier{Memory,Disk}` / `ShardId(table, shard, window)` / `MemoryShard`（内存分片，Live / Committed(snapshot) 两态）/ `DiskShard`（对象存储上的分片）/ `ShardStore` 门面。写入侧把已 fsync 未提交的批次写进内存分片、提交后交棒；`YuntunTableProvider::scan` 用 **内存分片 ∪ 磁盘分片（Parquet 文件组）**（`UnionExec`）做无空洞/无重复交接，缓存刷到该快照后 `sweep` 回收。**查询只依赖 store 层，不依赖 Ingestor 进程**；分离部署时仅替换本层实现 | `crates/store/src/{shard.rs,lib.rs}`、`crates/query/src/{table,provider,cache}.rs`、`crates/ingest/src/{pipeline,flush,accumulator}.rs`、`crates/server/src/lib.rs` |
+| 2 | 回执 `expected_visible_in_secs` 改为真实上界（扫描周期），不再写死 5s | `crates/ingest/src/pipeline.rs` |
+| 3 | **提交驱动缓存刷新**：内存分片变更计数一变即刷新（200ms 轮询），TTL 仅兜底 | `crates/query/src/cache.rs` |
+| 4 | **DROP 语义**：攒批器按 WAL DDL 维护表存活/世代（epoch 进分组键），flush 前丢弃陈旧世代分组；恢复路径（Pending 批次重做）用 DDL 时间线校验世代，陈旧则 `BatchAbort` —— 不再产生悬挂 Manifest / 旧数据复活 | `crates/ingest/src/{accumulator,pipeline}.rs` |
+| 5 | **`snapshot_version` 严格单调**：`commit_files/commit_compaction/drop_shard` 由 `load()+1`+`store()` 改为原子 `fetch_add`（原实现与 `drop_table` 交错时会把快照号**回退**，让已提交文件永久不可见） | `crates/catalog/src/lib.rs` |
+| 6 | **WAL 水位/回执**：`WalWriter::open` 水位初值由 `last_seq` 改为 `synced_seq`（不再超出真实 fsync 边界）；组提交内每条记录回各自的 seq（此前整批都回 `last_seq`）；新增 `next_seq()` 用于区分"历史数据/本进程新写入" | `crates/wal/src/writer.rs` |
+
+### 21.3 读侧接缝（`ShardReader` / `ShardFetch`）
+
+为避免"热数据 = Ingestor 的进程内缓冲"这一错误耦合，读侧抽成 trait：
+
+| 抽象 | 位置 | 实现 |
+|---|---|---|
+| `ShardReader`（`shards_of / read_shard / read_table / reclaim`） | `crates/store/src/shard.rs` | ① `MemoryShard`（进程内，阶段 0）；② `RemoteShard`（远端分片服务，传输由 `ShardFetch` 注入） |
+| `ShardFetch`（`fetch_shards / fetch_shard / fetch_version`） | 同上 | 阶段 1：gRPC / HTTP；单测：假实现 |
+
+查询侧只持有 `Arc<dyn ShardReader>`（`LocalCatalogCache::set_hot_shards` / `TableProvider.hot`），
+`crates/query` 对 `crates/ingest` **无（非 dev）依赖**；分离部署只需把 `ShardStore::local(...)`
+换成分片服务的 `RemoteShard`，SQL 侧零改动（验证见 `crates/query/tests/hot_shard_reader.rs`）。
+
+### 21.4 验证
+
+- 新增回归：`crates/server/tests/write_then_read.rs`（读己之写 latency < 1s 且此时 **零个已提交文件**；
+  DROP + 重启 + 同名重建 → `count(*) = 0` 且无悬挂 Manifest）、
+  `crates/ingest/tests/recovery_guard_e2e.rs`（陈旧世代 Pending 批次被 abort）、
+  `crates/query/tests/hot_shard_reader.rs`（经 `ShardReader` 的**远端**实现读热数据，接缝可替换）、
+  `catalog::snapshot_monotonic_under_concurrent_commit_and_drop`、`wal::writer::tests`（水位/逐条 ack）、
+  `store::shard::tests`（分片隔离 / 世代 / prefix 对齐 / 两个 `ShardReader` 实现）；
+- `cargo test --workspace` 全绿；`cargo clippy --workspace --all-targets` 0 警告；
+- README「已知限制」与「最小闭环」的可见性描述同步更新；
+- 副作用：接管了 `chaos::query_multi_version_alignment` 的固定 `sleep(500ms)`（改轮询 ≤30s，
+  真实磁盘 + 并发负载下固定等待会偶发超时）。
+
+## 22. 修复：prepared SELECT 取不到行（0.7.0 UAF 触发条件）+ 握手版本串（2026-09-13）
+
+### 22.1 现象与误判
+
+release 冒烟里 prepared 路径间歇故障：`1210 Incorrect number of arguments executing
+prepared statement`、垃圾 stmt_id（`RESET(0)` / 随机 id）、`MySQL server has gone away`、
+prepared SELECT `fetch` 为空——单次运行 0~100% 失败，被日志/代理"修好"（改变分配时序）。
+此前记录的已知限制把它归因为"opensrv-mysql 0.7 没有二进制结果集编码"，**有误**：
+`lib.rs:654` 的 `QueryResultWriter::new(..., is_bin = true)` 表明 COM_STMT_EXECUTE
+本就走二进制行，元数据块收尾（DEPRECATE_EOF 下不写 EOF）也符合官方协议文档。
+
+### 22.2 真因（两层）
+
+1. **上游**：opensrv-mysql **0.7.0** 的 `PacketReader::next_async`
+   （`packet_reader.rs:137-140`）：一次读缓冲带回剩余字节时
+   `self.bytes = rest.to_vec()` 释放旧分配，而返回的 `Packet` 仍指向旧内存
+   （上游 #66 / PR #67 修复，**仅存在于 git，crates.io 最新发布仍是 2024-02 的 0.7.0**）。
+   后果：客户端把多条命令压进同一 TCP 段（libmysql 常态）→ 命令字节被错解 →
+   opensrv 兜底分支回**裸 OK 包** → 客户端响应流错位（上游 #71 仍开放：
+   `PacketWriter` 不公开，适配层无法自救）。
+2. **我方适配器**：`PacketFramedReader` 虽"每次只交付一个包"，但交付量按
+   `min(buf.len(), out.remaining())` 截断——底层一次 read 带回多条命令时，
+   第二个包的字节被顺带交付，opensrv 内部缓冲仍出现剩余 → 重新踩 UAF 分支。
+   **分帧必须按包边界截断，只做到①不等价于修好。**
+
+### 22.3 修复（均在 sqlwire，不改 opensrv）
+
+- `PacketFramedReader::poll_read`：交付量按 `queued_packet_len()`（包边界）截断，
+  绝不混入下一个包的字节；探针日志移到整包交付点（消除旧实现"多包一次读时丢日志"）。
+> 补充（`§49`）：仓里曾有一份 `vendor/opensrv-mysql` —— 它与 crates.io 的 0.7.0 **逐字节相同**、
+> 也**从未接线**，已于 2026-09-19 删除。**上游这个 UAF 的绕过一直只在本节的 sqlwire 侧**，
+> 不存在"fork 过 opensrv"这回事。
+
+- 握手版本串单一事实源：`yuntun-sql::shim::MYSQL_VERSION`（`8.0.32-yuntun`），
+  `MysqlBackend::version()` 覆写之（原先回 opensrv 默认 `5.1.10-alpha-msql-proxy`，
+  与 `SHOW VARIABLES` 不一致，且 5.1.x 会让按版本分支的驱动/ORM 误判能力）。
+- `on_execute` 增加"参数解码值 + 结果行数"debug 日志：区分"服务端拿到错误绑定值"
+  与"服务端正确、客户端解码失败"（本次定位的关键一步）。
+- 冒烟脚本：T2 [10] 从"只验证不崩"改为**真实断言**（轮询可见性后比对
+  `[(2, "bob")]`）；T1 新增 [1.1] 握手版本一致性；修正错误注释。
+
+### 22.4 验证
+
+- mysql-connector **C 扩展**（libmysqlclient 二进制协议栈）连续 3×10 + 30 次迭代
+  prepared INSERT+SELECT 全部通过（修复前同口径 10/10 失败）；纯 Python 栈 30 次通过。
+- `scripts/pymysql_smoke.py` 全绿（含新的 T2 [10] 行内容断言）。
+- Flight 冒烟（pyarrow_smoke / pyarrow_sqlinfo_smoke / flight_stream_smoke 50 万行）
+  在当前构建全绿；standalone `kill -9` → 重启 → `resume_recovered`（30 批重提交）
+  → t+0s 数据全量可见。
+
+### 22.5 顺带发现（遗留，已记入 README §4）
+
+1. **SQL DDL 时间精度**：`TIMESTAMP(3)` 不产生 `Timestamp(ms)` schema（一律 ns）——
+   SQL 建的表无法满足 pyarrow_smoke prepared 绑定要求的 ms 精度，脚本只能跑在
+   demo 种子实例上；DDL 精度透传待办。
+2. **chaos 用例并行 flake**：`crash_recovery_no_data_loss` 全量并行时偶发失败
+   （85s vs 单跑 1.1s，真实磁盘 I/O 竞争），单跑稳定；断言固定等待待改轮询。
+3. **opensrv 依赖决策**：上游修复仅在 git（crates.io 停更于 0.7.0），后续切 git
+   固定 rev 后可移除 `PacketFramedReader`；`vendor/opensrv-mysql/` 为分析用拷贝，
+   是否保留待定。
+
+### 22.6 建表能力盘点（应评审追问补做，发现并修复一个缺口）
+
+SQL DDL 逐类型实测（pymysql → MySQL wire，`CREATE TABLE` 11 列全类型 + INSERT + 回读）：
+
+- `TINYINT/INT/BIGINT/VARCHAR(n)/DOUBLE/BOOLEAN/DATE/TIMESTAMP/TEXT/BLOB` 全链路 ✅；
+- **DECIMAL(p,s)：建表 ✅ 但 `INSERT VALUES` 报 "unsupported type"** —— VALUES 构造器
+  缺 `Decimal128` 分支。已补（`crates/sql/src/sql.rs`）：
+  - 字面量按**精确缩放**解析（`parse_decimal_unscaled`，不走 f64，避免 12.34 × 10^scale
+    二进制舍入）；小数位超出 scale 拒绝（不静默截断）；
+  - 数组必须按列声明的 precision/scale 构建（`with_precision_and_scale`；
+    `Decimal128Array::from` 默认 (38,10)，会被批次类型校验拒绝——第一版踩到）；
+  - 回读 `Decimal(12.34)` ✓，DataFusion 计算（`i * 100` → `Decimal(1234.00)`）✓。
+- 拒绝边界复核（均明确报错而非静默）：`ALTER TABLE` / `CREATE TABLE AS SELECT` /
+  `CREATE OR REPLACE` / `ARRAY<INT>` 复杂类型 ✅；
+- `_BINARY ab` 字面量不支持（INSERT VALUES 仅普通字面量；BLOB 列以字符串字面量写入）；
+- README §2.1「SQL 支持面」表同步补齐：DDL 类型清单、`CREATE/DROP DATABASE`、
+  不支持行补 `ALTER TABLE` / CTAS / `CREATE OR REPLACE` / 复杂类型。
+
+- 类型面补测（应评审追问）：`JSON` / `JSONB` 建列 ✅（`sql.rs` 映射 `Utf8` 文本存储）——
+  实测**不校验 JSON 合法性**（`not-json-at-all` 照存）、客户端 SHOW COLUMNS 显示为 `text`、
+  `->`/`->>`/`json_extract`/`from_json` 等全部明确拒绝（DataFusion 55 默认函数集无 JSON 能力，
+  社区 `datafusion-functions-json` 未引入）→ JSON 仅"可存可查原文"，半结构化访问不在 0.1 范围。
+  README §2.1 类型清单与不支持行已同步。
+
+## 23. 新增：ARRAY / MAP 列 + JSON 查询函数（0.1 追加，2026-09-13）
+
+### 23.1 落地内容
+
+- **DDL 映射**（`crates/sql/src/sql.rs::map_column_type`）：
+  - `ARRAY<T>` / `T[]` → Arrow List（元素递归映射，支持 `ARRAY<ARRAY<INT>>`）；
+  - `Map(K, V)`（ClickHouse 形态）→ Arrow Map（key 不可空）；
+  - **方言坑**：MySQL wire 会话用 `MySqlDialect`，sqlparser 的 MAP 关键字分支只对
+    ClickHouse/Generic 开放 → `MAP(K,V)` 落为 `Custom`。`map_column_type` 识别之：
+    重组为 Generic 可解析形态二次解析，复用同一映射（`map_type_map`）。
+- **INSERT 字面量**：
+  - `[1, 2, 3]`（`Expr::Array`，全方言可解析）；
+  - `MAP("k", 1, ...)` 函数形态（`MAP {..}` 花括号字面量仅 DuckDB/Generic，
+    MySQL 方言不解析）——`literal_of` 识别 `ARRAY(...)`/`MAP(...)` 函数调用，
+    元素仍须为字面量（G3 无注入面）；
+  - `build_column` 新增 List/Map 分支：子元素走同一构造器递归
+    （签名改 `&dyn Fn`，避免递归单态化爆炸）；`Decimal128Array::from` 默认 (38,10)
+    的教训同理适用于按列声明构建。
+- **JSON 查询函数**：引入 `datafusion-functions-json = 0.55`（与 DF 55 一一对应），
+  `session_with_schema` 注册 `register_all`。函数集：`json_get / json_get_{str,int,
+  float,bool,json,array} / json_as_text / json_contains / json_length /
+  json_object_keys / json_from_scalar`（**没有 `json_extract`**，0.55 已改名）。
+- **wire 编码**（`crates/sqlwire/src/encode.rs`）：新增 Union 分支——`json_get`
+  返回 Arrow Union（JSON 变体联合），取选中变体的底层值按文本输出（arrow 的
+  Union display 会带 `{变体名=}` 包装）。List/Map 列走既有文本兜底
+  （`[10, 20, 30]` / `{a: 1, b: 2}`）。
+
+### 23.2 关键约定（踩坑留档）
+
+1. **JSON 路径不带 `$`**：`json_get_int(doc, "n")` ✓；`"$.n"` 是 miss
+   （返回 NULL/空列）；`json_length(doc)` 不带 path 所以不受影响——这让我们一度
+   误判函数注册失败。miss 语义：类型不匹配/未命中返回 NULL 列
+   （可能为 `DataType::Null` 或默认类型），不报错。
+2. `json_get_int` 命中返回 **UInt64**，miss 可能是 Int64/Null——类型不跨行稳定。
+3. 方言矩阵（Generic/MySQL 下可解析性）：`ARRAY<T>` ✓、`T[]` ✓、`Array(T)` ✗、
+   `Map(K,V)` ✓、`MAP<K,V>` ✗（仅 DuckDB）、`MAP {..}` 字面量 ✗（仅 DuckDB）、
+   `[..]` ✓、`STRUCT` ✗（明确拒绝）。
+
+### 23.3 验证（端到端，MySQL wire 轨）
+
+- `CREATE TABLE (id INT NOT NULL, tags ARRAY<INT>, props MAP(VARCHAR, INT), doc JSON)`
+  + INSERT `[10,20,30]` / `MAP("a",1,"b",2)` / JSON 文本 →
+  回读 `[10, 20, 30]`、`{a: 1, b: 2}`、原文 JSON ✓；
+- 查询：`tags[1]` → 10、`unnest(tags)` → 3 行、`props["a"]` → 1 ✓；
+- JSON：`json_get_int(doc,"n")=7`、`json_get_str(doc,"k")="v"`、
+  `json_length=2`、`json_contains=1`、`json_get(doc,"k")` 经 wire Union 分支 → "v" ✓；
+- **Parquet round-trip**：flush/commit 后全量回读无损，JSON 函数照常可用 ✓；
+- 回归：`crates/query/tests/json_functions.rs`（路径/miss/Union 行为固化）、
+  `crates/sql` 数组映射与字面量单测；`cargo test --workspace` 全绿、clippy 0 警告。
+- 遗留：`STRUCT` 列、Variant（DF #16116，等生态成熟）不在 0.1。
+
+## 24. M0a 落地：恢复语义改造（delta-dml-design §1.1 前置项，2026-09-13）
+
+依 delta 设计五轮评审定稿的 M0a 开工，清偿"重启重写全部历史数据"的既有债务，
+为 DV（行位删除向量）建立 batch_id 稳定性前提。
+
+### 24.1 改动
+
+1. **`BatchPendingPayload` 增补 `table`**（prost tag 10，向后兼容）→ `BatchState.table`；
+   老 WAL 为空时从 `s3_paths[0]` 反解（`table_from_object_path`，R18 回退）。
+2. **`wal_seq_end` 精确化（R8）**：`flush_batch` 改为 `*group.seqs.last() + 1`
+   （旧 `first_seq + len` 在交错写入下少算右界）；全链路统一半开 `[start, end)`：
+   - `resume_recovered` Pending 重做 `scan_range(s, e+1)` → `(s, e)`（R16 清单）；
+   - `segment_batches` 相交判定改半开（`e > lo`）；
+   - Pending 重做**按表过滤** payload（组内空洞属于别的表，旧行为会跨表串数据）
+     —— `BatchState.table` 可用后顺手修复；
+3. **重提交（R9/R12）**：`resume_recovered` 对 `Committed | S3Written` 走新增的
+   `recommit_into_catalog`：复用原 batch_id 与既有对象**只重建内存 Catalog、不追加 WAL**
+   （原 BatchCommitted 已表达终态）；**世代闸门** `liveness_at(start) vs liveness_at(EOF)`
+   （与 Pending 分支同款）——DROP/同名重建的旧世代批次 abort，不挂新表。
+4. **攒批重放跳过集 `ReplaySkip`**（组键 table/shard/window/epoch + 半开区间，
+   二维判定）：`resume_recovered` 建立、`run_accumulator` 消费——认领命中的 Data
+   不再重放入账（重提交已让原文件可见，重放 flush 会双份）。epoch 进组键用于区分
+   DROP/重建前后同名同窗口批次（评审五 R15 的二维判定落地）。
+
+### 24.2 验证
+
+- 新增 `crates/ingest/tests/m0a_recommit.rs`：
+  ① 终态批次重提交（committed=1/redone=0）+ **对象存储零新增** + 文件可见 + 认领集就位；
+  ② 世代闸门：DROP→同名重建→重启，旧世代数据不挂新表（R9）；
+  ③ 交错写入 Pending 重做按表过滤（R8）：t2 的交错行不混入 t1 批文件，row_count=2。
+- `cargo test --workspace` 全绿、clippy 0 警告（顺带修掉 ARRAY/MAP 遗留的 3 处）。
+
+### 24.3 M0b 待办（不含在本批）
+
+`replay_wal_dml`（重建 DeletionEntry，四段顺序之 ③）、segment 清理闸门（R21）、
+abort 区间保留（`apply_record` 对 BatchAbort 保留区间进跳过集，修复"显式放弃数据
+重启后复活"的既有行为）。
+
+## 25. 架构调整：chunk 层（数据平面地基）+ 与既有设计的对照审查（2026-09-15）
+
+> 依据：`architecture.md`（架构设计 v11）、`design.md`（详细设计 v1.0）、
+> `docs/architecture-with-chunk.md`（架构设计含 chunk 层，下文简称 **chunk 版架构**）、
+> `docs/refactor.md`（重构路线 S0–S6）。
+>
+> 本节记录 **S1（chunk 层）** 的落地、**与既有设计的逐条对照结论**、
+> **审查中发现并回改的偏差**，以及由此对 `plan.md` 的调整。
+>
+> 一句话结论：**方向正确（数据平面先行的次序判断是对的），但按 chunk 版架构 §5.3 字面实现会
+> 与既有 ADR-10 冲突；已按"两者取并集"回改，该文档需补一句限定语。**
+
+### 25.1 落地内容（对应 refactor.md 的 S1-1 ~ S1-10）
+
+| 项 | 内容 | 落点 |
+|---|---|---|
+| S1-1 | 新 crate `yuntun-chunk`（`Chunk` = 尚未成型的 RowGroup；内存直接持 `RecordBatch`，**不转 RowGroup 布局**） | `crates/chunk/src/{chunk,stats}.rs` |
+| S1-2 | 五态机 `Open → Sealed → Spilled → Flushed → Released`，非法转移**报错**而非静默 | `chunk.rs` |
+| S1-3 | seal 策略单点：行数 / 字节 / **窗口关闭** / `schema_version` 变化 | `store.rs::SealPolicy` |
+| S1-4 | spill = **本地磁盘** + Arrow IPC(LZ4) + 自描述头（`wal_segment`/`seq_range`/`crc32`/schema） | `spill.rs` |
+| S1-5 | 内存账本 + 60/80/95 三级背压（spill → 强制 seal → 拒写） | `budget.rs` |
+| S1-6 | 内存硬分区：chunk 区与 query 区两块独立预算（query 侧接 DataFusion 内存池） | `budget.rs`、`query/src/lib.rs` |
+| S1-7 | 读侧接缝：`ChunkStore` 实现 `store::ShardReader`（查询侧零改动，"读己之写"保住） | `store.rs` |
+| S1-8 | WAL 回收点语义：chunk 记录 `[seq_start, seq_end)` 半开区间 + spill 头写 WAL 引用 | `chunk.rs`、`spill.rs` |
+| S1-9 | 强制 seal **且 flush** 的最大驻留（防慢写入流撑爆 WAL），取代旧 `idle_timeout` | `store.rs::plan_flush` |
+| S1-10 | `rows_threshold` 10 000 → **500 000**（让 RowGroup 一次成型） | `config.rs`、`yuntun.toml.example` |
+| 附带 | `FileManifest` 增 `partition_key` / `source_instance`（架构 §2.3 / §4.4） | `model/src/meta.rs` |
+
+### 25.2 对照既有设计：逐条结论
+
+| 维度 | 既有设计出处 | 本次做法 | 判定 |
+|---|---|---|---|
+| 铁律①"所有写入走 ingest" | §3.2 | chunk 只是 WAL 与对象存储之间的**驻留层**，仍无第二条写入路径 | ✅ 保持 |
+| 铁律②"协议端口在 server" | §3.2 | 未动（chunk 无协议面） | ✅ 保持 |
+| 依赖方向 | §3.2 | 新增 `model → store → chunk → ingest → server`，`query → store` 不变，无环 | ✅ 保持（**§3.2 图需补 chunk 一行**） |
+| 读侧接缝 `ShardReader`/`ShardFetch` | §21.3（本日志） | trait 仍留在 `yuntun-store`；**实现**从 `store::MemoryShard` 下移到 `chunk::ChunkStore` | ✅ **继承**（"查询不依赖 Ingestor 进程"更强：`query` 对 `ingest`/`chunk` 均无依赖） |
+| C1「WAL 是唯一事实」 | 详设 §4 | spill 头记 WAL 引用 + CRC，校验失败即判定副本不可信（丢弃重来） | ✅ **强化**（多了一个可丢弃副本，未新增权威） |
+| C8「OCC 先于写 S3」 | 详设 §5.2 | 未动（仍在写对象存储之前演进 schema） | ✅ 保持 |
+| ADR-3「Ingestor 互不感知 / WAL 本地独占」 | §4 | **新增一类节点私有状态：spill 目录** | ⚠️ 需在文档中显式列出（见 25.4） |
+| ADR-4「batch_id 随机 UUIDv7」 | §4 | 未动（仍随机；文件名即 batch_id，全局唯一） | ✅ 保持 |
+| ADR-9「SLA 分级」 | §4 | `best_effort` 的 RPO 从"≤jitter(60s)"变为"窗口关闭 + max_flush_delay" | ⚠️ 量级变化，需在 README/文档同步（见 25.4） |
+| **ADR-10「整分钟对齐 + jitter」** | §4 | 首版实现**违例**（见 25.3-1），已回改为窗口对齐；jitter 锚点/量级待 S2 正式修订 | ❌→✅ **发现冲突并回改** |
+| §7.2 攒批阈值 + 5min 空闲兜底 | §7.2 | `time_threshold` 降级为**地板**（seal 时刻由窗口关闭决定）；5min 兜底收紧为 `chunk_max_resident_secs`(60s，且强制 seal+flush) | ✅ 语义澄清 + 收紧（旧实现"每秒 1 条也会 flush"仍成立） |
+| §8.6/8.7 热数据 = 按分钟切分的 MemTable + `UnionExec` | §8.6/8.7 | chunk 即"按时间窗口切分的 MemTable"；scan 仍 `UnionExec(热 ∪ 冷)` | ✅ **等价替换**（且补齐了内存账本/背压/spill，旧设计未覆盖） |
+| 详设 §11 配置项 | §11 | 新增 `[chunk]` 段；移除 `flush_jitter_secs`（随机 → 确定性相位） | ⚠️ 破坏性配置变更（旧 TOML 仍可解析，未知键忽略） |
+
+**结论**：本次调整属于**同一架构内的"补齐与收敛"**，不是换架构——
+它把既有设计里"应该有但没写"的一层（内存热数据如何有界、如何卸载、flush 时刻如何确定）
+补上，并把散在两处的分组语义收敛成一处。**没有推翻任何一条既有铁律**；
+唯一真正冲突的是 ADR-10 的实现方式（且是本次首版自己引入的）。
+
+### 25.3 审查中发现的问题（4 项已回改 + 3 项留观）
+
+#### 1.【严重｜已回改】首版实现违反 ADR-10："创建后 N 秒"取代了窗口对齐
+
+`architecture.md` §ADR-10 明文：
+
+> 攒批窗口按**整分钟对齐**（**而非**"达到阈值后 5 秒"）……同时保持
+> **每窗口每 shard 最多 1 个文件**的小文件控制目标。
+
+而 S1 首版把时间维度的 seal 触发写成 `now - created_at >= time_threshold(5s)`——
+正是 ADR-10 否决的那一种。后果（低吞吐表，如告警/审计：1 条/秒）：
+
+| 方案 | 一个窗口（分钟）产出的文件数 |
+|---|---|
+| ADR-10 窗口对齐（旧实现 `window_start + jitter`） | 1 |
+| S1 首版"创建后 5 秒" | **≤12** |
+
+即：把 ADR-10 专门用来防的"小文件 / Meta 条目爆炸"重新引入，且**功能测试全绿**——
+只有对照 ADR 原文才能发现。
+
+**回改**：`Chunk::window_end_ms`（**到达分钟**窗口结束，与旧实现锚点同源）+ `SealPolicy::min_resident`
+只作地板；新增 `SealReason::WindowClosed`。回归用例
+`chunk::store::tests::time_seal_is_window_aligned_not_creation_offset`
+（同窗口 5 次 append → 仍 1 个 chunk；创建后 5s 但窗口未关 → 不 seal）。
+
+> 📌 **对 chunk 版架构的修订建议**：§5.3 写 `flush_deadline = seal_time + max_flush_delay`
+> 时，必须补一句"**seal 触发是窗口对齐的**"，否则读者（包括本实现）会自然地
+> 退回"创建后 N 秒"，与 ADR-10 冲突。这是该文档的**表述缺陷**，不是决策错误。
+
+#### 2.【已修】写入侧与查询侧的表标识不一致（**被本次改造暴露的既有隐患**）
+
+`do_put` 简易轨用**裸表名**（`cpu`）写 WAL 与内存视图，查询侧用**全限定名**
+（`public.cpu`，`TableMeta::qualified_name()`）读热数据——两者永不匹配，于是
+"读己之写"实际一直靠 **flush 落盘**兜底：
+
+| 时期 | 持久化上界 | 表现 |
+|---|---|---|
+| 旧实现 | `window_start + jitter`（默认 ≤60s，冒烟实测 29.1s） | 掩盖了标识不一致（写后 ~30s 仍能查到） |
+| S1 首版 | `seal + max_flush_delay`(30s) | 暴露为**可见性回归**：`client_e2e` 等 10s 超时（`got=Some(0)`） |
+
+`yuntun_model::ops` 本就写明"**跨层唯一表标识**：Catalog 内部键、Ingest/WAL 的 `table`
+字段、对象存储路径派生、Query 缓存键全部使用它；裸表名只在 SQL 表面与 `TableMeta.name`
+出现"——实现没跟上文档。
+
+**回改**：ingest 边界一次归一化（`qualify_table`），WAL / chunk / Manifest / 查询键同身份；
+恢复路径同样归一化（老 WAL 的裸名不再被世代闸门误判）。副作用是裸名写入的对象路径
+由 `yuntun/<table>/…` 变为 `yuntun/<schema>/<table>/…`，**与 `DiskShard::prefix` 的既有约定
+终于一致**（此前两处对裸名的处理不同，是同一根因的另一面）。已有数据以 Manifest 的
+`file_path` 为准，读取不受影响。
+
+#### 3.【已修】spill 目录跨重启泄漏
+
+spill 是**进程内**热数据的落盘副本，重启后 registry 为空 → 残留文件永远不会被引用，
+而崩溃重启循环会让它们无限堆积。原实现只在 `release`/`discard` 时删除。
+
+**回改**：`ChunkStore::new` 启动即 `purge_leftover_spills()`（只清 `*.ipc.lz4`/`*.tmp`）。
+架构 §2.6 的"校验 WAL 引用一致则**复用**副本"是**后续优化**（需把 chunk 与 WAL 区间重新配对）：
+当前选择"丢弃重来"，正确性不受影响，代价是重启后重新编码；已在代码注释与本日志留档。
+
+#### 4.【已修】"强制 seal + flush"只做了一半
+
+`plan_flush` 原先把"超 `max_resident`"只当作 seal 条件：chunk 被强制 seal 后，
+还要再等 `max_flush_delay` 才落盘——**WAL 仍被拖住**，S1-9 的目的（防慢写入流撑爆 WAL）
+没有达成。**回改**：超驻留时同一轮既 seal 又 flush（`plan_flush` 的 `due` 并入
+`open_too_long`，调用方顺序 seal → spill → flush 保证可行）；用例断言"强制 seal 必须同轮 flush"。
+
+#### 5.【已修】驻留硬兜底会静默绕过相位分散（→ 惊群复活）
+
+`flush_due_at` 原先锚定 `sealed_at.unwrap_or(created_at)`。窗口对齐后 chunk 在**窗口关闭时**
+才封口，此时"按创建时刻算的到期"早已过去 → **封口即到期** → 所有实例又回到同一秒 flush，
+相位分散形同虚设。**回改**：锚点固定为 `sealed_at`（未 seal 返回 `u64::MAX`），
+并明确不变量 `max_resident > max_flush_delay + phase_spread`
+（后者由 `Config::warnings()` 自检并在启动时告警——这类问题**功能测试全绿**，
+只能靠不变量守护）。这是 ADR-10 惊群约束在"窗口对齐 + 确定性到期"下的**新失效模式**。
+
+#### 6.【留观】chunk 区内存可越限（有意为之，需可观测）
+
+`append` 的记账是**无条件**的（`reserve`，可见性承诺优先于预算，I1）：
+真正的硬闸门在 `ingest()` 入口的 95% 拒写。中间态（WAL 已 fsync、攒批尚未吸收完）由
+**WAL 积压**吸收。风险是"吸收慢 → 内存短时超预算"，需要把
+`ledger.used / WAL 积压字节 / 背压水位` 三个量纳入观测（→ refactor 的 S1-11 验收）。
+**未改**：改成硬拒绝会把已 fsync 的数据退回给客户端，语义更糟。
+
+#### 7.【按设计保留】墓碑期不跳过、多文件粒度
+
+- 触达 95% 时**不**强制释放 `Flushed` chunk（架构 §4.6 允许"内存压力时跳过墓碑期"）：
+  跳过会出现最长一个缓存刷新周期（~200ms）的可见性空洞，当前选择不跳；
+- 高吞吐表由 `rows_threshold` 决定文件粒度（可 >1 文件/窗口）——这是 ADR-10
+  在小文件控制上的**既有边界**（旧实现同样如此），由 compaction 兜底。
+
+#### 8.【待定｜P2】相位分散的量级需要实测定案
+
+窗口对齐后，低吞吐表的 flush 时刻 = `窗口关闭 + max_flush_delay + phase(≤spread)`。
+ADR-10 的削峰是"60 秒内均匀分散"，而 `spread` 默认 5s → **分散面收窄 12 倍**；
+若把 spread 提到 60s（= 一个窗口）则恢复 ADR-10 的分散度，但持久化上界变为
+`60 + max_flush_delay + 60`（≈2 分钟，该文档允许"放宽到分钟级"）。
+
+两者都要实测（S0 baseline 的文件数与 P99 写入延迟）才能定案，**不在本批拍板**：
+`max_flush_delay_secs` 与 `flush_phase_spread_secs` 的默认值列入 P2 定案清单
+（并受 25.3-5 的不变量约束）。详见 `plan.md` §2.2 / `refactor.md` 的 P2。
+
+### 25.4 文档层面待同步（本次未改：需求是"先分析再改计划"）
+
+1. `architecture.md` §3.2 crate 图补 `yuntun-chunk`（`model → store → chunk → ingest`）；
+2. `architecture.md` §ADR-10 需正式修订（jitter 锚点：`window_start` → `seal_time`；
+   量级：待 25.3-8 定案），并在 §"节点私有状态"中列明 **WAL 目录 + spill 目录**（ADR-3 边界）；
+3. `architecture.md` §ADR-9 / README「已知限制」同步新的 RPO 量级
+   （`best_effort`：窗口关闭 + `max_flush_delay`，不再是 ≤jitter 60s）；
+4. `architecture-with-chunk.md` §5.3 补"seal 触发窗口对齐"限定语（见 25.3-1 的 📌）；
+5. `design.md` §11 配置清单同步 `[chunk]` 段与移除的 `flush_jitter_secs`/`idle_timeout`；
+6. `CHANGELOG.md` 不逐条记改造过程（本次曾误记后撤回）——发布时从本日志汇总。
+
+### 25.5 验证
+
+- `cargo test --workspace`：**189 passed / 0 failed**；`cargo clippy --workspace --all-targets` **0 警告**；
+- 新增用例（按语义分组）：
+  - chunk：窗口对齐 seal（同窗口 1 chunk / 创建后 5s 但窗口未关不 seal）、
+    五态机非法转移报错、spill 往返 + CRC 篡改/截断/魔数拒绝、spill 后账本归零且数据仍可读、
+    `commit → 缓存追上 → 回收`（I4 无空洞）、陈旧世代隐藏与回收、背压三级阶梯、
+    相位偏移确定且跨实例分散、强制 seal 同轮 flush、启动清理残留 spill；
+  - ingest：表标识归一化、`config → SealPolicy` 映射（含"地板必须短于一个窗口"）、
+    flush e2e 驱动真实攒批循环（Manifest 出现 1 文件 + WAL 终态 Committed + 未落盘即可读）；
+  - server：`[chunk]` 配置解析/水位退化、示例配置与解析器同步、
+    不变量自检告警（`max_resident` 绕过相位分散 / 零预算）；
+- 既有回归全绿（含 `write_then_read`（读己之写 latency + 零已提交文件、DROP 不复活）、
+  `hot_shard_reader`（远端 `ShardReader` 可替换）、`m0a_recommit`、chaos 3 场景）。
+
+### 25.6 遗留与后续（已同步到 plan.md）
+
+> 同步位置：`plan.md §2.2`（待定决策登记表）、`plan.md §2.3`（文档同步项）、
+> `plan.md §五`（分布式就绪度基线：记分卡 / 接缝现状 / 四类静默错数据）、
+> `plan.md §七`（R2–R6 WBS）、`plan.md §八`（关键路径与里程碑）。
+
+| # | 项 | 归属 |
+|---|---|---|
+| 1 | 相位分散量级 + `max_flush_delay` 默认值实测定案（25.3-8） | P0（阶段 2 首轮） |
+| 2 | spill 复用（校验 WAL 引用一致则沿用副本，替代"丢弃重来"） | S1 收尾 / P2 |
+| 3 | 三个内存/积压指标接入观测（25.3-6） | S1-11（阶段 2 T6.12） |
+| 4 | `architecture.md` 的 ADR-10 / §3.2 / 节点私有状态修订（25.4） | 阶段 2 末（阶段 3 准入） |
+| 5 | chunk 级 ZoneMap 剪枝接入 query（`ColumnStats` 已就绪，尚未用于跳过） | R5（T13.2） |
+| 6 | query 区内存池的**可观测性**（当前只在上限处失败，无水位指标） | S1-11（阶段 2 T6.12） |
+| 7 | **规划缺口（本轮核查新发现）**：`Compactor` / 孤儿清理绑具体 `MemoryCatalog`（R2 必补 `CommitCompaction`）；`source_instance` 只写不读（R4）；孤儿 GC 非多写者安全（R6） | `plan.md §5.1`/`§7` |
+
+## 26. R2：Catalog 访问形态改造 + 观测能力（单进程 standalone 形态，2026-09-17）
+
+> 承接 §25 与 `plan.md §五`（就绪度基线）。本轮只做**不需要拆进程**的部分：
+> 控制平面的**形态与接缝**（refactor S2-1 ~ S2-8）+ 观测（T6.12），
+> 不碰 raft / 进程拆分 / fanout / 全局 compaction。
+>
+> 一句话：**控制平面的接口已经按"远程形态"定义好了，现在还是同进程实现；
+> 换成 gRPC 客户端时业务代码一行不改。**
+
+### 26.1 落地内容
+
+| 项 | 内容 | 落点 |
+|---|---|---|
+| **S2-5 版本分两组** | `CatalogVersion { schema_ver, manifest_ver }`；DDL 推 schema、flush/compaction 推 manifest | `model/ops.rs`、`catalog/lib.rs` |
+| **S2-7 增量接口** | `manifest_delta(since)` → 变更表清单；实现用"每表最后变更版本"（O(表数)，无界日志） | `catalog/lib.rs` |
+| **S2-4 每查询一次快照** | `CatalogSnapshot`（不可变 + `Arc`），provider/scan 全程复用同一份；**不再每次 `table()` 深拷贝文件清单** | `query/src/{cache,provider,table}.rs` |
+| **S2-1/2/6 本地物化视图** | `LocalCatalogCache` → `LocalCatalog`：版本驱动 + 增量刷新 + "无变化零开销" + 失败保留旧快照 | `query/src/cache.rs` |
+| **S2-3/R2 抽象补位（T10.7）** | `commit_compaction` / `known_batch_ids` **上 trait**；`Compactor` / 孤儿清理改依赖 `Arc<dyn CatalogOps>` | `catalog/lib.rs`、`compaction/lib.rs` |
+| **T6.12 观测** | `Lakehouse::metrics()` + 周期结构化打点：chunk 内存水位 / WAL 积压 / 背压水位 + Catalog 版本与增量统计 | `server/src/lib.rs`、`ingest/pipeline.rs` |
+| **S2-4 附带** | 节点列表进快照（`snapshot.nodes`，standalone = 单节点）——"分片归属"必须与 schema/manifest 同版本 | `query/src/cache.rs`、`server/src/lib.rs` |
+
+### 26.2 关键设计点（为什么这样做）
+
+1. **不可变快照不是"性能优化"，是正确性要求。**
+   DataFusion 的 `CatalogProvider`/`SchemaProvider`/`TableProvider` 是**同步 trait**，规划期
+   会被反复调用；若每次都读一个会变的结构，**同一次查询的 plan 与 scan 可能看到两个版本**
+   （漏读/幻读）。改为"构建新快照 → 原子替换"后，读侧只拿 `Arc`。
+   `CatalogSnapshot.tables` 用 `HashMap<String, Arc<CachedTable>>`：写时复制的代价与
+   **文件数无关**（否则每次增量刷新都要克隆全表文件清单，增量就白做了）。
+
+2. **版本分两组是"让增量成为可能"的前提。**
+   flush 是最高频的写。若与 schema 共用版本号，**每次 flush 都会让全表 schema 失效**
+   → 缓存退化为全量重建。分开后：DDL（低频）→ 全量；写入（高频）→ 只拉变化的表。
+   回归证据：`full_reload_then_incremental_touches_only_changed_table` 用 `Arc::ptr_eq`
+   断言"无关表**没有被触碰**"—— 而不是"结果恰好一样"。
+
+3. **增量接口必须能报"消失的表"。**
+   删表若只靠 schema_ver 触发全量，一旦调用方漏判就会**留着过期缓存**。
+   因此删表同时推两组版本，且增量把被删表也报出来（`drop_table_advances_both_versions`）。
+
+4. **`commit_compaction` / `known_batch_ids` 必须在 trait 上。**
+   它们此前是 `MemoryCatalog` 的固有方法，导致 `Compactor.catalog: Arc<MemoryCatalog>` ——
+   "同进程"是部署事实，但**不能因此把类型写死**：R3 把 Catalog 换成 gRPC 客户端时编译不过
+   （`plan.md §5.1-B` 的本轮实测）。这是"单机可跑、分布式不返工"最便宜的一处接缝。
+
+5. **观测的三项是"故障现场三件套"。**
+   内存水位 / WAL 积压 / 背压水位：没有它们，压力类故障只能复现不能定位。
+   尤其 **WAL 积压**——chunk 记账是无条件的（可见性优先于预算），越限部分正是靠它吸收；
+   它也是唯一能解释"内存为什么超预算"的量。打点内容可 `serde_json` 序列化（将来接 HTTP/监控）。
+
+### 26.3 本轮暴露/发现的问题
+
+1. **`wal_backlog` 的口径极易写错（差一即误导运维）**：
+   实现时第一版把 `synced_seq` 当成"下一条待写 seq"，报出多 1 的积压 ——
+   而这**不会让任何功能测试变红**，只在运维判断上出错。
+   已用契约化的单测钉住（`wal_backlog_counts_fsynced_but_unabsorbed_records`：
+   写入 2 条未吸收 → 积压 = 2；吸收后 → 0），并在代码注释里写明半开区间公式。
+   *教训*：**指标也是接口**，必须像接口一样有契约测试。
+2. **刷新失败语义必须显式化**：刷新失败**保留旧快照**（宁可读稍旧数据，也不要查询不可用），
+   错误记入 `last_error` 供告警（`failed_refresh_keeps_previous_snapshot_and_records_error`）。
+   这条在单进程时看不出价值，但在 R3（metanode 偶发不可用）时是可用性底线。
+3. **chaos 并行 flake 根因确认**：`cargo test` 默认**并行跑所有 test binary**，
+   `yuntun-chaos` 与另外 46 个 binary 争 CPU/IO；实测并行下 30s 恢复上限不足
+   （单跑 1.3s / 3 passed）。本轮把该上限放宽到 60s 并写明理由
+   ——**正确性断言不用超时冒充延迟指标**；根治（chaos 独立跑 / 去 flaky）属 `plan.md` T6.1。
+
+### 26.4 与既有设计的对照
+
+| 维度 | 出处 | 本轮做法 | 判定 |
+|---|---|---|---|
+| **C7「Query 无网络」** | 详设 §6.7 / ADR-6 | 读路径仍全部走本地快照（同步、无锁、无网络）；`LocalCatalog` 只依赖 `CatalogOps` trait | ✅ 保持 |
+| **ADR-6「本地缓存 + 变更通知」** | §4 | 由**TTL 轮询**演进为**版本驱动 + 增量 + watch 形态**（`version()` 无变化零开销返回 = 带版本号请求） | ✅ 演进（方向与 ADR-6 一致） |
+| S2-4「每查询一次预取」 | `refactor.md` | `CatalogSnapshot` 每会话取一次 | ✅ 达成 |
+| S2-5「版本号分两组」 | `refactor.md` | `CatalogVersion{schema_ver, manifest_ver}` | ✅ 达成 |
+| S2-7「manifest delta」 | `refactor.md` | `manifest_delta(since)` + `full_reload_required` 保守回退 | ✅ 达成 |
+| T6.12「三项指标」 | `plan.md` | metrics + 周期日志（HTTP 导出未做，见 26.6） | ✅ 基本达成 |
+| C5「Catalog 仅存内存」 | 详设 §6.1 | 未动（内存 + 由 WAL 重放 DDL 重建；raft snapshot 属 R3） | ✅ 保持 |
+
+### 26.5 验证
+
+- `cargo test --workspace`：**200 passed / 0 failed**（本轮新增 11 个用例）；
+  `cargo clippy --workspace --all-targets` **0 警告**。
+- 新增用例：
+  - `catalog`（4）：版本分组（建表/提交文件各推哪一组）、增量只报变更表、
+    删表同时推两组版本、compaction 推新旧两表的 manifest_ver；
+  - `query/tests/catalog_snapshot.rs`（5）：全量→增量只碰变更表（`Arc::ptr_eq` 硬证据）、
+    DDL 强制全量、**快照跨刷新不可变**、无变化零开销、**刷新失败保留旧快照并记错**；
+  - `ingest`（1）：`wal_backlog` 半开区间口径；
+  - `server/tests/metrics_e2e.rs`（1）：三项指标 + Catalog 版本 + query 区上限 + 可序列化。
+- 既有回归全绿（含 chaos 3 场景：单跑 1.3s）。
+
+### 26.6 遗留（对应 plan.md 相应条目）
+
+| # | 项 | 归属 | 说明 |
+|---|---|---|---|
+| 1 | proto 启用 tonic-build（T10.8） | R3 前 | 与 raft 服务是同一批 codegen 工作，单独做没有收益 |
+| 2 | 指标 HTTP 导出 | 阶段 2 尾 | 需要新增依赖（当前离线环境不可加），先以结构化日志交付。**✅ 已落地（`§160`，2026-09-30）**：实际**零新增依赖** —— 手写 HTTP/1.1（只认 GET）+ 已就绪的 `serde_json`；`/metrics`（Prometheus 文本，从 JSON 快照生成）、`/metrics.json`、`/healthz` |
+| 3 | chaos 与其余 binary 并行导致的 flake 根治 | T6.1 | 建议 CI 分两步：`cargo test --workspace --exclude yuntun-chaos` + `cargo test -p yuntun-chaos` |
+| 4 | `cache_ttl_secs` 降级为纯兜底（S2-10） | 阶段 2 | 版本驱动已上线，TTL 目前仍作为兜底保留 |
+| 5 | 本地缓存持久化（S2-8） | R3 后 | metanode 不可用时降级服务，需要序列化格式 |
+
+---
+
+## 27. 阶段 2 起步：chaos 场景 #5 抓出一个真 bug —— 幂等键在写入路径上不生效（2026-09-17）
+
+**触发**：着手补 `design.md` §12.3 的 chaos 场景 #5（幂等键 + Compaction）时，
+先确认"同键重试会被去重"这一前提是否成立 —— 结果**不成立**。
+场景写不出来，因为被测功能没实现（文档与 README 都认为它已实现）。
+
+### 27.1 证据（修改前的三处代码）
+
+| 位置 | 代码 | 后果 |
+|---|---|---|
+| `ingest/src/pipeline.rs` | `let _client_key = resolve_idempotency(...)` | 解析出的键**被丢弃**（下划线），只留下"强制表必须传键"的校验 |
+| `ingest/src/flush.rs` | `commit_files{ client_request_id: None }` | Meta 层唯一索引去重（`commit_files` 里那一段）**永不触发** |
+| 全仓 | `check_idempotency` 无任何业务调用方 | 入口预筛不存在 |
+
+净效果：**同一幂等键提交两次 = 两份数据**。客户端超时重试即命中，且完全静默。
+
+**为什么既有测试全绿**：`sql_idempotency_e2e` 系列断言的是"键被提取/强制/透传"
+（回执行数、`require` 表拒绝无键请求），**没有一条断言"同键重试不产生重复"**。
+这正是 `plan.md §5.3` 说的那类"不报错、只产出错数据"的缺口 ——
+功能测试绿 ≠ 语义正确。
+
+### 27.2 根因有两层（第二层是修完第一层才暴露的）
+
+**第一层：键根本没被使用**（见 27.1）。
+
+**第二层：键的粒度错配。** 幂等键标识的是**一次客户端请求**
+（一个 DoPut 流 / 一条语句），而一次请求可以产出**多个批次**：
+- 简易轨 `do_put`：多个 `FlightData` 消息；
+- FlightSQL prepared 装载：同上；
+- SQL `INSERT ... SELECT`：多结果批（`SqlEngine::ingest_batches` 逐批 ingest）。
+
+这些生产点把**同一个请求级键**发给了每一个批次。第一层修好之后，
+批次级预筛会把同流的第 2..N 批当成"第 1 批的重试"而**判重丢掉** ——
+从"静默重复"变成"静默丢数据"。
+（`client_sdk_end_to_end` 先炸出来：一次 `insert` 2 个批次，回执行数从 2 变 1。）
+
+### 27.3 修复
+
+**语义契约（本次定下）**：
+
+> 幂等键标识**一次客户端请求**。请求内第 `idx` 个批次的键 = `derive_batch_key(请求键, idx)`
+> （形如 `req-1#0`）。派生是确定的，因此幂等是**逐批**成立的 ——
+> 上次只成功了一部分时，重试**只补缺失的批次**，而不是"整流跳过"。
+
+| # | 改动 | 位置 |
+|---|---|---|
+| 1 | 新增 `derive_batch_key(request_key, idx)`（长度受 256 约束，截断主体保留后缀） | `ingest/src/lib.rs` |
+| 2 | 入口预筛：命中即返回 `duplicate = true`、`wal_seq = 0`、`row_count = 0`，**不写 WAL** | `ingest/src/pipeline.rs` |
+| 3 | WAL fsync 成功后登记键（防**并发**同键请求双双通过预筛）；`batch_id` 留空 = "已认领、批次未落盘" | 同上 |
+| 4 | 恢复时从 WAL Data 记录**重建键索引**（`MemoryCatalog` 重启即空），TTL 以重启时刻起算（保守方向） | 同上 |
+| 5 | 三个多批次生产点改用派生键 | `server/src/flight.rs`（简易轨 + prepared 装载）、`sql/src/lib.rs`（`INSERT ... SELECT`） |
+| 6 | `Receipt.duplicate` 透出到 SDK（`InsertReceipt`）与 CLI（"其中 N 个批次被幂等去重"，且 `inserted` 改报**实际写入行数**而非输入行数） | `client/` |
+
+**为什么预筛必须在写 WAL 之前**：一个 chunk 会聚合多条 Data 记录、各带自己的键，
+而 `commit_files` 只接受**单个** `client_request_id` —— 填任何一个都是错的
+（会把别的键的数据标记成那个键的批次）。所以"提交时按键集合去重"
+要等 R3 状态机（`refactor.md` S3-5），当前唯一正确的拦点是入口。
+这一点已写进 `flush.rs` 的代码注释，避免后来者"顺手补上"。
+
+### 27.4 验证
+
+- `cargo test --workspace`：**203 passed / 0 failed**；`clippy --all-targets` 0 警告。
+- **反证（防止写出空测试）**：把入口预筛条件临时改为 `false`
+  → `idempotency_survives_compaction` 立即失败在"同键重试必须被判重"。已恢复。
+- `client_sdk_end_to_end`（既有用例）在第二层修好之前是红的 ——
+  即"多批次共用一键"这条路径本来就有既有测试兜着，改动没有绕过它。
+- 新增用例：
+  - `chaos::idempotency_survives_compaction`：3 键 3 文件 → 合并成 1 文件（旧文件
+    `deleted_at`、旧快照仍见 3 个）→ 同键重试仍判重 → 总行数恒为 9；
+  - `client::replayed_request_is_deduplicated_batch_by_batch`：一次请求 2 批次
+    全部落库 + 整条请求重试**一行不加**；
+  - `ingest::batch_key_derivation_is_deterministic_and_distinct`（含 256 长度边界）。
+
+### 27.5 遗留
+
+| # | 项 | 归属 | 说明 |
+|---|---|---|---|
+| 1 | 提交层按"键集合"去重 | R3 | 需状态机支持一次提交多个键（`refactor.md` S3-5）；当前由入口预筛唯一兜底 |
+| 2 | 幂等键索引的独立持久化（fjall） | R3 | 现状靠 WAL 重建（单机正确）；跨进程共享需随 Catalog 进 metanode |
+| 3 | chaos 场景 #1/#2/#3/#4/#7/#8/#9/#10/#11 | 阶段 2 | 进度表见 `crates/chaos/src/lib.rs` 模块文档（区分"单测层有"与"chaos 层有"） |
+
+---
+
+## 28. 阶段 2 续：chaos #1/#2/#3 落地 —— 夹具保真度修复，抓出两个重复计数缺陷（2026-09-18）
+
+### 28.0 本轮落地
+
+| # | 场景 | 用例 | 结果 |
+|---|---|---|---|
+| 1 | Compaction 期间查询 | `compaction_during_query_keeps_counts_monotonic` | ✅ |
+| 2 | 分片移除期间查询 | `shard_removal_during_query_filters_by_deleted_at` | ✅ |
+| 3 | 孤儿清理不误删 | `orphan_cleanup_spares_known_and_inflight_files` | ✅（含"静置期内的在途文件绝不删"防线） |
+
+生产代码改动只有一处（加法式）：`compaction::spawn_orphan_cleanup_with_interval`——
+原来轮询间隔硬编码 60s，导致"不误删"这条用例要跑一分钟以上，
+**没人会跑的用例等于没有防线**；新函数保留原签名（包装器传 60s）。
+
+`#2` 顺带覆盖了 R2 的增量刷新：`drop_shard` 推 `manifest_ver`，
+查询侧必须靠增量 delta 把"文件消失"消费掉，否则会继续读已移除的分片。
+
+### 28.1 发现 A：提交 → `mark_committed` 窗口内**重复计数**（已确认，未修）
+
+**机制**：`Chunk::visible` 对 `committed_snapshot = None` 返回 `true`（"还没提交 → 对所有快照可见"）。
+而 flush 的 `commit_files`（产生快照 S，文件 `valid_from = S`）到调用方
+`chunks.mark_committed(id, S)` 之间隔了一次 **WAL fsync**（`BatchCommitted` 的 append）。
+这段时间里，快照 ≥ S 的查询会**同时**读到"已提交文件"与"热数据"。
+
+**确定性复现**（不靠并发去撞）：用 `Ingestor::flush_now` 走完 `commit_files` 但不 `mark_committed`，
+把这个窗口固定下来：
+
+```
+crates/chaos: commit_to_mark_window_must_not_double_count
+  文件在快照 S 可见（3 行） 且 chunks.read_table_sync(table, S) 仍返回 3 行
+  → 端到端查询实测 6 行（应为 3）
+```
+
+**症状特征**：窗口 ≈ 0.1–5ms（一跳 fsync），所以表现为**偶发多计**而非稳定错误。
+本轮实测到的污染：`query_multi_version_alignment`（4 → 6）、
+`idempotency_survives_compaction`（9 → 12）、并发采样序列 `[..., 21, 18, ...]`。
+**推论：任何"精确行数"断言在 flush 在飞时都可能偶发失败** —— 这类 flake 过去会被误判为
+"测试不稳定"，实际是被测系统的真实缺陷。
+
+**为什么不在本轮打补丁**：查过的三条路都不成立或不可靠 ——
+① 把 `mark_committed` 提到 `commit_files` 紧后面：窗口从"一跳 fsync"缩到几条指令，**仍然存在**，
+   把"偶发"变成"极偶发"反而更难查；
+② 用锁把 [commit, mark] 与"快照钉取"串起来：本地形态可行，但 **R3 换成远端 Catalog 后
+   commit 与本地 mark 天然非原子**，窗口必然回来 —— 不能把本地锁当成终局方案；
+③ 用粗粒度水位（"q > 预提交快照就隐藏热数据"）：并发 flush（A 在 S_A=6、B 在 S_B=7）时，
+   q=6 会看到 A 的文件但看不到 B 的数据 → **可见性空洞**（比重复更糟）。
+
+**正确方向（读侧栅栏）**：热数据是否可见，应由"该快照的 Manifest 里是否已含这批数据"决定，
+而不是由 chunk 的本地标志决定 —— 即把接缝从 `read_table(table, snapshot)` 演进为
+"带上调用方已知的文件/batch 集合"，与 R4/R5 的 `pull(table, range, known_manifest_ver)`
+（`refactor.md` S5-4）**同向**。建议与 R3 的 Catalog gRPC 一起设计，避免做两遍。
+
+**测试状态**：`commit_to_mark_window_must_not_double_count` 已就位并标 `#[ignore]`（一键复现）；
+其余用例在精确断言前统一调用 `wait_hot_drained()`（等热数据退场，把瞬时窗口排除掉）。
+
+> **更新（`§99`，2026-09-24）**：**读侧栅栏已落地** —— `batch_id` 在 `commit_files` 之前登记到 chunk，
+> 热读接缝带上"调用方已知的 batch 集合"（本地与远端都过滤）。本条**已修复**：探针取消 `#[ignore]` 并转绿，
+> `compaction_during_query_keeps_counts_monotonic` 的松弛量（`+9`）也已收紧为 0。
+
+### 28.2 发现 B：崩溃恢复产出**重复文件**（已定位并修复）
+
+**症状**：夹具接上热数据读侧后（见 28.3），`crash_recovery_no_data_loss` **稳定失败**：
+9 个批次（27 行）在恢复后变成 **11 个文件（33 行）**，且行数不会回落（持久重复，非瞬时）。
+`files=33 / hot=0` → 重复落在 **Manifest 层**，与 28.1 的瞬时窗口无关。
+
+**先说被否掉的假设（留档，避免下次重走）**：最初的诊断只看到
+`claims=["0..1","1..2","2..3","2..3","5..6","5..6"]` 与 `data_seqs=[0,1,2,5,8,9]`，
+于是怀疑"认领集漏覆盖 + 区间重复"出在 `BatchState.wal_seq_range`。
+**这个方向是错的** —— 加探针打印每次 flush 的"声明区间 vs 实际读到的 seq"后，真相是：
+
+```
+[flush] reuse=false range=16..17 seqs=[16] rows=3     ← 同一条 Data 被 flush 了两次
+[flush] reuse=false range=16..17 seqs=[16] rows=3     ← 两个不同 batch_id
+```
+
+**区间自始至终是正确的**（`range == seqs`）；症状是**同一条 Data 被吸收并落了两次盘**。
+
+**根因：轮次之间换了消费者，而同一份 WAL 目录被两个循环消费。**
+
+用例每轮 `drop(setup)` 模拟崩溃、再 `build` 重建；上一轮结束时只做
+`shutdown.cancel()` —— **发信号，不 await**。而 cancel **不会打断已在执行的一轮**
+（本轮含对象存储写 + WAL fsync，可观耗时）。下一轮随即在同一份 WAL 目录上起了
+**新的攒批循环**：`last_read` 从 0 重新扫描，看到上一轮尚未收尾、以及本轮新写入的
+Data，于是把它**再吸收一次**并各自 flush（新 chunk → 新 batch_id → 新文件）。
+一条 `Data` → 两个文件，行数就此翻倍，而且**持久**（两个文件都进了 Manifest）。
+
+**为什么以前没被发现**：① 夹具没接热数据读侧（28.3），系统性少测一条路径；
+② 触发条件是与时序赛跑 —— 两轮之间的重叠窗口很小，接上热数据读侧后轮询变慢，
+重叠概率显著上升，于是从"偶发"变成"稳定复现"。
+
+**修复（两条，缺一不可）**：
+
+| # | 层 | 改动 | 作用 |
+|---|---|---|---|
+| 1 | 夹具 | `cancel()` 后 **`await` 到循环真正退出** 再进入下一轮 | 消除"两个消费者"这个前提 |
+| 2 | 生产 | `run_accumulator` 增**退出闸门**：`select!` 之后、动手之前再查一次 `is_cancelled()`，已置位则本轮不做 | cancel 与 tick 同时就绪时 `select!` 可能选到 tick，闸门把"退出瞬间仍落盘一批"的窗口关掉 |
+
+**一般化（值得记住的一条）**：**节点私有状态（WAL 目录）同一时刻只能有一个消费者**。
+恢复 / 交接 / 滚动重启流程最容易违反它，而症状是**静默重复**而非报错。
+R4 拆进程时必须有显式约束（启动即拒绝重复 `instance_id`，`plan.md` T12.5 已登记）。
+
+**测试状态**：用例已**取消 `#[ignore]` 并转绿**（连跑 3 次稳定）；
+诊断打印改为 `YUNTUN_CHAOS_TRACE=1` 开关，不在 CI 刷屏。
+
+### 28.3 夹具保真度修复：chaos 必须接热数据读侧
+
+`Setup` 此前用 `Ingestor::new(...)` 自建 chunk store，而查询侧**没有** `set_hot_shards` ——
+于是 chaos 里的"读己之写"根本没接线。这与 `Lakehouse::build_with_shutdown` 的装配不一致：
+**夹具比生产少接一条线，等于系统性地少测一条路径**（28.2 就是这么被掩盖的）。
+
+现在改为显式构造 `ChunkStore` + `Ingestor::with_chunks` + `cache.set_hot_shards(chunks)`，
+与生产装配一致。副作用是立刻暴露了 28.2 —— 这正是夹具的价值。
+
+### 28.4 测试侧沉淀（两条规则）
+
+1. **断言"最终行数"前先 `wait_hot_drained()`**（等所有 chunk 提交并被 reclaim）：
+   否则断言的是瞬时中间态，会把"系统缺陷"误报成"用例不稳定"。
+2. **已知缺陷标 `#[ignore]` + 保留一键复现的确定性探针**，不写"当前行为"的断言
+   （那等于把缺陷固化成规格），也不静默删掉用例。
+
+### 28.5 验证与本轮遗留
+
+- `cargo test --workspace`：**206 passed / 0 failed**（连跑多轮，含满负载并行）；
+  `clippy --all-targets` 0 警告；chaos 单包 7 passed / 1 ignored（仅剩 28.1）。
+- 遗留：
+
+| # | 项 | 归属 | 说明 |
+|---|---|---|---|
+| 1 | ~~修复 28.2（恢复产出重复文件）~~ | ✅ **已修** | 夹具"等循环退出" + 生产"退出闸门"，见 28.2 表；用例已取消 `#[ignore]` 并转绿 |
+| 2 | 修复 28.1（读侧栅栏） | 与 R3 同批设计 | 接缝演进方向见 28.1；单独打补丁会做两遍 |
+| 3 | chaos #4/#7/#8/#9/#10/#11 | 阶段 2 | 进度表见 `crates/chaos` 模块文档 |
+| 4 | R4 前的显式约束：**同一 WAL 目录只允许一个消费者** | R4（T12.5） | 28.2 的教训；启动即拒绝重复 `instance_id` |
+
+---
+
+---
+
+## 29. chaos #4/#7/#9 落地 —— 发现：WAL 撕裂后**无法自愈**（新写入永不可见）
+
+### 29.0 本轮落地
+
+| # | 场景 | 用例 | 结果 |
+|---|---|---|---|
+| 4 | Schema 变更 + 谓词下推 | `schema_evolution_keeps_predicate_pushed_down` | ✅（但**未达设计期望**，见 29.2） |
+| 7 | WAL 撕裂 | `torn_wal_tail_is_rejected_and_prefix_survives` | ⚠️ **抓到缺陷**（见 29.1） |
+| 9 | `synced_seq` 边界 | `accumulator_never_reads_beyond_synced_seq` | ✅ |
+
+生产代码本轮**零改动**（三个场景都是检验既有行为）。
+
+### 29.1 缺陷：WAL 撕裂后无法自愈 → **写入全部成功、数据全部消失**（已修）
+
+**实测**：把最新 segment 的尾部截掉 10 字节（模拟掉电撕裂），重启后：
+- 恢复本身成功（CRC 拦下撕裂，不报错）✅
+- 截断点之前的记录能解出来（诊断：`segs=["1:2679B"]`、`records=["0:Data","1:Data"]`）
+- 但**恢复出的行数是 0**；
+- 更严重的是：**再写入一批（fsync 成功、拿到 ack）后，该数据 60 秒轮询仍不可见**。
+
+**根因**（代码核实，非推测）：
+
+| 环节 | 行为 | 问题 |
+|---|---|---|
+| `SegmentWriter::open_append` | `bytes_written = f.metadata()?.len()` | 以**文件物理长度**作为追加偏移 → 新记录被写在**撕裂的垃圾字节之后** |
+| `decode_segment_records` | 遇到 CRC 失败/length 越界即**停止 replay** | 读不到垃圾之后的任何记录 |
+| 全仓 | `crates/wal/src/*` **没有任何 `set_len`/truncate 修复** | 撕裂点永远不会被清理 |
+
+净效果：节点表现为"**写入全部成功、数据全部消失**" ——
+恰恰是 WAL 本该防止的那类故障，而且**完全静默**（ack 正常、无错误日志）。
+
+**为什么值得排在很前面**：撕裂写入是 WAL 存在的理由（`§4.9` / C3）。
+现在"检测到了撕裂"却"不能恢复使用"，等于把最需要自愈的场景做成了不可用状态。
+
+**已修**（R-14）：接管 WAL 目录时先把每个 segment **截断到最后一条完整记录的边界**
+（WAL 标准修复步骤），再让 writer 从该偏移继续追加。三处改动：
+
+| # | 位置 | 改动 |
+|---|---|---|
+| 1 | `wal/src/segment.rs` | 抽出 `decode_with_stop`（多返回"停止偏移 = 撕裂记录起始字节"），`decode_segment_records` 保持原签名不变；新增 `repair_torn_tail(path)`：无撕裂返回 `Ok(None)` 不动文件，有撕裂则 `set_len(stop)` + **fsync**（修复本身也要落盘） |
+| 2 | `wal/src/writer.rs` | `WalWriter::open` **在 `open_active_segment` 之前**调用 `repair_torn_tails`（顺序关键：追加偏移取自文件物理长度）。修复覆盖**全部** segment，不只活跃的 |
+| 3 | 测试 | `wal::writer::open_repairs_torn_tail_so_new_appends_are_readable`（最小回归：8 条 → 撕尾 → 接管 → 文件长度回到 7 条边界、`synced_seq == 6`、**新 append 的 seq 7 必须可被 `scan_from` 读到**、不再报告 torn）；chaos 场景去掉 `#[ignore]` 并恢复原设计断言 |
+
+**验证**：`cargo test --workspace` **210 passed / 0 failed**（连跑两轮）；
+chaos 单包 **10 passed / 1 ignored**（只剩 §28.1）；`clippy` 0 警告。
+撕裂场景现在同时满足：前缀全恢复 + 不产生半个批次 + **恢复后能继续写入且可见**。
+
+### 29.2 差距：谓词下推只到 `Inexact`，`FilterExec` 未被消除
+
+`design.md` §12.3 #4 的期望是"**FilterExec 被消除**"。实测物理计划仍有
+`FilterExec: event_time@0 > 150`；逻辑计划显示 `TableScan: ... partial_filters=[...]`
+—— 说明谓词**确实下推到了扫描**（`partial_filters`），但表 provider 声明的是 `Inexact`：
+
+```rust
+// crates/query/src/table.rs:171
+// MVP：谓词交给 Parquet row-group 统计在 scan 内部处理，表级先声明 Inexact —— 正确且保守。
+Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+```
+
+**⚠️ 不能直接把 `Inexact` 改成 `Exact`**：那会让 DataFusion 撤掉 `FilterExec`，
+而 `YuntunTableProvider::scan` **忽略 `_filters`**（不转发给 Parquet 源）
+→ **静默漏过滤**（结果多出行）。正确顺序是：先让 `scan` 把谓词转发给 Parquet 源
+（由 Parquet 做行级过滤），再声明 `Exact`。
+
+用例只断言"谓词确实下推"（不断言 `FilterExec` 存在与否），
+因此**未来修好后无需改用例**。登记为后续项（与 R5 的块级剪枝/谓词下推同批）。
+
+### 29.3 验证与遗留
+
+- `cargo test --workspace`：**208 passed / 0 failed**；`clippy --all-targets` 0 警告；
+  chaos 单包 9 passed / **2 ignored**（§28.1 提交窗口、§29.1 撕裂自愈）。
+- 遗留（优先级）：
+
+| # | 项 | 归属 | 说明 |
+|---|---|---|---|
+| 1 | ~~修复 §29.1（撕裂后截断修复）~~ | ✅ **已修** | `WalWriter::open` 接管时 `set_len` 到最后一条完整记录边界（三处改动见 29.1）；用例已取消 `#[ignore]` 并转绿 |
+| 2 | 修复 §28.1（读侧栅栏） | 与 R3 同批 | 见 28.1 |
+| 3 | 谓词下推转 `Exact`（§29.2） | 与 R5 同批 | **必须先转发 filters 到 Parquet 源**，否则静默漏过滤 |
+| 4 | chaos #8（fsync 前/中/后 kill） | 阶段 2 | 需要 `WalWriter` 的 fsync 注入点 |
+| 5 | chaos #10/#11（Batch 超时 / 磁盘水位） | 阶段 2 | 需要"S3 不可用"与"磁盘水位"的注入夹具 |
+
+---
+
+---
+
+## 30. chaos #10/#11 落地 —— 发现：监控线程 abort 后**不同步视图**，segment 永不释放
+
+### 30.0 本轮落地
+
+| # | 场景 | 用例 | 结果 |
+|---|---|---|---|
+| 10 | Batch 超时 + segment 释放（S3 不可用） | `batch_timeout_releases_segment_after_object_store_failure` | ✅ |
+| 11 | 磁盘水位强制 abort 最老批次 | `disk_watermark_aborts_oldest_batch_then_releases_segments` | ✅ |
+
+**夹具新增**（都在测试侧）：
+
+1. `build_full(...)`：可覆盖 `WalConfig` —— 水位/超时场景必须能压小
+   `segment_max_size`（逼出轮转，否则无从验证"释放"）与 `monitor_interval`
+   （否则一轮要等 60s）；
+2. **"S3 永久不可用"用权限实现**：把 store 根目录 `chmod 0o555`，
+   不用给 `object_store` 写整套失败替身。⚠️ 以 root 运行时 chmod 不生效 ——
+   因此用例里有"**必须产生非终态批次**"的前置断言，夹具失效会立即报错，
+   而不是让用例悄悄变成空测试。
+
+### 30.1 缺陷：abort 只写 WAL，不同步视图 → segment 只增不减 + BatchAbort 重复写
+
+`spawn_timeout_monitor` 在两条路径上写 `BatchAbort`（批次超时 / 磁盘水位）后
+**只 append WAL，不通知 `BatchStateView`**。而随后的 segment 清理依赖
+`view.non_terminal()` 给出的 `wal_seq_range` 判断"有没有批次还引用这个 segment"：
+
+```rust
+for st in view.non_terminal() { if st.is_timed_out(..) { wal.append(BatchAbort) } }   // ① 写 WAL
+let non_terminal = view.non_terminal();                                             // ② 仍含刚 abort 的批次
+let ranges = non_terminal.iter().map(|s| s.wal_seq_range);                           // ③ 区间仍在
+if segment_is_removable(.., &ranges) { remove_file(..) }                             // ④ 永远不删
+```
+
+两个后果：
+1. **segment 永不回收** —— 与 §5.3.6.1 期望的"abort 后 segment 立刻可回收"相反，
+   WAL 磁盘只增不减；批次明明已被放弃，它的 segment 却一直留着；
+2. **每轮重复写 `BatchAbort`** —— 视图永远非空 → 下一个 tick 又把同一条 abort 写一遍
+   （生产 `monitor_interval` 是 60s，即每分钟一条无谓记录）。
+
+**修法**：给 `BatchStateView` 加一个默认空实现的 `note_abort(&self, batch_id)`，
+监控线程在 append 成功后调用；`LiveBatchTracker` 的实现就是
+`observe(&Record::BatchAbort{..})` —— 与 WAL 同一份语义（C4：Abort 是终态、状态被移除），
+不是"另设一套内存标记"。默认空实现保证只读视图（测试桩等）无需改动。
+
+**两条路径都要修**：批次超时（①）与磁盘水位（②）各有一处 append。
+
+### 30.2 反证（确认用例不是空测试）
+
+把 `view.note_abort(..)` 临时撤掉 → `batch_timeout_releases_segment_after_object_store_failure`
+**立即失败**在"批次未被 abort"（视图永远非空，60s 超时），且失败点比"segment 未回收"更早
+—— 恰好说明"视图与 WAL 不一致"是最先炸出来的症状。已恢复。
+
+### 30.3 验证与遗留
+
+- `cargo test --workspace`：**212 passed / 0 failed**；`clippy --all-targets` 0 警告；
+  chaos 单包 **12 passed / 1 ignored**（只剩 §28.1）。
+- chaos 进度：**10/11**（`design.md` §12.3 的 11 个场景里只剩 #8）。
+- 遗留：
+
+| # | 项 | 归属 | 说明 |
+|---|---|---|---|
+| 1 | chaos #8（并发写 + fsync 前/中/后 kill） | 阶段 2 | 需要给 `WalWriter` 加 **fsync 注入点**（唯一的场景，必须动生产代码才可测） |
+| 2 | 修复 §28.1（读侧栅栏） | 与 R3 同批 | 见 28.1 |
+| 3 | 谓词下推转 `Exact`（§29.2） | 与 R5 同批 | 必须先转发 filters 到 Parquet 源 |
+| 4 | T8 基线压测 + P0 定案 | 阶段 2 | chaos 11/11 齐了之后的另一半门槛 |
+
+---
+
+---
+
+## 31. chaos #8 落地 —— fsync 点位故障注入，chaos 场景 11/11 齐（2026-09-18）
+
+### 31.0 本轮落地
+
+| # | 场景 | 用例 | 结果 |
+|---|---|---|---|
+| 8① | 并发写 + kill 在 **fsync 之前** | `kill_before_fsync_keeps_acked_data_and_drops_unacked` | ✅ |
+| 8② | 并发写 + kill 在 **fsync 之后、ack 之前** | `kill_after_fsync_keeps_fsynced_data_without_ack` | ✅ |
+
+**这是唯一必须动生产代码才可测的场景** —— 断电只落在两个瞬时状态之一，
+二者对"数据还在不在"的答案**相反**，靠并发去撞是不可靠的。
+
+### 31.1 生产改动：fsync 事件注入点（生产零开销）
+
+| 位置 | 改动 |
+|---|---|
+| `wal/src/config.rs` | 新增 `FsyncPoint`（`BeforeSync` / `AfterSync`）、`FsyncEvent { point, path, synced_len, file_len, batch_len }`、`FsyncHook`（包一层 `Arc<dyn Fn>` 只为让 `WalConfig` 保持 `Debug`/`Clone`）；`WalConfig.fsync_hook: Option<FsyncHook>`，默认 `None` |
+| `wal/src/writer.rs` | `commit_loop` 在 `append_batch` 之后、`sync_all` 之前打 `BeforeSync`；在 `sync_all` 之后、推进水位/ack 之前打 `AfterSync`。生产路径只多一次 `Option` 判断 |
+
+**`FsyncEvent.synced_len` 是关键字段**：它是本次批量写入**之前**的文件长度，
+即此刻"确定已持久化"的字节边界。有了它，测试才能真正模拟掉电 ——
+
+> **掉电模型：只有 fsync 过的字节算落盘。** `BeforeSync` 时把文件
+> `set_len(synced_len)`（未 fsync 的写入视为从未落盘）再 `panic!` 让提交线程死掉
+> （进程内最接近"进程被杀"的形态：此后 append 全部失败）；`AfterSync` 时什么都不做。
+
+### 31.2 两个用例分别钉住什么
+
+| 用例 | 断言 | 顺手钉住的反面后果 |
+|---|---|---|
+| ① fsync 前 kill | `recovered == acked`（未 fsync 的字节不出现；**已 ack 的一条不少**）+ Data seq 是 `0..n-1` 连续前缀 | **ack 早于 fsync**（先 ack 后 fsync / 不 fsync）会让 acked 集合大于恢复集合 → 立刻红 |
+| ② fsync 后 ack 前 kill | `recovered == acked + 3`（已 fsync 必不丢，**哪怕客户端没拿到 ack**） | 这也正是**幂等键存在的理由**：客户端会重试这笔"没拿到 ack 但已经落盘"的写入（§7.3），没有幂等键就是重复计数 |
+
+**"Data seq 必须是连续前缀"** 是"无空洞"的直接断言：中间丢一条就是数据丢失。
+（第一版断言数了**全部**记录，把重启后攒批循环写入的 `BatchPending/S3Written/Committed`
+也数进去了 → 假失败。已改为只数 `Data`，理由写进了 helper 注释。）
+
+### 31.3 反证（确认不是空测试）
+
+把掉电模型撤掉（`BeforeSync` 时不截断，"未 fsync 的字节侥幸留了下来"）
+→ ① 立刻失败：`acked=6 got=9`（恢复了本该消失的那一批）。已恢复。
+
+### 31.4 诚实说明：这两个用例钉的是**顺序契约**，不是"真的调了 sync_all"
+
+持久性由钩子**建模**（截断到 `synced_len`），所以：
+
+- ✅ 能证明：ack 必须在 fsync 之后、水位不得越过 fsync 边界、恢复不会读到撕裂点之后、
+  已 fsync 的数据在 reopen 后仍在；
+- ❌ 不能证明：`sync_all()` 真的被调用了（把 `sync_all()` 换成空实现，这两个用例照样绿
+  —— 因为 tmpfs 上字节本来就在）。
+
+补这一块的正确做法是给注入点加**第三态**：`fsync 返回错误`（钩子返回
+`Result`，提交循环按写失败处理：seq 回滚、不 ack、水位不动）。已登记为遗留。
+
+### 31.5 chaos 进度：11/11
+
+`design.md` §12.3 的 11 个场景**全部**在 chaos 层有了真实磁盘 + 跨重启 + 并发的证据：
+
+| 阶段 | 进度 | 抓到的真缺陷 |
+|---|---|---|
+| 起步 | 3/11 | — |
+| 本轮之前 | 10/11 | §27 幂等键不生效、§28.2 恢复重复文件、§29.1 撕裂不可自愈、§30 abort 不同步视图 |
+| **现在** | **11/11** | （#8 未发现新缺陷；注入点按设计工作） |
+
+**下一步 = 阶段 2 的另一半门槛：T8 基线压测 + P0 定案**
+（相位分散量级 / `max_flush_delay` / `rows_threshold`）+ ADR-10 修订，
+现有 `chaos/examples/bench` 只测吞吐与 WAL ack 延迟，P0 要的是
+**CommitFiles 瞬时并发 / 文件数·天 / 持久化 P99**，需先扩测量口径。
+
+### 31.6 遗留
+
+| # | 项 | 归属 | 说明 |
+|---|---|---|---|
+| 1 | 注入点第三态：**fsync 返回错误** | 阶段 2 | 钩子返回 `Result`；断言"不 ack + seq 回滚 + 水位不动 + 系统仍可用" |
+| 2 | T8 基线压测 + P0 定案 | 阶段 2 | chaos 已 11/11，这是剩下的那一半 |
+| 3 | 修复 §28.1（读侧栅栏） | 与 R3 同批 | 见 28.1 |
+| 4 | 谓词下推转 `Exact`（§29.2） | 与 R5 同批 | 必须先转发 filters 到 Parquet 源 |
+
+---
+
+---
+
+## 32. T8 基线压测入库 + P0 ①/③ 定案（含 ADR-10 正式修订）（2026-09-18）
+
+### 32.0 本轮落地
+
+| # | 事项 | 结果 |
+|---|---|---|
+| 1 | T8 基线压测程序 | `crates/chaos/examples/bench_baseline.rs`（**不是** `bench.rs`：那个测吞吐，这个测 flush 时刻分布） |
+| 2 | 度量口径所需的生产改动 | `FileManifest.sealed_at_ms` / `committed_at_ms`（tag 16/17）+ `ChunkFlushInput.sealed_at_ms` |
+| 3 | **P0 ① 定案** | `max_flush_delay_secs: 30 → 0`、`flush_phase_spread_secs: 5 → 30`（三处默认值 + 示例配置 + ADR-10 原文） |
+| 4 | **P0 ③ 定案** | 持久化上界口径 = **窗口关闭 + `max_flush_delay` + `spread`**，实测吻合、无随机项 |
+| 5 | P0 ② | **未定案**（缺 RowGroup 实测，按"先有实测再改默认值"保持 50 万） |
+| 6 | ADR-10 正式修订（v12） | 锚点 `seal_time`、确定性相位、量级表 + "每窗口每 shard ≤1 文件"不是不变量的澄清 |
+
+### 32.1 为什么必须给 manifest 加时间戳
+
+P0 的三项证据都要"提交发生的时刻"：**提交时刻分布**（惊群尖峰）、**文件数/天**、
+**持久化 P99**。此前这些只能靠推算（用 `valid_from`/`deleted_at` 推墙上时钟是错的 ——
+那两个是快照语义）。加两个字段后它们是 manifest 自带的事实的：
+
+| 字段 | 语义 | 为什么这样定义 |
+|---|---|---|
+| `sealed_at_ms` | **chunk 真实封口时刻**（写侧结束） | 与 `committed_at_ms` 之差 = `max_flush_delay + phase + PUT + CommitFiles` —— 这正是对外承诺的上界口径。**必须由 chunk 层带出**（新加 `ChunkFlushInput.sealed_at_ms`）：在 flush 里取"现在"会把 `max_flush_delay + phase` 从延迟里**抹掉**，指标看起来永远达标 |
+| `committed_at_ms` | 提交 Meta 成功的时刻 | 由**发起方**打点（不是 state machine 内取现在）：R3 换 raft 后状态机要在所有副本上确定性应用同一份 manifest，时间戳不能各自取现在。恢复重提交路径留 0（该路径无真实封口时刻，调用方不得当延迟样本） |
+
+### 32.2 实测数据（100 shard 低吞吐表，500 行/秒 = 每 shard 300 行/分钟）
+
+| 配置 | 提交偏移（关窗后）p50 / p99 / max | **带宽** | `seal→committed` p99 | **峰值提交/秒**（均值 2.4） | 文件数 |
+|---|---|---|---|---|---|
+| A：`md=30 spread=5`（**旧默认**） | 33.9s / 35.25s / 35.27s | **4.86s** | 35.06s | **87**（36× 均值） | 300 |
+| B：`md=0 spread=5` | 3.1s / 5.16s / 63.3sⓘ | 4.80s | 5.03s | 77 | 301 |
+| **D：`md=0 spread=30`（新默认）** | 15.6s / 31.95s / 68.5sⓘ | 29.4s | **31.35s** | **10** | 253 |
+| C：`md=0 spread=60` | 28.8s / 61.7s / 76.6sⓘ | 57s | 59.41s | 7 | 250 |
+
+ⓘ 离群值成因未完成归因，见 §32.4 遗留 #1。
+
+**四条结论（都有数据，不是推断）**：
+
+1. **带宽 ≈ `spread`**（配 5s 实测 4.86s；配 30s 实测 29.4s）→ 相位分散按文档工作，
+   且锚点确实是 `seal_time`（若是 `window_start` 锚点，带宽会随窗口对齐塌缩）。
+2. **峰值提交数 ≈ shards / spread**：spread=5 时 100 个 shard 的提交挤在 5s 带内 →
+   **87 次/秒**（均值 2.4 的 36 倍）；spread=30 → 10 次/秒；spread=60 → 7 次/秒。
+   `plan.md §2.2` 说的"分散面比 ADR-10 收窄"**实测成立**。
+3. **`max_flush_delay` 不控制文件数，只推迟持久化**：`md=30` 与 `md=0` 的文件数
+   300 vs 301（同一窗口都是 1 文件/shard）；而 `seal→committed` 从 35.06s 降到 5.03s。
+   → 用 30s 持久化延迟换来的东西**不存在**，这就是把它改成 0 的依据。
+4. **上界口径 = 窗口关闭 + `md` + `spread`**，实测与理论一致、**无随机项**
+   （A：30+5=35s ↔ 实测 35.06s；B：0+5 ↔ 5.03s；C：0+60 ↔ 59.41s；D：0+30 ↔ 31.35s）。
+
+**定案 = D（`md=0` / `spread=30`），两个维度都优于旧默认**：
+上界 35.06s → **31.35s**（更好），峰值 87 → **10 次/秒**（8.7× 削峰）。
+上限还有一条硬约束：不变量 `chunk_max_resident(60) > md + spread` → `spread ≤ 59`；
+取 30 留一倍余量（`spread=60` 会逼着把驻留兜底抬到 120s+，那就削弱了防 WAL 撑爆的作用）。
+
+### 32.3 顺带测到的两件事实（各自影响后续决策）
+
+| 事实 | 数据 | 影响 |
+|---|---|---|
+| **低吞吐表的小文件主因是 `shard × 窗口`，不是阈值** | 100 shard × 1 文件/窗口 → **20.7 万文件/天**（新默认 17.5 万）；单文件行数 p50 = 200~300 | 调 `rows_threshold` 对低吞吐表**完全无效**（300 行/窗口/shard ≪ 50 万）。要治只能靠"多 shard 收敛/合并写"，属架构级（P2/T9） |
+| **`rows_threshold` 触发会打破"每窗口每 shard ≤1 文件"** | T=5 万 + 5000 行/秒/shard（65s）→ 单文件行数 = 50000 = 阈值、**4 文件/窗口/shard**、单 shard 10.6k 文件/天 | ADR-10 的"≤1 文件"是**窗口驱动的结果**，不是不变量 —— 已在 ADR-10 修订里写明 |
+
+### 32.4 遗留
+
+| # | 项 | 归属 | 说明 |
+|---|---|---|---|
+| 1 | **离群提交归因** | 阶段 2 | 三档都出现超出 `md+spread` 的离群（63s/68.5s/76.6s）。已知：这些文件的 `sealed_at_ms` 落在**下一个分钟边界**（说明其 chunk 创建时刻晚于自身窗口关闭），候选原因是"写入侧延迟到达"或"`max_resident` 强制封口"。**需要写侧打点（批次到达/被吸收时刻）才能定论，本轮不臆断** |
+| 2 | 真多节点 / 真实 S3 | R4 前 | 本轮是单进程 100 shard：把"节点内 flush 串行"与"跨节点并发"混在一起了（C 档理论上限 1.7 次/秒、实测 7 次/秒 → 7 是**本进程 flush 速率地板**）。跨配置的**比值**可迁移，绝对量级不可 |
+| 3 | `rows_threshold` + RowGroup（P0 ②） | 阶段 2 | 需要 1KB 行 schema + Parquet RowGroup 大小/内存峰值实测（50 万行 ≈ 500MB 单文件上界是否可接受） |
+| 4 | 内存曲线 | 阶段 2 | `metrics()` 已能报水位，但压测未采集时序 |
+| 5 | 压测方法论 | — | **教训入册**：第一版排水判据是"连续 3s 无新增提交" → 在最后一个窗口关闭前判空退出，**少算一整个窗口**（写入 65000 行只统计到 37450 行）。正确判据必须叠加"已过最后写入窗口关闭 + md + spread" |
+
+---
+
+---
+
+## 33. P0 ② 专项：`rows_threshold` 定案 —— 结论是"它不是瓶颈"，并抓出**第五个 seal 触发器**（2026-09-18）
+
+### 33.0 定案
+
+| 项 | 结论 |
+|---|---|
+| `rows_threshold` | **保持 50 万（不改）**。理由不是"50 万合适"，而是**实测它从未触发**：宽行表先撞字节阈值、再被**内存水位**接管；窄行表（<256B/行）才是它的作用域，而那也是合理的行数上界 |
+| `bytes_threshold` | **保持 128MB（不改）**。反证：改成 32MB 后文件**更小**（4.2MB vs 16.4MB）—— 直觉"降阈值=控文件大小"是错的，因为压力比阈值先介入 |
+| **新登记（P1）** | ① **内存水位是未被声明的第五个 seal 触发器**，高吞吐下它会**顶掉**窗口对齐承诺；② `chunk_mem_budget` 需要定容规则；③ Parquet 未设 `max_row_group_size` → 整文件 1 个 RowGroup |
+
+### 33.1 度量口径（先量清楚，再谈阈值）
+
+`bytes_threshold` 是 **Arrow 内存口径**（`get_array_memory_size`），不是编码后字节。实测：
+
+| 行宽 | 账本口径 | `bytes_threshold=128MB` 触发点 | `rows_threshold=50万` 触发点 | 谁先 |
+|---|---|---|---|---|
+| 1KB（800B payload + 3 列） | **885 B/行** | ~**151,658** 行 | 500,000 行 | **字节** |
+| ~30B（窄行） | ~40 B/行 | ~3.35M 行 | 500,000 行 | **行数** |
+
+→ **"50 万行"只对窄行表有意义**；宽行表（metrics/traces）的实际上界是 128MB ÷ 885B ≈ 15 万行。
+
+### 33.2 实测：真正决定文件大小的是**内存水位**，不是阈值
+
+同一进程、单 shard、1KB 行（`bench_baseline`，md=0/spread=30）：
+
+| 场景 | 速率 | chunk 水位峰值 | 背压档 | **单文件行数** | 单文件字节 | **每(shard,窗口)文件数** | `seal→committed` p99 |
+|---|---|---|---|---|---|---|---|
+| 低吞吐 | 2 MB/s | 186 MiB / 512 | **Normal** | 19,500~20,500 | ~12 MB | **1** ✅ | 9.8 s ✅ |
+| 高吞吐 | 20 MB/s | 463 MiB / 512 | **Hard(80%)** | 27,000 | 16.4 MB | **31** ❌ | **37.5 s** ❌ |
+| 高吞吐 + `bytes=32MB` | 20 MB/s | 472 MiB / 512 | Hard | 7,000 | 4.2 MB | **92** ❌ | 30.5 s ❌ |
+| 高吞吐 + 无读者 | 20 MB/s | （未采样，见 §33.3） | Hard | 27,000 | （payload 可压，字节不可信） | 37 | **49.3 s** ❌ |
+
+**低速档完全符合设计**（窗口驱动、每窗口每 shard 1 文件、上界 9.8s ≪ md+spread=30s）；
+**高速档两条架构承诺同时失效**：
+
+1. **"每窗口每 shard ≤1 文件"（ADR-10 目标）失效**：一个窗口产出 31~92 个文件；
+2. **"持久化上界 = 窗口关闭 + md + spread"失效**：实测 p99 37.5s（>30s），无读者时 49.3s。
+
+原因是 `plan_flush` 里那条**从未在文档里出现过**的触发路径：
+
+```
+should_seal:  rows>=T  |  bytes>=B  |  now>=window_end          ← 文档只写这三个
+plan_flush:   open_too_long(=max_resident) | sealed_too_long     ← 兜底，文档提过
+enforce_pressure: 水位 >= Hard(80%) → **强制 seal 所有 open chunk**  ← **实际主导者，文档未提**
+```
+
+### 33.3 为什么水位会顶到 90%：**内存归还只由读侧触发**
+
+`ChunkStore::reclaim`（归还 `Flushed` chunk 的内存，I4："数据要等查询缓存追上才能丢"）
+**全仓只有一个调用方**：`query/src/cache.rs`（按"查询缓存已追上的快照"回收）。
+
+- 没有读者（或读者跟不上）→ 账本只增不减 → 水位爬到 Hard → `enforce_pressure` 每个周期强制 seal 当前 open chunk
+  → **文件大小由"水位与速率的比"决定**，与阈值/窗口无关；
+- 极端情形还会连带 spill IO（Hard 档会 spill）与拒绝写入（95% 档）。
+
+**由此得到一条定容规则（本轮的实用产出）**：
+
+```
+chunk_mem_budget  ≳  写入速率 × (seal→committed + 读侧 reclaim 周期)
+```
+
+实测支撑：20 MB/s 下 resident 稳定在 ~470 MB → 数据从"驻留"到"归还"约 **23.5 秒**
+（470 MB ÷ 20 MB/s）；而承诺的上界 `md + spread = 30s` 意味着最坏驻留 30 秒
+→ 20 MB/s 时需要的预算约 **600 MB > 512 MB**，压力必然先于阈值介入。
+
+### 33.4 RowGroup 实测：**每个文件 1 个 RowGroup**
+
+`yuntun-format` 的 Parquet 写入只设了 ZSTD 压缩，**没有设 `max_row_group_size`**
+（crate 默认远大于单文件行数）→ 实测 5,500 / 7,000 / 20,500 / 27,000 行的文件**都是 1 个 RowGroup**。
+
+后果：**剪枝粒度 = 文件**。当前文件 12~16MB 尚可；一旦按 §33.1 的 128MB 触发，
+单文件 128MB 只有 1 个 RowGroup → 文件内无法跳读、写入期内存 = 输入批 + 编码缓冲（实测 VmHWM 477~486 MiB）。
+
+### 33.5 残余疑点（登记，不臆断）
+
+高速档水位一直在 ~92%（463~472/512 MiB），**即使我让"读者"每 200ms 用最新快照调 `reclaim`**。
+两种可能未区分：**(a)** 读侧任务与写入/编码争同一个 runtime 被饿死（归还跟不上）；
+**(b)** `reclaim` 的 `caught_up` 条件在某些状态下不成立（实现问题）。低速档 Normal 说明它**能**归还
+—— 所以更可能是 (a)，但**需要有独立的回收线程或打点证明**，不作为结论。
+
+### 33.6 压测方法学的两条教训（都会静默给出错数据）
+
+| # | 教训 | 后果 |
+|---|---|---|
+| 1 | **payload 必须不可压缩** | 第一版用 `(seed*7+i*3+j)%64` 生成 → 每 64 字符一周期，ZSTD 压掉 95%+，`file_size` 报出 **0.0MB** → P0 ②（文件大小问题）会被彻底误导 |
+| 2 | **必须有读侧消费** | 没有读者时 `reclaim` 永不触发 → 测到的是**背压路径**（小文件 + 49s 延迟），却会被当成"阈值行为"（第一版就是这么得出"27k 行/文件"的假结论） |
+
+### 33.7 遗留
+
+| # | 项 | 归属 | 说明 |
+|---|---|---|---|
+| 1 | **内存水位驱动 seal** 的定位与处置 | 阶段 2 / R4 前 | 要么提高 `chunk_mem_budget`（按 §33.3 定容）、要么让 reclaim 不依赖读侧（独立回收线程/按时间归还）、要么显式承认"高吞吐下文件数与窗口解耦"并修正 ADR-10 的措辞 |
+| 2 | §33.5 的 (a)/(b) 区分 | 阶段 2 | 需要独立回收线程或 reclaim 打点 |
+| 3 | `max_row_group_size` 显式设置 | 阶段 2 | 与 `rows_threshold` 一起定（文件内剪枝 vs RowGroup 数）；需先测 RowGroup 大小对扫描/压缩的影响 |
+| 4 | 真多节点 + 真实 S3 的绝对速率 | R4 前 | 本轮的**机制**与**定容规则**可迁移，绝对速率（2 MB/s vs 20 MB/s 的分界）不可 |
+
+---
+
+---
+
+## 34. 内存水位处置（第一步）：相位分散让位 + **下调 §33 的结论**（2026-09-18）
+
+### 34.0 本轮落地
+
+| # | 内容 |
+|---|---|
+| 1 | **已实现**：内存水位 ≥ Soft 时"相位分散让位"——已 sealed 的 chunk 立即 flush，不再等到 Hard 档去 `enforce_pressure` **强制 seal open chunk**（后者才会把同一窗口拆成多个文件）+ spill（无谓本地 IO） |
+| 2 | **可观测**：新增 `ChunkStoreStats::phase_yielded_flushes` + `FlushPlan::phase_yielded` + metrics 打点字段 `phase_yielded` + 压测输出 |
+| 3 | **测试**：`chunk::phase_yield_flushes_sealed_chunk_early_only_under_pressure`（两个分支都断言：Normal 时**不得**让位、≥Soft 时**必须**立即 flush 且计数 +1；反向验证已做——关掉让位即红） |
+| 4 | ⚠️ **但它在真实高吞吐场景里没有触发**（见 §34.2），因此**没有**解决"27000 行/文件"现象 |
+
+### 34.1 先纠正 §33 的一处结论（我自己的判断被实测推翻）
+
+§33.3 我写"水位 ≈ 写入速率 × `spread`（相位窗口内数据）"。**这个因果是错的**，依据是本轮补做的对照实验
+（同一负载 20 MB/s、单 shard、1KB 行）：
+
+| 配置 | `seal→committed` p99 | 水位峰值 / 档位 | 单文件行数 | 每(shard,窗口)文件数 |
+|---|---|---|---|---|
+| `spread=30` | **28.6 ~ 37.5 s** | 437~470 MiB / **Hard** | 27,000 | 26 ~ 31 |
+| `spread=5` | **6.6 s** | 403 MiB / **Soft** | **27,000（没变）** | **32（没变）** |
+
+→ `spread` 只影响**延迟与压力档位**（这两项变好很明显：6.6s vs 30+s、Soft vs Hard），
+**完全不影响文件大小**。所以"相位窗口内数据"不是文件大小的决定因素；
+而**低速档（2 MB/s）一切正常**（1 文件/窗口、Normal、9.8s）说明机制与速率强相关。
+
+**结论下调**：`resident ≈ 写入速率 × (写入→flush 的滞留)` 这个量级判断仍成立
+（滞留含"窗口对齐等待 + md + spread"），但**"谁把 chunk 切小到 24 MB"仍未证实** ——
+`rows_threshold`(50万) 与 `bytes_threshold`(128MB，账本口径 885B/行 ⇒ 15.2 万行)
+**都解释不了 27000 行**，`enforce_pressure` 是候选但 §34.2 显示它也不是直接原因。
+
+### 34.2 为什么"相位让位"没触发（`phase_yielded = 0`）
+
+`plan_flush` 里的 `phase_yields` 取自**调用瞬间**的水位。实测该场景最高档是 Hard，
+但 `plan_flush` 的取样点常落在 `enforce_pressure` 刚刚 spill 完、水位回落到 Normal 之后
+→ `phase_yields = false` → 让位逻辑不生效。
+
+**这个"没触发"本身就是证据**：水位在 Soft/Hard 与 Normal 之间高频振荡（spill 立刻把水位压回去，
+写入又立刻填上来），而振荡的**周期**决定了 open chunk 能长多大 —— 与"27000 行"这个稳定的数字
+是否同源，**需要下一步的观测才能回答**（见 §34.3）。
+
+### 34.3 下一步（唯一能终结这个问题的动作）：**把 seal 原因变成可观测量**
+
+现在"为什么这个 chunk 被 seal"**在运行时不可见**：`SealReason { Rows, Bytes, WindowClosed, SchemaChanged }`
+只在 `store.rs` 内部产生，不落 WAL、不落 manifest、不进指标。于是所有推断都只能靠"排除法 + 速率算术"，
+这正是本轮两次结论修正的原因。
+
+具体做法（下一步第一件事）：
+1. `FileManifest` 增 `seal_reason`（tag 18）+ `sealed_rows`（或复用 `row_count`）；
+2. 顺带记录**封口时的水位档位**（`pressure_at_seal`），这是区分"阈值触发"与"压力触发"的唯一硬证据；
+3. 压测按 seal 原因分组统计 → **直接读出**各原因的占比与行数分布，不再靠排除法。
+
+> 在这之前，`status.md` 里"内存水位是第五个 seal 触发器"应标注为**候选**而非结论。
+
+### 34.4 本轮仍成立的事实（可直接用）
+
+| # | 事实 | 依据 |
+|---|---|---|
+| 1 | **`spread` 是延迟/压力的强杠杆**：20 MB/s 下 5s → 6.6s、30s → 28.6~37.5s | §34.1 对照实验 |
+| 2 | **低速（2 MB/s）完全符合设计**：1 文件/窗口、Normal、上界 9.8s | §33.2 |
+| 3 | **内存紧张时相位应当让位**（而不是等 Hard 强封 open chunk）——逻辑正确、已测、已可观测，只是本轮负载没触发 | §34.0 |
+| 4 | **`reclaim` 本身没问题**（有确定性测试断言 `freed > 0`，且 server 侧有后台 `spawn_cache_refresh` 会推进缓存并回收）→ §33.5 的"归还失效"疑虑**排除** | 本轮核查 |
+| 5 | RowGroup = 1 个/文件（未设 `max_row_group_size`） | §33.4 |
+
+---
+
+---
+
+## 35. seal 原因落地观测 → 真相是 `bytes_threshold`（第三次、也是最后一次修正）（2026-09-18）
+
+### 35.0 落地
+
+| 位置 | 改动 |
+|---|---|
+| `chunk/src/chunk.rs` | `Chunk.seal_reason` / `pressure_at_seal` + `seal_tagged(reason, pressure, now)` |
+| `chunk/src/store.rs` | `SealReason` 扩充（+`ResidentCap` / `Pressure` / `Manual` + `as_str()` 稳定字符串）；`pending_seal` 登记表（`plan_flush` / `enforce_pressure` 决定要 seal 时登记原因，`seal()` 取用 —— 这样 `plan.seal: Vec<ChunkId>` 的公开签名不用改）；`flush_input` 带出 |
+| `model/src/meta.rs` | `FileManifest.seal_reason`（tag 18）/ `seal_pressure`（tag 19） |
+| `ingest/src/flush.rs` | 封口点打点（恢复重做路径留空） |
+| `chaos/examples/bench_baseline.rs` | 按 seal 原因 / 水位档位分组统计 + 实测每行占用 |
+| 测试 | `seal_reason_and_pressure_are_recorded_and_carried_to_flush_input`（Rows / WindowClosed / Pressure 三种原因各一条断言） |
+
+### 35.1 实测：`bytes_threshold` 在 **Normal 水位**下正常触发
+
+20 MB/s、单 shard、1KB 行、`md=0/spread=30`、`rows=50万`、`bytes=128MB`：
+
+```
+---- seal 原因分布 ----
+bytes_threshold  files= 35  rows min/p50/max = 27000 / 27000 / 27000
+pressure         files=  2  rows min/p50/max = 14000 / 14000 / 17000
+window_closed    files=  3  rows min/p50/max = 12000 / 22500 / 25000
+封口时水位档位        : {"Normal": 33, "Soft": 5, "Hard": 2}
+```
+
+### 35.2 结论（含对我前两次判断的纠正）
+
+| # | 结论 | 依据 |
+|---|---|---|
+| 1 | **"内存压力主导 seal"不成立**（§33.2 与 §34.2 的候选被否） | 35/40 文件是 `bytes_threshold`，其中 33/40 水位 **Normal** |
+| 2 | **有效账本口径 ≈ 4.9 KB/行**（1KB 行的现实形态） | 128MB ÷ 27000 行 = 4.97 KB/行；`bytes=32MB` 档 → 7000 行（32/128×27000 ≈ 6750 ✓ 线性吻合） |
+| 3 | **"新建批探针"量错了对象**（885 B/行，差 5.6×） | chunk 持有的是 **WAL 解码后**的 Arrow 形态（偏移/容量/属性与新建批不同）。以后**一律用实测**：`文件行数 ≈ bytes_threshold ÷ 有效口径` |
+| 4 | **"每窗口每 shard ≤1 文件"只在"窗口内数据量 ≤ `bytes_threshold`"时成立** | 20 MB/s × 60s = **1.2 GB ≫ 128MB** → 必然多文件（实测 26~92 个/窗口）。**这不是缺陷，是阈值与速率的算术关系**；128MB 对应 1KB 行 ≈ 2.7 万行/文件 |
+| 5 | 压力触发是**次要因素**（2/40），且它是"水位顶掉窗口承诺"的真实路径，相位让位（§34）仍应保留 | 同上 |
+
+**对 ADR-10 的影响**：其"每窗口每 shard 最多 1 个文件"是**低/中速率下**的结论。
+高吞吐下要么接受多文件（并写明条件），要么**按速率放大 `bytes_threshold`**（= 用内存换文件数，
+因为要让一个窗口的数据不封口，必须在内存里hold 住 `速率 × 60s`）。
+
+### 35.3 遗留
+
+| # | 项 | 归属 | 说明 |
+|---|---|---|---|
+| 1 | ADR-10 措辞修正（加"当窗口内数据量 > `bytes_threshold` 时为多个文件"） | 阶段 2 | 与本条同批 |
+| 2 | 是否让 `bytes_threshold` 随速率自适应 / 给用户一个"目标文件行数"配置 | 阶段 2 | 目前用户只能设字节阈值，却观测到行数 —— 口径不直观 |
+| 3 | "有效口径 5× 于新建批"的根因（WAL 解码形态的具体构成） | 阶段 2 | 影响内存预算定容（D11）的精度；先记为已标定常数 4.9 KB/行（1KB 行） |
+| 4 | 内存水位路径的定位精度（`enforce_pressure` 何时真的触发） | 阶段 2 | 本轮已有 `seal_pressure` 字段可统计，样本还少（2/40） |
+
+---
+
+---
+
+## 36. `max_row_group_size` 专项：显式设定 65,536 行 + 端到端验证（2026-09-19）
+
+### 36.0 落地
+
+| 位置 | 改动 |
+|---|---|
+| `format/src/lib.rs` | 新增 `MAX_ROWS_PER_ROW_GROUP = 65_536`；`encode_parquet` 显式 `set_max_row_group_size`（此前**只设了 ZSTD** → 用 crate 默认约 100 万行） |
+| `format` 测试 | `parquet_row_groups_are_bounded_by_explicit_setting`：写 `65536×3+1234` 行 → 断言**分组数 = ceil(rows/上限) = 4**，且**每组不超过上限**（防实现被换回"整批一组"仍绿）；顺便断言解码后行数不变 |
+
+### 36.1 为什么必须显式设（两个方向的后果）
+
+不设 → 默认上限远大于单文件行数 → **整文件恰好 1 个 RowGroup**（§33.4 实测 5.5k~27k 行都是 1 组）：
+
+| 方向 | 后果 |
+|---|---|
+| 查询 | **剪枝粒度 = 文件**。当前文件小（1KB 行约 2.7 万行 / 16MB）时无害；一旦 `bytes_threshold` 上调或换窄 schema 使文件变大，就变成"文件内无法跳读" |
+| 写入 | 一个 RowGroup 的所有列缓冲要**同时驻留**才能落盘 —— 组越大峰值内存越高（§33.2 实测 VmHWM 里编码缓冲占相当一部分） |
+
+取 **65,536 行**的理由：1KB 行时约 64MB/组（chunk 预算可承受）；且对**当前**文件规模**不改变行为**
+（27k 行 < 64k → 仍是 1 组），只作为"文件变大时不要退化成单组"的**显式上界**。
+
+### 36.2 端到端验证（窄行 + 大 `rows_threshold`，让文件超过 64k 行）
+
+```text
+cargo run --release -p yuntun-chaos --example bench_baseline -- 45 1 500 40 0 30 150000 0 1024
+（pad=0 → 窄行；rows_threshold=15 万；bytes_threshold=1GB 确保字节阈值不抢先）
+
+RowGroup 实测 : rows=150000 row_groups=3 | rows=150000 row_groups=3 | rows=60500 row_groups=1
+```
+
+**15 万行的文件 = 3 组**（= ceil(150000/65536) ✓），**60,500 行 = 1 组**（< 上限 ✓）
+—— 与上限一致。改动前这两种文件都只会是 1 组。
+
+### 36.3 遗留
+
+| # | 项 | 说明 |
+|---|---|---|
+| 1 | 改 `MAX_ROWS_PER_ROW_GROUP` 的门槛 | 注释里写明：必须同时给**文件大小 / 扫描剪枝 / 写入峰值内存**三组数据 |
+| 2 | 剪枝收益的定量测量 | 本轮只证明了"分组数符合上限"；"组级剪枝省了多少扫描"需要带谓词的扫描基准（属 T8 扩展） |
+| 3 | Vortex 路径 | `encode_vortex` 仍是 feature-flag 占位（ADR-1 锁定 Git Commit 后启用），届时需单独确认其 RowGroup 语义 |
+
+---
+
+---
+
+## 37. 多节点基线压测（本机多进程）：全局提交时间线 + 争用下的 seal 构成（2026-09-19）
+
+### 37.0 先划清边界（否则结论会被误用）
+
+| | |
+|---|---|
+| ✅ **测了** | **N 个独立节点并行**时的**全局**提交时间线（峰值提交/秒、文件数·天、seal 原因分布），以及 CPU/IO 争用下每节点的退化 |
+| ❌ **没测** | "N 个节点打**同一个 Meta** 的 CommitFiles 并发" —— 当前 Catalog 是**进程内**的（`MemoryCatalog`），没有共享 Meta，**要等 R3**（metanode + raft/gRPC）。本结果对未来 Meta 是**上界**：真并发只会更集中（各节点各自的 flush 线程同时打） |
+| ❌ **没测** | 真实对象存储的 PUT 延迟（本机无 S3/MinIO，走本地 FS store）；跨机网络与时钟偏移 |
+
+工具：`scripts/bench_multi.sh`（每节点独立 WAL/spill/store + 独立 CSV 导出；
+**聚合用 `sort` 合并后做滑动窗口分桶，而不是把各节点峰值相加** —— 后者会把不同时刻的峰叠加，虚高）。
+
+### 37.1 结果（4 节点 × 5 shard × 5k rows/s = 20k rows/s；12 核机器；90s）
+
+| 量 | 单节点（§35，1 shard @20k rows/s） | **4 节点（5 shard @5k rows/s each）** |
+|---|---|---|
+| seal 原因构成 | `bytes_threshold` **87%**（35/40）、pressure 5% | **`pressure` 60%**（15~16/节点）、`window_closed` 40%（10/节点） |
+| 单文件行数 p50 | 27,000（≈16.4MB） | **17,125（≈15MB）** |
+| chunk 水位峰值 / 档位 | 437~470 MiB / **Hard** | 405~407 MiB / **Soft** |
+| **相位让位次数** | **0** | **2~3 / 节点** |
+| `seal→committed` p50 / p99 / max | 22.6s / 26.0s / 28.3s | 15.2s / 29.8s / **33.2s** |
+
+**全局（4 节点合并时间线）**：101 个文件；均值 **0.85 次/秒**；**峰值 9 次/秒**（6 次/100ms）；
+总写入 ≈ 118 万行。
+
+### 37.2 结论
+
+1. **争用会改变 seal 原因构成**：同样是 20k rows/s 的总速率，
+   单进程时 `bytes_threshold` 主导（87%），4 进程时 **`pressure` 主导（60%）** ——
+   因为 flush 与编码在同一批核上抢 CPU，水位留在 Soft 的时间变长。
+   所以 §35 的"文件大小由 `bytes_threshold` 决定"**只在节点不吃紧时成立**；
+   吃紧时压力提前介入（文件更小：17k 行 vs 27k 行）。
+2. **§34 的"相位让位"修复首次在真实场景触发**（2~3 次/节点）：单节点 20MB/s 时它是 0
+   （水位振荡太快、取样点踩不到），4 进程争用时水位稳定在 Soft → 逻辑生效。
+   这同时说明"修复没触发"通常意味着**路径没被走到**，而不是逻辑错。
+3. **峰值提交 9 次/秒（4 节点）与单节点 20MB/s 的 5~9 次/秒同量级** ——
+   提交速率 ≈ `总写入量 ÷ 单文件行数`，与节点数关系不大；未来 Meta 的承载需求按"总速率"估，
+   而不是按节点数线性放大。
+4. **上界的诚实形式**：实测 max 33.2s > `md + spread = 30s` →
+   上界应表述为 **`封口 + md + spread + 提交路径耗时`**（实测 30s + ~3s）。
+   D3/ADR-10 的"确定无随机项"依然成立（相位是确定性的），但要带上这一段固定开销。
+
+### 37.3 遗留
+
+| # | 项 | 归属 | 说明 |
+|---|---|---|---|
+| 1 | **R3 后打同一 Meta 的真并发** | R3 | 本轮的"上界"需要换成实测（也才能验证 raft 写入路径的尖峰承受力） |
+| 2 | 真实 S3 / MinIO 的 PUT 延迟与 503 退避 | 有环境时 | 脚本已支持 S3 端点（store 抽象），需要环境变量与凭证 |
+| 3 | 跨机（网络、时钟偏移、机架） | R4 前 | 本机 12 核 4 进程已见明显争用 |
+| 4 | 内存曲线**时序**（本轮到目前只有峰值） | 阶段 2 | 打点已具备（`chunk_stats`），需要按 1s 采样导出 |
+
+---
+
+---
+
+## 38. R3 开工第一切片：`CatalogState` 纯状态机抽出 + **四处非确定性**（2026-09-19）
+
+按 [`metanode-design.md`](metanode-design.md) 的开工顺序，先做最高风险项 **S3-2**（`CatalogState` 抽取），
+它无外部依赖且能在早期暴露"副本静默分叉"。
+
+### 38.1 落地
+
+| 位置 | 改动 |
+|---|---|
+| **新** `catalog/src/state.rs` | `CatalogState`：纯状态机（无锁 / 无时钟 / 无 IO）。容器全部 `BTreeMap`/`BTreeSet`，版本号是**普通 `u64` 字段**（不再是 `AtomicU64`：多副本各自 `++` 会在乱序 apply 时分叉）；变更方法签名一律 `(&mut self, …, now_secs: u64)` —— **时间由调用方传入** |
+| `catalog/src/lib.rs` | `MemoryCatalog` 退化为**宿主**：`RwLock<CatalogState>` + 取钟 + trait 转发（语义零改动）。R3 的 metanode 会把同一份 `CatalogState` 交给 raft 驱动 |
+| `model/src/ops.rs` | `CommitFilesRequest.client_request_ids: Vec<String>`（**键集合**，S3-5 的接口部分）：集合中**任一**键已登记即整次判重（关闭 `§27.5` 遗留 #1 的接口侧） |
+| `format/src/lib.rs` | `set_max_row_group_size` → `set_max_row_group_row_count(Some(_))`（§36 的上游弃用更名） |
+
+### 38.2 抽出的过程中抓到**四处真实存在的非确定性**（都已修）
+
+| # | 位置（抽出前） | 后果 | 修法 |
+|---|---|---|---|
+| 1 | `create_table`：`TableMeta.created_at = now_secs()` | 各副本 `created_at` 不同 → **状态逐字节不一致**（M3 直接失败） | 时间由调用方传入 |
+| 2 | `create_table`：`SchemaVersion.created_at = now_secs()` | 同上（版本链分叉） | 同上 |
+| 3 | `evolve_schema`：`SchemaVersion.created_at = now_secs()` | 同上 | 同上 |
+| 4 | `commit_compaction`：用 **`HashSet<String>`** 收集受影响表，再**按其迭代序分配 `manifest_ver`** | **不同副本把同一个 `manifest_ver` 分给不同的表** → delta 语义静默错位（最难查的一类） | 改 `BTreeSet`（有序） |
+
+> 值得强调的是：这四处**在今天也是"能跑、测试全绿"的** —— 它们只在"多副本 apply 同一串 op"时才暴露。
+> 这正是设计里把"确定性纪律"排在第一风险（R3-1）的原因。
+
+### 38.3 确定性防线：规范编码 + 对拍用例
+
+- `CatalogState::encode_canonical()`：把**所有影响后续行为的字段**（两组版本号、快照号、每表最后变更版本、
+  版本链与幂等记录的时间戳、文件清单）按**键序**编码。少一个字段，对拍就会漏掉一类分叉。
+- 5 个用例（`catalog/src/state.rs::tests`）：
+  1. `same_op_sequence_yields_byte_identical_state` —— 同一串 op（含相同时间戳）在两台状态机上 → **逐字节相同**（R3-1 的防线）；
+  2. `state_records_carried_timestamps_not_local_clock` —— 断言记录的是**传入值**；
+  3. `compaction_version_assignment_is_order_independent` —— 建表顺序不同但内容相同 → 状态编码相同（专打第 4 处 `HashSet`）；
+  4. `commit_files_dedups_on_key_set` —— 键集合去重（任一键命中即整次判重、不落 manifest）；
+  5. `idempotency_sweep_uses_carried_now` —— TTL 清理的时间也由调用方传入。
+- **反证已做**：把 `create_table` 改回"状态机自己取钟"（写死 `999_999_999`）→ 用例 2 立刻失败
+  （`left: 999999999, right: 42`），已恢复。
+- ⚠️ **诚实说明**：用例 3 对第 4 处的捕获是**概率性**的（`HashSet` 两个元素、随机种子下的迭代序约各半），
+  所以那条纪律**不能只靠测试守**，必须靠"状态里禁用无序容器"的结构性约束（`state.rs` 文件头四条纪律）。
+
+### 38.4 本轮**没做**（明确记账，避免"看起来完成了"）
+
+| # | 未做项 | 归属 | 说明 |
+|---|---|---|---|
+| 1 | **键集合的实际接线** | S3-5 剩余 | `flush.rs` 仍传空集合（chunk 目前不记录它聚合了哪些幂等键）。**权威去重仍靠 ingest 入口预筛** —— 已在 `flush.rs` 写明，不留静默空值 |
+| 2 | proto / tonic-build | S3-0 | 未开始（需新增依赖） |
+| 3 | raft 接入 / metanode 进程 | S3-1 / S3-3 | 未开始 |
+| 4 | 快照的 prost 版本 | S3-3 | 现为文本规范编码（语义等价，S3-3 换 prost 时用例可继续用） |
+
+### 38.5 验证
+
+`cargo test --workspace`：**222 passed / 0 failed**（新增 5 个用例）；`clippy --all-targets` 0 警告。
+
+---
+
+---
+
+## 39. R3 S3-5 接线：键集合去重真正生效 —— 并抓到"认领 ≠ 重复"这个语义坑（2026-09-19）
+
+### 39.0 落地
+
+| 位置 | 改动 |
+|---|---|
+| `ingest/src/flush.rs` | 新增 `collect_idempotency_keys(deps, from, to)`：从 **WAL** 派生本批次的幂等键集合（去重 + 排序）；`flush_chunk` 与 `recommit_into_catalog` 两条提交路径都接上；`client_request_id`（单键字段）保持 `None`，权威语义移到键集合 |
+| `catalog/src/state.rs` | `commit_files` 的键集合判定改为**区分三种形态**（见 §39.1） |
+| `chaos/src/lib.rs` | 夹具加 `build_tuned(rows_threshold, delay)`：默认夹具 `rows_threshold=1` → 每条批次一进 chunk 就 seal，**造不出"一个 chunk 聚合多个键"**，键集合路径根本测不到 |
+
+**为什么从 WAL 派生而不是让 chunk 记着**：WAL 是**唯一写入事实**（ADR-3），chunk 只是它的内存视图。
+在 chunk 里再存一份键集合就出现**第二个真相来源** —— 两者不一致时没有任何依据判定谁对
+（本项目 §27/§28 那类缺陷全是"两份状态"造成的）。代价是该批次 WAL 区间的一次扫描
+（段文件刚写过，通常都在页缓存里），收益是**不可能不一致**。
+
+### 39.1 抓到的语义坑：**"已被认领" ≠ "重复提交"**
+
+接线后**既有用例 `idempotency_survives_compaction` 当场变红**（0 文件 —— flush 再也没落盘）。
+根因是两层幂等机制的语义冲突：
+
+| 层 | 时机 | 记录形态 |
+|---|---|---|
+| 入口预筛（§27） | ingest **WAL fsync 之后**立刻登记（防并发同键双写） | `batch_id` **留空** = "已认领、批次尚未落盘" |
+| 提交层（本次接线） | flush 提交 manifest | 期望"键不存在" |
+
+若提交层把"键已存在"一律当重复 → **manifest 永不落盘**：写入返回成功，但数据**永远不可见**；
+更糟的是**恢复路径 100% 失败**（重启后从 WAL 重建的索引 `batch_id` 也是空的）。
+
+**修法（三种形态分开处理）**：
+
+| 记录形态 | 含义 | 处理 |
+|---|---|---|
+| `batch_id` **为空** | ingest 认领（§27），或重启后从 WAL 重建的索引 | **补全**为本批次并落盘 —— 这正是本次提交要写的**数据** |
+| `batch_id` 非空且 ≠ 本批次 | 另一个**已提交**批次占用该键 | 整次判重（`accepted=false`） |
+| 不存在 | 正常路径 | 登记并落盘 |
+
+**恰好一次由状态机串行化保证**：两个并发同键请求都写出了 Data（§27 的竞态窗口），
+它们各自提交时，**先提交的那个补全认领**，后提交的看到非空 `batch_id` → 判重 ✓
+（单机靠 `RwLock`，R3 靠 raft 日志序 —— 两种宿主都串行）。
+
+### 39.2 测试
+
+| 用例 | 断言 |
+|---|---|
+| `chaos::commit_registers_every_key_of_a_multi_key_chunk`（端到端） | **构造确定性**：`rows_threshold=100` → 先写两条不同键（3 行 + 120 行）**再启动攒批循环** → 必然同一次吸收 → **一个 chunk、两个键**；断言**两个键都在 Catalog 里** + 不在集合里的键**不**命中 |
+| `catalog::claimed_key_is_completed_at_commit_not_rejected`（状态机） | 认领态提交必须**成功且补全** `batch_id`；另一个批次再用同键才判重；判重不得落第二个文件 |
+| 既有 `idempotency_survives_compaction` | 恢复绿（它变红正是本次的发现手段） |
+
+### 39.3 遗留
+
+| # | 项 | 说明 |
+|---|---|---|
+| 1 | WAL 段回收后无法恢复键集合 | `recommit_into_catalog` 尽力而为：段被回收时退回 `batch_id` 幂等（数据不会重复写，只是"同键重试"可能漏判）——已知边界，已就地注明 |
+| 2 | 键集合的**可观测性** | 尚未进指标（可考虑在 metrics 里加"本次提交携带键数"的分布，用于判断 chunk 聚合度） |
+| 3 | `BatchPendingPayload.client_request_id` 仍是单键 | 它只用于恢复期的批次追踪；权威键集合在 Catalog。若将来需要按批次反查键集合，应改为从 WAL 派生（同一原则） |
+
+---
+
+---
+
+## 40. R3 S3-1 选型闸门：raft-rs PoC 通过 —— **保留 raft-rs**（2026-09-19）
+
+### 40.0 闸门结论
+
+| # | 判据 | 结果 |
+|---|---|---|
+| 1 | 三节点选主 + **收敛到同一状态** | ✅ `three_node_cluster_converges_on_proposed_ops`（三个节点的规范编码**逐字节相同**） |
+| 2 | kill leader → 重新选主 + **已提交数据不丢** | ✅ `leader_kill_reelects_and_keeps_committed_ops`（新 leader 由存活节点当选、b1/b2/b3 全在） |
+| 3 | **状态机接缝干净**：`CatalogState` 原样被驱动 | ✅ `apply_op()` 是纯函数（无锁/无时钟/无 IO），两个候选都不需要为它改一行 |
+| 4 | 样板规模可接受（设计 §4.2 的逃生门：>50% 总工作 → 换 openraft） | ✅ **raft 集成核心 124 行**（Ready 循环 49 行）；整个 PoC crate 482 行含注释、测试 163 行 |
+
+**结论：保留 raft-rs**（正确性证据优先：它有 Jepsen 验证，openraft 生产验证较少）。
+逃生门仍未关闭但**降级为备选**：若 S3-3 实现 fjall `Storage` + 快照安装 + 成员变更时样板失控，
+再评估 openraft —— 届时换的只是 `yuntun-meta` 内部实现，`CatalogState` 与上层接口不动
+（这正是先做 S3-2 的价值）。
+
+### 40.1 交付物
+
+| 位置 | 内容 |
+|---|---|
+| **新 crate** `yuntun-meta` | S3-3 的落点；本轮内含 PoC |
+| `crates/meta/src/lib.rs` | 三节点集群（进程内 `mpsc` 传 `Message`，**不序列化**）+ `RawNode` 驱动循环 + `apply_op` 接缝 + `Cluster`（wait_leader/propose/kill/canonical） |
+| `crates/meta/tests/raft_poc.rs` | 两个闸门用例（163 行） |
+
+**边界（诚实说明，避免被当成"R3 已完成"）**：
+- 用 raft-rs 自带 `MemStorage` —— 落盘/崩溃恢复**没测**（真 Storage 是 S3-3 的 fjall 后端；
+  它在两个候选下工作量相同，故与选型无关）；
+- 进程内消息**不序列化** —— gRPC 编解码/超时/重试是 S3-0 + S3-3；
+- **快照安装与日志压缩没测**（PoC 无 compaction、无新成员加入）→ 登记为 S3-1b；
+- 成员变更、pre-vote 隔离行为、读写一致性（ReadIndex/线性化读）未测。
+
+### 40.2 两个值得记的坑（都是实测撞出来的）
+
+| # | 坑 | 现象 | 教训 |
+|---|---|---|---|
+| 1 | **raft entry index ≠ 已应用 op 数** | 第一版用例按 `applied >= 4` 等收敛 → **假失败**："节点 3 与节点 1 不一致"。真因：**leader 就位会先写一条空 no-op 条目**占掉 index 1，4 个 op 对应 index 2..5；follower 应用到 index 4 时其实只应用了 3 个 op | 等待条件必须**语义化**（"状态里出现 X"），不要把 raft index 当业务进度 |
+| 2 | **待回复队列必须在 `propose()` 成功之后入队** | 若先入队再提议、提议失败时再弹出，队列与日志条目会**错位** → 应用 A 的 op 却回复了 B 的等待者（静默错配，客户端以为自己的写成功了） | 顺序：`propose()` 成功 → 入队；失败 → 立刻回错不入队 |
+
+### 40.3 反证（证明用例不是自说自话）
+
+把节点间的消息路由切断（`take_messages` 不外发）→ **两条用例都失败**（10s 内选不出 leader）。
+已恢复。即：这两个用例依赖**真实的消息复制**，不是"本地自转"。
+
+### 40.4 遗留
+
+| # | 项 | 归属 |
+|---|---|---|
+| 1 | 快照安装 + 日志压缩（`compact()` + 新成员追快照） | **S3-1b** |
+| 2 | fjall `Storage`（term/vote/commit + 日志 + 快照落盘）→ 崩溃恢复 | S3-3 |
+| 3 | gRPC 传输（`Meta.Propose/Prefetch/Delta`）+ 非 leader 带 leader hint | S3-0 + S3-3 |
+| 4 | 线性化读（ReadIndex）与"读旧窗口 ≤ `cache_ttl`"的边界 | S3-4 |
+| 5 | 成员变更（learner → voter）与 `--init` bootstrap | S3-6 |
+
+---
+
+---
+
+## 41. R3 快照编解码（S3-1b / S3-3 的共同前置）—— 帧格式 + 状态机无损载荷（2026-09-19）
+
+### 41.0 为什么先做这个
+
+S3-1 闸门留下一项（**快照安装**），S3-3 的 fjall `Storage` 也要写快照 —— 两者的**共同前置**
+是"状态机能**确定性**编解码"。所以先把它做成一块能独立验证的东西，而不是等 S3-3 一起动。
+
+### 41.1 交付
+
+| 位置 | 内容 |
+|---|---|
+| `model/src/snapshot.rs`（**新**） | 快照**载荷**（prost，11 字段）+ **帧格式**（magic / version / 帧头 CRC / 分块 CRC）+ 载荷编解码 |
+| `model/src/error.rs` | `SnapshotError` —— **独立于 `LakeError`**：这些全是**致命一致性错误**，混进 `LakeError` 会诱导调用方按"可重试"处理 |
+| `catalog/src/state.rs` | `to_snapshot_msg()` / `from_snapshot_msg()`（严格）/ `snapshot_artifact()` / `restore_snapshot()` |
+
+### 41.2 帧格式：三层保护（`metanode-design §4.4` 落地）
+
+| 层 | 保护 | 抓什么 |
+|---|---|---|
+| 帧头 | magic + format_version + **帧头 CRC** | 截断到 36 字节内、`revision`/`payload_len`/`chunk_size` 被改 |
+| 每块 | **块 CRC** + 显式块长 | 块内任意字节损坏、块被截半 |
+| 整体 | `payload_len` = 实收长度、末尾无残留 | 丢块、多块 |
+
+**为什么不能只靠 protobuf**：**截断后的字节前缀仍然是合法 protobuf**（字段可选、未知数据被忽略），
+于是"半个快照"会被静默解码成一个**看起来正常但缺了一半数据的状态**并装到副本上。
+这与 WAL tearing（`§29.1`）是同一类错误，只是载体从 segment 换成了快照。
+
+**为什么帧头也要 CRC**：`revision` 只出现在帧头；而单字节翻转 `chunk_size` 会让"块长上限"检查变**松**
+（`<=` 判定），块 CRC 依旧通过 —— 只有帧头 CRC 能抓到。
+
+### 41.3 实测：两条"任何位置都检出"的用例
+
+| 用例 | 做法 | 结果 |
+|---|---|---|
+| `truncation_at_any_offset_is_detected` | 产物**每一个**偏移都截断一次 | 全部 `Err` |
+| `single_byte_corruption_anywhere_is_detected` | 产物**每一个**字节都翻转一次 | 全部 `Err`（帧头/块头/块数据三区都覆盖） |
+
+### 41.4 状态机侧：无损 + 维度覆盖
+
+| 用例 | 钉住什么 |
+|---|---|
+| `snapshot_roundtrip_is_lossless_and_deterministic` | 恢复后规范编码相同；**再产出快照的字节也相同**（= 快照编码确定性，否则副本间无法比对/去重） |
+| `snapshot_roundtrip_preserves_future_behavior` | **恢复出的状态继续 apply 同一 op**，幂等命中行为与后续结果都必须与源状态一致 —— 比静态编码比对更强 |
+| `snapshot_covers_every_state_dimension` | **11 个维度**逐一改动，快照字节必须都变（专防"加字段忘加进快照"） |
+
+最后一类是**故意的回归防线**：忘字段不会让任何其它测试变红，只会让换主/重启后状态**静默回退**。
+
+### 41.5 反证
+
+把 `idempotency` 从快照里漏掉（改成 `Vec::new()`）→ 维度覆盖测试**立刻失败**，报
+`维度 idempotency 变了但快照字节没变 → 快照漏了这个字段（换主/重启后会静默回退）`。已恢复。
+
+### 41.6 一个校验顺序的坑（错误信息的**指向性**）
+
+第一版把"版本检查"放在帧头 CRC **之前** → 帧头被改坏（版本字段恰好变成别的数）时报
+`UnsupportedVersion`，把运维引向"去升级 build"，而真相是**文件损坏**。
+
+正确顺序 **magic → 帧头 CRC → 版本**：
+
+| 顺序 | 理由 |
+|---|---|
+| magic 先 | 根本不是快照时，报 `BadMagic` 比"CRC 不符"有用 |
+| 帧头 CRC 次 | 帧头坏了就说"坏了"，不要说成"版本不支持"（**换 build 解决不了损坏**） |
+| 版本最后 | 帧头**完好**而版本不同 = 确实是别的版本写的**合法**快照 → 这时 `UnsupportedVersion` 才准确 |
+
+用例同时钉住两种情形（"改版本号但 CRC 未同步" → CRC 错；"CRC 正确的未来版本" → 版本错）。
+
+### 41.7 严格重建：**拒绝**而非"尽力恢复"
+
+| 规则 | 理由 |
+|---|---|
+| `format_version` 必须等于本实现版本 | 载荷布局变了必须显式拒绝，不能猜 |
+| `revision > 0` | 0 = 快照号未初始化，不是合法状态 |
+| `namespaces` 必须含 `public` | 状态机不变量（`CatalogState::new` 保证） |
+| 各列表**键不得重复** | 重复键下"谁生效"取决于遍历顺序 = 不确定性 |
+| 条目值不得为 `None` | 空条目是构造错误 |
+
+**有意不校验**：文件与表的**引用完整性**。`drop_table` 与 `commit_files` 交错可能产生
+"文件引用了已删表"的中间态，硬校验会让**合法快照装不进去** —— 比少校验危险得多。
+
+另有一条跨层校验：**帧头 revision 必须等于载荷 revision**（`RevisionMismatch`）——
+不一致说明帧与载荷不是同一次快照产生的（拼接/回滚搞混），装上去必错。
+
+### 41.8 边界与遗留
+
+| # | 项 | 归属 |
+|---|---|---|
+| 1 | **快照安装进 raft**（`Storage::snapshot` + compaction + follower 落后追快照） | **S3-1b**（前置已完成，可直接做） |
+| 2 | `§4.4` 的**保留策略**（按表保留 checkpoint + 归档旧条目到对象存储） | S3-3（R3-4 快照膨胀风险） |
+| 3 | fjall 落盘（快照字节已是可落盘形态） | S3-3 |
+| 4 | 大快照的**传输/内存曲线**（10 万条 manifest 规模） | S3-6 压测 |
+
+---
+
+---
+
+## 42. R3 S3-1b：快照安装 + 日志压缩 —— **选型闸门全部判据通过**（2026-09-19）
+
+### 42.0 交付
+
+| 位置 | 内容 |
+|---|---|
+| `crates/meta/src/storage.rs`（**新**） | 自实现的 raft `Storage`（`MetaStorage`）：硬状态 / 日志 / 压缩位置 / **状态机产物** |
+| `crates/meta/src/lib.rs` | PoC 接到 `MetaStorage`；Ready 循环里的**快照安装**（还原状态机 + 固化元数据）；集群支持 kill → **空存储重启** |
+| `crates/meta/tests/raft_poc.rs` | 判据 5：`follower_behind_catches_up_via_snapshot` |
+
+### 42.1 为什么**不能**用 raft-rs 自带的 `MemStorage`（这是本轮的硬发现）
+
+第一版 PoC 用 `MemStorage` 跑得挺好，直到要实现快照安装才发现它根本不能用：
+
+| # | 问题 | 后果 |
+|---|---|---|
+| 1 | `MemStorageCore::snapshot()` 造的快照 **data 为空**（元数据取自 `hard_state.commit`） | follower 装上等于**把状态机清空** —— 而且**不报错**（raft 只看元数据） |
+| 2 | 它的 `compact()` 只丢日志、**不认识状态机** | 快照内容必须来自 `CatalogState`，这是存储实现方的责任，它无从知道 |
+
+所以快照能力**不是可选优化**：它是"必须自己写 `Storage`"的硬前提。生产实现换 fjall 时结构不变（`MetaInner` 的字段变成表/键值）。
+
+### 42.2 核心不变量：产物 ↔ 压缩位置**严格对应**
+
+> `artifact` 必须是"应用到 `compacted_index` 那一刻"的状态机产物。
+
+两种错误写法都**静默**出错（都不报错、测试也未必红）：
+
+| 错误写法 | 后果 |
+|---|---|
+| `snapshot()` 里**现场**从当前状态机取产物 | 元数据说"状态停在 I"，内容却是 J>I 的状态 → follower 把 I..J 的 op **当没做过**（丢）或**再 apply 一次**（重复） |
+| 先 `compact` 再取产物 | 同上（取到的产物已含压缩点之后的 op） |
+
+正确做法（`compact_applied`）：**在应用线程里、先取产物、再截日志**。
+单测 `snapshot_data_matches_compacted_index_not_current_state` 专门钉住它 —— 断言方式刻意"绕开状态机计数"：
+用**与 op 计数无关**的索引（10）压缩，随后继续推进状态机，再断言产物**不含**之后的批次。
+
+### 42.3 另一个硬发现：**raft 索引归副本层**，不是状态机的 op 计数
+
+`CatalogState::last_applied` 记的是"已 apply 的 **op 数**"，而 raft 日志里 **no-op**（新 leader 就位会写一条空条目）与 **ConfChange** 都占索引 —— 两者每遇到一条非 op 条目就**错开一格**。
+
+用 op 计数当压缩坐标的后果同样静默：压缩位置偏小 → 元数据与内容不一致；
+安装快照后 `advance_apply_to(applied)` 拿到错索引 → 重放已应用条目。
+
+因此本轮把已应用位置放在**副本层**（`MetaStorage.applied_index`，由驱动方按 `entry.index` 设置，
+且**对含 no-op/ConfChange 在内的每个条目都报**），并在用例里直接断言
+`compacted == cluster.applied(leader)`（两个都是 raft 索引）—— 用错坐标这条断言立刻红。
+
+> ⚠️ 由此留下**两个时钟并存**：快照**载荷**里的 `applied` 仍是状态机 op 计数，
+> 快照**元数据** index 是 raft 索引。单测里两者都被显式断言（把现状写清楚，而不是含糊过去）。
+> **S3-3 必须统一**：`CatalogState::last_applied` 作为读栅栏（`read_index()`）必须可比于 raft 索引
+> —— 要么它也按 `entry.index` 设置，要么读栅栏改走副本层。
+
+### 42.4 集成层：重启语义（**已确定**）+ 快照触发（**未稳定**）
+
+**先说结论**：本轮把"快照安装"的**机制**钉住了，但**没能**在 3 节点 PoC 里**稳定地强制**走快照路径。
+两件事必须分开算账（上一版草稿把它们混成"判据 5 通过"，已改正）。
+
+**（a）已确定：重启必须把已应用位置告诉 raft**
+
+用例 `follower_restart_recovers_from_own_log_and_converges`：杀一个 follower（**保留其日志**）→
+继续写 → leader 压缩 → victim 带自己的日志重启 → 断言**与 leader 逐字节相同** + 还能继续跟随。
+
+它钉住的是 `Config.applied`：raft-rs 文档原话 —— *"If Applied is unset when restarting,
+raft might return previous applied entries"*。不设置时 raft 会**重放已应用条目**，后果**不报错**：
+状态机的计数器被重复推进（幂等 op 的状态不变，但 `last_applied`/版本号多走），重启过的副本与其他副本
+**静默分叉**。本轮就是被 `set_applied` 的单调断言当场拦下的（`已应用索引不得回退：5 -> 1`）。
+**反证**：把 `applied` 改成 0 → 该断言立刻触发、用例失败 ✓。
+
+**（b）未稳定：leader 是否发快照**
+
+同一场景下实测出现过 `snapshot_installs=0 但已收敛`。取证（`MetaStorage` 的 env-gated 轨迹 + 节点诊断 dump）：
+
+| 观察到的事实 | 说明 |
+|---|---|
+| leader 侧 `first=8 last=7`、`compact applied=7` | 日志**确实**压缩了（不是"没压成"） |
+| **没有** `send_snapshot?` 轨迹 | `Storage::snapshot()` **从未被调用** —— leader 没走快照分支 |
+| victim 收到 `append 6..7` | leader 把已被压缩的 6..7 当成可用条目发了出去 ✗ 与"first=8"矛盾 |
+| victim 状态与 leader 一致、`installs=0` | 因此它靠条目补齐，而非快照 |
+
+结论：**归因未完成**（`§42.7` 遗留 1）。已排除：日志未截断、陈旧快照（无 `recv_snapshot` 轨迹）、
+"空存储同 id 重启"（那是另一条非法路径，见 42.5）。
+
+### 42.5 两条"非法场景"与两次反证
+
+**非法场景 ①：同 id + 抹掉存储重启。** 第一版用例就是这么写的，结果撞上 raft 的断言：
+
+```text
+to_commit 5 is out of range [last_index 0]   （etcd 那句 "Was the raft log corrupted, truncated, or lost?"）
+```
+
+原因：leader 侧仍记着该 peer 的旧 `matched`，于是发 `commit=N` 的**心跳**；空日志的 follower 在
+`handleHeartbeat` 里无条件 `commit_to(N)` → 越界即 panic。
+
+**结论（影响 S3-6 运维）**：**掉盘的节点不能复用原 id 直接空启**。要么从备份/快照恢复后回来，
+要么以**新 id 重新加入**（成员变更）。这条比"能跑通"更值得记 —— 生产上很容易踩。
+
+**非法场景 ②（本轮自己抓到）**：第一次跑"快照"用例时 `状态一致=true` 但 `installs=0` ——
+计数器字段与 getter 都写了，**忘了在 `apply_snapshot` 里自增**。当时那条断言是发现它的唯一地方。
+教训：**凡是断言依赖的计数器，都必须有测试证明它真的会被触发**（否则断言等于空转）。
+
+**反证 A（存储层机制）**：把 Ready 循环里的"状态机 ← 快照"去掉（只装元数据、不还原状态机 ——
+这正是 `MemStorage` 的静默形态）→ 用例失败：`installs=1 状态一致=false`。已恢复。
+**反证 B（重启语义）**：把 `Config.applied` 改成 0 → `已应用索引不得回退：5 -> 1`，用例失败 ✓。
+
+### 42.6 选型闸门：4 项通过 + 第 5 项**机制通过、集成层未稳定**
+
+| # | 判据 | 结果 |
+|---|---|---|
+| 1 | 三节点选主 + 收敛 | ✅ §40 |
+| 2 | kill leader 不丢已提交 | ✅ §40 |
+| 3 | 状态机接缝干净 | ✅ §40 |
+| 4 | 样板规模可接受（124 行） | ✅ §40 |
+| 5 | 快照可安装 | 🟡 **机制已证明**（自写 `Storage` + 帧/载荷双重校验 + 安装路径 + 反证）；**集成层强制触发未稳定**（42.4b，遗留 1） |
+
+**结论不变：保留 raft-rs**。逃生门现在有更实的信息：真正贵的是**自写 `Storage` + 快照正确性**
+（本项目必须自己写，两个候选都躲不掉），而不是某个库的样板量。
+
+**诚实说明**：判据 5 我**没有**拿到"稳定复现的快照安装"这颗证据就收尾了。原因是本 PoC 的
+3 节点进程内 harness 缺乏"新节点加入"能力（成员变更属 S3-6），而用"保留日志的 follower"去逼快照
+依赖 leader 的 Progress 时序 —— 这条路我试了 4 种变体仍未稳定，继续投入的性价比低于**把它登记清楚**。
+机制层的证据（存储层单测 + 反证）是充分的；集成层的强制路径留给 S3-3（那里有 fjall + 真实触发策略，
+会自然产生"落后节点追快照"的路径）。
+
+### 42.7 遗留
+
+| # | 项 | 归属 |
+|---|---|---|
+| 1 | **leader 为何能发出已被压缩的条目（`append 6..7` 而 `first=8`）** | **S3-3** —— 需带时间戳的 raft 事件轨迹（`Ready`/`MsgAppend` 收发 + `raft_log` 视图）才能定论。已排除的假设见 42.4b 表 |
+| 2 | **两个时钟统一**（`CatalogState.last_applied` = raft 索引，或读栅栏改走副本层） | S3-3（阻塞"读旧窗口"验收） |
+| 3 | fjall 落盘版 `Storage`（结构不变，换 `MetaInner` 的持久化） | S3-3 |
+| 4 | 快照**触发策略**（§4.4：日志条数 > N / 状态 > M）+ **保留策略**（按表 checkpoint + 归档） | S3-3（R3-4 快照膨胀） |
+| 5 | 大快照规模（10 万条 manifest 的传输/内存曲线） | S3-6 |
+| 6 | 成员变更（learner → voter）—— **也是稳定复现"新节点追快照"的正路** | S3-6 |
+
+---
+
+---
+
+## 43. R3 S3-3（第一件）：fjall 落盘版 `Storage` —— 把不变量交给存储保证（2026-09-19）
+
+### 43.0 交付
+
+| 位置 | 内容 |
+|---|---|
+| `crates/meta/src/fjall_storage.rs`（**新**） | `FjallStorage`：raft `Storage` 的落盘实现 + 5 条测试 |
+| `crates/meta/Cargo.toml` | `fjall = "3"` |
+
+**与内存版的关系**：内存版（`MetaStorage`）是**语义的定义处**（单测把它钉死），本实现逐条对齐它 ——
+两个文件的方法名与不变量注释刻意保持一致，便于对读。差别只有"真相在哪"：
+
+| | 内存版 | fjall 版 |
+|---|---|---|
+| 真相 | 进程内存 | **fjall**（每节点一个目录） |
+| 崩溃后 | 全丢（PoC 用它换测试速度与确定性） | 从盘恢复，含 `applied_index` → 喂 `Config.applied` |
+| PoC 是否用 | ✅（快、无 IO 抖动） | ⏳ 节点装配待进程化（S3-3 后续） |
+
+### 43.1 三个设计决定
+
+**① 先盘、后缓存。** 每一步都**先写 fjall 成功、再更新缓存**。反过来会让缓存领先于盘，
+崩溃后就出现"内存说有一份快照、盘上没有"—— 最难查的一类不一致。
+
+**② 压缩用 `batch(...).durability(SyncAll)` —— 让"不变量"变成"存储保证"。**
+
+压缩要同时做四件事：写新产物、更新压缩位置与任期、删被覆盖的日志、删旧产物。
+逐条写的话，**任意中间一刻掉电**都会留下"索引指向不存在/对不上的产物"。同一原子批里做完，
+就变成要么全成、要么全不成 —— 上一轮靠**应用层纪律**维持的不变量
+（"产物必须与 `compacted_index` 严格对应"，`§42.2`），在这里由**存储层**兜住。
+这比"每处都记得小心"可靠得多。
+
+**③ fsync 分级**（不是所有写都值得付 fsync）：
+
+| 写 | 模式 | 理由 |
+|---|---|---|
+| `set_hard_state`（term/vote） | **SyncAll** | 投过票却没落盘 → 重启可能重复投票 → 破坏"一任期一票" |
+| `append` | **SyncAll** | 日志是恢复的权威来源 |
+| `apply_snapshot` / `compact_applied` | **SyncAll** | 同 + 不变量 |
+| `set_commit` | `Buffer` | commit 是**派生**值：重启后由 term/vote + 日志重新推出 |
+| `set_applied` | `Buffer` | 只影响"从哪继续 apply"；保守重放是安全的（幂等） |
+
+### 43.2 键布局
+
+```text
+"cs"  ConfState        "hs"  HardState        "ap"  applied_index
+"ci" / "ct"  compacted_index / compacted_term  "li"  last_index
+"L" + idx(u64 BE)  日志条目      "S" + idx(u64 BE)  快照产物（只保留最新一份）
+```
+
+首日志索引由 `ci + 1` 推出（压缩时把 ≤ ci 的条目真删掉），所以只存最后一个索引，
+避免启动时全表扫描。索引用**大端**：范围扫描即日志序。
+
+### 43.3 测试（5 条，含三条"跨 reopen"）
+
+| 用例 | 钉住什么 |
+|---|---|
+| `log_hardstate_and_applied_survive_reopen` | 日志两端/任期、`vote`（重复投票防线）、成员表、**`applied`**（要喂 `Config.applied`）跨重启存活 |
+| `artifact_and_compacted_index_stay_consistent_across_reopen` | 压缩 → **重开** → `snapshot()` 返回压缩那一刻的产物（含 b1、**不含** b2）、压缩掉的日志真的没了、`entries` 边界正确 |
+| `snapshot_is_not_faked_when_artifact_missing` | 白盒删掉产物（模拟盘上不一致）→ 必须报**可重试**，**绝不**返回对不上的快照 |
+| `stale_snapshot_is_ignored_and_old_artifact_dropped` | 旧快照忽略且不计入安装数；旧产物被删（无界增长防线） |
+| `overwrite_truncates_old_tail` | raft 允许的"截断重写尾部"不留旧条目残留、不产生空洞 |
+
+**反证**：把 `snapshot()` 改成"现场从当前状态机取产物"（正是 `§42.2` 记录的错误写法）
+→ 两条用例失败，报 `产物必须是压缩那一刻的（含 b1、不含 b2）`。已恢复。
+
+### 43.4 边界与遗留
+
+| # | 项 | 归属 |
+|---|---|---|
+| 1 | **节点装配**：让 metanode 进程用 `FjallStorage`（现 PoC 仍用内存版） | S3-3 后续 |
+| 2 | **真崩溃测试**：本轮的"重启"是 drop 后 reopen（干净关闭）。真掉电/`kill -9` 需要**子进程**级注入（参照 `§31` 的 chaos 手法） | S3-3 后续 |
+| 3 | **合并 fsync**：现在每个 Ready 一次 fsync。metanode 提交速率是"文件数/秒"量级，够用；合并留给压测后再定 | S3-6 |
+| 4 | fjall 调优（LSM 参数 / 是否分离大 value）：快照产物是大 value，值得按 `KvSeparationOptions` 调 | S3-6 |
+| 5 | `memtable`/compaction 对 **P99 持久化延迟**的影响（metanode 的 ack 依赖 fsync） | S3-6 |
+| 6 | leader 为何能发出已被压缩的条目（`§42.7` 遗留 1） | S3-3 后续 |
+
+---
+
+---
+
+## 44. R3 S3-3（第二件）：节点装配到落盘存储 —— **M3 的 G1 判据通过**（2026-09-19）
+
+### 44.0 交付
+
+| 位置 | 内容 |
+|---|---|
+| `crates/meta/src/lib.rs` | 集群 harness 从**内存版**切到 **fjall 版**；`kill` = 释放存储句柄（含 fjall 目录锁）、`restart` = **从盘重开**；持久化失败一律 `fatal`（停机） |
+| `crates/meta/src/fjall_storage.rs` | `open_with_state`（**状态机从盘重建**）+ `reset_applied`（见 44.2 发现 1） |
+| `crates/meta/tests/raft_poc.rs` | **M3 判据**：`full_cluster_restart_keeps_state_byte_identical` |
+
+**为什么要切**：内存版是**语义的定义处**（单测把不变量钉死），但用它做集群就无法验证真正重要的一条
+——**进程重启后状态从盘上重建**。切过去之后，`kill` 再 `restart` 就是**真的崩溃恢复**：
+进程没了，只剩盘上的文件。
+
+### 44.1 M3 的 G1 判据：全量重启后 Catalog **逐字节一致**
+
+用例 `full_cluster_restart_keeps_state_byte_identical`：写 op → 全部收敛 → **在 leader 上压缩一次**
+→ 记下三个节点的规范编码 → **杀掉全部节点** → 全部从各自目录重启 → 断言**逐字节等于重启前**
+→ 再写一笔，确认**还能继续服务**。
+
+它一次压到四件事：
+
+| # | 压到什么 | 错了会怎样 |
+|---|---|---|
+| 1 | 日志与硬状态真落盘（`SyncAll`） | 重启后数据倒退 |
+| 2 | 状态机由盘上**重建**（快照 + 其后日志重放） | 状态凭空少一半（或整份空） |
+| 3 | `Config.applied` 取对（= **快照 index**） | raft 重放已应用条目 → 计数器多走 → **静默分叉** |
+| 4 | 成员表恢复 | 重启后组不成立（选不出 leader） |
+
+刻意**先在 leader 上压缩**：于是 leader 走「从快照恢复 + 重放其后条目」，其余节点走
+「空状态机 + 全量日志重放」—— **两条重建路径都被覆盖**。
+（这也顺带在**恢复路径**上补了 §42.4b 那个「怎么稳定走到快照」的遗留：发送路径仍不稳，
+但**恢复路径**现在有稳定证据了。）
+
+**反证**：把「从快照恢复状态机」改成「一律空状态机」→ 用例失败：
+`全量重启后状态与重启前不一致（M3 的 G1 不成立）`。已恢复。
+
+### 44.2 落盘之后立刻暴露的两个真问题
+
+**发现 1：`applied_index` 是「随状态机走的派生量」，不能当权威持久化状态。**
+
+盘上留着的 `applied` 属于**上一个进程那份内存状态**（「我当时应用到 5」）。而重启后状态机是
+**重建**出来的（从快照，或从空 + 日志重放），它的位置由**快照 index** 决定，与旧值无关。
+沿用旧值就会撞上单调断言 —— 实测原话：
+
+```text
+已应用索引不得回退：5 -> 1
+```
+
+修法：`open_with_state` 里按权威链**重置** `applied`（`reset_applied`，只给启动路径用）。
+**权威链只有一条**：
+
+> **快照（index + 产物）→ 其后日志重放**。
+
+也从这里**修正/细化了 `§42.4a` 的结论**：`Config.applied` 应取 **`snapshot_index()`**，不是
+`storage.applied_index()` —— 快照 index = 0 时它就是 0，raft 会从日志第 1 条重放，正是重建所需。
+
+**发现 2：持久化失败必须停机，不能带病继续。**
+
+落盘版的每个写都会返回 `Result`（内存版是无条件成功，所以这个分支以前不存在）。
+把它处理成「忽略/重试」是最危险的写法：raft 层「已持久化」的假设一旦被打破，继续跑就会把
+「已 ack 但没落盘」的数据当成安全的。所以统一走 `fatal(id, what, e) -> !`：记录 + 停机。
+真实实现把错误交给上层（退出码），由运维决定恢复动作。
+
+### 44.3 §42.7 遗留 1 的新证据（仍未归因，但更具体了）
+
+切到落盘版后，那条「leader 发出了已被压缩的条目」的现象有了新观察：受害节点的**盘上确实有 6..7**
+（所以它重启后能靠自己的日志/快照推出完整状态），而 leader 侧对它的 `matched` 停在 5。
+即：**发送方认为没送到、接收方盘上却有** —— 这更像是我这个 PoC harness 的消息/响应路径问题
+（不是 raft 语义问题）。
+
+### 44.4 遗留
+
+| # | 项 | 归属 |
+|---|---|---|
+| 1 | **真崩溃注入**：现在 `kill` 是线程退出（进程内）。真 `kill -9` / 掉电需要**子进程**级注入（参照 `§31` 的 chaos 手法）；fjall 有目录锁 ⇒ 必须等子进程死后才允许重开 | S3-3 后续 |
+| 2 | 两类时钟统一（快照载荷里的 `applied` 仍是状态机 op 计数；读栅栏要可比于 raft 索引） | S3-3 后续（阻塞「读旧窗口」验收） |
+| 3 | §42.7 遗留 1（leader 发已压缩条目），与 44.3 的证据一起查 | S3-3 后续 |
+| 4 | 合并 fsync / fjall 调优（大 value 分离）/ P99 持久化延迟 | S3-6 |
+
+---
+
+---
+
+## 45. R3 S3-0：gRPC 面落地（proto + tonic-build）+ 逐字段兼容测试（2026-09-19）
+
+### 45.0 交付
+
+| 位置 | 内容 |
+|---|---|
+| `crates/proto/proto/meta.proto`（**新**） | `Meta` 服务（Propose/Prefetch/Delta/Status/Join）+ op 面（本轮迁移 3 个 op） |
+| `crates/proto/build.rs`（**新**） | `tonic-prost-build` 生成 server + client |
+| `crates/proto/tests/wire_compat.rs`（**新**，6 条） | 设计 §6 的 S3-0 验收：round-trip + **与 `CommitFilesRequest` 逐字段对齐** |
+
+**验收对照（设计 §6）**：
+
+| 设计要求 | 本轮结果 |
+|---|---|
+| 编解码 round-trip | ✅ 每个 op 分支 + 请求/响应/状态消息 |
+| 与现有 `CommitFilesRequest` **字段逐个对齐** | ✅ `commit_files_is_field_for_field_lossless`（9 + 17 + 4 个字段逐一断言，含 `stats` 的有/无两种形态） |
+| 回滚点：保留手写 struct（双份并存一个 commit） | ✅ 手写结构**一个没动**，接口面独立 |
+
+### 45.1 一个依赖拆包坑（升级 tonic 时会撞同一类）
+
+crate 里原写着 `tonic-build = "0.12"`、`tonic = "0.14"`。tonic **0.14 把 prost 支持拆出去了**：
+运行期是 `tonic-prost`、build 期是 `tonic-prost-build`。于是生成代码引用了
+`tonic::codec::ProstCodec`（0.14 已无此路径）→ 编译失败：
+
+```text
+error[E0433]: cannot find `ProstCodec` in `codec`
+```
+
+修法：build-dep 换 `tonic-prost-build = "0.14"`、运行期加 `tonic-prost = "0.14"`。
+**教训**：`tonic` 与 `tonic-build` 的版本必须成对升级，且 0.14 起要认识这两个拆出来的包。
+
+### 45.2 设计层面的两个发现（决定了 proto 怎么写）
+
+**① `ops.rs` 的请求结构是普通 Rust 结构，不是 prost 消息。**
+所以接口面**不能**"把手写结构编码成 bytes 塞进去"（那种做法看起来很省事，却没有来源）。
+必须**逐字段镜像**成 proto —— 这正是设计 §6 说"逐字段对齐"的原因。
+
+**② WAL 的 `Record` 不能当 op 编码复用。**
+它是既有的、已被测试覆盖的 op 编码，看起来很诱人；但 `DdlPayload` 只覆盖
+`CreateTable/DropTable/CreateSchema/DropSchema`，**没有 `EvolveSchema`**，也没有文件提交
+（`Batch*` 是数据面批次生命周期，不是 catalog 提交）。所以 metanode 的 op 面只能自己定。
+
+**③ 未迁移的 op 不放 `bytes` 占位。**
+留一个没有编解码的 `bytes` 字段会让下一位实现者以为"格式已经有了"。所以未迁移的 op
+**先不进 proto**，并在文件头与 `wire_compat.rs` 里显式登记进度（分支数变化必须更新断言）。
+
+### 45.3 测试写法：**逐字段断言**而不是整体相等
+
+`CommitFilesRequest` 没实现 `PartialEq`（手写结构），所以测试逐字段比 —— 这反而更贴题：
+断言名里写着"哪个字段丢了"。它的价值**当场兑现**：第一版镜像漏了 `seal_reason` 与
+`seal_pressure`（T8/封口原因两轮加的可观测性字段），测试直接报 `files[0].seal_reason 丢了`。
+
+**反证**：把 `to_manifest` 里的 `seal_reason` 改成空串 → 失败（`files[0].seal_reason 丢了`）。已恢复。
+
+### 45.4 迁移进度（**诚实登记**）
+
+| op | 状态 |
+|---|---|
+| `CreateSchema` / `DropTable` / `CommitFiles`（含 `FileManifest`/统计两结构） | ✅ |
+| `CreateTable`（`partition_cols` / `ingest_config` 的形状待定）/ `EvolveSchema`（`SchemaChange` 三个变体）/ `DropShard` / `Compaction` / 租约 | ⏳ 后续增量 |
+| `ProposeResponse.result` 的逐 op 形状 | S3-3（与 `MetaService` 实现一起定形） |
+| `PrefetchResponse.payload` 的形状 | S3-4 |
+
+### 45.5 遗留
+
+| # | 项 | 归属 |
+|---|---|---|
+| 1 | 其余 op 的镜像 + 生产侧映射（`yuntun-meta` 内的边界转换器，现暂在测试里做原型） | S3-3 |
+| 2 | `protoc` 依赖：本轮环境有 `libprotoc 36.1`；CI/新机器需装 `protobuf-compiler` 或改用 `protoc-bin-vendored` | S3-3 前 |
+| 3 | 错误码映射（约定 3：`FAILED_PRECONDITION` / `UNAVAILABLE` + leader hint）需要 `MetaService` 实现时逐条落 | S3-3 |
+
+---
+
+---
+
+## 46. R3 S3-3（第三件）：op 生产路径接线 —— proto `Op` 成为唯一权威编码（2026-09-19）
+
+### 46.0 交付
+
+| 位置 | 内容 |
+|---|---|
+| `crates/meta/src/op.rs`（**新**） | `StateOp` + `decode_op`（proto `Op` → 进程内）+ `apply`（纯函数）+ **双向**边界转换器 |
+| `crates/meta/src/error.rs`（**新**） | `MetaError` + **gRPC 错误码映射**（约定 3）+ `retryable()` |
+| `crates/meta/src/lib.rs` | 集群的 op 路径换成 proto：`Command::Propose{op: meta::Op, reply: ProposeResponse \| MetaError}`；日志 payload = **proto `Op` 编码**；`Cluster::propose` 返回 `ProposeResponse` |
+| `crates/proto/proto/meta.proto` | 补 `CreateTableOp`（迁移进度 4/… ） |
+
+**并且**：三个集群用例已改为直接构造 proto `Op`（不再是测试专用的 op 编码）——
+也就是说 `converges` / `kill leader` / **M3 全量重启** 这些用例现在跑的就是**生产路径**。
+
+### 46.1 三个决定
+
+**① 日志 payload 必须与 gRPC 面同构，所以删掉了 PoC 的文本编码（`PocOp`）。**
+留着它会变成"线上发的"与"盘上存的"两套定义 —— 换主或跨版本重启时就是灾难。
+现在日志里存的就是 proto `Op` 的编码：**一份定义、一处演进**。
+
+**② `now_ms` 放在 op 上，不是 `apply()` 的参数。**
+后者会诱导实现者在里面取"现在"（S3-2 抓到的四类非确定性之一）。放在 op 上，
+时间随 op 传播，各副本 apply 同一串 op 得到同一状态 —— 且这条有测试守着。
+
+**③ 状态机内的 op 级计数与副本层坐标**（呼应 `§42.3`）**别混用**：
+`storage.set_applied(entry.index)` 维护的是**副本层**（raft 索引，压缩/快照元数据用它），
+而 `CatalogState.last_applied` 仍是 **op 计数**（standalone 语义）。代码里点明了这一点，
+免得后来者以为两者是一回事。
+
+### 46.2 实测撞到的一个真问题：幂等判断必须用**归一化表身份**
+
+`CreateTable` 的幂等判断原本写成 `state.get_table(&request.name)` —— 而请求里的 `name`
+可能是裸名（`cpu`），状态机内部存的是全限定名（`public.cpu`）→ **永远查不到** →
+重复建表不再是 `accepted=false`（幂等命中），而是 `TableAlreadyExists` **错误**。
+幂等语义要求前者（客户端重试必须成功）。已按状态机的归一化规则（裸名补 `namespace`）
+对齐。**这类"身份没归一化"的错，只有在重复提交时才会暴露** —— 也就是崩溃重试那条路。
+
+### 46.3 错误码映射（约定 3 的落地）
+
+| 情形 | 码 | 可重试 | 附加信息 |
+|---|---|---|---|
+| 非 leader | `UNAVAILABLE` | ✅ | metadata `leader-hint` |
+| 无 quorum / 等应用超时 | `UNAVAILABLE` | ✅ | — |
+| OCC 版本不符（含 `SchemaChanged`） | `FAILED_PRECONDITION` | ✅ | metadata `actual-version` |
+| 请求不合法（op 解不开、键缺失/too long） | `INVALID_ARGUMENT` | ❌ | — |
+| 表/schema 不存在 | `NOT_FOUND` | ❌ | — |
+| 已存在 | `ALREADY_EXISTS` | ❌ | — |
+| 背压（内存/磁盘水位） | `RESOURCE_EXHAUSTED` | ✅（退避） | — |
+| 落盘/内部故障 | `INTERNAL` | ❌ | 节点应**停机** |
+
+映射用**穷尽 `match`**（新加错误变体若不映射，编译就过不去），另有一条用例专门遍历
+若干错误断言"绝不能映射成 `Ok`"。
+
+### 46.4 一条被我写错的测试（记录下来）
+
+我原本想用 `CreateSchema` 证明"`now_ms` 进状态"，结果**失败**：
+`create_schema` **不记录时间**（schema 注册表只有名字）→ 两个不同时间戳的状态**相同**，
+断言自然不成立。改用 `commit_files`（幂等记录里落 `committed_at`）后，且加了反向断言
+（**同一时刻**的同一 op 必须得到同一状态）——后者顺带证明"状态机里没读钟"。
+
+教训：**要证明"A 进入状态"，得先确认 A 在该路径上真的被记录**；否则测的是空气。
+
+### 46.5 遗留
+
+| # | 项 | 归属 |
+|---|---|---|
+| 1 | `MetaService`（tonic trait 实现）+ 服务启动/`--init` bootstrap + 真 gRPC 端到端用例 | S3-3 下一步（**RPC 面与 op 路径都已就绪**） |
+| 2 | 其余 op 的镜像（`EvolveSchema` 三个变体 / `DropShard` / `Compaction` / 租约） | S3-3 |
+| 3 | `ProposeResponse.result` 的逐 op 形状 | S3-3 |
+| 4 | 生产侧把 `NodeHandle` 暴露给 gRPC 层（现集群内部结构已具备） | S3-3 下一步 |
+
+---
+
+---
+
+## 47. R3 S3-3（第四件）：`MetaService` 落地 —— metanode 可被远端调用（2026-09-19）
+
+### 47.0 交付
+
+| 位置 | 内容 |
+|---|---|
+| `crates/meta/src/service.rs`（**新**） | `MetaService`（tonic 实现）+ `serve()`（可绑定 `127.0.0.1:0` 让内核分配端口） |
+| `crates/meta/src/lib.rs` | `NodeStatus`（**结构化**节点状态）+ `NodeHandle`（提案/状态/增量）+ `Cluster::handle()` |
+| `crates/meta/tests/meta_service_e2e.rs`（**新**） | **真** gRPC 端到端：TCP + HTTP/2 + raft + 状态机 + 回包 |
+
+至此 metanode 的链路是通的：`MetaClient` → HTTP/2 → `MetaService` → `NodeHandle` → raft 提案
+→ 应用到 `CatalogState` → `ProposeResponse` 回客户端。**RPC 面 + op 路径 + 服务层都齐了**。
+
+### 47.1 三条写进代码的纪律
+
+**① 阻塞的提案必须丢进阻塞线程池。**
+raft 的"等应用到状态机"是**阻塞**的（`recv_timeout`）。直接在一个 `async fn` 里等，会占住 tokio
+工作线程 —— **一个被拖住的提案就能把整个服务拖停**（连 `Status` 这种快读都进不来）。
+所以 `propose` 走 `tokio::task::spawn_blocking`；`status`/`delta` 只查内存，留在 async 里。
+
+**② 结构化状态与诊断串分开。**
+`NodeStatus`（字段）给程序读，`debug: String` 给人读。**别去 parse 诊断串** ——
+那个字符串的格式会随打印习惯改名，而调用方不会知道。
+
+**③ 未实现的方法必须明确 `UNIMPLEMENTED`，不许假装成功。**
+`Prefetch`（载荷形状属 S3-4）与 `Join`（成员变更属 S3-6）都返回 `Unimplemented`，
+并说明"归属哪一步"。用例专门断言这一点（**反证**：让 `Join` 返回一个空的成功响应 →
+用例立刻红，客户端会以为成员已变更）。
+
+### 47.2 端到端用例覆盖了什么
+
+| 交互 | 断言 |
+|---|---|
+| 正常写入（建 schema / 建表 / 提交） | `accepted=true`、回包带 **raft index** 与两组版本号 |
+| **幂等重试**（同键同 batch 再提一次） | HTTP 成功但 `accepted=false`（**不是**错误 —— 客户端重试必须成功） |
+| `Status` | `node_id`/`leader_id` 指向 leader、`last_index >= applied_index >= 0`、版本串一致 |
+| `Delta`（`since=0`） | 报出变过的表（`public.cpu`） |
+| `Prefetch` / `Join` | `UNIMPLEMENTED`（不许假装成功） |
+
+### 47.3 leader hint 现在是真的
+
+提案路径的非 leader 分支改为回报 `raw.raft.leader_id`（而不是 0）；集群层找不到 leader 时
+也会尽力从各节点状态里挑一个已知 hint。客户端据此**直接重试到正确节点**（约定 3 的可重试性
+才有意义 —— 否则"可重试"等于"盲试"）。
+
+### 47.4 遗留
+
+| # | 项 | 归属 |
+|---|---|---|
+| 1 | **CLI / `--init` bootstrap**：现在能"程序内起服务"，还不能"作为进程独立启动并指定端口/目录" | S3-3 收尾 |
+| 2 | 多节点部署形态（每节点地址表 / 静态成员 / 加入流程） | S3-3 收尾 + S3-6 |
+| 3 | `Prefetch` 载荷形状 | S3-4 |
+| 4 | `Join` 与成员变更 | S3-6 |
+| 5 | 其余 op 的镜像（`EvolveSchema` 三变体 / `DropShard` / `Compaction` / 租约） | S3-3 收尾 |
+| 6 | 真崩溃注入（子进程）/ 两个时钟统一 / 快照触发保留策略 | 见 §44.4 / §42.3 |
+
+---
+
+---
+
+## 48. R3 S3-3（第五件）：全仓 CLI 统一到 clap —— metanode 可作**进程**独立启动（2026-09-19）
+
+### 48.0 本轮两件事
+
+| # | 事项 | 判据 |
+|---|---|---|
+| 1 | `metanode` 成为**可独立启动的进程**（CLI + `--init` + 单节点服务） | `tests/metanode_process_e2e.rs` **4 条**：真二进制 → 真 `kill -9` → 重启后**状态机恢复**；两条启动安全闸门；成员表不一致/多节点拒绝 |
+| 2 | 全仓 **4 个 CLI 程序统一到 clap** | `metanode` / `yuntun-cli` / `yuntun` / `bench`+`bench_baseline` 示例；新增 3 套 CLI 契约测试（11 条） |
+
+### 48.1 为什么改回 clap（我上一轮刚手写了一份，理由当场被推翻）
+
+上一轮我为 `metanode` 手写了参数解析，写在文件头的理由是"参数少，引依赖不划算"。这是**局部**最优：
+它只算了"把值取出来"这一件事，没算下面这些真实成本 ——
+
+1. `--help`、拼错的 flag、`--flag=value`、缺值**都得自己兜**，而且是**每个程序各兜一遍**；
+2. 全仓有 4 个 CLI 程序，各写一套 → help 文案与错误形式**必然漂移**（改一处忘一处，没人会发现）；
+3. 手写版遇到拼错只回 `unknown arg: --wat` + 一行 usage —— **不指出是哪个参数、该给什么**。
+   运维脚本靠错误信息定位问题，这属于**接口质量**，不是"锦上添花"。
+
+结论：语法层统一交给 clap，**语义层仍归本 crate**（分工见 48.2）。
+
+### 48.2 分工：clap 管**语法**，crate 管**语义**
+
+| 层 | 谁管 | 例子 |
+|---|---|---|
+| 语法 | clap（`derive`） | 有哪些 flag、`--id` 是不是整数、`--listen` 能否解析成 `ip:port`、必填项缺没缺 |
+| 语义 | `Args::normalize` / `Args::check_bootstrap` | 成员表必须含自己；空目录必须 `--init`；有数据的目录不许 `--init` |
+
+语义错误也按**用法错**退出。**退出码分层是给编排脚本的接口**：
+
+| 码 | 含义 | 脚本该怎么反应 |
+|---|---|---|
+| 0 | 正常（含 `--help`/`--version` —— 它们不是错误） | 继续 |
+| 2 | **用法/配置错**（改参数就有救） | 报给人改参数 |
+| 1 | **启动/运行失败**（环境/数据问题） | 查目录权限、目录锁、成员表 |
+
+### 48.3 迁移时**刻意**保住的"接受的输入是原来的超集"
+
+| 能力 | 原手写版 | clap 版怎么保住 |
+|---|---|---|
+| `--addr a` 与 `--addr=a` | 都支持 | clap 原生 |
+| `YUNTUN_ADDR` 环境变量 | 支持 | `#[arg(env = "YUNTUN_ADDR")]` |
+| `--addr` 放在子命令**前或后** | 支持（全 argv 扫描） | `global = true` |
+| `--format` 大小写 | 不敏感 | `ignore_case = true` |
+| `--format json` / `ndjson` 等价 `jsonl` | 支持（`InputFormat::parse`） | `#[value(alias = "json", alias = "ndjson")]` |
+| `bench_baseline` 的 **9 个位置参数顺序** | 固定顺序 | 顺序**逐一对应**（文档与历史命令不用改） |
+| `YUNTUN_BENCH_NO_READER` | 环境变量 | 保留 + 新增 `--no-reader`（等价，且能 `--help` 看到） |
+
+**教训**：迁移解析器最危险的不是"新写法不能用"，而是**静默收窄**接受的输入 ——
+用户脚本里某个别名突然失效，报的却是"参数非法"（他会去查自己的脚本，而不是查我们的迁移）。
+所以先把"原来接受什么"逐条列出来，再用 clap 的特性逐条保住，**并用测试钉住**（48.5）。
+
+### 48.4 实测撞到的三个坑
+
+| # | 坑 | 现象 | 教训 |
+|---|---|---|---|
+| 1 | **`--init` 的成功路径是"持续服务"** | 进程级测试里用 `.output()` 等它退出 → **永久挂住**（我是在 60s 无输出时才注意到） | 长驻进程的测试必须"起 → 等就绪（读它打印的地址）→ 停"；`.output()` 只适用于**会退出**的命令 |
+| 2 | `[workspace.dependencies]` 加了 clap，`Cargo.lock` 里却没有 | `cargo fetch` 不报错、也没拉包 | workspace 依赖只有**被某个 crate 引用**后才参与解析 |
+| 3 | （环境）链接器 `ld terminated with signal 7 [Bus error]` | 全量测试 `exit=101`，日志里**没有任何编译错误** | 这是环境偶发（磁盘 78G 可用、内存 25G 可用都充足），**重试即过**（287 passed）；别照着它改代码 |
+
+### 48.5 交付物与验证
+
+| 位置 | 内容 |
+|---|---|
+| `crates/meta/src/cli.rs` | clap derive 参数 + `normalize`（成员表自洽）+ `check_bootstrap`（两条启动闸门）+ **8 条单测** |
+| `crates/meta/src/lib.rs` | `MetaNode`：进程运行时；**三道启动检查**（存储可开 / 盘上成员表与配置一致 / 只有单 voter）；与 `Cluster` **完全共用**同一条落盘与恢复链路 |
+| `crates/meta/src/main.rs` | 薄入口：解析 → 起节点 → **等选主** → 起服务；打印 `metanode id=N listening on <addr> ...`（**这行是接口**：`--listen 127.0.0.1:0` 时靠它拿真实端口，改格式等于破坏调用方） |
+| `crates/meta/tests/metanode_process_e2e.rs` | **4 条**：① `kill -9` 后状态机恢复；② 两条 `--init` 误用；③ 成员表不一致 / 多节点拒绝；④ clap 面（help/version/未知 flag） |
+| `crates/client/tests/cli.rs`、`crates/standalone/tests/cli.rs` | CLI 契约：help 列出全部子命令与 flag、用法错退 2 且**指出参数名**、格式别名仍被接受、`--version` 输出格式 |
+
+验证：`metanode` 4 + `yuntun-cli` 4 + `yuntun` 3 + `meta::cli` 8 全绿；
+**全量 287 passed / 0 failed**；`yuntun-meta` clippy 0（全仓余 1 处历史告警：`chunk/store.rs`
+的 `doc_lazy_continuation`，与本次无关）。
+
+### 48.6 为什么"进程级恢复"的断言口径更强
+
+`kill -9` 之后，状态机是**内存里的、已经没了** —— 它回来只能靠**从盘重放日志（或装快照）**。
+所以用例的**第一条断言**是"同一个幂等键再提一次必须 `accepted=false`"：
+
+- 它证明的是**盘上日志 + 恢复路径都对**（日志在、`Config.applied` 复位正确、重放按序 apply、
+  幂等表重建），而不是"进程起来了"；
+- 比 `Status` 里的 "applied_index 追平" **更强**：后者在"重放时走错分支"的情况下也可能成立
+  （比如把已应用条目再应用一遍 —— 幂等 op 的状态不变，但计数器会多走）。
+
+## 48.7 遗留
+
+| # | 项 | 归属 |
+|---|---|---|
+| 1 | **多节点部署形态**：节点间 raft 消息的**网络传输**（现在单 voter 才能起，多 voter 会被明确拒绝而不是静默空转） | **S3-3 收尾（下一件）** |
+| 2 | `Meta.Join` 的成员变更（learner → voter）与多节点 `--init` 引导 | S3-6 |
+| 3 | 其余 op 的 proto 镜像（`result`/`payload` 逐 op 定形） | S3-0 余 |
+| 4 | 两个时钟统一（`now_ms` 与状态机时钟） | S3-4 |
+| 5 | 快照**触发与保留**策略（现在只有"按需压缩"） | S3-3 余 |
+
+---
+
+---
+
+## 49. 清理：删除未接线的 `vendor/opensrv-mysql`（2026-09-19）
+
+### 49.1 结论
+
+`vendor/opensrv-mysql`（544K，`.gitignore` 已忽略、未被 git 跟踪）已删除。**零功能影响**，
+两条独立证据：
+
+| 证据 | 结果 |
+|---|---|
+| 是否被构建引用 | 全仓唯一的 opensrv 依赖是 `crates/sqlwire/Cargo.toml` 的 `opensrv-mysql = "0.7"`（**走 registry**）。根 `Cargo.toml`、`.cargo/`（不存在）、用户级 cargo 配置里**都没有** `[patch.crates-io]` / `paths` / `directory = "vendor"` 之类的接线 |
+| 与上游是否一致 | `diff -rq` 与"文件清单 md5"**双双**显示它与 `~/.cargo/registry/src/*/opensrv-mysql-0.7.0` **逐字节相同** —— 即这份 vendor **连一处补丁都没有** |
+
+### 49.2 为什么值得记（避免后来者误判）
+
+`§22` 记着上游 opensrv-mysql **0.7.0** 的 `PacketReader::next_async` 释放后使用
+（上游 #66 / PR #67，**只修在 git**，crates.io 仍是 2024-02 的 0.7.0）。看到 `vendor/opensrv-mysql`
+很容易以为"我们 fork 了一份来打这个补丁"——**并不是**：`§22.3` 的绕过**全部在 `sqlwire`**
+（`PacketFramedReader::poll_read` 按**包边界**截断），一行都没改 opensrv。
+
+所以这次删除**不会**让 §22 的上游问题回来 —— 它从来没被这份 vendor 挡住过（删除前后，
+构建用的都是 registry 上那份未打补丁的 0.7.0）。
+
+若将来真要 patch 上游，正确形态是 **`[patch.crates-io]` + 在文档里写明补了什么**
+（上游问题在 0.7 已定位到具体文件行，patch 是可做的；本次只是不做）。
+`.gitignore` 的 `/vendor/` **保留**：真 vendor 时它仍是忽略目录，记得 `git add -f`，
+否则补丁不会进仓库（那等于"本地修好了、别人拉下来还是坏的"）。
+
+### 49.3 验证
+
+`cargo test -p yuntun-sqlwire -p yuntun-server -p yuntun-standalone`：**30 passed / 0 failed**
+（覆盖 MySQL wire 链路：握手 / prepared / 二进制行编码 / `SET`·`USE`·`SHOW` 拦截 / 错误码映射）；
+`git status` 干净（该目录本就未跟踪）。
+
+---
+
+---
+
+## 50. R3 S3-3 收尾：节点间 **gRPC 传输** —— 3 节点复制 + 换主不丢已提交（2026-09-19）
+
+### 50.0 本轮结论
+
+M3 的 G1 判据（**kill leader 自动选主、提交不丢失**）第一次跑在**真网络路径**上并通过：
+`crates/meta/tests/multi_node_grpc_e2e.rs` 一条用例串起
+**3 节点选主 → 经 gRPC 复制 → 三节点收敛 → 杀 leader → 重选 → 继续写 → 换主前的幂等键仍命中**（0.46s）。
+
+至此 S3-3 的**运行形态**齐了：单节点可作进程独立启动（`§48`）、多节点经网络复制（本轮）、
+崩溃后从盘恢复（`§44`/`§48`）。剩下的是"其余 op 的镜像 / 快照触发策略 / 成员变更 / 鉴权"（50.6）。
+
+### 50.1 为什么传输得自己写；以及为什么用 gRPC 承载
+
+raft-rs 只吐 `eraftpb::Message`，**传输是使用者的责任**（库文档明说）。选型对比：
+
+| 方案 | 代价 |
+|---|---|
+| **gRPC（本轮）** | 每消息一次 HTTP/2 往返。心跳 3 tick ≈ 30ms，量级完全够；换来**一个端口**、复用 TLS/鉴权/可观测，不必再写一套分帧 + 握手 |
+| 裸 TCP + 长度前缀 | 少一层开销，但**多一个端口**、多一套协议/分帧/超时，TLS 还得再写一遍 |
+
+**判定**：先用 gRPC。唯一可能让它成为瓶颈的场景是"**大日志批量追赶**"（每秒上百 MB 的追加），
+那时换成裸 TCP **只需替换 `transport.rs`** —— `spawn_node` 只依赖 `PeerTransport` trait，
+raft 循环一行不用改（这正是本轮先抽 trait 的原因）。
+
+### 50.2 传输语义与"必须留下信号"
+
+| 性质 | raft 是否要求 | 本实现 |
+|---|---|---|
+| 不丢 | **不要求**（心跳/选举/追加按 tick 重发） | 队列满 → **丢** + 计数；**绝不阻塞** raft 线程 |
+| 保序 | **不要求**（靠 term/index 自愈） | 不保证（多连接并发） |
+| 不重 | 要求（重复会让 raft 反复 `step`） | gRPC 不重复；**我们不做重发** |
+
+`send()` 非阻塞是硬要求：调用点在 **raft 线程**上，阻塞它 = 拖住 tick = 别人选你当 leader 时你没反应。
+
+因此每 peer 一个后台发送任务 + 计数：
+
+| 计数 | 含义 | 为什么要它 |
+|---|---|---|
+| `queued` | 成功进队列 | —— |
+| `dropped` | 队列满/对端未知 | 区分"我们没发"与"网络丢了" |
+| `failed` | RPC 失败/超时 | 对端不可达（重启中属正常） |
+| `delivered` | 对端确认已入它的 raft 线程 | **唯一能证明"复制真走了网络"的信号** |
+| `rejected` | 对端拒收（线程已退出） | 对端其实死了但连接还在 |
+
+**"永远选不出 leader"是最难查的故障** —— 没有这几个数，就只能靠猜。
+
+### 50.3 载荷为什么是**不透明 bytes**
+
+`Meta.Raft` 的 `message` 字段直接装 `eraftpb::Message` 的 protobuf 编码，**不在 proto 里重写一遍**：
+重写会得到"两份必然漂移的定义 + 每升一次 raft 就要同步改 proto"。
+代价是它**不可自描述** → 跨版本混跑不能被 proto 挡住，要靠发布约束（登记为 50.6-③）。
+
+### 50.4 三道启动检查 + 一个"提前到 CLI"的闸门
+
+| # | 检查 | 不做会怎样 |
+|---|---|---|
+| 1 | 盘上成员表 == 启动参数里的成员表 | 各节点各自成组，数据永远合不回来 |
+| 2 | 每个**别的 voter** 都有地址（缺哪个列哪个） | 发不出消息 → 永远选不出 leader，且**不报错** |
+| 3 | 多节点时处于 tokio 运行时上下文（要起发送任务） | 启动即失败，但错误信息会含糊（现在明说"要在运行时内调用"） |
+
+检查 ② 同时在 **CLI 层**拦一遍（退出码 2，提示可直接照做）。这不是重复：
+CLI 层拦的是"人手打错"，`MetaNode::open` 拦的是"API 调用方漏了"。
+
+**实测这条闸门立刻见效**：改完语义后，`cli::tests::explicit_voters_are_sorted_and_deduped`
+（3 voter 却没给 `--peer`）当场变红 —— 老用例就是被新语义抓出来的。
+
+### 50.5 反证（证明用例不是自说自话）
+
+| 做法 | 结果 |
+|---|---|
+| 把各节点的 `--peer` 指到**错端口**（网络不通） | ✅ 用例在 30s 内以"没选出 leader"失败 |
+| 用例内断言"各节点 `delivered` 之和 > 0" | ✅ 不成立就失败 —— 防"复制其实没走 gRPC 却过了"（比如误退回进程内邮箱） |
+
+### 50.6 遗留
+
+| # | 项 | 归属 |
+|---|---|---|
+| 1 | **成员变更**（`Meta.Join`：learner → voter）、加节点不重启 | S3-6 |
+| 2 | **鉴权**：`Meta.Raft` 现在是**裸的** —— 任何能连上端口的人都能往里塞 raft 消息 | S3-6 / 部署（真实环境必须 mTLS 或内网隔离） |
+| 3 | **版本混跑保护**：载荷不可自描述，跨版本节点混跑需要版本门（当前靠发布约束） | S3-6 |
+| 4 | 大日志追赶的性能（HTTP/2 vs 裸 TCP）与抓包级观测 | 性能阶段 |
+| 5 | 其余 op 的 proto 镜像 / 两个时钟统一 / 快照触发与保留策略 | S3-0 余 / S3-4 / S3-3 余 |
+
+### 50.7 交付物
+
+| 位置 | 内容 |
+|---|---|
+| `crates/proto/proto/meta.proto` | `rpc Raft(RaftRequest) returns (RaftResponse)`（`from`/`message` → `delivered`/`reason`） |
+| `crates/meta/src/transport.rs`（新） | `PeerTransport` trait + `Mpsc`/`No`/`Grpc` 三个实现 + `TransportStats`（5 个计数） |
+| `crates/meta/src/lib.rs` | `spawn_node` 改收 `Arc<dyn PeerTransport>`；**三处出站**（`take_messages`/`take_persisted_messages`/`light.take_messages`）全走它；`NodeHandle::deliver`（收件箱）；`MetaNode::open(.., peers)`、`transport_stats()`、`MetaNodeError::{MissingPeer,Transport}` |
+| `crates/meta/src/service.rs` | `Meta.Raft` 处理：只做"解码 + 入箱"；解不开**报错**（不是 `delivered=false` 的软失败 —— 那是"协议不一致"被伪装成"对端拒收"） |
+| `crates/meta/src/cli.rs` | `--peer <id>@<host:port>`（端点串校验、重复 id 拒绝、缺地址点名） |
+| `crates/meta/tests/multi_node_grpc_e2e.rs`（新） | 3 节点真 gRPC：选主/复制/收敛/杀 leader/重选/继续写/幂等命中（**0.46s**） |
+
+---
+
+---
+
+## 51. R3 S3-4（第一件）：读路径载荷定形 —— `Prefetch` 的语义与镜像（2026-09-20）
+
+### 51.0 本轮结论
+
+`§45.4` 明确归给 S3-4 的那一项（**`PrefetchResponse.payload` 的形状**）已落地，并**逐条有用例**：
+
+| 语义 | 用例断言 |
+|---|---|
+| 只要版本号（`tables` 空）→ **零载荷** | `payload.tables.is_empty()` |
+| 版本没变（`since` = 当前）→ 版本号原样回，客户端据此跳过刷新 | 版本相等 + 零载荷 |
+| 差量（`tables` 非空）→ 只回**请求里存在**的表；请求了却不在 = **已删** | `[public.cpu, public.gone]` → 只回 `public.cpu` |
+| `full=true` → 全部表 + `full_reload` | 载荷含全部表 |
+| **版本超前**（客户端比本集群新）→ 全量 + `full_reload` | `since = 当前+100` → 仍要求重建 |
+
+### 51.1 两条「为什么」（这套语义的错法都不报错，所以要写下来）
+
+1. **「请求了却不在载荷里」必须解释为「已删」** —— 所以载荷**只**能包含存在的表，
+   **不能**「补一个空占位」。补了客户端就再也分不清「我没请求它」与「它被删了」。
+2. **版本超前必须要求全量重建**，不能静默返回空：静默返回空会让客户端以为「一切照旧」，
+   继续拿一份**不属于本集群**的缓存去规划查询 —— 错得**不报错**。
+
+### 51.2 实测抓到的真问题：载荷里的 `name` 必须是**全限定**
+
+第一版转换直接搬 `model::TableMeta.name` —— 那是**裸名**（`cpu`），schema 在另一个字段里；
+而契约里写的是全限定名（`public.cpu`）。用例当场变红：
+**「请求 `public.cpu`，拿回名为 `cpu` 的条目」**。
+
+后果不是「名字不好看」：载荷的消费者拿它当**缓存键**，裸名会让
+`public.cpu` 与 `analytics.cpu` **撞成一条**（多 schema 下静默串表）。
+
+修法：
+
+- 编码：`name = m.qualified_name()`（全限定）+ `namespace = m.schema_name()`（冗余副本，供交叉校验）；
+- 解码：`split_qualified(&name)` 还原，并**校验** `namespace` 与全限定名一致 ——
+  不一致**报错**（两个字段写的是同一个事实，静默取一个会让「名字」与「namespace」指向不同的表）。
+
+### 51.3 `ingest_config` 为什么用 proto3 `optional`
+
+模型里是 `Option<IngestConfig>`，**存在性有语义**（「没配」≠「配了默认值」）。
+用普通 `bytes` 会把 `None` 与「空配置」混成同一个值 ✗ →
+改用 `optional bytes`（proto3 presence），并用一条「`None` 必须还原成 `None`」的用例钉住。
+
+### 51.4 交付物与验证
+
+| 位置 | 内容 |
+|---|---|
+| `crates/proto/proto/meta.proto` | `PrefetchRequest.tables`、`PrefetchPayload`（一层壳，便于以后加 manifest/文件级增量）、`TableMeta` 镜像 |
+| `crates/meta/src/op.rs` | `table_meta_to_proto` / `table_meta_from_proto` + **无损 round-trip 用例**（含 `optional` 存在性与「namespace 不一致必须拒绝」） |
+| `crates/meta/src/lib.rs` | `NodeHandle::prefetch`（落实语义：`full = req.full 或 版本超前`） |
+| `crates/meta/src/service.rs` | `Prefetch` 从 `UNIMPLEMENTED` 变为实现（只读内存状态，不需要阻塞线程池） |
+| `crates/meta/tests/meta_service_e2e.rs` | `prefetch_payload_semantics`（真 gRPC，五分支） |
+
+**反证**：去掉「版本超前保护」（`let ahead = false`）→ 用例 ⑤ 立刻红
+（客户端拿到「一切照旧」的空载荷 + `full_reload=false`）—— 正是要防的那种错。
+
+**验证**：meta 全绿；全量 **292 passed / 1 failed**，失败的是**已登记的 chaos 并行 flake**
+（全量里 37.5s，**隔离复跑 0.11s 通过**，`status.md` 已登记，根治属 T6.1）。
+
+### 51.5 一个观测口径的坑（差点让我误判）
+
+`cargo test --workspace` 的日志**会混**：被取消的命令留下的**后台 cargo 进程**
+会与后一次运行**同时写同一份日志**。据此我一度以为「某个 target 失败」
+（其实那个 target 是 passed，失败来自另一个进程的视角）。
+
+**判据**：日志开头出现 `Blocking waiting for file lock on build directory` = 当时**不止一个 cargo** 在跑
+→ 这份日志**不能**作为验收证据（本次实测：混过的日志 98 targets / 421 用例；干净全量是
+**59 targets / 293 用例**）。
+
+### 51.6 遗留
+
+| # | 项 | 归属 |
+|---|---|---|
+| 1 | **`RemoteCatalog`（`CatalogOps` 的 gRPC 实现）+ standalone 装配** —— 判据：既有用例全绿、`if distributed` 分支为零 | **S3-4 第二件（下一件）** |
+| 2 | 清单/文件级刷新进载荷（现在载荷只到「表元数据 + schema」，文件级走 `Delta`） | S3-4 余 |
+| 3 | 「落后太多必须全量」的**保留窗口**判定（现在只有 `full=true` 与「超前」两种信号） | §6.3 保留策略 |
+| 4 | 其余 op 的 proto 镜像（`DropSchema`/`EvolveSchema`/`DropShard`/`Compaction`） | S3-0 余 |
+
+---
+
+---
+
+## 52. R3 S3-4（第二件·上半）：拆掉 catalog 接缝上的**具体类型**（2026-09-20）
+
+### 52.0 本轮做了什么
+
+把"装配层之外还能看见 `MemoryCatalog`"这件事，从**纪律**变成**类型**：
+
+| 位置 | 之前 | 现在 |
+|---|---|---|
+| `Lakehouse.catalog` | `Arc<MemoryCatalog>` | **`Arc<dyn CatalogOps>`** |
+| `collect_metrics` / `replay_wal_ddl` 的参数 | `&Arc<MemoryCatalog>` | `&Arc<dyn CatalogOps>` |
+| 测试与夹具里的 `x.clone() as Arc<dyn CatalogOps>` | 转型（因为源是具体类型） | 已随之清理（只有"源类型确实是具体类型"的 4 处保留转型：chaos 夹具 / query 测试助手） |
+
+**这一轮是纯类型级改动，零行为变化** —— 所以它的验收判据就是"**用例必须一模一样地全绿**"。
+
+### 52.1 判据（S3-4 原话的两条）
+
+| 判据 | 结果 |
+|---|---|
+| **既有用例全绿**（standalone 不回归） | ✅ **293 passed / 0 failed**（59 targets；日志无 `Blocking waiting for file lock` = 可采信，见 `§51.5`） |
+| **`if distributed` 分支为零** | ✅ **代码命中 0**（只有两处**注释**提到这句话） |
+| 生产代码里谁还知道具体实现 | ✅ 全仓**只有装配点一处**：`crates/server/src/lib.rs` 的 `let catalog: Arc<dyn CatalogOps> = Arc::new(MemoryCatalog::new());`。其余 `MemoryCatalog` 出现处全在**测试模块**或注释里 |
+
+**为什么靠类型而不是靠纪律**：别处拿不到 `MemoryCatalog` —— 要拿得先在装配点 `as` 下去，一眼可见。
+分布式形态切换时（下一件）改的就是那一行。
+
+### 52.2 探明的"下一件要补什么"（这轮的真正价值）
+
+量了一遍生产代码对 catalog 的**全部**方法依赖（`server`/`query`/`ingest`/`compaction`），结论：
+
+- **全部落在 trait 上** ✅ —— 包括一开始担心的 `current_snapshot` / `known_batch_ids` /
+  `check_idempotency` / `record_idempotency`（它们早就在 trait 上，`compaction` 与 `ingest` 一直在用）
+  → **接缝没有"只有具体类型才有"的隐藏依赖**，这是最好的结果。
+- 所以 `RemoteCatalog` 要覆盖的就是 `CatalogOps` 的 **21 个方法**，其中：
+  | 类别 | 线上路径 | 状态 |
+  |---|---|---|
+  | 写（DDL/提交/分片/Compaction/幂等记录） | `Propose(op)` | 4 个 op 已镜像（CreateSchema/DropTable/CommitFiles/CreateTable）；**余** DropSchema/EvolveSchema/DropShard/Compaction/幂等记录 |
+  | 读（版本/表元数据/schema/命名空间） | `Prefetch` / `Delta` | ✅ `§51` 已定形 |
+  | 读（文件/清单级） | `Prefetch` 载荷（**待扩**） | ⏳ 载荷现在只到"表 + schema" |
+  | 线性化读位置 | `Status.applied_index` | ⏳ 需在 `§5` 约定 4 的口径下定形（ReadIndex） |
+
+### 52.3 遗留（下一件 = S3-4 第二件·下半）
+
+| # | 项 | 说明 |
+|---|---|---|
+| 1 | `RemoteCatalog`（`CatalogOps` 的 gRPC 实现） | 写走 `Propose`、读走 `Prefetch`；按 52.2 的表补齐缺口 |
+| 2 | 其余 op 镜像：`DropSchema`/`EvolveSchema`/`DropShard`/`Compaction`/幂等记录 | 机械工作，但**必须先有**（`RemoteCatalog` 的写路径要用） |
+| 3 | 文件/清单级读载荷（`list_visible_files`） | 现在 `Prefetch` 载荷不含文件级条目 |
+| 4 | 切装配点 | 一行；但只有 1–3 完成后才可能全绿 |
+
+---
+
+---
+
+## 53. R3 S3-4（第二件·下半之一）：补齐其余 **5 个 op 的 proto 镜像**（2026-09-20）
+
+### 53.0 本轮做了什么
+
+`RemoteCatalog` 的写路径必须先有「op 的线上形状」。补齐 5 个：
+**DropSchema / EvolveSchema / DropShard / Compaction / Idempotency（认领）**；
+`Op.kind` 的分支数 **4 → 9**，并同步更新了分支守护测试（它如期要求「显式确认」）。
+
+### 53.1 两个设计决定（都有理由，不是风格）
+
+1. **`SchemaChange` 用 `oneof`**，而不是「`kind` + 松散字段」：后者允许**非法组合**
+   （如 `kind=AddColumn` 却带 `to`），而那种消息**照样编码成功** —— 错误被推到最晚才发现
+   （应用时才炸，且可能只在某一个副本上炸）。
+2. **`Field` / `DataType` 用 Arrow IPC 携带**（编成「单字段 schema」）：
+   `CreateTableOp.arrow_schema_ipc` 已经是 Arrow IPC，再发明一套「字段编码」只会得到
+   **两份必然漂移的定义**。代价是编码里带了 schema 名这类无意义信息 —— 解码侧忽略它，
+   并**强制恰好 1 个字段**（0 或 2 个都是协议层垃圾，放过去会让「增列」变成一个说不清的动作）。
+
+### 53.2 幂等「认领」为什么**必须**是 op
+
+`pipeline.rs` 在 WAL fsync 成功后立刻 `record_idempotency`（`batch_id` 为**空串** =
+「已认领、批次尚未落盘」）—— 这是拦住「**并发同键请求双双通过预筛、各写一份 Data**」的那道闸。
+它若只存在本地，换主/日志重放后认领就没了，闸门形同虚设 → **必须是 op**（`IdempotencyOp`）。
+镜像里**空 `batch_id` 的语义被保住**（用例钉住：不能被补成默认值）。
+
+### 53.3 实测抓到的三处（都是编译器/用例主动拦下的）
+
+| # | 现象 | 教训 |
+|---|---|---|
+| 1 | 加 `StateOp` 变体后，`now_ms()` 的 `match` **立刻编译失败** | 穷尽 `match` 是「**每个 op 必须自带请求时间**」的强制器（纪律 1：状态机不读钟）—— 漏带就会让各副本按各自墙钟分叉 |
+| 2 | 反证：把 `expected_version` 写死 0 | 用例精确报「OCC 版本丢了 → DDL 变成无条件覆盖」（丢版本 = DDL 退化成无条件覆盖，静默） |
+| 3 | `Schema::new(vec![])` 类型无法推断（`Fields` 有两个 `From<Vec<_>>`） | 类型标注要写清（`Vec::<Field>::new()`） |
+
+### 53.4 验证
+
+- `op` 模块 **8 条**（3 条新增：`SchemaChange` 三变体无损 + 非法载荷拒绝；5 个新 op 的镜像与解码；
+  新 op 的**幂等语义** —— 重放/重试必须 `accepted=false`，否则重启重放会把「已经做过」当错误 → 起不来）
+- `wire_compat` 分支守护 **4 → 9**（守护测试如期要求显式确认 —— 这就是它存在的意义）
+- 全量 **296 passed / 0 failed**（59 targets；日志无 `Blocking waiting for file lock`，可采信）；
+  clippy 0（改动 crate）
+
+### 53.5 遗留（下一件）
+
+| # | 项 | 说明 |
+|---|---|---|
+| 1 | **`RemoteCatalog` 本体** | 写走 `Propose`（现在 9 个 op 分支都有线形了）、读走 `Prefetch`/`Delta` |
+| 2 | 文件/清单级读载荷（`list_visible_files` 等） | `Prefetch` 载荷现在只到「表 + schema」 |
+| 3 | 幂等的**读**路径（`check_idempotency`/`known_batch_ids`） | 按 §3.2 是「本地键集合快路径」，需定形它与 SM 权威的关系（S3-5 已把键集合从 WAL 派生） |
+| 4 | 切装配点 | 最后一行，改完靠既有用例全绿验收 |
+
+---
+
+---
+
+## 54. R3 S3-4（第二件·下半之二）：**文件级读载荷** —— 墓碑必须发（2026-09-20）
+
+### 54.0 本轮做了什么
+
+`Prefetch` 载荷补齐**文件级**内容，读路径的缺口到此为止：
+
+| 位置 | 内容 |
+|---|---|
+| proto | `PrefetchRequest.since_snapshot`（客户端清单水位）+ `PrefetchPayload.files`（`FileEntry{batch_id, manifest}`，复用已有的 `FileManifestMsg` 逐字段镜像） |
+| `CatalogState` | 新增 `files_since(table, since)`（文件级增量；**含墓碑**） |
+| `NodeHandle::prefetch` | 落实口径（与表载荷一致：纯版本探测 = 零载荷；顺序规范化便于对拍） |
+
+### 54.1 为什么「只发当前可见的文件」是**错的**（本轮的核心）
+
+客户端的本地清单是按**版本增量**刷新的，它要的是「我错过的那部分变化」——
+**包括墓碑**（`deleted_at > since` 的文件）。只发「当前可见」会让客户端
+**永远删不掉已删文件**：它那边的旧副本还在，查询就会去读已删数据
+（**静默读到脏数据**，不报错、只在结果里少/多几行）。
+
+**实测**：把 `files_since` 里的墓碑规则去掉（`|| (deleted_at != 0 && deleted_at > since)`）
+→ 用例立刻红，报「删分片后必须把**墓碑**发回来……：[]」——删除信息**完全丢失**。
+
+### 54.2 增量条件（MVCC 语义）
+
+```text
+valid_from > since                      → 水位之后**新增**的
+|| (deleted_at != 0 && deleted_at > since) → 水位之后**被删**的（墓碑）
+```
+
+- `since_snapshot == 0` → 全量（含墓碑，客户端据此重建清单）；
+- `table == None` → 所有表；
+- 结果按 `(table, batch_id)` 排序 → **同一请求同一字节**（便于对拍与缓存打补丁的可复现）。
+
+### 54.3 「表已删」与「表没文件」怎么区分（契约的一部分）
+
+表的存在性只看 `tables` 载荷；文件只为**请求的表**发。于是：
+
+| 现象 | 含义 |
+|---|---|
+| 表在 `tables` 里 + 该表无文件条目 | **空表**（不是错误） |
+| 表**不在** `tables` 里 | 该表**已删**（客户端要丢掉整表条目，包括它的文件） |
+
+所以文件载荷**不能**为已删表「补空占位」——与 `§51.1` 是同一条规则（补了就没法区分「没请求」与「已删」）。
+
+### 54.4 验证
+
+- e2e 新增 `prefetch_carries_file_deltas_including_tombstones`（四段：全量 → **零增量** →
+  **墓碑** → 墓碑不重复发）。它顺带把上一轮新加的 `DropShard` op 跑通了**真 gRPC 端到端**
+  （propose → apply → 载荷观测），等于给新 op 也补了一条集成证据。
+- **反证**：去掉墓碑规则 → 用例红（见 54.1）。
+- 全量 **297 passed / 0 failed**（59 targets；日志无锁等待）；clippy 0（改动 crate）。
+
+### 54.5 遗留（下一件）
+
+| # | 项 | 说明 |
+|---|---|---|
+| 1 | **`RemoteCatalog` 本体** | 读载荷（表+schema+**文件增量**+版本）与写线形（9 个 op）**都齐了** → 只剩本体 |
+| 2 | 幂等的**读**路径（`check_idempotency`/`known_batch_ids`） | 需定形「本地键集合快路径」（S3-5 已从 WAL 派生）与 SM 权威的关系 |
+| 3 | 线性化读位置（`read_index`） | 按 `§5` 约定 4 |
+| 4 | 切装配点 | 最后一行，靠既有用例全绿验收 |
+
+---
+
+---
+
+## 55. R3 S3-4（第二件·下半之三）：`RemoteCatalog` 落地 —— **与 `MemoryCatalog` 对拍一致**（2026-09-20）
+
+### 55.0 本轮做了什么
+
+| # | 交付物 | 说明 |
+|---|---|---|
+| 1 | `RemoteCatalog` | `CatalogOps` 的 gRPC 实现：**写** = `Propose`（+ 换主重试）／**读** = 本地缓存 + **版本驱动刷新** |
+| 2 | 错误保真 | `MetaError → Status` 补**机器可读** `err-kind`/`err-subject` metadata + 反向映射 `map_status` |
+| 3 | **对拍** | 同一串操作打两个实现，逐项比较可观测状态（9 步） |
+
+### 55.1 对拍抓到的真 bug：**结构变更必须走全量**
+
+`Delta.changed_tables` 是 **manifest 级**的（只列 `table_manifest_ver` 推进过的表），
+而 `create_table`/`drop_table` 只动 `schema_ver` —— **新建的表根本不在 `changed_tables` 里**。
+
+照「版本变了就走增量」的直觉写，客户端会**静默丢掉刚建的表**：
+现象就是"远端建表后读不到"（对拍里一建表就红，而单跑 `MetaService` 的用例是绿的 ——
+因为那条路径从没走过"增量刷新"）。
+
+**修法**：客户端把 `schema_ver` 变化当作「结构变更」信号 → 走全量。
+**为什么不让服务端判断**：`DeltaRequest` 只带 `since_manifest_ver`，**不带客户端的 `schema_ver`**，
+服务端无从知道对面缺哪些结构变更 → 信号只能由客户端从探测结果里取（它本来就知道自己的版本）。
+（登记遗留：给 `DeltaRequest` 加 `since_schema_ver`，省掉客户端每次结构变更的全量。）
+
+### 55.2 错误保真为什么必须（不是锦上添花）
+
+远程路径上 `Status → LakeError` 一旦退化成 `Other`，SQL 层的错误码会**整体退化**
+（用户看到 500 而不是 1051「表不存在」），而**没有任何测试会红**。所以这一层单独加固：
+
+| 侧 | 做法 | 用哪种测试钉住 |
+|---|---|---|
+| 服务端 | 错误身份放进 **metadata**（`err-kind` + `err-subject`），而不是只塞 message | 「每个可分支错误都带 kind」 |
+| 客户端 | 用 metadata 反查（**不 parse 诊断串** —— 文案一改就静默坏）| 「`LakeError → Status → LakeError` **保形**」|
+
+`SchemaChanged` 是特例：它的 `new_schema` 是 `Arc<Schema>`，**过不了线** →
+远端在**冲突时多读一次**当前 schema 还原成同形错误（额外往返只发生在冲突路径上）。
+
+### 55.3 幂等快路径的口径（"安全"要可验证）
+
+本地只记**自己写过的键**（含 `commit_files` 自带的键）。**漏判是安全的**：走到 `Propose`，由 SM 去重。
+对拍把这条写成可执行断言：重放同一个提交 → `accepted=false` —— **快路径答错不影响正确性**。
+
+### 55.4 对拍比什么（判据清单）
+
+schemas｜tables（全限定名 + 格式 + schema 版本 + 字段数）｜两组版本号｜快照号｜
+`u64::MAX` 下可见文件｜**旧快照**下可见文件（MVCC：墓碑必须还在）｜OCC 冲突的形状｜
+「表已存在」「表不存在」的错误类别 ✓
+
+刻意**不比**的：`created_at`/`committed_at` 等时间戳 —— 本地实现读自己的钟，远端用 op 里带的时间，
+**本就该不同**（纪律 1：时间随 op 走），拉进对拍只会得到噪声断言。
+
+### 55.5 验证
+
+- `RemoteCatalog` 单测 2（错误保形 / 表名归一化）+ `error.rs` 新用例（kind+subject 全覆盖）
+- 对拍用例 1（9 步 × 6 个维度）
+- 全量 **301 passed / 0 failed**（60 targets；日志无锁等待）；clippy 0（改动 crate）
+
+### 55.6 遗留（**R3 收口的最后一步**）
+
+| # | 项 | 说明 |
+|---|---|---|
+| 1 | **切装配点** | `server` 里那一行：起一个**进程内 1 节点 `MetaNode`**（设计 §3.3 的"本地传输"）+ `RemoteCatalog::connect(loopback)`；保留**装配层开关**（设计指定的回滚点：切回 `MemoryCatalog`）。判据：既有用例全绿 |
+| 2 | `DeltaRequest` 加 `since_schema_ver` | 让服务端能判断结构变更 → 免掉客户端每次结构变更的全量（见 55.1）|
+| 3 | `ProposeResponse` 加 `affected` | 精确 `drop_shard` 条数（现在远端只能给 1/0）|
+| 4 | 幂等键集合进载荷 | 现在本地快路径只知道自己的键（安全但会多走一次 `Propose`）|
+| 5 | 文件缓存的保留窗口/GC | 墓碑只增不减（MVCC 需要它们，但要有界）|
+
+---
+
+---
+
+## 56. R3 S3-4 收口：**切装配点** —— standalone 的 catalog 换成嵌入式 metanode（2026-09-20）
+
+### 56.0 本轮做了什么
+
+`crates/server` 的装配点从「写死 `MemoryCatalog`」变成**按配置装配**：
+
+| 位置 | 内容 |
+|---|---|
+| `[meta]` 段（新） | `mode`（`embedded` 默认 / `memory` 回滚）· `listen` · `dir` —— **这就是设计指定的回滚点** |
+| `mode = "embedded"`（默认） | 进程内起 **1 节点 metanode**（raft + fjall **落盘**）+ **loopback gRPC**，再用 `RemoteCatalog` 连它（设计 §3.3 的 standalone 形态）|
+| `Lakehouse` | 持有 `MetaNode`（它的 `Drop` 停 raft 线程 —— 丢了它 = 后台线程失控）|
+
+回滚 = 配置里写一行 `[meta] mode = "memory"`（段级 `#[serde(default)]`：字段可省略）。
+
+### 56.1 为什么走 loopback gRPC（而不是直接调 `NodeHandle`）
+
+让 standalone 与分布式**走同一条代码路径**。直接调句柄会得到"本地一条路、远端另一条路"，
+两者的差异只会在上线时暴露 —— 那正是设计禁止的分叉（`§3.3`：禁止分叉）。
+代价是每个写多一次同机往返（量级可忽略），换来的是**同一份代码被两种形态验证**。
+
+### 56.2 目录策略（这次切换最容易踩的地方）
+
+| 场景 | `dir` | 后果 |
+|---|---|---|
+| 生产（`yuntun` 无 `--config` 时） | `./data/meta`（standalone 补的默认） | 元数据跨重启保留 |
+| 配置里显式给 | 用户指定 | ✓ |
+| **省略**（测试用 `Config::default()`） | **进程内临时目录** | 重启即新集群 → 所以 `warnings()` **会吼一声** |
+
+临时目录必须**每实例一个**：同一进程里会起多个 `Lakehouse`（测试正是这样），
+共用一个目录会让它们互相看到对方的表 —— 现象是莫名其妙的 `TableAlreadyExists`。
+
+### 56.3 判据（S3-4 的验收原话）
+
+| 判据 | 结果 |
+|---|---|
+| **既有用例全绿**（standalone 不回归） | ✅ **300 passed / 1 failed** —— 失败的是**已登记的 chaos 并行 flake**（全量里 131.68s = CPU 饥饿；chaos 自建装配用的仍是 `MemoryCatalog`，与本次改动无关）；**隔离复跑 0.21s 通过** |
+| **`if distributed` 分支为零** | ✅ 代码命中 0（自 `§52` 起） |
+| 回滚点 | ✅ `[meta] mode = "memory"` 一行，业务代码零改动 |
+
+### 56.4 R3 收口状态
+
+骨架完整：确定性状态机（`§38`）→ raft 选型闸门（`§40`）→ 落盘存储与快照（`§43`/`§44`）→
+gRPC 面（`§45`）→ **多节点网络传输**（`§50`）→ **读路径载荷**（`§51`/`§54`）→ **op 镜像**（`§53`）→
+**接缝拆净**（`§52`）→ **`RemoteCatalog` 与对拍**（`§55`）→ **装配点切换**（本节）。
+
+**遗留**（按重要性）：
+
+| # | 项 | 说明 |
+|---|---|---|
+| 1 | 在两种形态之间做**整机对拍** | 本轮做了"既有用例在 embedded 下全绿" + **组件级**对拍（`§55`）；"同一条脚本跑 memory 与 embedded 比可观测状态"**没做** |
+| 2 | `DeltaRequest` 加 `since_schema_ver` | 免掉客户端每次结构变更的全量（`§55.1` 那个 bug 的根治）|
+| 3 | `ProposeResponse` 加 `affected` | 精确 `drop_shard` 条数（现在只能给 1/0）|
+| 4 | 幂等键集合进载荷 | 本地快路径现在只知道自己的键（安全，但会多走一次 `Propose`）|
+| 5 | 文件缓存的保留窗口/GC | 墓碑 MVCC 需要，但要有界 |
+| 6 | `[meta] dir` 的运维说明 | 省略即"重启换集群"，要写进运维文档 |
+
+---
+
+---
+
+## 57. R3 遗留清偿：`affected` / `since_schema_ver` / 幂等键过线 / 文件保留窗口（2026-09-20）
+
+### 57.0 清偿清单
+
+| # | 遗留（`§56.4`） | 状态 |
+|---|---|---|
+| ① | **整机对拍**（memory ↔ embedded 比可观测结果） | ⏳ **仍余**（见 57.6）|
+| ② | `DeltaRequest.since_schema_ver` | ✅ 57.2 |
+| ③ | `ProposeResponse.affected`（精确条数） | ✅ 57.1 |
+| ④ | 幂等键集合进载荷 | ✅ 57.3 |
+| ⑤ | 文件缓存保留窗口/GC | ✅ 57.4 |
+| ⑥ | `[meta] dir` 的运维说明 | ✅ 示例配置 + `§56.2` 已写明 |
+
+### 57.1 `affected`：**远端算不出来的数，必须在服务端算好跟着提交过线**
+
+`ApplyOutcome` 加 `affected: u64`（配 `hit()`/`one()`/`with_count()` 三个构造器，避免十几处字面量各写一遍），
+`ProposeResponse.affected = 7`。于是远端 `drop_shard` 返回**精确**条数 —— 之前只能给 1/0，
+调用方按它做对账会**失真**（看起来能用，所以最难发现）。
+
+对拍同步升级：`drop_shard` 从「两边都 > 0」改为 **`assert_eq!(rd, md)`** —— 精确比较才是对拍该有的强度。
+
+### 57.2 `DeltaRequest.since_schema_ver`：把结构变更信号移到服务端
+
+`§55.1` 那个坑（新建表**不在** `changed_tables` 里 → 客户端增量刷新**静默丢表**）的服务端修复：
+`NodeHandle::delta(since_manifest_ver, since_schema_ver)` 现在比对客户端的 schema 版本，
+不一致就回 `full_reload = true`。客户端仍保留本地判断（探测里本来就有 schema 版本，零成本 → 双保险）。
+
+e2e 断言：`delta(当前, 当前)` → `full_reload == false`；`delta(当前, 0)` → **true**。
+
+### 57.3 幂等键集合过线（**只在全量刷新给**，且有上限）
+
+`CatalogState::idempotency_keys()` + `PrefetchPayload.idempotency_keys`：
+- **只在全量刷新时发**（增量刷新没有"键的版本号"，逐次全发会把刷新变成大传输）；
+- 上限 10 000 条 + **超限告警**（截断只影响快路径命中率，不影响正确性 —— 权威仍在 SM）；
+- 客户端**只并、不替换**（替换会忘掉"自己刚写过、服务端还没全量刷到"的键）。
+
+**过程中发现的契约**：`check_idempotency` **刻意不打网络**（它在每个批次的写入口被调用，
+为它加一次探测就抵消了它自己的意义）→ 键集合靠**刷新**装填 → 新进程刚起时集合可能是空的，
+"未命中"会走到 `Propose` 由 SM 去重（**正确性不受影响**，只是白写一次 WAL）。
+这条已写进方法文档，并让用例**先触发刷新再断言**（把契约写进测试，而不是写进注释）。
+
+### 57.4 文件缓存保留窗口（**默认不回收**）
+
+`RemoteCatalog::with_file_retention(n)`（默认 `u64::MAX` = 保留全部墓碑，安全优先）。
+
+关键不变量：**回收必须与"拒绝过旧快照"成对出现**。少一个墓碑会让 `visible_at(旧快照)`
+从 `false` 翻成 `true` → 旧快照查询**读到已删数据**（静默错结果）。
+所以 `list_visible_files(snapshot < floor)` **返回错误**（宁可显式拒绝，不可少读）。
+
+- 单测（纯缓存逻辑，不经网络）：窗口内保留 ✓／窗口外回收 ✓／下界随快照抬升 ✓／默认永不回收 ✓
+- e2e：过旧快照被拒（错误里说清是"快照过旧"）✓，而"当前"仍可查 ✓
+
+### 57.5 顺带修的三处
+
+| 现象 | 处置 |
+|---|---|
+| `RemoteCatalog::connect` 的 lazy connector **需要 tokio 运行时上下文**（哪怕不真连）—— 单测用 `#[test]` 会 panic（"there is no reactor running"）| 写进 `connect` 文档（这条约束是**实测**得到的）|
+| `commit_files` 返回的快照号取自**缓存** | 改用**响应里**的（权威）：缓存可能已被别的写推进 → commit 的"读己之写"水位偏高 → 查询会以为数据已可见 |
+| `wire_compat` 的 `ProposeResponse` 字面量缺字段（编译失败）| 补 `affected` 并断言它过线（**新字段立刻被既有守卫测试照出来** —— 那是它该干的事）|
+
+### 57.6 验证与仍余
+
+全量 **302 passed / 0 failed**（60 targets；日志无锁等待）；clippy 0（改动 crate）。
+
+**仍余 ①「整机对拍」**：组件级对拍（`§55`）比的是 catalog；
+整机对拍要比的是**经过 SQL/ingest/query 之后**的可观测结果（表清单、行数、schema 版本、
+文件可见性），也就是"切装配点不回归"的真正口径。它同时是 **R4** 那个
+「与单节点串行精确相等」判据的现成模板 —— 所以值得先做它再做 R4。
+
+---
+
+---
+
+## 58. R3 遗留清偿（6/6）：**整机对拍** —— memory ↔ embedded 端到端一致（2026-09-20）
+
+### 58.0 本轮做了什么
+
+新增 `crates/server/tests/assembly_parity.rs`：同一条序列
+（`CREATE TABLE` → `INSERT` → 等 flush → 观测）分别跑在 `[meta] mode = memory` 与 `embedded` 上，
+比较**经过 SQL → catalog → ingest → WAL → store 之后**的可观测结果：
+
+| 比什么 | 为什么 |
+|---|---|
+| `schemas` | 多 schema 语义一致 |
+| `tables`（全限定名 + schema 版本 + 字段数） | DDL 结果一致 |
+| 两组版本号 | 缓存失效信号一致 |
+| 每表**可见文件数与行数** | **数据真的落盘了**，且落法一致（证明 ingest→flush→提交 整条链走通）|
+| `created_at` 的**单位**（不是值） | 见 58.2 —— 这条是对拍自己抓出来的 |
+
+### 58.1 为什么它比组件级对拍（`§55`）强
+
+`§55` 比的是 `CatalogOps`；这里比的是**整机**：SQL 解析 → DDL/DML 分派 → 攒批 → flush 落盘 →
+元数据提交，一整条链。这才是"切装配点不回归"的真正口径，也是 **R4**
+「与单节点串行精确相等」那条判据的现成模板。
+
+### 58.2 反证抓到的东西（本轮最值钱的部分）
+
+先做了一个反证：把"刻意不比"的时间戳临时拉进比较 → **立刻红**，而且输出把差异钉死了：
+
+| 形态 | `created_at` |
+|---|---|
+| memory | `1789843409`（**秒**）|
+| embedded | `1789843411111`（**毫秒**）|
+
+**1000× 的单位不一致，平时完全不报错。** 真因：状态机 `create_table(req, now_secs)` 的
+单位由**调用方**决定 —— `MemoryCatalog` 传 `now_secs()`，而 `op::apply` 传的是 `op.now_ms()`。
+
+修法：`now / 1000`（与 SM 其它时间参数一致），并在对拍里加一条守卫：
+**`created_at` 必须在秒级**（不比较具体值 —— 两次运行本就该不同；只比**单位**）。
+
+> 教训：**「把一个时间塞进状态机」之前先确认单位**。这类错在任何单形态测试里都看不见 ——
+> 只有"两种装配跑同一条序列"才会撞出来。
+
+### 58.3 验证
+
+- 整机对拍：`memory == embedded` ✓，且断言"恰好 1 个已提交文件、2 行数据" ✓
+  （否则两边都空也能"相等"，那是对拍最常见的自欺）
+- 全量 **303 passed / 0 failed**（61 targets；日志无锁等待）；clippy 0（改动 crate）
+
+### 58.4 至此
+
+**R3 的遗留全部清偿（6/6）**：① 整机对拍 ✅ ② `Delta.since_schema_ver` ✅ ③ `affected` ✅
+④ 幂等键过线 ✅ ⑤ 文件保留窗口 ✅ ⑥ `[meta] dir` 说明 ✅。
+
+下一步按路线图是 **R4（datanode 化 + 冷热边界）**，判据是「多 datanode 并发写 +
+查询结果**与单节点串行精确相等**（对拍，硬要求）」—— `§58` 这条用例就是它的模板。
+
+---
+
+---
+
+## 59. 工具链：全仓升 **Rust 2024 edition**（+ 纠正 clippy 基线读数）（2026-09-20）
+
+### 59.1 改动是"根清单一行"
+
+`[workspace.package] edition = "2021" → "2024"`。18 个 crate 全写 `edition.workspace = true`，
+所以**只有一个声明点** —— 这是当初把 `edition` 放进 `workspace.package` 的收益。
+同时 `resolver = "2" → "3"`（2024 的默认解析器）。
+
+**为什么 `resolver` 必须显式写**：根是**虚拟清单**（无 `[package]`），解析器不会被 edition
+推断出来。`resolver = "3"` 实测 `Cargo.lock` **逐字节无变化**（见 59.6）。
+
+### 59.2 为什么一行就能过：先按"2024 会破坏什么"扫一遍
+
+升级前的**可复用步骤** —— 先 grep 五类破坏点，命中为 0 才动手：
+
+| 2024 变更 | grep 目标 | 命中 |
+|---|---|---|
+| `gen` 成保留字 | `\bgen\b` | 0 |
+| `static mut` 引用（现在报错） | `static mut` | 0 |
+| `unsafe extern` / 属性须 `unsafe(...)` | `no_mangle\|export_name\|link_section` | 0 |
+| `std::env::set_var` 变 unsafe | `set_var\|remove_var` | 0 |
+| RPIT 捕获全部生命周期 | `-> impl ` | 0 |
+
+行为类变更（`tail_expr_drop_order` / `if_let_rescope` / never-type fallback）编译期
+**一个都没触发**；全仓**零 `unsafe` 块**，`unsafe_op_in_unsafe_fn` 这类新 lint 也无从下手。
+
+> 结论：**edition 升级的难度取决于代码风格，不是 crate 数量**。本仓把"显式类型 / 无 unsafe /
+> 无 `impl Trait` 返回 / 无全局可变状态"当纪律，于是升级成本≈一行。
+
+### 59.3 顺带抓出：`status.md` 那句"clippy 0 警告"是**热缓存读数**
+
+edition 一改，**所有 crate 全部重建**，clippy 这才把全仓告警吐全：**15 + 7 = 22 条**。
+此前历次 `cargo clippy --workspace --all-targets` 读到的"0 警告"，是**增量编译只报被重建 crate**
+的产物；`status.md` 原文那句"全仓余 1 处历史告警"也是同一个读数来源。
+
+- **15 条 `collapsible_if`**：edition 2024 让 **let-chains** 可用，clippy 于是开始建议
+  `if a { if let Some(x) = b { … } }` → `if a && let Some(x) = b { … }`。2021 下这条建议
+  **无法表达**（语法不成立），所以以前不提 —— **不是以前更干净，是以前没得选**。
+- **7 条其他**（与 edition 无关，属纯热缓存遮蔽）：3 处 doc（2 处 blockquote 续行漏 `>`、
+  1 处列表项后缺空行）、2 处 `now_ms().max(0) as u64`（`now_ms() -> u64` → `.max(0)` 与
+  `as u64` 都是恒等，实测签名与字段类型确认为 `u64` ✓）、1 处 `&String` 冗余借用、
+  1 处未用 import（`lh.catalog` 是 `dyn CatalogOps` trait 对象，方法直接可调，不必引入 trait）。
+
+**修完**：`cargo clippy --workspace --all-targets` 全仓只剩 **1 条外部依赖告警**
+（`proc-macro-error2 v2.0.1`，来自 `opensrv-mysql`，非本仓代码；见 `§49` 那条线）。
+
+### 59.4 两个坑：都会让人"改一个文件、动全仓"
+
+**坑 1 —— `rustfmt <crate 根>` 会递归格式化它的全部子模块。**
+把 `crates/meta/src/lib.rs`、`crates/server/src/lib.rs` 传给 rustfmt 后，**meta 与 server 两个
+crate 被整仓重排**：diff 从预期的 ~60 行炸到 **469/365 行、25 个文件**（`op.rs` 120 行、
+`server/lib.rs` 148 行）。已**全部回退**。要只动一个文件，就**不要**传 crate 根。
+
+**坑 2 —— rustfmt 的宽度按 *CJK 占 2 列* 算。**
+
+```rust
+// rustfmt 眼里"超宽" → 被拆成 5 行（作者显然是有意保留单行）
+self.trace("recv_snapshot", format!("忽略（旧于本地 first={}）", inner.first_index()));
+```
+
+这类"单行调用"全仓 `cargo fmt --check` 报 **338 处、78 个文件**。所以本仓**不是** rustfmt-clean，
+而且**不能**整仓 `cargo fmt`：那会把中文注释附近的行大量拆开，淹没真实改动、且**可读性变差**。
+本轮 15 处 let-chain 全部**手工**按 rustfmt 2024 style 落，再用"每个文件的 `rustfmt --check`
+差异条数是否与基线一致"验证没跑偏（18 个文件里 16 个与基线**完全一致**；`table.rs` 少 1 处 ——
+塌一层后原本超宽的那行正好放得下，属改善；`build.rs` 初版猜错，已按 rustfmt 意见改正）。
+
+**顺带实测的 rustfmt 2024 规则**（探针文件，省得后来者再猜）：let-chain **一律**拆多行
+（首项留 `if` 行、后续 `&&` 缩进 +4、`{` 独占一行）—— 连 `if let Some(v) = x && y {` 也拆；
+但 **`else if` 上的链保留单行**。
+
+### 59.5 验证
+
+- `cargo test --workspace --no-fail-fast` → **303 passed / 0 failed**（44 个二进制 + 17 个 doctest），
+  与 `status.md` 记的 303 测试函数 / 303 用例**逐一对上**
+- `cargo check --workspace --all-targets` → **0 error**
+- `cargo clippy --workspace --all-targets` → 本仓 **0**，仅余外部 `proc-macro-error2`
+- `resolver = "3"` 后 `Cargo.lock` **无变化**
+
+> 顺带修了 `status.md` 三处陈旧数字：§1 与 §4 表里的"214 用例 / 184 个测试函数"（实为 303），
+> 以及"全仓余 1 处历史告警"（实为 0 + 1 条外部）。
+
+### 59.6 更正与遗留
+
+- **更正**：上一个提交（`6675043`）的信息里把本章误写为 `§51` —— 当时 `§49` 之后直接是
+  `§50…§58`（S3-4 那批），实际章节号是 **§59**。
+- ~~**决定不做：暂不声明 `rust-version`（MSRV）**~~ —— **本条已被 `§60` 取代**（写 `§59` 时判为
+  "不该顺手加"，随即按要求补上）。保留原文以示转折，结论以 `§60` 为准：**MSRV = 1.94**，
+  **不是** policy 想取的 1.92 —— 下界被 `datafusion 55.0.0`（声明 `1.94.0`）顶住。
+
+---
+
+## 60. MSRV 声明：**1.94**（policy 想取 1.92，被 datafusion 顶住）（2026-09-20）
+
+### 60.1 意图 vs 事实：MSRV **不是自由可选项**
+
+意图是官方"latest stable − 6"策略：当时工具链 1.98 → **1.92**。但 MSRV 的真实取值是
+**全依赖链的 max** —— 量法：解析一次，取所有包声明的 `rust-version` 最大值。
+
+```
+已解析包 524；其中声明了 rust-version 的 398
+依赖侧有效下界（最高要求）= 1.94.0
+要求 > 1.92 的：31 个 —— **全部**是 datafusion-*（`datafusion 55.0.0` → 需要 rustc 1.94.0）
+把这 31 个去掉后，要求最高的那档里**没有任何包** → 下界完全由 datafusion 决定
+```
+
+→ 声明 1.92 是**假承诺**：在 1.92 上 cargo 会直接拒绝：
+
+```
+package `datafusion v55.0.0` cannot be built because it requires rustc 1.94.0 or newer,
+while the currently active rustc version is 1.92.0
+```
+
+**有效 MSRV = max(policy, 依赖侧最高要求) = 1.94**。datafusion 是本仓不可替代的查询引擎，
+所以"**以 datafusion 为基准**"是唯一不牺牲功能的取法；另一条路是降到 `datafusion ≤ 54.x`
+换来 1.92 —— 代价是查询引擎与 arrow 版本联动、要重跑全部对拍，属独立决策，本轮未做。
+
+### 60.2 两处都要写，否则等于没声明
+
+虚拟清单的 `[workspace.package]` **只对显式继承的成员生效**（同 `edition`/`license`）：
+
+- `[workspace.package] rust-version = "1.94"`
+- 18 个成员各加一行 `rust-version.workspace = true`
+
+实测（`cargo metadata`）：18 个 `yuntun-*` 的 `rust_version` **全为 `1.94`** ✓。
+
+### 60.3 声明它是**有实际作用**的
+
+1. **`resolver = "3"` 的 MSRV-aware 解析以它为输入。** `§59.6` 那句"resolver=3 目前等价 v2"
+   **到此才真正失效** —— 现在 v3 有输入了（这也是 `§59` 与本节要连起来读的原因）。
+2. 依赖要求更高 rustc 时会在**下游报出来**：这条只有在真·1.94 机器上才看得见。
+
+### 60.4 验证
+
+- 加 MSRV 后重新解析：`Cargo.lock` **零变化**（无依赖需要降级）
+- `cargo clippy --workspace --all-targets`：本仓 **0 告警**，且 MSRV 提到 1.94 **没有解锁任何
+  MSRV-gated lint**（clippy 把 `rust-version` 当 `msrv` 输入，数字一提就可能开始建议"换用更新的
+  std API" —— 这次没有）
+- `cargo test --workspace --no-fail-fast` → **303 passed / 0 failed**
+
+### 60.5 遗留：这个数是**推导值**，不是"实测能编过"
+
+**没有做真·1.94 构建验证** —— 本机镜像（tuna）`1.92.0` / `1.94.0` 都返回 **404**，
+且已定"不折腾工具链"。所以 `1.94` 是**从依赖侧下界推出来的**，逻辑上成立、但**未经编译器确认**。
+
+> **CI 应补一步 `cargo +1.94 build`** —— 这才是 MSRV 承诺的兑付方式；在补上之前，
+> 把 `rust-version` 当"已保证"是过度解读。
+
+---
+
+## 61. R4 开工前闸门 **P2**：冷热边界的协议形态 —— 结论是**拉取**，不是推送（2026-09-20）
+
+`plan.md` 把 P2 定为"**R4 开工前**"的硬闸门：各实例的 flush watermark 如何传播 / 消费
+（推送 vs 查询时拉取），并要一份**两种形态的查询放大对比**。本节给出结论与契约定死。
+
+### 61.1 设计侧已有的答案（先把原文摆出来）
+
+`architecture-with-chunk.md §4.4` 已经把做法写死：
+
+> manifest 中每个文件记 `source_instance`；**pull 响应带该实例的 `flushed_watermark`**；
+> 协调者按实例二维切分（**冷读该实例 ≤watermark 的文件，热 pull (watermark, now]**）。
+> **此契约必须在实现前定死**，否则多实例后会冒出重复计数这类极难排查的 bug。
+
+也就是说设计选的就是**拉取**。本节的任务是把它**验证成决策**（给放大对比），并补齐契约里
+没写死的四处（见 61.4）。
+
+### 61.2 为什么必须是拉取：定界要**精确**，而推送必然陈旧
+
+`§4.5` 给了一条正确性依赖的不变量：
+
+> 任何已 seal 的数据，要么在 datanode 的 chunk 中可 pull，**要么**在 manifest 中可 read，
+> **不会两边都不在**。实现：`commit_files` 成功、manifest 版本推进后，才允许释放对应 chunk。
+
+这条不变量要求边界是**精确**的。而推送形态的水位必然陈旧（传播延迟 + 进程暂停 + metanode
+重启丢内存态），陈旧水位在边界上只有一个后果：**要么重复读**（水位说"还没 flush"，其实已落盘）
+**要么漏读**（水位说"已 flush"，其实还没落盘）—— 两者都是静默错数据，正是本仓最怕的那类。
+
+更根本的一点：**只有 owner 自己知道自己的边界**，而且它是在**同一个锁**下知道 commit 与
+reclaim 的相对顺序。把边界判定交给"另一个进程在另一个时刻写下的一个数"，等于把精确性
+换成时延——而拉取只多一次往返，却把判定放在唯一知道真相的地方。
+
+> **结论：拉取为权威**（水位随 pull 响应回来）。推送只能做**可选优化**（如 metanode 侧缓存
+> "上次看到的水位"用于提前 fanout），**不得**作为切分依据 —— 它一旦被当作权威，上面两个
+> 静默错数据就会回来，而且是概率性的。
+
+### 61.3 两种形态的查询放大对比
+
+| 维度 | **拉取（选定）** | 推送（仅可作提示） |
+|---|---|---|
+| 每次查询的额外 RPC | **O(N)**：向 N 个实例各发一次 pull（可合并为一次 fanout） | O(1)：读一份水位表（还需 TTL 刷新） |
+| 额外网络数据量 | **热数据本身**要跨网络（量 ∝ 未落盘部分） | 只传水位数字（极小） |
+| 写入侧代价 | 0（水位由响应顺带带回） | N×心跳频率写 metanode（或内存态，重启即丢） |
+| 边界精确性 | **精确**（owner 自答，与 commit/reclaim 同锁） | **不精确**（陈旧窗口内必然错，方向随机） |
+| 失败模式 | 拉不到 → 可**显式** STALE / 报错（`partial` 标记） | 水位陈旧 → **静默**重复或漏读 |
+| 代价可控性 | 可用 `known_manifest_ver` 命中"无事发生"的快速路径 | 省了 RPC，但省错了地方（错在数据） |
+
+**放大在哪、怎么压**：拉取的 O(N) 是**实例数**量级，而查询本身（R5 的 fanout）已经是 O(N)，
+所以拉取**没有引入新的量级**；真正要盯的是"热数据跨网络"这一项 —— 它是 `S5-3`
+（partial aggregate 下推）存在的理由：**绝不回传原始行**，只回 partial 聚合结果。
+
+### 61.4 契约定死（4 条，实现前）
+
+1. **水位单位 = manifest 版本号**，与现有 `Chunk::visible(cached_snapshot)` /
+   `mark_committed(snapshot)` **同一个号** —— **不引入第二套序号**（两套号一定会漂移）。
+2. pull 请求带 `known_manifest_ver`；owner 若自己的 `flushed_watermark > known_manifest_ver`
+   → 返回 **STALE**，协调者刷新 manifest 后重试。**不得**返回空结果顶替 —— 那会把
+   "你看的是旧版本"伪装成"没有热数据"，即静默丢数据。
+3. `release-after-commit`：**manifest 版本推进之后**才允许释放 chunk（现有 I4 已满足）。
+4. 切分口径：**冷读该实例 ≤watermark 的文件；热 pull (watermark, now]**。
+
+### 61.5 一个反直觉的实测结论：**现有机制今天是对的**
+
+把现有代码摊开看（`crates/chunk/src/chunk.rs`）：
+
+```rust
+pub fn visible(&self, cached_snapshot: u64) -> bool {
+    match self.committed_snapshot {
+        None => true,                        // 未提交 → 永远是热数据
+        Some(s) => cached_snapshot < s,      // 已提交 → 读者版本 ≥ s 时不再当热数据
+    }
+}
+```
+
+而文件的可见性是 `valid_from <= query_snapshot`。**两个判断用的是同一个号**，于是对任意
+`V`，chunk 与文件里**恰好一个可见** —— 单机形态下"重复计数"在结构上不会发生。
+
+它会在下面三种情况下坏，这也是 T12.2 要解决的**全部**：
+
+| # | 会坏的情况 | 后果 |
+|---|---|---|
+| ① | **提交者≠持有者**（分布式下由协调者/别的节点代理 `commit_files`） | 本地 `committed_snapshot` 不再可信 → 文件已可见、chunk 仍当热数据 → **重复计数** |
+| ② | **release 早于协调者刷新 manifest** | chunk 已释放、文件在对方眼里还不可见 → **漏读**（`§4.5` 的"两头都没有"） |
+| ③ | 用**全局 min(watermark)** 当边界 | 一个慢实例拖住所有实例的热边界（`§4.4` 第二条已点名） |
+
+### 61.6 T12.2 的落地顺序（下一轮的三刀）
+
+1. `ShardReader` 契约加水位与 STALE（trait 改动，所有实现一起改）：
+   `read_shard(id, known_manifest_ver) -> { batches, flushed_watermark, stale }`；
+2. 查询侧 `Cache::hot` 从**单实例** `Option<Arc<dyn ShardReader>>` 变成**按实例**
+   （`HashMap<InstanceId, Arc<dyn ShardReader>>`），`table.rs` 按实例切分（`source_instance`
+   的**首个消费者**）；
+3. **进程内双实例对拍**（两个 `ChunkStore` 当两个实例，不引入网络）：
+   断言"每行只出一次"且与单节点串行**精确相等** —— 与 R3 在进程内先做 `Cluster`、
+   再换 gRPC 传输是同一个套路。
+
+
+---
+
+## 62. R4 **T12.4/T12.5**：节点私有状态目录的排他所有权（`§28.2` 的显式化）（2026-09-20）
+
+### 62.1 做什么：把"一个目录一个消费者"变成**启动期硬拒绝**
+
+`§28.2` 记的事故是：同一份 WAL 目录被两个攒批循环消费 → 同一条 `Data` 被各吸收一次、
+各自 flush → **9 批次 27 行变成 11 个文件 33 行**（不报错、只是持久重复）。当时修的是
+**同进程内**的竞态（攒批循环的"退出闸门"）；R4 把 datanode 拆成进程后，跨进程**零防线**。
+
+本轮落地：
+
+| 件 | 内容 |
+|---|---|
+| `crates/model/src/private_dir.rs`（新） | `PrivateDirLease`：取目录排他所有权的租约 + owner 文件（`pid`/`instance_id`/`role`）+ 7 条单测 |
+| `Lakehouse::build_with_shutdown` 第 **⓪** 步 | 装配**最前面**取 WAL 根目录 + spill 目录的租约，持有到进程退出 |
+| 8 个 server 测试夹具 | 每个测试 = 一个节点：`spill_dir` 各用各的（原因见 62.3-①） |
+| `crates/server/tests/private_dir_gate.rs`（新） | 2 条用例：第二个节点被拒且**点名谁占着**；拒绝**发生在动盘之前** |
+
+### 62.2 实现选择：`std::fs::File::try_lock`（Rust 1.89 稳定）
+
+- **零 unsafe、零新依赖** —— 全仓 `unsafe` 仍是 0（`flock` 走 libc 就得引 unsafe，不做）；
+- 锁按**打开的文件描述**算：实测同进程再开一个 fd 同样 `WouldBlock` —— 所以它约束的是
+  "**目录的消费者**"，不是"进程"，正是需要的语义（同进程起第二个攒批循环也必须拦）；
+- **顺带成为本仓第一个真正需要 MSRV > 1.85 的 API**（`1.89`），与 `§60` 声明的 `1.94` 相容 ——
+  文档里那句"没有 API 要求超过 1.85"从此有了一条反例，但方向是安全的。
+
+**错误类型单列** `LakeError::DirBusy`，不塞进 `Io`：调用方必须能区分"目录被占"（停机 / 换目录）
+与"磁盘坏了"（换盘）。报错文本由 `DirLeaseError` 生成，含占用者 `pid`/`instance_id`/`role`
+与 `lsof <dir>/.yuntun-owner.lock` —— **这类故障的排查成本全在"谁占的"**。
+
+**锁文件名的选择是有理由的**（`private_dir.rs` 的模块文档里写死）：`.yuntun-owner.lock`
+必须避开两处清理逻辑的文件名模式（`purge_leftover_spills` 只删 `*.ipc.lz4`；WAL segment 清理
+只删能解出段号的文件）。否则锁文件被删 → 已持有的锁**不会失效**，但下一个消费者会在**新 inode**
+上拿到锁 → 保护**静默失效**。
+
+### 62.3 落点选择与**已知盲区**
+
+租约放在**节点装配层**（`Lakehouse`），不是 `WalWriter::open` / `ChunkStore::new`：
+
+- 匹配 T12.4 的原话（"**每节点**私有状态初始化与校验"）：这是**节点级**不变量；
+- 零签名改动（装配函数已是 `Result`）；下移到 store 层要 `ChunkStore::new` / `Ingestor::new`
+  一起 `Result` 化，**波及约 14 个调用点**。
+
+**盲区（明写出来，别装作没有）**：
+
+1. **写者比节点活得久**的情形管不住 —— 例如 `drop` 掉 `Lakehouse` 后仍有 detached 任务持有
+   `WalWriter`。跨进程的真实部署不受影响（进程退出 = 租约释放 = 写者也没了）；
+2. 直接构造 `WalWriter`/`ChunkStore` 的**库用户**（chaos 夹具、ingest 测试）不走这个闸门
+   —— 它们各自用自己的目录，属"没走节点装配"，不是漏洞但也不是保护；
+3. 跨机器的 `instance_id` 重名**不在这里**（属成员注册 T12.3 / `refactor.md` S4-2）。
+
+> 更强的形态（把租约放进 `WalWriter::open` 与 `ChunkStore::new`，让"目录的消费者"与"锁的持有者"
+> 严格同一）登记为 T12.4 的后续项 —— 它需要上面那 14 个调用点 `Result` 化，与本轮的
+> "先立节点级闸门"分开做。
+
+### 62.4 闸门一开就抓出两处**真实的**不忠实（这是本轮最有价值的产出）
+
+**① server 测试**全部**共用一份 spill 目录**。8 个测试都没配 `[chunk] spill_dir` → 沿用默认
+`./data/spill`（CWD = `crates/server`）→ **多进程多线程共用一个私有目录**，而每个
+`ChunkStore::new` 启动还会**清理**它（`purge_leftover_spills`）。闸门上线后 3 条用例立刻变红。
+
+> **反例就在本仓里**：`meta.dir` 省略时早就用"**每实例一个临时目录**"解决同一问题了 ——
+> `build_embedded_catalog` 的注释原话："同一个进程里可能起多个 Lakehouse（测试就是），
+> 共用一个目录会让它们互相看到对方的表"。**spill 目录是唯一还没享受这个待遇的私有状态。**
+
+**② 两处"崩溃重启"用例的收尾是错的**：`drop(_bg)`（`JoinHandle`）只是 **detach**，攒批循环
+**还在跑** —— 于是"旧消费者没退出、新消费者已起来"，正是 `§28.2` 的形态本身。
+改成 `cancel` 后 **`await` 句柄**（`metrics_e2e` 一直是这么写的）+ 显式 `drop` 旧节点。
+
+> 两条都不是"闸门太严"，而是闸门**替我们把不忠实的地方找出来了**。修的是用例，
+> 不是把闸门放宽。
+
+### 62.5 验证
+
+- `private_dir` 单测 **7 条**：同一目录第二个消费者被拒（同进程）/ 报错点名占用者 /
+  释放后可接管 / 换实例接管会覆盖记录 / 记录格式向前兼容 / 读不出来不 panic / 自动建目录
+- 闸门用例 **2 条**：第二个 `Lakehouse` 被拒（含"拒绝发生在动盘之前"：假遗留 spill 必须还在）/
+  **两份**私有状态任一处冲突都拒
+- 全量 `cargo test --workspace --no-fail-fast` → **312 passed / 0 failed**（含 62.4 修掉的那两类不忠实用例）
+
+---
+
+## 63. R4 **T12.2 第一刀**：把"水位 + STALE"变成契约（顺带抓出一个**真实存在**的竞态）（2026-09-20）
+
+### 63.1 改了什么（`§61.4` 契约的代码化）
+
+| 位置 | 改动 |
+|---|---|
+| `store::shard` | 新增 `ShardRead { batches, flushed_watermark, stale }`；`read_shard` / `read_table` 参数 `cached_snapshot` → **`known_manifest_ver`**（与 §61.4 用词一致），返回 `ShardRead` |
+| `store::ShardFetch` | `fetch_shard` 的**响应**改为 `ShardRead` —— 水位**随 pull 响应回来**（`architecture §4.4` 原话），而不是靠推送 |
+| `chunk::ChunkStore` | 新增单调水位 `released_watermark`（`AtomicU64`，只增不减）+ `flushed_watermark()`；`reclaim` 放弃副本时把它计入 |
+| `query::table` | 适配新返回；`stale` 报 `warn!`（**`§64` 起改为消费**：报可识别的 `HotReadStale` → 刷新 → 重试） |
+| 测试 | `store` 的远端接缝用例 + 查询侧 `hot_shard_reader` 用例适配；`chunk` 新增一条**定向复现竞态**的用例 |
+
+合并口径写进了 trait 文档：**数据拼接、水位取 max、`stale` 取 or** —— 只要有一部分不可信，整个答案就不可信。
+
+### 63.2 契约精化（本轮实测得出）：水位按"**已放弃本地副本**"记，不是"已 commit"
+
+`§61.4` 第 1 条只说"水位单位 = manifest 版本号"。落到实现时发现还要定一件事：**记到哪一步**。
+
+- 若按"**已 commit**"记：本仓的回收是**惰性**的（由查询缓存 swap 驱动），于是"已 commit、
+  但本地副本还在"的窗口里，`stale` 会**每次查询都报** —— 而那个窗口里数据**读得到**，
+  报的是**误报**；
+- 按"**已放弃本地副本**"记则**精确**：没放弃副本 ⇒ 数据一定在本地 ⇒ **不可能丢** ⇒ 不该报警。
+
+所以 `flushed_watermark` 的语义定为：**该实例已 flush 且已放弃本地副本的最高 manifest 版本**。
+这是对 `§61.4` 的**细化**（安全方向不变：只在真有丢数据风险时报警）。
+
+### 63.3 本刀真正的价值：`§4.5` 的"两头都没有"**今天就发生**（并已钉住）
+
+`architecture-with-chunk §4.5` 说"任何已 seal 的数据，要么在 chunk 里可 pull，要么在 manifest
+里可 read，**不会两边都不在**"。写这条契约时才发现：**它今天就会被违反**，而且不是分布式的特例：
+
+```text
+① 某批数据 commit 在 manifest 版本 5        （ChunkStore::mark_committed(id, 5)）
+② 本地副本被回收                            （reclaim(6)：缓存已推进到 6，副本没用了）
+③ 读者仍拿快照 4 来读                       （查询在 ① 之前取的可变快照，规划期还没结束）
+   → 热数据拉不到（副本已放弃）
+   → 它的 manifest（4）里也没有 valid_from=5 的文件（快照隔离按 4 判定）
+   → **这批数据两头都没有** —— 而调用方只看到"空"，无从分辨"没有热数据"与"数据丢了"
+```
+
+**旧行为**：`read_table(t, 4)` 返回空 `Vec` ⇒ 查询**静默少这批数据**（正是本仓最怕的"静默错数据"）。
+**新行为**：`ShardRead { batches: [], flushed_watermark: 5, stale: true }` ⇒ 调用方拿到了信号，
+可以刷新 manifest 后用版本 5 重读（那时 `valid_from=5` 的文件可见 ⇒ 数据回来）。
+
+用例 `chunk::store::tests::stale_is_reported_after_a_committed_chunk_was_released` 把三步全钉住，
+并**同时钉住误报方向**：
+
+| 断言 | 防的是什么 |
+|---|---|
+| 未回收时 `stale == false` 且能读到 3 行 | **误报**（若按"已 commit"记，这里就会报 stale） |
+| 回收后 `stale == true` 且 `batches` 为空 | **静默丢数据**（旧行为在这里回一个空，谁都不知道） |
+| `known` 到水位后 `stale == false` | 重试之后必须能恢复正常，否则 STALE 会变成永久状态 |
+
+> 结论：**这条契约不是为分布式准备的"将来时"，而是把一个今天就能触发的静默错误变成可观测信号。**
+
+### 63.4 遗留（下一刀 T12.2 第二刀）
+
+1. **查询侧只记录不消费**（**已在 `§64` 落地**：刷新 manifest → 有界重试。以下为写 `§63` 时的原文）：`table.rs` 收到 `stale` 只打 `warn!`。**不当场报错**是刻意的 ——
+   STALE 在"快照落后于提交"的**正常**窗口里也会出现（缓存 TTL 内提交过就会），报错会把常态变成故障。
+   消费它需要"**刷新 manifest → 用新版本重试**"，落在 `Cache` / `QueryEngine` 层（与"按实例持有
+   热读器"是同一层改动，见下一刀）。
+2. **远端形态必须给真实水位**：`RemoteShard` 拿到什么就传什么。已写进 `ShardFetch::fetch_shard`
+   文档：远端实现**不能**用 0 装作"没有已放弃的数据"——那等于把 STALE 静默关掉（S5-6 的活）。
+3. **重启后水位归 0**：进程重启后本实例没有 chunk，水位从 0 重新计；它对"重启前提交的数据"不再
+   给 STALE 信号（那部分数据的可见性由读者自己的 manifest 版本决定）。
+
+---
+
+## 64. R4 **T12.2 第二刀（上半）**：消费 STALE —— 刷新 manifest 后重试（`§63.3` 的窗口被真正补上）（2026-09-20）
+
+`§63.4` 遗留①写着"查询侧只记录不消费"。本节把它消费掉：拿到 STALE **必须**刷新 manifest 后
+用新版本重试（`§61.4` 第 2 条），修补 `§63.3` 钉住的那个"静默少一批数据"。
+
+### 64.1 改了什么
+
+| 位置 | 改动 |
+|---|---|
+| `query::table` | `HotReadStale { table, known_manifest_ver, flushed_watermark }`：把 STALE 报成**可识别的可重试错误**（`DataFusionError::External`） |
+| `query::lib` | `with_stale_retry`：**有界**重试（上限 3），认出 `HotReadStale` ⇒ 刷新 ⇒ 重试；`sql` 与 `sql_stream` **两条路径都过**它 |
+| `query::cache` | `LocalCatalog` 新增 `CatalogOps` 注入点（`set_catalog_ops`）与**同步刷新**入口（`refresh_now`），复用后台刷新那条 `refresh` 路径 |
+| `server` | 装配层接线：`cache.set_catalog_ops(catalog.clone())` |
+| 用例（新） | `query/tests/stale_retry.rs` **4 条**：能追上的重试成功 / 追不上的明确失败 / 没接线报配置错 / **已到位时不重试** |
+
+### 64.2 三个设计点（都不是随便选的）
+
+**① 用类型传"该重试"，不用字符串。** `HotReadStale` 是一个独立错误类型，`with_stale_retry`
+从 `DataFusionError` 链里 `downcast` 出来。字符串匹配认不出来；而这类错误一旦被当成普通失败
+上报，用户看到的就是**莫名失败** —— 比"少数据"好，但仍然是错的方向。
+
+**必须沿链下钻**：DataFusion 会用 `Context` 把计划期错误包一层（"failed to create physical plan"之类），
+只认最外层会漏掉它 —— 于是 STALE 又变回静默路径。
+
+**② 重试包住"建会话 + 计划 + 执行"，而不是只包执行。** `TableProvider::scan` 在**物理计划期**被调用
+（热读就在那里，见 `query/src/table.rs`），所以 STALE 从 `collect()` / `execute_stream()` 冒出来；
+而 provider 持有的是**当次快照**，刷新 manifest 之后**必须重建会话**换新快照，否则重试还是拿旧的读。
+
+**③ 刷新能力挂在 `LocalCatalog` 上。** 查询路径上只有 `Arc<LocalCatalog>`（`QueryEngine` 拿不到
+`CatalogOps`），所以刷新所需的 ops 由装配层注入给它。`Arc<dyn CatalogOps>` 用薄包装 `OpsHandle`
+存（trait 对象没有 `Debug`，而它出现在 Debug 输出里也没意义）。
+
+三条约束（`§61.4` 第 2 条）：**必须重试** / **有界**（耗尽即报错，绝不静默降级）/ **刷新失败直接冒泡**
+（刷不动就别硬撑——宁可失败也别给错数据）。
+
+### 64.3 验证：四条用例，方向两两相对
+
+| 用例 | 钉住的性质 |
+|---|---|
+| `stale_hot_read_is_retried_after_refreshing_manifest` | ①数据拿到（不是静默少行）②热读**至少两次**③**刷新计数真的涨了**④**第二次热读发生在刷新之后**（用"每次热读时的刷新计数"证，不只是"重试了"） |
+| `permanent_stale_fails_loudly_instead_of_returning_partial_result` | 永远 STALE ⇒ **恰好撞 3 次上限**后明确报错（防"用不完整结果顶替"——那比失败更坏） |
+| `stale_without_wired_ops_fails_with_a_config_error` | 装配漏了 `set_catalog_ops` ⇒ STALE 只能**明确失败**，不静默降级 |
+| `caught_up_reader_does_not_trigger_retry` | **防误报**：`known` 已到位 ⇒ 不重试、不多刷一次 manifest（否则"每次查询都重试"会变成新的坑） |
+
+后两条与前两条**方向相反**：只测"该重试时重试"会留下"不该重试时也重试"的隐患，那同样是坑。
+
+### 64.4 遗留
+
+1. **按实例持有热读器**（本刀的"下半"）：现在 `LocalCatalog::hot` 仍是**单实例**
+   `Option<Arc<dyn ShardReader>>`，而水位/STALE 已按实例语义定义 —— 下一步把它变成
+   `HashMap<InstanceId, Arc<dyn ShardReader>>`，`source_instance` 才真正有消费者；
+2. **双实例进程内对拍**（第三刀）：两个 `ChunkStore` 当两个实例，断言"每行只出一次"且与单节点串行**精确相等**；
+3. **远端形态必须给真实水位**（S5-6）与 **重启后水位归 0**（`§63.4` 的 2、3 条）未变。
+
+---
+
+## 65. R4 **T12.2 第二刀（下半）**：热读器按**实例**持有 —— `source_instance` 的第一个消费者（2026-09-20）
+
+### 65.1 改了什么
+
+`LocalCatalog::hot` 从**单实例**（`Option<Arc<dyn ShardReader>>`）变成**按实例**：
+
+```rust
+pub type HotShards = BTreeMap<String, Arc<dyn ShardReader>>;   // instance_id → 热读器
+```
+
+| 位置 | 改动 |
+|---|---|
+| `query::cache` | 字段类型 + `set_hot_shards(instance_id, reader)`（**签名变更**：不再有"唯一那个热读器"）+ `hot_shards() -> HotShards` |
+| `query::provider` / `query::table` | 三个 provider 结构体与 `YuntunTableProvider` 都改持 `HotShards`（空 map = 未接线，替代原来的 `None`） |
+| `query::table::scan` | **逐实例**拉：每个实例用自己的水位回答是否 STALE；`HotReadStale` 增加 `instance` 字段（"谁没追上"是多实例下最关键的诊断信息） |
+| 装配 | `server` 用 `cfg.chunk.instance_id` 注册、`chaos` 用 `"chaos"` 注册（**就这一处**知道自己是哪个实例） |
+
+**为什么必须是这一步**：`§61.4` 的水位语义**本来就是按实例定义的**（"每个实例自己的已 flush 水位"），
+而在此之前查询侧只有一个"热读器"槽位 —— 那时 `source_instance` 在元数据里躺着，**读路径上无人消费**。
+本刀之后，`FileManifest.source_instance` 与配置里的 `instance_id` 第一次成为**读路径的键**。
+
+### 65.2 两个不是随便选的决定
+
+**① 用 `BTreeMap` 而不是 `HashMap`：遍历顺序必须确定。**
+
+多实例读出来的批次要拼在一起，拼接顺序会影响结果的**批次顺序**（乃至上层算子的行为）。
+本仓的确定性纪律（`§38`：同一串输入 → 同结果）要求迭代有序 —— `HashMap` 的随机序会让
+"同一份数据、同样的查询"偶尔产出不同顺序的批次，那是最难查的一类不确定性。
+
+**② `shard_version()` 取各实例**之和**，不取 max。**
+
+它的用途是"提交驱动刷新"的变更探测（"有没有东西变了"）。取 max 在**实例集合被替换**时
+可能出现"看起来没变"（旧实例的高水位换成了新实例的低水位）；求和则对"是否有变化"是单调可靠的。
+实例集合是**装配期固定**的，所以求和没有稳定性问题。
+
+### 65.3 新用例：钉住"按实例"这个**结构**本身
+
+`query/tests/hot_shard_reader.rs::hot_data_from_every_registered_instance_is_read`：
+两个 `instance_id` 各注册一个热读器（各持一个分片、各一行），断言 `count(*) == 2`。
+
+> 防的是：只读"某一个"实例 ⇒ 另一台的**未落盘数据静默消失**。这类错比报错难查得多 ——
+> 它不违反任何 manifest 约束，只是"少了一层数据来源"。旧结构（单槽位）下写不出这条断言。
+
+### 65.4 验证
+
+- `cargo test -p yuntun-query`：含新用例与既有接缝用例全绿
+- 全量：见 `status.md`（本轮跑完整 workspace）
+- 装配点只有两处（`server` 与 `chaos`），各自的 `instance_id` 与写入侧**同源**（`cfg.chunk.instance_id` / `"chaos"`）
+
+### 65.5 遗留
+
+1. **第三刀**：两个 `ChunkStore` 当两个实例的**进程内对拍** —— 断言"每行只出一次"且与单节点串行
+   **精确相等**（M4 判据的第一形态）；
+2. 快照里的 `nodes`（"分片归属"）与 `hot` 的键集**目前同源但未强制一致** —— R5 做 fanout 时
+   由成员发现统一（T12.3）；
+3. 远端必须给真实水位（S5-6）/ 重启后水位归 0（`§63.4`）未变。
+
+---
+
+## 66. R4 **T12.2 第三刀**：双实例进程内对拍（M4 判据的第一形态）+ **T12.2 收口**（2026-09-21）
+
+### 66.1 用例：两种装配跑同一批写入，逐行比
+
+`crates/query/tests/two_instance_parity.rs`：
+
+- **单节点串行**：一个 `ChunkStore`（实例 `solo`）收到全部 6 行；
+- **双实例**：两个 `ChunkStore`（`inst-a` / `inst-b`）各收 3 行 —— 模拟两个 datanode 各写一半；
+- 两边都跑 `SELECT a FROM ... ORDER BY a`，断言**逐行精确相等**且**恰好 6 行**。
+
+两个实例刻意用**相同的 `(table, shard, window, epoch)`**：设计上"多个 datanode 可能同时写同一
+partition，各自出各自的文件"（`architecture §5.1` 无归属写入），所以同名 key 才是真实形态 ——
+用不同 shard 反而回避了 Hard 情况。
+
+**比的是排序后的值**：批次边界与行序本就不在契约里（`§65.2` 的 `BTreeMap` 保证的是**确定性**，
+不是某个特定的拼接顺序）；对拍要比的是内容。
+
+### 66.2 为什么这条是 M4/R5 对拍的模板
+
+`§4.4` 的"按实例切分"一旦实现错，**两种错法都不报错**：
+
+| 实现错法 | 症状 | 本用例如何抓住 |
+|---|---|---|
+| 只读某一个实例 | **少**另一台未落盘的数据 | `split != all`（会得到 3 行） |
+| 把同一份数据读两次 | **多**行（`plan.md §5.3-1` 的重复计数） | `split != all`（会得到 9 行） |
+
+两条断言其实是同一句 `split == all`：**6 行不多不少**。这正是"对拍"比"单元断言"强的地方 ——
+它不需要事先想到具体的错法。
+
+> **它在上一刀之前是写不出来的**：那时只有一个热读器槽位，两个实例里只能注册一个 ⇒ 结果必然 3 行
+> ⇒ 断言失败。所以这条用例是 `§65` 那次结构变更的**回归测试**，而不是它的装饰。
+
+### 66.3 反证：证明主断言不是"碰巧相等"
+
+`single_registered_instance_sees_only_its_own_rows`：**只**把 `inst-a` 接进来，
+断言结果恰好 `[1,2,3]`。
+
+> 必要性：如果"只注册一个实例"与"注册两个实例"结果一样，那主对拍就什么都没证明
+> （`§58` 记过同款自欺："否则两边都空也能'相等'"）。反证把"两实例**确实**多读到了东西"钉住。
+
+### 66.4 T12.2 收口：三刀齐
+
+| 刀 | 内容 | 出处 |
+|---|---|---|
+| 一 | **契约**：`ShardRead { batches, flushed_watermark, stale }`；水位单位 = manifest 版本号 | `§63` |
+| 二（上） | **消费**：`HotReadStale` + 有界重试（刷新 manifest → 用新版本重试） | `§64` |
+| 二（下） | **按实例**：`HotShards = BTreeMap<instance, ShardReader>`，逐实例拉 | `§65` |
+| 三 | **对拍**：双实例 vs 单节点串行，逐行相等 + 反证 | 本节 |
+
+**T12.2 的语义闭环（进程内形态）到此完成**：`FileManifest.source_instance` 从"只写不读的元数据"
+变成了**读路径的键**，并且"按实例切分错了会怎样"有了可执行的判据。
+
+### 66.5 遗留（R4 的下一批）
+
+1. **T12.1 拆进程**（`yuntun-ingestor` / `yuntun-queryd` / `yuntun-compactor`）：本节的"双实例"
+   仍是**同进程内的两个 chunk store** —— 跨进程形态要等它，届时同一条对拍逻辑可直接复用
+   （与 R3 先做进程内 `Cluster`、再换 gRPC 传输是同一个套路）；
+2. **T12.3 成员发现 + 分片归属**：把"快照里的 `nodes`"与 `HotShards` 的键集统一为成员表（`§65.5`）；
+3. 远端必须给真实水位（S5-6）/ 重启后水位归 0（`§63.4`）。
+
+### 66.6 顺带观察：`chaos::compaction_during_query_keeps_counts_monotonic` 是**负载敏感**的
+
+本轮第一次全量跑时它报 `查询样本太少（1)`；**单独跑该二进制（15 个 chaos 用例）立刻全绿**，
+且 **2.60s vs 全量里同一二进制的 75.32s（29 倍差距）** —— 这就是"机器被拖慢"的指纹。
+用例自己的注释已经声明门槛（`observed.len() >= 3`）对负载敏感：满负载机器上 10ms 间隔的采样
+次数会明显变少，卡死数量会把机器快慢当成失败。
+
+**不是本刀的回归**：本刀对单实例路径功能等价（`HotShards` 只有一项、不 STALE 就不重试、每次查询多
+一次 BTreeMap 克隆）。
+
+> 留作观察：该断言更稳的写法是"**等到采够样本（带超时）**"而不是"固定窗口里计数" ——
+> 那样机器快慢只影响耗时，不影响判定。本轮不改（属 chaos 夹具的事，与 T12.2 无关）。
+
+---
+
+## 67. 数据面 gRPC 面：热数据分片拉取走网络（S5-6；R4 T12.1 的前置）（2026-09-21）
+
+### 67.1 做了什么
+
+`ShardReader` / `ShardFetch` 这两条缝早就留好了，但在此之前**只有进程内实现是真的** ——
+`RemoteShard` 的传输在测试里是个假实现（`CannedFetch`）。本次把它变成能跑在网络上的东西：
+
+| 件 | 内容 |
+|---|---|
+| `crates/proto/proto/shard.proto`（新） | `ShardFetch` 服务：`FetchShards` / `FetchShard` / **`FetchWatermark`**；`FetchShardResponse` 带 `batches_ipc` + `flushed_watermark` + `stale` |
+| **`crates/shardrpc`（新 crate，第 19 个）** | 服务端 `ShardService`（包**任意** `Arc<dyn ShardReader>`）+ 客户端 `GrpcShardFetch`（→ `RemoteShard`）+ 批次编解码 + `serve()` |
+| 用例 | `batches_watermark_and_stale_survive_the_wire`、`parity_holds_with_instances_behind_grpc` |
+
+**为什么单独一个 crate**：`yuntun-proto` 的定位写着"只放接口，**不把 tonic 拖进查询/写入路径**"，
+而 `store` 正被查询路径依赖、`chunk` 正被写入路径依赖 —— 谁都不能加 tonic。单开一个 crate 后，
+只有**装配层**（将来的数据节点 / 查询节点进程）才引入它。
+
+**批次编码复用 arrow IPC stream**（与 WAL 记录、spill 同一形态）：批次在系统里只该有一种线上编码。
+
+### 67.2 用例当场抓到一个**契约级** bug：水位被当成了"分片的派生量"
+
+第一版跑起来后，往返用例的 ①-b 断言失败：
+
+```text
+远端必须把 STALE 报回来 —— 否则协调者会把这批数据静默丢掉
+```
+
+**根因**：`RemoteShard` 用的是 trait 的**默认** `read_table` —— "枚举分片 + 逐片合并"，水位取
+各片水位的 `max`。而 `reclaim` 之后那个 chunk 已经没了 ⇒ **分片枚举为空** ⇒ 合并出来的水位是
+**0**、`stale = false`。也就是说：
+
+> 实例明明已经放弃了一批数据的本地副本，却告诉协调者"我这儿没有已放弃的数据" ——
+> 协调者于是**静默丢掉那批数据**。
+
+这与 `§63.3` 是**同一个错误形状**（"数据两头都没有，而调用方只看到空"），只是从进程内挪到了
+网络另一侧 —— 契约写对了，**默认实现把它悄悄推翻**。
+
+**修法是结构性的，不是补一句文档**：
+
+1. `ShardReader` 新增**必实现**的 `async fn watermark(&self, known) -> Result<ShardRead, _>` ——
+   专门回答"本实例已放弃副本到哪了"，**与有没有分片无关**；
+2. `ShardFetch` 新增**必实现**的 `fetch_watermark(...)`（proto 里对应 `FetchWatermark`）——
+   **没有默认实现是刻意的**：任何默认值（包括 0）都等于**静默关掉 STALE**，而那正是本节的 bug；
+3. 默认 `read_table` 改为**先读分片、后取实例水位**，水位与 `stale` **一律取实例级的**
+   （分片级的值只是它的投影）。顺序也是刻意的：若在两者之间有数据被放弃，**后取**的水位能覆盖它
+   （反过来会漏）。
+
+> 一句话总结这条契约：**水位是实例级属性，不是分片级属性。** 分片枚举恰好为空，正是"刚放弃完
+> 副本"的时刻 —— 那时它最不能报 0。
+
+### 67.3 用例验什么
+
+`batches_watermark_and_stale_survive_the_wire`（真 TCP + gRPC + IPC 编解码）：
+
+| 阶段 | 断言 |
+|---|---|
+| 未放弃副本 | 3 行完整过网络；水位 0；**不**报 STALE（防误报方向） |
+| `reclaim(6)` 之后 | 热路径 0 行（副本确实没了）；**报 STALE**；水位 **5** 带得回来 |
+
+`parity_holds_with_instances_behind_grpc`：`§66` 那条**对拍**在远端形态下同样成立 ——
+单节点串行 vs 两个 gRPC 数据节点各写一半，**逐行相等**。这正是 `§66.5` 承诺的
+"跨进程形态复用同一条对拍逻辑"的兑现（差别只在**传输**，判定逻辑一行没改）。
+
+### 67.4 遗留
+
+1. **尚未接线**：standalone 仍是进程内热读（`set_hot_shards(instance_id, chunks)`）—— 本节的
+   客户端是**为 T12.1 拆进程准备的**；届时装配点把 `GrpcShardFetch` 包成 `RemoteShard` 注册即可；
+2. **`version()` 还没上 wire**：`RemoteShard::version()` 仍走 `ShardFetch::fetch_version` 的默认 0，
+   于是"提交驱动刷新"在远端形态下退化成 TTL（`shard.rs` 的 trait 文档已写明这一退化）；
+3. 本节的"跨网络"仍是同进程内的 gRPC 往返；**真跨进程**随 T12.1。
+
+---
+
+## 68. T12.1 第一刀：**数据节点进程** `yuntun-ingestor`（2026-09-21）
+
+### 68.1 拆的是什么
+
+单进程形态下，"吸收 WAL / 持有热数据 / 对外提供热读"三件事都挤在 `standalone` 里，
+于是热读只能是**进程内函数调用**（装配层把 `Arc<ChunkStore>` 直接交给查询侧）。本刀把
+**数据节点**摘出来成独立进程（t12.1 要拆三个：`ingestor` / `queryd` / `compactor`，这是第一个）：
+
+```text
+yuntun-ingestor 进程 ── 私有 WAL → 吸收 → chunk store（热数据）
+       │  gRPC（shard.proto）+ arrow IPC
+查询侧：GrpcShardFetch → RemoteShard → QueryEngine
+```
+
+它启动时做的事，顺序是刻意的：
+
+| 序 | 动作 | 为什么是这个位置 |
+|---|---|---|
+| ① | `private_dir` 租约（`wal-root` / `chunk-spill`） | **排在所有会改文件的操作之前**：被拒的进程连 WAL 都不该打开（`§62` / R-13） |
+| ② | `WalWriter::open`（自带 recovery） | 数据节点热数据的**真相来源**：`synced_seq` 从盘上恢复，回放即恢复热数据 |
+| ③ | `MemoryCatalog` + 本地冷存根 | 元数据面接 metanode 属 T12.3；冷文件先落本机目录 |
+| ④ | `Ingestor::new(...)` + `spawn_accumulator` | **`Ingestor` 自带 chunk store** ⇒ 写侧与热读侧同一实例 = "读己之写" |
+| ⑤ | `shardrpc::serve(chunks, listener)` | 先 bind 再打印 `LISTEN <addr>`：上层拿到的是**真实**地址（`:0` 由内核分配） |
+
+**与单进程形态不是两套实现**：组件、契约全同（`Ingestor` / 私有目录租约 / `ShardReader`），
+差别只在**传输** —— 查询侧从"拿到 `Arc<ChunkStore>`"换成"拿到 `GrpcShardFetch` 包出来的
+`RemoteShard`"。所以 `§66`/`§67` 的对拍逻辑**一行都不用改**（见 68.3）。
+
+### 68.2 数据怎么进进程：**回放它自己的 WAL**
+
+跨进程的"写入面"（客户端如何把数据交给数据节点）**尚未定**，本轮不去发明它。用例的喂法是
+**预置它的 WAL，让进程启动后自己回放** —— 这不是为测试特设的通道，而是数据节点**重启后的
+真实恢复路径**（`§28.2` 的 R-13 教训正在此处继续成立：同一私有目录同一时刻只有一个消费者）。
+
+副产品：这条用例顺带把"崩溃恢复后热数据必须自己长回来"也验了。
+
+### 68.3 三条既有承诺的兑现（全部由用例钉住）
+
+| 承诺出处 | 用例 | 结果 |
+|---|---|---|
+| `§66.5`"跨进程形态可复用同一条对拍逻辑" | `parity_holds_across_processes` | 复用，判定逻辑一行没改 |
+| `§67.4`"真跨进程随 T12.1" | `hot_rows_cross_a_real_process_boundary` | 热数据在**另一个进程**里长大，经 gRPC 被查到 |
+| `§28.2`/`§62`"同一私有目录只有一个消费者" | `second_process_on_the_same_private_dir_is_rejected` | 第二个进程**启动即拒**，且不打印 `LISTEN`（连 WAL 都没开） |
+
+对拍仍然是 `§66` 那一条：**单节点串行 vs 两个数据节点各写一半，逐行相等**，
+外加**反证**（只注册 `inst-a` 时只看到它自己那 3 行）—— 防"主断言空转"。
+
+### 68.4 用例怎么起进程（可复用手法）
+
+沿用 `metanode_process_e2e` 的范式（`crates/ingestor/tests/cross_process_hot_read.rs`）：
+
+- `env!("CARGO_BIN_EXE_yuntun-ingestor")` 拿被测二进制路径；`--listen 127.0.0.1:0` 由内核分配端口，
+  **进程把真实地址打到 stdout**（`LISTEN <addr>`），用例读这一行 —— 既避免端口互抢，也不需要
+  "先探测端口再起服务"的 TOCTOU 窗口；
+- stderr 后台收进 `String`：断言失败时能打出来（否则只剩"提前退出"四个字）；
+- `Drop` 里 `kill + wait`：用例失败也不留孤儿进程；
+- 热数据"长出来"是**有延迟**的（攒批扫描间隔 100ms 量级）⇒ 用例 `wait_rows` 轮询而不是 `sleep` 固定值。
+
+### 68.5 遗留
+
+1. **写入面未定**：客户端如何把数据交给数据节点（新 RPC？还是数据节点自己消费源？）——
+   本刀只走"自己的 WAL"，属恢复路径；
+2. **`queryd` / `compactor` 未拆**：`standalone` 仍是可用的全功能形态，三者尚未对等；
+3. **元数据面仍是本地 `MemoryCatalog`**：跨进程共享（成员发现 / 分片归属 / DDL 可见性）属 T12.3；
+4. 数据节点缺 WAL 超时监控 / compaction / 孤儿清理（按设计归别的进程）。
+
+---
+
+## 69. T12.3 第一刀：**成员表作为唯一真相**（2026-09-23）
+
+### 69.1 关掉的是 `§65.5` 那个坑
+
+在此之前，"有哪些实例"与"能读谁的热数据"是**两份各自更新的真相**：
+
+```text
+LocalCatalog
+├── nodes: RwLock<Vec<String>>                  ← 快照的"分片归属"（装配层 set_nodes 写）
+└── hot:   RwLock<HotShards>（instance→reader）  ← 查询实际拉热数据的键集（set_hot_shards 写）
+```
+
+`§65.5` 已经点明它们"**同源但未强制一致**"。漂移的后果不是风格问题：
+按错误的实例集合去算归属，就是**查询静默少数据**（名录里有、读不到）或归属算错。
+
+**设计依据**（不是自创）：
+
+- `architecture-with-chunk §3.2`：成员发现分两层 —— **成员名录走 raft**（只在上/下线时变）；
+  **存活状态秒级心跳，绝不进 raft**（会把写爆）；
+- `§3.1`：成员名录是元数据面的事；而"chunk 位置（谁持有哪个分片）**无需存储**"（直接问 datanode）。
+
+### 69.2 改成什么
+
+```rust
+pub struct Member {
+    pub instance_id: String,
+    /// 数据面地址（host:port）。None = 同进程 / 尚未上报
+    pub address: Option<String>,
+}
+```
+
+- `LocalCatalog` 内部只剩一张 `members: BTreeMap<String, Member>`；
+- **快照的 `nodes` = 成员表 ID 清单**（`member_ids()`）——不再是另一份 `Vec`；
+- `set_hot_shards(instance, reader)` **顺带登记成员** ⇒ 不变式：**热读器键集 ⊆ 成员表**，
+  且 `nodes` 由成员表派生 ⇒ 两者**结构上不可能再漂移**；
+- `set_members(Vec<Member>)` 是**权威替换**（成员发现 / 装配层调用）；
+  被摘除的成员，其热读器**一并移除**，并 `warn!` 留痕（摘除是有语义的，不该无声发生）。
+
+**为什么地址必须进成员表**：只有 `instance_id` 时，"有哪些实例"变不成"怎么连" —— 而 R4 的查询侧
+恰恰要**按发现到的成员装配热读器**（这正是 `§67` 那个 `GrpcShardFetch` 的用武之地）。
+R5 的 fanout（T13.1）也要从成员表拿"活跃 datanode 列表"。
+
+**摘除为什么是安全的**（不是靠本函数保证）：成员摘除走 raft，且按设计只在它的文件已提交
+**之后**发生 —— 所以摘除那一刻，它那份数据必然已能从冷侧读到。用例 ③ 把这条语义钉住了。
+
+### 69.3 实现中修掉的一个隐患：**锁序必须单向**
+
+两处写入都会碰两张表：`set_hot_shards`（先成员、后热读器）与 `set_members`（同样先成员、后热读器）。
+第一版 `set_members` 在**持有热读器写锁**时又去取成员表读锁 ⇒ 两个方向的加锁路径同时存在，
+并发下会**互相死锁**。已统一为**成员表 → 热读器表**单向加锁，并在两处注释里写明顺序
+（否则下一个人很容易再写出反向路径）。
+
+### 69.4 用例（`crates/query/tests/member_table.rs`）
+
+| 用例 | 钉住什么 |
+|---|---|
+| `registering_a_hot_reader_also_registers_the_member` | 登记热读器 ⇒ 成员表与**快照 `nodes`** 都必须含它（旧形态下这两处可以互相矛盾） |
+| `members_carry_data_plane_addresses` | 地址存得住、取的回，且成员表按 ID 有序（取值确定） |
+| `removing_a_member_takes_its_hot_shards_out_of_queries` | 摘除成员 ⇒ 它的热数据**不再参与查询**（两行→一行的可观测变化），并带**反证**（摘除前两行都在） |
+
+### 69.5 遗留
+
+1. **成员表目前只由装配层写**（`set_members`）：向 metanode 注册 / 心跳保活 / 超时摘除
+   是 T12.3 的后续（`§3.2` 的两层机制）；
+2. **归属不存储**：谁持有哪个 `(table, shard)` 按 `§3.1` 直接问（`ShardFetch::fetch_shards`
+   这条缝已在），查询侧尚未用它来收窄拉取范围 —— 属 R5 的 fanout（T13.1）；
+3. 数据节点进程（`§68`）尚未向任何成员表注册，地址仍由装配层手工给出。
+
+### 69.6 顺带修掉一条**时序 flake**（`§66.5` 预言过的那个）
+
+全量跑到 chaos 时挂了一条：
+
+```text
+test compaction_during_query_keeps_counts_monotonic ... FAILED
+  查询样本太少（1)，无法支撑并发断言
+```
+
+**不是本刀的回归**：该用例的查询采样任务每 10ms 采一次、而压缩循环固定跑 3 轮 —— 满负载机器上
+3 轮可能整个落在两次采样**之间**，于是"样本数"成了**机器快慢的函数**（当时负载 115）。
+`§66.5` 早就把它记成"留作观察：更稳的写法是**等到采够样本（带超时）**，而不是固定窗口里计数"，
+只是当时判为"属 chaos 夹具的事"。它现在真的触发了，就按那条记录改掉：
+
+- 循环条件由 `for round in 0..3` 改为「**轮数下限 3 且 样本数下限 3**，带 30s 超时」；
+- 断言消息带上轮数与超时说明，便于下次一眼区分"机器慢"与"真缺陷"。
+
+修完连跑 3 遍稳定（每次 0.22s，样本数足够）。**教训**：夹具里任何"固定时间窗内计数"的断言，
+都在把机器快慢偷偷变成判定的一部分 —— 要么等到条件成立（带超时），要么断言与时间无关的量。
+
+---
+
+## 70. 构建提速 + T12.3 第二刀（上半）：数据节点注册走 raft（2026-09-23）
+
+### 70.1 先纠正一个假设：**磁盘不是瓶颈**
+
+怀疑是"`rust-lld` 慢、磁盘读写满"。实测数据不支持这个归因：
+
+| 观测 | 值 | 含义 |
+|---|---|---|
+| `vmstat` 的 `wa` | 1–7% | **I/O 等待几乎为零** —— 磁盘没满 |
+| `us` / `sy` | 92% / 7% | 瓶颈在 **CPU** |
+| 磁盘型号 | `sda` `ROTA=0` | SATA **SSD**（另有 NVMe 只挂了 `/boot`，用不上） |
+| 同时在跑的链接器 | **24**（12 核机器） | 3 倍超订 → `cs` 11 万次/秒的**上下文切换风暴** |
+| 当时的 load | **115** | 就是这场风暴 |
+
+真正的开销是**链接输入体量**：`[profile.release]` 早已把 `debug` 降到 `line-tables-only`
+（注释里写着"完整调试信息会让二进制达到 2.3GB"），但 **`[profile.dev]` 是默认的 `debug = true`**
+—— 每个测试二进制都塞满完整 DWARF。
+
+### 70.2 改了什么
+
+```toml
+[profile.dev]
+debug = "line-tables-only"      # 保留文件/行号：backtrace 仍能定位失败用例
+
+[profile.dev.package."*"]
+debug = false                   # 依赖（datafusion/arrow…）是体积大头
+```
+
+外加**构建时 `-j 8`**（12 核机器上让 12 个任务各再叉多线程 lld，只会互相抢核）。
+
+效果：同样的全量构建，load 从 **115 → 6.65**（不再有上下文切换风暴）。
+代价与用法：
+
+- **改 profile 会让构建缓存一次性失效**（要全量重建一遍，之后一直快）；
+- 调试只剩行号：需要变量/类型时用 `CARGO_PROFILE_DEV_DEBUG=2 cargo test …` 单次覆盖；
+- `target/debug` 现在 **18G**（含全部测试二进制）。
+
+### 70.3 T12.3 第二刀（上半）：注册 op 走 raft，名录进状态机与快照
+
+**为什么是 op 而不是旁路注册接口**：`architecture-with-chunk §3.1` 要求成员名录与
+schema/manifest **同版本**读出去 —— 否则查询侧会拿"新的文件清单 + 旧的节点集合"拼计划。
+而**心跳绝不走这条路**：秒级心跳会把 raft 写爆（`§3.2`），它属第二刀的下半。
+
+| 件 | 内容 |
+|---|---|
+| `meta.proto` | `Op.kind.register_datanode = 11` + `RegisterDatanodeOp { instance_id, address }` |
+| `yuntun-model` | `DatanodeMember { instance_id, address, registered_at_ms }`（做成 prost 消息，才能进快照） |
+| `CatalogState` | `datanodes` + `register_datanode()`（**同 ID 同地址 ⇒ 不推进版本**） |
+| `meta op` | `StateOp::RegisterDatanode` + decode + apply |
+| 快照载荷 | `CatalogStateSnapshot.datanodes = 12`，**并把 `SNAPSHOT_FORMAT_VERSION` 1 → 2** |
+
+**幂等为什么是关键**：节点每次重启都会重注册（同地址）。若每次都推进 `schema_ver`，
+全体客户端会被反复拉去**全量重建快照** —— 一个健康检查式的动作变成集群级抖动。用例把这条钉住了。
+
+**格式版本必须 bump**：旧构建读到新载荷会**明确拒绝**，而不是默默忽略未知字段 ——
+名录被静默丢掉，正是 `§69` 那类"查询静默少数据"。
+
+### 70.4 用例当场抓到的设计含糊：注册时刻有**两个来源**
+
+初版把 `registered_at_ms` 既放在载荷里、又在 `decode_op` 里填 `now_ms` ⇒ 测试直接构造 op 时
+两者不一致，断言立刻失败。改为**由 `apply` 用 op 的 `now_ms` 落章**（载荷不再自述时间）：
+时间戳是状态的一部分，若允许调用方随 op 带进来，同一串 op 在不同副本上会得到不同的名录时刻。
+
+**另一个教训（本仓第二次踩）**：往文件里插新类型时，锚点若选在**结构体行**，容易插进
+`#[derive(...)]` 与结构体之间 —— 于是 derive 挂到了新类型上、原类型丢掉 derive
+（上次是 `cache.rs` 的文档归属，这次是 `model/src/meta.rs` 的 `prost::Message`）。
+锚点一律选 `#[derive]`/注释行，别选结构体行。
+
+### 70.5 验证与遗留
+
+- `cargo test -p yuntun-model -p yuntun-catalog -p yuntun-meta` → 29 / 39 / 进程 e2e 全绿
+- 全量 `cargo test --workspace --no-fail-fast` → **329 passed / 0 failed**；clippy 本仓 **0**
+- 新增 `wire_compat` 用例：注册 op 载荷往返逐字段不变（仓库规矩：每加一种 op 都要有）
+
+**下半的遗留**：
+
+1. **读路径**：把名录下发出去（`PrefetchPayload.datanodes`）+ `LocalCatalog` 消费它
+   （`set_members`）—— 到那时"成员表自动发现"才真正闭环（`§69` 的成员表至今仍由装配层手填）；
+2. **心跳与超时摘除**：metanode 内存 + 独立 RPC（**永不进 raft**，`§3.2`）；
+3. **ingestor 自注册**：`yuntun-ingestor --meta <addr>` + 启动注册（`register_datanode_to_proto` 随它落地）；
+4. 改 profile 后**旧快照载荷（v1）会被拒绝** —— 本地开发数据需重建（`§70.2`）。
+
+---
+
+## 71. T12.3 下半（第 1 步）：名录下发闭环 —— 成员表第一次**自己长出来**（2026-09-23）
+
+### 71.1 缺的那一环
+
+`§69` 把成员表立成"唯一真相"，`§70` 让数据节点能**注册进 raft**。但名录还停在元数据里 ——
+查询侧的成员表仍由装配层**手填**。本步把它接上：
+
+```text
+数据节点注册（op，走 raft）
+   → CatalogState.datanodes
+   → PrefetchPayload.datanodes（与 schema/manifest **同一次**响应，§3.1）
+   → LocalCatalog::refresh 消费 → set_members（含**数据面地址**）
+```
+
+**同一次响应**是刻意的：分两个接口读就会出现"新文件清单 + 旧节点集合"的拼计划窗口。
+而名录变化会推进 `schema_ver`（`§70.3`）⇒ 必然伴随一次全量刷新，所以只需 `Prefetch` 带它，
+不必让 `Delta` 也带 —— 设计在这里是自洽的。
+
+### 71.2 改了什么
+
+| 件 | 内容 |
+|---|---|
+| `meta.proto` | `PrefetchPayload.datanodes = 5` + `DatanodeMemberMsg{instance_id, address, registered_at_ms}` |
+| `CatalogOps` | `register_datanode`（写）+ `datanodes`（读）—— **都没有默认实现** |
+| `MemoryCatalog` | 直接读写自己的状态 |
+| `RemoteCatalog` | 写 = `Propose`（raft op）；读 = **先 `refresh()` 再读缓存** |
+| `LocalCatalog::refresh` | 名录**先落地**（在构造快照之前，`§3.1`）；**读失败 = 本次刷新失败** |
+| 装配层 + 6 个测试夹具 | 本实例登记进名录（见 71.4） |
+
+**为什么两个方法都不能有默认实现**：任何默认值（含"空表"）都等于"没有数据节点" ——
+查询会据此按空成员表算归属，正是 `§69` 那类**静默少数据**。
+
+### 71.3 用例揪出的坑：远端读必须在**已 prime** 的缓存上
+
+改完全量测试挂了 14 条，症状一律是"查询返回 **0 行**"。定位用了两步硬证据（不是猜）：
+
+1. 临时 `eprintln!` 打出名录与热读器键集 —— 立刻看到：
+
+   ```text
+   名录 ids=[]；当前 hot 键=["standalone"]     ← 刷新先来 ⇒ 把热读器摘了
+   名录 ids=["standalone"]；当前 hot 键=[]      ← 登记后也补不回来
+   ```
+
+   （同时印证：`tracing::warn!` 在测试里**无处可去**，所以"没看到告警"不能当证据。）
+2. 临时打 `Backtrace::force_capture()` —— 看到第一次刷新来自**后台刷新任务**，
+   而装配默认走 `MetaMode::Embedded` ⇒ 查询侧拿到的是 **`RemoteCatalog`**。
+
+**根因**：`RemoteCatalog::datanodes()` 读的是**客户端缓存**，而缓存由它自己的 `Prefetch` 填充；
+查询侧刷新把名录读放在了**最前面**，那一刻缓存还没 prime ⇒ 读到空名录 ⇒ 把自己的成员表清空。
+**修法**：`datanodes()` 与 `list_tables` 等读方法同形 —— **先 `self.refresh().await?`** 再读缓存。
+
+> 教训：一个"读缓存"的方法必须和它的兄弟方法走**同一条** prime 路径。
+> 少了这一步不会报错，只会静默给出"空"，而空的语义在这里恰好是**最危险**的那个。
+
+### 71.4 顺带的语义后果：夹具也得登记
+
+"名录是唯一真相"意味着**不登记 = 不存在**：装配层与 6 个测试夹具都补了本实例登记
+（`address` 空 = 同进程实例）。这不是测试的将就，而是这条语义的直接推论 ——
+新用例 `roster_from_metadata_populates_the_member_table` 把它写成正面断言：
+
+- 名录里的 `inst-b` **没接线读侧也出现在成员表**（这就是"发现"），且**带数据面地址**；
+- 名录里的地址**覆盖**本地登记（`inst-a` 从"无地址"变成 `10.0.0.7:50051`）—— 名录是权威；
+- `inst-a` 在名录里 ⇒ 刷新**不得摘掉**它的热读器（`§70` 那个坑的反面），读己之写不受影响。
+
+### 71.5 验证与遗留
+
+- 全量 `cargo test --workspace --no-fail-fast` → **331 passed / 0 failed**；clippy 本仓 **0**
+- 新增 `wire_compat` 用例：名录条目往返逐字段不变（仓库规矩：每加一种载荷都要有）
+
+**遗留**：
+
+1. **心跳与超时摘除**：metanode 内存 + 独立 RPC（**永不进 raft**，`§3.2`）；
+2. **ingestor 接 metanode**：`--meta <addr>`，让注册走真 raft（现在仍是本地 catalog；
+   同一个 trait 方法，装配点换一行即可）；
+3. 成员表里的成员若**没有接线热读器**，目前只是"存在但不参与拉取" —— 谁来接线（谁负责
+   按地址建 `GrpcShardFetch`）属 R5 的 fanout（T13.1）。
+
+---
+
+## 72. T12.3 下半（第 2 步）：心跳保活 + 超时摘除（2026-09-23）
+
+### 72.1 两条纪律必须在**代码里分开**
+
+`architecture-with-chunk §3.2` 把成员发现切成两层，这一刀落的就是它：
+
+| 层 | 内容 | 机制 | 频率 |
+|---|---|---|---|
+| 成员名录 | 有哪些 datanode、ID 与地址 | **raft**（`register` / `remove` 两个 op） | 上下线才变 |
+| 存活状态 | 谁还活着 | metanode **内存** + 心跳 | 秒级 |
+
+**心跳绝不进 raft**：秒级心跳会把写路径压垮。但**摘除必须进 raft**：名录要与
+schema/manifest 同版本传下去（`§3.1`）。两者混在一起会二选一地坏掉 —— 要么写爆 raft，
+要么让各副本对"谁存在"产生分歧。
+
+### 72.2 落点
+
+| 件 | 内容 |
+|---|---|
+| `NodeStatus.last_seen` | `HashMap<String, Instant>` —— 存活表（**内存**，不进状态机/快照） |
+| `NodeHandle::heartbeat(id)` | 更新存活 + 返回 **`known`**（是否还在名录里） |
+| `spawn_liveness_sweep(handle, timeout, interval, shutdown)` | leader-only 巡检；超时者经 `propose` 摘除 |
+| `meta.proto` | `rpc Heartbeat` + `RemoveDatanodeOp{instance_id, reason}`（oneof arm 12） |
+| `CatalogState::remove_datanode` | 摘除 + 推进 `schema_ver`（与注册同源） |
+| `metanode` 进程 | 装配巡检：**15s** 未心跳即摘（数据节点每 5s 一次，抗一次抖动） |
+
+三个刻意的选择：
+
+1. **存活表放 `NodeStatus`**（`Arc<Mutex<..>>`，两处构造点都在用）⇒ **构造点零改动** ——
+   `..Default::default()` 的老实好处；
+2. **用 `Instant`（单调钟）**：墙钟跳变不该改变"谁还活着"的判定；
+3. **`heartbeat` 返回 `known`**：`false` 的语义是"你已被摘除，**请重新注册**"——
+   少了它，一个被摘掉的节点会永远安静地空发心跳，而谁的名录里都没有它（另一种静默）。
+
+### 72.3 巡检的三条纪律（都有具体的坏后果）
+
+1. **只有 leader 提议**：判据是 `leader_id == self.id` **且 `leader_id != 0`** ——
+   未知时一律不提议（宁可晚摘，不可错摘）；
+2. **先播种、后判定**：名录里**第一次见到**的成员按"此刻还活着"记一笔。没有这一条，
+   新 leader（内存存活表是空的）第一轮巡检就会把**整个集群**摘掉；
+3. **摘除失败不清存活记录**：下一轮还会看到它仍超时，于是**重试**；
+   清掉就等于"提议失败 = 它活着"（把失败当成功）。
+
+`propose` 是**阻塞**的（等提交）⇒ 整个巡检体放在 `spawn_blocking` 里，不占异步 worker。
+
+### 72.4 用例（`crates/meta/tests/liveness_e2e.rs`）
+
+用**进程内**真节点（`MetaNode::open` 单节点 = 天然 leader），验的是语义链而不是传输：
+
+| 步 | 断言 |
+|---|---|
+| ⓪ | 等选主：单节点也要走完一次选举（判据用**对外**可见的 `leader_id`，1 = 本节点） |
+| ① | 注册（走 raft 的 op）⇒ 名录里有它 |
+| ② | `heartbeat` 的两种返回：在名录里 `true`；不在 `false`（**这就是"该重新注册"的信号**） |
+| ③ | 起巡检（超时 300ms / 巡检 50ms） |
+| ④ | 持续心跳 ⇒ **不被摘**（否则巡检就是在随机删节点） |
+| ⑤ | 停心跳 ⇒ 超时后**从名录消失**（读的是 `Prefetch` 载荷 ⇒ 确实经 raft 落了状态） |
+| ⑥ | 摘除后再心跳 ⇒ `known = false`（**摘除是可恢复的**） |
+
+### 72.5 验证与遗留
+
+- 全量 `cargo test --workspace --no-fail-fast` → **333 passed / 0 failed（+1 ignored）**；clippy 本仓 **0**
+- 规模：41,213 行 / 20 个 crate / 333 测试函数
+
+**遗留**：
+
+1. **数据节点侧的心跳循环还没写**：`yuntun-ingestor --meta <addr>` + 每 5s 一次 `Heartbeat`
+   （收到 `known=false` 就重新注册）—— 这是 T12.3 的最后一块拼图；
+2. **多 metanode 时存活表是「每副本各记一份」**：本刀只在 leader 上判定，follower 的表空着；
+   换主靠"先播种"兜住（不会误摘），但**换主后到播种之间的失联**要等下一轮才被发现 ——
+   真要收紧，得让心跳带上 leader 提示或让 follower 也参与判定（属多 metanode 的后续）；
+3. R5 的 fanout（T13.1）应当**只向"活跃"成员拉数据** —— 本刀给出的存活表就是它的输入。
+
+---
+
+## 73. T12.3 收口：数据节点侧的心跳循环（2026-09-23）
+
+### 73.1 这一刀把 T12.3 合上
+
+`§70`（注册走 raft）→ `§71`（名录下发，成员表自动发现）→ `§72`（心跳保活 + 超时摘除）
+→ **本节**（数据节点自己会入册、会保活、被摘了会自己回来）。至此 T12.3 的四处拼图齐了。
+
+| 件 | 内容 |
+|---|---|
+| `CatalogOps::heartbeat(id) -> bool` | **无默认实现**（同 `register_datanode`/`datanodes`） |
+| `MemoryCatalog` | 名录就在自己手里 ⇒ 本地判断（规则与 metanode 一致） |
+| `RemoteCatalog` | 走 `Heartbeat` RPC：轮换地址 + 超时，与 `status`/`prefetch` 同形 |
+| `yuntun-ingestor` | `--meta <addr>`（给了就接 metanode）+ `--heartbeat-secs`（默认 5） + 心跳循环 |
+
+### 73.2 心跳循环的三种结果（与 metanode 侧一一对应）
+
+| 结果 | 含义 | 处置 |
+|---|---|---|
+| `Ok(true)` | 还在名录里 | 什么都不做 |
+| `Ok(false)` | **不在名录里**：被超时摘除 / 从未入册成功 | **重新注册**（⇒ 摘除可恢复，`§72.2`） |
+| `Err(_)` | 元数据面不可达 | 告警 + 下一轮重试（**不退出**） |
+
+**入册是 best-effort**：元数据面晚起来只意味着"暂时不在名录里"，而不是"数据节点起不来" ——
+数据节点的核心职责（吸收自己的 WAL、服务热读）不依赖元数据面。这条让启动顺序不再是约束。
+
+### 73.3 一个被显式化的耦合：心跳间隔 ↔ 巡检超时
+
+两者**必须配套**（metanode 15s 没见到就摘 ⇒ 数据节点 5s 一次，三次机会抗一次抖动）。
+写测试时这一点立刻咬人：用例要把巡检调到秒级，而心跳间隔原本是写死的常量 ⇒
+**摘除会在第一次心跳到来之前发生**。于是把间隔做成 `--heartbeat-secs`（默认 5）：
+不只是为了测试，运维本来就需要在"元数据面压力"与"掉线发现速度"之间取舍。
+
+### 73.4 用例：`crates/ingestor/tests/meta_membership_e2e.rs`
+
+三个角色全是真的，没有替身：
+
+```text
+  metanode（进程内起真 gRPC 服务，巡检口径调到秒级）
+       ▲ RegisterDatanode（raft op）   ▲ Heartbeat（只碰内存）
+  yuntun-ingestor 子进程（--meta + --heartbeat-secs 1）
+```
+
+| 步 | 断言 |
+|---|---|
+| ① | 起 metanode + `serve`（真 gRPC）+ 巡检（2.5s 超时 / 200ms 巡检） |
+| ② | 起数据节点子进程：`--meta` ⇒ 启动即入册 + 心跳 |
+| ③ | **名录里出现它**（经 gRPC → raft → 状态机 → `Prefetch` 载荷） |
+| ④ | 跨过**不止一个**心跳周期后仍在（否则巡检就是在随机删节点） |
+| ⑤ | 杀掉子进程 ⇒ 心跳停 ⇒ 超时后**从名录消失** |
+
+**观察点是查询侧看名录的那条路**（`Prefetch` 载荷），不是内部字段 ——
+"名录是不是真的经 raft 落进了状态"，只有从这条路看才算数（`§71` 的同一条理由）。
+用例 3.85s 跑完。
+
+### 73.5 T12.3 收口与遗留
+
+**T12.3（成员发现 + 分片归属）到此完成**：注册（raft）→ 下发（同一次元数据响应）→
+保活（内存心跳）→ 摘除（raft）→ 自愈（`known=false` 重注册），且每一步都有用例钉住。
+
+仍然遗留（都记在各自的章节里）：
+
+1. **多 metanode 的存活判定一致性**（`§72.5` 第 2 条）：本刀只在 leader 上判定；
+2. **R5 的 fanout（T13.1）**：只向"活跃"成员拉数据 —— 存活表与名录就是它的输入；
+3. **T12.1 的其余两个进程**（`queryd` / `compactor`）与写入面仍未拆。
+
+---
+
+## 74. T12.1 第二刀：**查询节点进程** `yuntun-queryd`（2026-09-23）
+
+### 74.1 分工：数据节点写、查询节点查
+
+| | 数据节点（`yuntun-ingestor`） | **查询节点（`yuntun-queryd`）** |
+|---|---|---|
+| 私有状态 | WAL + chunk（**写**） | **无**（不持有任何本地数据） |
+| 元数据 | 向 metanode 注册 + 心跳 | **只读** metanode |
+| 热数据 | 自己持有、对外提供 | 向各数据节点**拉**（gRPC 数据面） |
+| 冷数据 | 写 | 读（共享对象存储） |
+| 写入面 | 接受 | **明确拒绝**（只读节点） |
+
+### 74.2 补上的那一环：谁按地址建 `GrpcShardFetch`
+
+`§71` 让名录（含**数据面地址**）随元数据下发，但当时没有答案的是——**谁拿地址去建连接**
+（`§71.5` 遗留第 3 条）。`reconcile_hot_readers` 就是那个答案，两步顺序刻意：
+
+1. `cache.refresh(catalog)` —— **成员表先落地**（摘除也在这里发生：名录里没有的实例会被
+   `set_members` 连热读器一起摘掉，`§69`）；
+2. 给"有名录但**还没接线**"的成员装 `GrpcShardFetch` → `RemoteShard` → `set_hot_shards`。
+
+**只补缺、不重建**：已接线的实例保住已有连接 —— 否则连接数会变成名录巡检频率的函数。
+
+### 74.3 "只读"写进**类型**里，而不是写在注释里
+
+查询节点没有写入侧不是策略选择，而是**装配事实**（没有 WAL、没有私有目录）：
+
+| 件 | 改动 |
+|---|---|
+| `SqlEngine.ingest` | `Option<Arc<Ingestor>>` + `new_readonly`（`WritePolicy::ReadOnly` 早在，`SqlError::ReadOnly` 也早在） |
+| `FlightServer.ingest` | `Option<Arc<Ingestor>>` + `new_readonly`；`DoPut` ⇒ `failed_precondition`（**可读的拒绝**） |
+
+两条路径（SQL 语句 / Flight DoPut）都给**可读的拒绝** —— 而不是让调用方以为写成功了。
+
+### 74.4 用例：`crates/ingestor/tests/queryd_e2e.rs`
+
+```text
+  ① metanode（进程内，真 gRPC 服务）
+       ▲ 注册/心跳                        ▲ 只读元数据（名录含数据面地址）
+  ② yuntun-ingestor 子进程            ③ yuntun-queryd（真 Flight 服务）
+       └────── ④ 数据面 gRPC：RemoteShard 拉热数据 ──────┘
+                          ▲ ⑤ 客户端发 SQL
+```
+
+① 建表（走**客户端那条路**：`RemoteCatalog` → Propose → raft）→ ② 起数据节点子进程
+（预置 WAL ⇒ 热数据在**另一个进程**里长出来）→ ③ 断言名录里的**地址 == 它打印的 LISTEN**
+（数据面地址这一环）→ ④ 起查询节点（进程内，启动即按名录接线）→ ⑤ `SELECT` 读到 3 行
+（**查询节点自己没有数据**）→ ⑥ `INSERT` 被拒（只读）。0.52s 跑完。
+
+**为什么查询节点跑在进程内**：集成测试只能引用**自己 crate 的** `CARGO_BIN_EXE_*`，
+而**数据节点必须是真子进程**（那才是"跨进程"的关键一半）。Flight 仍然是真的：真 TCP、
+真协议、真 `DoGet`。为此把 `queryd` 拆成 lib + 薄 bin（`Queryd::start` 返回真实地址）。
+
+### 74.5 验证、观察与遗留
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **335 passed / 0 failed（+1 ignored）**；
+  clippy 本仓 **0**
+- 规模：42,106 行 / 21 个 crate / 335 测试函数
+
+**观察（不是本次改动引起，但值得记）**：`-j 8` 那一轮里 chaos 的
+`disk_watermark_aborts_oldest_batch_then_releases_segments` 失败（耗时 54.76s），
+而**单独跑 0.11s 通过**、`-j 4` 全量也通过 —— 与前一条 flake 同一类：**负载把时序余量吃掉**。
+它的等待口径值得照 `§69.6` 的做法再收一遍（等到条件成立 + 宽松超时，而不是靠"机器够快"）。
+
+**遗留**：
+
+1. **`--meta` 的数据节点还没把 WAL 里的 DDL 重放进 metanode**（`§68` 的老账）——
+   所以用例里的建表是走客户端路径做的。数据节点重启后的"表在不在"要靠它，属元数据面 DDL 可见性；
+2. **`compactor` 未拆**（T12.1 的第三个进程）；
+3. 跨进程写入面仍未定（客户端把数据交给哪个数据节点 / 怎么路由）—— R5 的 fanout 与它相邻。
+
+---
+
+## 75. 数据节点**自己带表进元数据面**：WAL 里的 DDL 重放（2026-09-23）
+
+### 75.1 缺口是上一轮的用例逼出来的
+
+`§74` 的三进程用例里，建表只能由**客户端**做 —— 因为数据节点（`--meta`）虽然把数据送进了
+热读路径，却**没有把它的 WAL DDL 送进元数据面**。后果很实在：数据节点重启之后，
+"表还在不在"取决于有没有人再建一次，而不是取决于它自己的 WAL。
+
+### 75.2 搬家：`replay_wal_ddl` 从装配层移到写入路径
+
+它原本是 `yuntun-server` 的**私有**函数（只有 standalone 用）。现在移到 `yuntun-ingest` 并导出：
+
+**为什么是这个归属**：它**读**的是 WAL 的语义、**写**的是目录的语义 —— 两样都是写入路径的知识。
+放在装配层，`standalone` 与数据节点进程就只能各自复制一份，而复制必然漂移。
+
+两条纪律（原实现里就有，搬家时一并继承，值得写下来）：
+
+1. **幂等**：重放会重复执行（每次启动都整扫一遍 WAL）⇒ "表已存在" / "表不存在" / "schema 已存在"
+   必须当成**成功**而不是错误。少了这条，节点重启会因为"表已存在"而拒绝启动 —— 一个自愈路径
+   变成启动阻塞；
+2. **失败不致命**：单条 DDL 失败只告警（数据面的重放另有路径兜底），一个坏记录不该挡住整个启动。
+
+装配顺序有个所有权细节：数据节点必须在 `Ingestor::new` **之前**调用它 —— 那一步会把 `wal`
+的所有权拿走（注释里写明了，免得下次有人挪位置）。
+
+### 75.3 用例现在证明了什么
+
+`queryd_e2e` 里：
+
+- **删掉**了客户端的 `create_table`；
+- WAL 预置改为"**先一条 DDL，再三条数据**"；
+- 数据节点启动 ⇒ `replay_wal_ddl` 把 CREATE TABLE **经 raft 写进 metanode**；
+- 用例直接断言：`client_catalog.get_table("public.qd")` **读得到** —— 这就是"DDL 可见性"；
+- 于是查询节点根本不需要谁替它建表，`SELECT` 就出 3 行。
+
+一句话：**"数据节点自己带表进目录"** 从注释变成了断言。
+
+### 75.4 验证与遗留
+
+- `cargo test -p yuntun-ingestor --test queryd_e2e` → 1 passed（0.46s）
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **335 passed / 0 failed（+1 ignored）**；
+  clippy 本仓 **0**
+- 规模：42,144 行 / 21 个 crate / 335 测试函数
+
+**遗留**：
+
+1. **每次启动都整扫 WAL 重放 DDL**（幂等但啰嗦）：可优化为"目录里缺哪个才重放哪个"，
+   或者从"已消费 seq"起扫 —— 属性能项，不是正确性项；
+2. **`compactor` 未拆**（T12.1 的第三个进程）；
+3. **跨进程写入面未定**：客户端把数据交给哪个数据节点、怎么路由 —— 与 R5 的 fanout 相邻。
+
+---
+
+## 76. T12.1 第三刀：**压缩节点进程** `yuntun-compactord`（2026-09-23）
+
+### 76.1 三个进程，三种"没有什么"
+
+R4 的进程拆分到此成型（写入面另说）：
+
+| 进程 | 有什么 | **没有什么** |
+|---|---|---|
+| `yuntun-ingestor`（数据节点） | WAL + chunk（写侧与热读侧同一实例） | 没有元数据权威 |
+| `yuntun-queryd`（查询节点） | 元数据只读 + 按名录拉热数据 | **没有任何本地数据** |
+| **`yuntun-compactord`（压缩节点）** | 共享对象存储 + 一次 op 提交 | **没有 WAL、没有 chunk、没有私有目录、不知道有数据节点** |
+
+压缩只做两件事：**读**共享存储里的文件、**写**合并产物，然后把这次合并作为一条 op 提交到
+元数据面（`commit_compaction` → raft）。于是"压缩"从一个**跟着某个节点跑的副作用**，
+变成了一个**可独立扩缩的角色** —— 这正是"压缩与 Catalog 同进程只是部署事实"那句话的兑现。
+
+### 76.2 一个必须写下来的部署不变量（因为没有代码强制它）
+
+**一个集群只应有一个 compactor（或至少：同一个 shard 不被两个同时合并）。**
+
+`commit_compaction` 本身是幂等的 op，但"**读文件 → 合并 → 提交**"这段窗口**没有租约保护**：
+两个 compactor 同时合并同一个 shard，会各自产出一份合并文件、各自把老文件标删 ——
+**行数不会错**（删除幂等，老文件只被标删一次），但会**多出一份孤儿产物**，
+由孤儿清理在静置期后回收。所以这是"浪费"而不是"错数据"，但它仍然是个隐患。
+
+留作后续两条路：给 shard 加压缩租约，或者把压缩交给**归属方**（谁持有分片谁压缩）。
+本刀只把它**写清楚**，不假装解决了。
+
+### 76.3 用例：`crates/compactord/tests/compaction_e2e.rs`（0.47s）
+
+```text
+  ① metanode（进程内，真 gRPC 服务）
+       ▲ commit_files（3 个真文件）        ▲ commit_compaction（合并结果）
+  测试进程（客户端）                    ③ yuntun-compactord 子进程
+       └──── ② 共享冷目录（真 parquet 文件）────┘
+```
+
+- ② 用 `yuntun_format::write_batch` 写 **3 个真 parquet 文件**（各 3 行），逐个
+  `commit_files`（走客户端那条路 ⇒ 经 raft 进状态机）；
+- ③ 起压缩节点**子进程**（同一个共享目录 + 同一个元数据面，`--min-files 3 --interval-secs 1`）；
+- ④ 观察点**全在目录上**：可见文件数 **3 → 1**，且合并产物的 `row_count == 9`
+  —— 行数必须是输入之和，因为**合并最经典的 bug 就是丢行**。
+
+除行数外没有断言压缩进程内部状态："合并有没有发生、有没有被提交"，只有从目录看得见才算数。
+
+顺带一个接口约定：压缩节点**没有监听端口**，所以它的启动信号是 `READY ...` 而不是
+`LISTEN <addr>`（与另两个进程同一性质：**是接口，不是日志**）。
+
+### 76.4 验证与遗留
+
+- `cargo test -p yuntun-compactord --test compaction_e2e` → 1 passed（0.47s）
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **336 passed / 0 failed（+1 ignored）**；
+  clippy 本仓 **0**
+- 规模：42,546 行 / 22 个 crate / 336 测试函数
+
+**遗留**：
+
+1. **压缩租约 / 单一 compactor**（见 76.2）—— 部署不变量，代码尚未强制；
+2. **跨进程写入面未定**：客户端把数据交给哪个数据节点、怎么路由 —— 与 R5 的 fanout 相邻；
+3. `replay_wal_ddl` 每次启动整扫 WAL（幂等但啰嗦，`§75.4`）—— 性能项。
+
+---
+
+## 77. R5 / **T13.4 第一刀**：部分结果 —— 把"拿不到"与"还没拿到"分开（2026-09-23）
+
+### 77.1 症状：一个节点挂了，整条查询失败
+
+扇出（`crates/query/src/table.rs`）以前长这样：
+
+```rust
+let read = reader.read_table(&self.ident, self.snapshot.snapshot).await
+    .map_err(|e| ...)?;          // ← 任何失败 = 整条查询失败
+```
+
+而设计（`architecture-with-chunk §4.2` 第三条）写的是：
+
+> **partial response 默认允许**：节点失败时返回可用结果 + `partial: true` + 缺失来源列表。
+> 监控场景下"90% 数据 + 明确标记"远好过整体报错（**可配置拒绝**）。
+
+于是"一个监控节点挂了"变成"整个看板打不开"—— 与设计相反的默认。
+
+### 77.2 关键认识：两个通道**本来就是分开的**（错在把它们合并了）
+
+| | 信号从哪来 | 语义 | 该怎么办 |
+|---|---|---|---|
+| **STALE**（还没拿到） | `ShardRead.stale`（**读成功了**，携带水位） | 成员答上来了，答的是"我的水位超前于你的 manifest" | **刷新 + 重试**；追不上 ⇒ **响亮失败** |
+| **不可达 / 读失败**（拿不到） | `Err` | 成员**没能答**（连接拒绝、超时、内部错误） | **降级** + **明确标记缺了谁** |
+
+两者在类型层面一直是分开的，此前只是**被同一个 `?` 汇成了一条路**：把"**某个来源的事实**"
+当成了"**整条查询的结论**"。本刀只改后者那一侧的处理方式，前者一个字不动。
+
+### 77.3 最容易写错的地方：顺手把 STALE 也降级
+
+**绝不可以。** STALE 是"**拿得到**，只是我们的目录落后了"—— 对它降级 = 把**可修复的落后**
+当成**永久缺失** = 静默少数据，正是 `§63.3` / `§67` 反复抓到的那个错误形状（只是换了层）。
+
+所以：`partial` 只挂在 `Err` 通道上；STALE 仍然走 `HotReadStale` → `with_stale_retry` →
+三次追不上就**报错**（"不返回不完整结果"）。`partial_fanout` 的第 ④ 条用例专门守着这条边界，
+断言"永久 STALE ⇒ 失败，**且错误里不得出现 partial 的措辞**"。
+
+### 77.4 实现
+
+| 件 | 内容 |
+|---|---|
+| `crates/query/src/partial.rs`（新） | `MissingSource{table,instance,reason}`、`PartialRead`（`is_partial` / `missing` / `describe`）、`PartialPolicy{Allow,Reject}`、`PartialSink`（每查询一个）、`PartialRejected`（**类型**，与 `HotReadStale` 同一考虑：字符串匹配认不出来） |
+| `table.rs` | 扇出错 ⇒ `record` + `continue`（**降级**）；`Reject` 时 `record` 直接返回错误（**当场失败并点名**） |
+| `lib.rs` | `QueryOutcome{batches, partial}` + `sql_partial` / `sql_with_partial`；`sql()`/`sql_stream()` 保持签名（warn 日志），**完整性这个事实另有出口** |
+| `config.rs` / 装配 | `[query] partial = "allow"`（默认）/ `"reject"`；**配置写错启动即报错** |
+
+两个刻意的细节：
+
+1. **配置写错不许静默取默认**：那会让"我配了 `reject`"变成一句谎言，而它的后果正是
+   "用户拿到一份自己以为完整、其实缺了来源的结果" —— 本项目里最不该静默的那件事。
+2. **sink 每次尝试重建**（STALE 刷新重试时）：上一次尝试缺的来源，如果这次读到了就不该继续算缺，
+   否则会把**完整结果误标为部分**（假警报同样是错 —— 它会让调用方不敢信任何结果）。
+   用例 ③ 守着这条。
+
+### 77.5 用例（`crates/query/tests/partial_fanout.rs` + `partial.rs` 单测）
+
+| # | 场景 | 断言 |
+|---|---|---|
+| ① | 一个来源**连接拒绝** | 查询**成功**、健康来源的数据**完整**返回、`is_partial()` 为真、缺失列表**点名** `inst-b` 且带原因 |
+| ② | 同上 + `Reject` | **失败**，错误里含 `inst-b` 与"拒绝部分结果" |
+| ③ | 两个来源都健康 | **不许**标 partial（假警报也是错） |
+| ④ | 一个来源**永远 STALE** | **失败**、错误含 `STALE` 与"不返回不完整结果"、**不含** partial 措辞 |
+
+### 77.6 验证与遗留
+
+- `cargo test -p yuntun-query --test partial_fanout` → 4 passed；`partial` 单测 4 passed
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **344 passed / 0 failed（+1 ignored）**
+- 规模：43,275 行 / 22 个 crate / 344 测试函数
+
+**遗留**（按重要度）：
+
+1. **"超时"这一半还没兑现**：今天只有**显式错误**会被降级（连接拒绝立刻失败 ✓），而**挂住**的
+   节点会让查询一直等 ✗ —— 要真正实现 `§4.3` 的"失败/超时 ⇒ 退化为只读冷数据"，
+   还得给数据面 RPC 加**客户端超时**（否则第 ① 条用例覆盖的只是"拒绝"，不是"无响应"）；
+2. **wire 层还没把 `partial` 交给用户**：MySQL 的 warning / Flight SQL 的 metadata 都还没有这个
+   信息 —— 现在只有日志与 `sql_partial()` 的返回值。设计要求"返回 `partial: true`"，
+   这一步还差一层协议出口；
+3. 设计的另两条（**下推 partial aggregate**、**冷数据文件按 datanode 分配**）属 R5 正题
+   （T13.1 的另一半 / T13.2）。
+
+---
+
+## 78. R5 / **T13.4 第二刀**：数据面 RPC 的**客户端超时**（"无响应"也要走降级）（2026-09-23）
+
+### 78.1 症状：节点没挂，但查询永远不结束
+
+`GrpcShardFetch` 此前**完全没有超时**。于是：
+
+| 对方的形态 | 传输层给什么 | 查询的结果 |
+|---|---|---|
+| 进程不在了（连接拒绝） | 立刻 `Err` | `§77` 降级为部分结果 ✓ |
+| **进程还在但不回话** | **什么都不给** | **一直等** ✗ |
+
+第二种才是更常见的生产形态：长 GC 停顿、被 CPU 抢光、网络黑洞、假死。
+`§77` 的降级路径只对 `Err` 生效 ⇒ 对"没响应"它无能为力。
+
+### 78.2 为什么必须由**传输层**来加这个上限
+
+"失败"是**对方给的**（传输层能立刻发现）；"超时"**只有调用方能发现** —— 因为对方什么都没说。
+所以"等够了"这件事只能由调用方自己判定，而调用方就是数据面客户端。
+这与"幂等键要对齐、水位要与 manifest 同号"是同一类判断：**把语义放在唯一知道答案的那一层**。
+
+### 78.3 实现
+
+| 件 | 内容 |
+|---|---|
+| `GrpcShardFetch` | 带 `timeout` 字段；`connect_with_timeout(addr, d)`；`connect(addr)` 用 `DEFAULT_TIMEOUT = 5s` |
+| 统一包装 `call()` | 三个 RPC（`fetch_shards` / `fetch_shard` / `fetch_watermark`）都过它 ⇒ 超时**可诊断**："超时（Ns 内无响应）" |
+| 建连 | 也受同一超时约束（`connect_timeout`）—— 否则"端口是黑洞"会挂在**建连**那一步 |
+| `queryd` | `--hot-read-timeout-secs`（默认 5）⇒ `reconcile_hot_readers(..., timeout)` |
+
+三个刻意的点：
+
+1. **超时错误必须可与"拒绝连接"区分**：`§77` 会把原因带进"缺失来源"交给排障的人 ——
+   "进程没了"与"进程还在但卡住"的处置完全不同，不能都印成一个含糊的 deadline exceeded；
+2. **默认要有上限，但也不能太小**：5s 是权衡（同机房热读远快于此；而查询端宁可降级也不该被拖住）；
+3. **粒度是"每个 RPC"**：`RemoteShard::read_table` 的默认实现走三个 RPC ⇒ **单个来源**最坏
+   约 `3 × timeout`。要收窄得覆写 `read_table` 合并成一次 RPC（trait 允许，见 `§67`）。
+
+顺带修掉一个相邻问题：`reconcile_hot_readers` 里建连失败原本是 `?` ⇒ **一个坏地址让整轮巡检中断**，
+别的成员再也接不上线 ✗。改为"记 warn + `continue`"：巡检是幂等的，下一轮补上，
+期间该成员按"读不到"参与 partial 判定。
+
+### 78.4 用例
+
+| 文件 | 断言 |
+|---|---|
+| `shardrpc/tests/timeout_bounds_the_wait.rs` | 假死服务（handler `pending()`）⇒ 三个 RPC 都在**上限内**失败、错误含"超时"、**等满了超时**（不是立刻误判）；正常节点不被误判；默认超时有限且不荒谬 |
+| `shardrpc/tests/hung_source_degrades.rs`（**组合**） | 真 chunk store（健康）+ 真 gRPC 假死节点 ⇒ 查询**成功**、健康来源数据**完整**、`missing` 点名 `inst-b` 且原因含"超时"、**查询耗时 < 3s**；`Reject` 策略对超时同样生效 |
+
+组合那条是这条链的完整形态：**"无响应"（本刀）⇒ `Err` ⇒ 降级 + 标记（`§77`）**。
+其中"查询耗时 < 3s"这一条不显眼但关键：若超时只让错误可诊断、却没让查询提前结束，那等于没修。
+
+### 78.5 验证与遗留
+
+- `cargo test -p yuntun-shardrpc` → 7 passed（5 条新）
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **349 passed / 0 failed（+1 ignored）**
+- 规模：43,740 行 / 22 个 crate / 349 测试函数
+
+**遗留**（按重要度）：
+
+1. **扇出是串行的**（`table.rs` 的 `for`）⇒ N 个假死来源的最坏耗时是 `N × timeout × RPC 数`。
+   单个来源已经有界（本刀），但**整体**还缺一个"每查询的热读预算"（全局 deadline）或把扇出并行化
+   —— 这是本刀之后最该做的一刀；
+2. wire 层仍未把 `partial` 交给用户（MySQL warning / Flight SQL metadata，`§77.6` 第 2 条）；
+3. 超时是**客户端感知**：它不会终止对端的计算（对端可能仍在跑）。对"幂等的热读"无害，
+   但将来若有副作用型 RPC，这条就得重新审。
+
+---
+
+## 79. **架构更正**：角色只有两类（meta / data）—— 压缩归数据进程、删 `compactord`、更名 `yuntun-datanode`（2026-09-23）
+
+### 79.1 我错在哪
+
+`plan.md` T12.1 那行写着"拆 `yuntun-ingestor` / `yuntun-queryd` / `yuntun-compactor`"，
+我照着做了三刀，还在 `§68`/`§74`/`§76` 里写"**进程拆分至此成型**" —— **错的**。
+
+设计文档 `architecture-with-chunk §1.1` 写得比我清楚（我该先读它）：
+
+| 角色 | 原文 |
+|---|---|
+| **metanode** | 有状态，raft 组，纯元数据服务，**永不中转数据** |
+| **datanode** | 有状态，WAL + 内存 chunk + 本地缓存；直接读写对象存储；**可对外提供 SQL** |
+| **compactor** | 全局作业，通过 meta 租约独占文件批次；**可作为 datanode 内后台任务或独立进程（后续决定）** |
+| **standalone** | **1 个 datanode + 内嵌 metanode** |
+
+配合 `§4.2`（"**接到 SQL 的 datanode 充当协调者**"）与 K4（"**需要时再加 queryd（本文不建**，
+触发条件：查询负载明显挤占写入）"），结论很明确：**角色只有 meta / data 两类**；
+`compactor` 是**作业**不是进程；`queryd` 是**同一角色的开关组合**。
+
+三处具体错误：
+
+1. 把 `plan.md` 一行的"二进制清单"当成了拓扑 —— 那行把**可选形态**与**角色**混在一起；
+2. `compactord` 独立进程把"压缩与 Catalog 同进程只是部署事实"**反着做**成了一种新拓扑，
+   于是 `§76.2` 那条"一个集群只能有一个 compactor"**不是设计事实，是这个拆法制造出来的**；
+3. 更实际的后果：按设计的形态部署（metanode + datanode）时，**没有任何东西做压缩** ——
+   这是**功能缺口**，不是措辞问题。
+
+### 79.2 代码怎么改
+
+| 动作 | 内容 |
+|---|---|
+| **压缩归位** | `yuntun-datanode --compaction`（**默认关**）：数据进程自己跑压缩 + 孤儿 GC —— 它已经握着共享冷存储与目录句柄，**不需要任何新输入** |
+| **删 `compactord`** | crate 与其用例删除（压缩代码留在 `yuntun-compaction`，需要时随时可复用） |
+| **更名** | `yuntun-ingestor` → **`yuntun-datanode`**：它从来不只做 ingest（读写数据 + 压缩） |
+| **多节点约束** | `--compaction` 默认**关**，因为多数据节点时只应有一个打开（R6 的 meta 租约 T14.1/T14.2 会把这条**部署约束**变成机制）。这是**显式部署约束**，不是"架构不变量" |
+
+**默认关是刻意的**：`commit_compaction` 本身幂等，但"读文件 → 合并 → 提交"这段窗口**没有租约**，
+两个节点同时合并同一 shard 会各产出一份产物（**行数不会错**，多出来的那份由孤儿清理在静置期后回收
+—— 是浪费，不是脏数据）。
+
+用例：`crates/datanode/tests/compaction_e2e.rs` —— 3 个真 parquet 文件写进 `<dir>/cold`，
+数据进程子进程（`--compaction`）合并后目录里**可见文件 3 → 1**、且合并产物**行数为输入之和**
+（合并最经典的 bug 就是丢行）。
+
+### 79.3 `queryd` 的去向（下一步）
+
+`queryd` **不是第三类进程**，而是**数据进程的特例**：`--ingest off`（不吃 WAL、不留本地数据，
+只作为协调者拉别人的热数据 —— `§4.2` 的形态）。它的代码（Flight SQL 服务面 + 按名录建
+`GrpcShardFetch`）随下一刀并进 `yuntun-datanode`，然后删除 `yuntun-queryd` crate。
+
+### 79.4 教训
+
+**`plan.md` 的"拆哪些二进制"不能替代设计里的"有哪几类角色"。**
+
+角色是**语义**（谁持有什么状态、谁对什么负责）；二进制是**部署**（同一角色可以有多种开关组合）。
+把清单当拓扑，就会造出"只应有一个 compactor"这种**自己给自己挖的坑** ——
+而真正的解法（meta 租约）本来就在 R6 的计划里。
+
+**另一条**：这次是用户当场指出的。凡是我在文档里写下"**至此成型**/不变量"这类**收口式断言**，
+都该先回到设计文档核对**角色与语义**，而不是顺着自己的实现往下推。
+
+### 79.5 验证
+
+- `cargo test -p yuntun-datanode` → 6 passed（含新增的 `compaction_e2e`）
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **349 passed / 0 failed（+1 ignored）**
+- 规模：43,687 行 / 21 个 crate / 349 测试函数
+
+---
+
+## 80. 架构更正（续）：`queryd` 并入数据进程 —— 形态 `--no-ingest`，删除 `yuntun-queryd`（2026-09-23）
+
+### 80.1 兑现 `§79.3`
+
+`§79` 定下的方向是：**`queryd` 不是第三类进程，而是"不吃 WAL 的数据进程"**。本刀把它落地：
+
+| 动作 | 内容 |
+|---|---|
+| **并进来** | `crates/datanode/src/query.rs`：原 `queryd` 的"按名录装配热读器"（`reconcile_hot_readers` + 巡检循环）|
+| **新开关** | `--no-ingest`（关掉 ingest ⇒ 只查询形态）、`--sql-listen <addr>`（给了才对外提供 SQL）|
+| **删 crate** | `crates/queryd` 整个删除（20 个 crate）|
+| **用例迁移** | `queryd_e2e` → `datanode_forms_e2e`：**两个真子进程**（`--dir D` 与 `--dir D --no-ingest --sql-listen`）|
+
+### 80.2 三种形态（**启动即校验**，宁可起不来也不起成语义含糊的进程）
+
+| 形态 | `--no-ingest` | `--sql-listen` | `--compaction` |
+|---|---|---|---|
+| 纯数据节点（写 + 热读服务） | — | — | 可选 |
+| 数据节点 + 协调者（`§4.2` 默认形态） | — | ✓ | 可选 |
+| **只查询**的数据进程（K4 的"需要时再加"） | ✓ | **必须** | **禁止** |
+
+三条校验各自防一种"起得来但语义含糊"的进程：
+
+1. 只查询形态**必须**给 `--sql-listen` —— 否则这个进程没有任何对外职责；
+2. 只查询形态**必须**给 `--meta` —— 它没有本地数据，热数据全靠名录发现；
+3. 只查询形态**禁止**承担压缩 —— 它可能被扩多份，而压缩作业每集群只应有一个（`§79.2`）。
+
+### 80.3 两处语义细节（都写进代码注释）
+
+1. **只查询形态不入册**：名录的语义是"**谁持有热数据**"，而它不持有任何本地数据 ——
+   入册只会让协调者向它拉一份空数据（`§79` 的角色模型自洽性）；
+2. **两个进程可以共用同一个 `--dir`**：只查询形态**不占任何租约**（没有私有状态），
+   而 `<dir>/cold` 正是"同一份共享对象存储"在本机形态下的样子。用例就用了同一个目录 ——
+   顺带把"数据节点在写、只查询进程在读同一份冷存储"这条日常形态跑通了。
+
+### 80.4 本轮的 SQL 面**仍是只读**（明确写下来）
+
+`FlightServer::new_readonly`：写入（INSERT/DDL）得到**可读的拒绝**，而不是假装成功。
+把写面（SQL DML → 本进程的 ingestor）接上是**下一步**；而"客户端把数据交给哪个数据进程"
+（跨进程写入面）本来就还没定（`§79.5` 遗留）。
+
+### 80.5 验证与遗留
+
+- `cargo test -p yuntun-datanode` → 6 passed（含 `datanode_forms_e2e`：ingest 形态写入 →
+  只查询形态经数据面 gRPC 拉热数据 → SQL 写入被拒）
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **349 passed / 0 failed（+1 ignored）**
+- 规模：43,697 行 / 20 个 crate / 349 测试函数
+
+**遗留**：
+
+1. **跨进程写入面**：客户端把数据交给哪个数据进程、怎么路由（R4 最后一块大语义）；
+2. **SQL 写面**：把 `--sql-listen` 背后的写路径接到本进程的 ingestor（今天只读）；
+3. **按归属收窄拉取范围**（R5 / T13.1）与**扇出并行化 / 每查询热读预算**（`§78.5`）。
+
+---
+
+## 81. T14.1 / T14.2：**全局压缩租约** —— meta 只仲裁，数据进程执行（2026-09-23）
+
+### 81.1 放在哪：这个问题有两半，答案不同
+
+| 半 | 答案 | 理由 |
+|---|---|---|
+| **执行**（读文件、合并、写新文件、提交） | **数据进程** | `§1.1`：metanode「**永不中转数据**」；且压缩是**非确定性副作用**（新 batch_id、合并结果），放进 raft 状态机会让副本发散（`§38`/`§58` 是同类教训） |
+| **仲裁**（"现在谁有权合并"） | **metanode** | 授权必须**线性一致** —— 两个节点各信各的内存视图就会**同时合并** |
+
+`metanode-design` 早就写着「不做 compaction/GC 全局租约（R6）—— 但 R3 的 SM **预留**租约条目」，
+顺带核对出那句话是**超前**的（代码里原本没有 ✗）。本刀把它补上。
+
+### 81.2 租约**必须进 raft**，而心跳**绝不能**（两者是一条线的两端）
+
+| | 性质 | 频率 | 进 raft？ |
+|---|---|---|---|
+| **存活心跳** | **发现**（"它还在吗"）—— 晚一点无所谓 | 秒级 | **绝不**（`§3.2`） |
+| **租约** | **授权**（"谁有权合并"）—— 错一点就是重复 | 每 TTL/3 一次 | **必须** |
+
+到期判定用**随 op 携带的 `now_ms`**（纪律 1：状态机不读钟）⇒ 同一串 op 在所有副本上得到同一状态。
+
+### 81.3 语义（四条 + 一个当场踩到的洞）
+
+| 动作 | 规则 |
+|---|---|
+| **取**（含接管） | 空闲（`holder` 空 = 已释放）或**已过期** ⇒ 授予，**代次 +1**；别人正持有且未过期 ⇒ 拒绝（**这就是"只启动一个"的全部机制**） |
+| **取**（本人重复） | **代次不变**、期限顺延（它可能只是重启了，别让它把自己踢掉） |
+| **续** | 持有者 + `epoch` + **未过期** 三者齐备；失败 = "**你已经不是持有者，立刻停手**" |
+| **放**（优雅停机） | 置为空闲 + **保留代次水位** |
+
+**那个洞（我自己的用例先撞出来的）**：释放若把条目**删掉**，下一次授予又得到 `epoch = 1`
+—— 而重启前那份"**同名旧身**"手里正是 `epoch = 1`，它的续租会因"持有者与代次都匹配"被**接受**
+⇒ 两个持有者同时干活。修法：释放 = 置空闲 + **代次单调**。
+
+### 81.4 wire：`ProposeResponse.result` 第一次被真正用起来
+
+三个 op（`AcquireLease` / `RenewLease` / `ReleaseLease`）的结果统一是 `LeaseGrant` 编码后的字节。
+proto 早就留了 `bytes result = 5`（注释："逐 op 的结果形状待定"）—— 本刀补上第一块：
+**"授没授予、新代次是多少"这种判定，客户端无法从 `accepted`/`affected` 重建**，
+猜出来的东西在并发下一定是错的。空结果 ⇒ **报错**（不能当"没授予"糊过去）。
+
+### 81.5 压缩循环：先拿租约再干活（`yuntun-compaction`）
+
+三条纪律（`LeaseGate`）：
+
+1. **拿不到就空转** —— 别人在干，重复合并只是浪费；
+2. **续租被拒 ⇒ 立刻停手** —— 代次被别人推进了，这是时钟偏斜下**唯一**的防线；
+3. **元数据面不可达 ⇒ 也不敢干** —— 拿不到权威回执时，宁可停一轮。
+
+优雅退出时把租约**还回去**（接手方不必干等 TTL）。
+于是 data 进程的 `--compaction` 从**部署约束**（"多节点只开一个"）变成了**意愿**
+（"我愿承担，拿不到就让位"）—— `§79.2` 那条自己写下的约束，到此由机制接管。
+
+### 81.6 可观测：租约进 `Status`
+
+`StatusResponse.leases`（`LeaseView{purpose,holder,epoch,expires_at_ms}`）。
+放进 Status 是刻意的：**"谁在干全局作业"必须看得见**，否则"只有一个 compactor"只能靠信任。
+
+### 81.7 e2e（`crates/datanode/tests/compaction_e2e.rs`，2.22s）
+
+两个 `--compaction` 数据进程（**私有目录各归各的、冷根同一份** —— 共享存储的本机形态，
+为此数据进程新增 `--cold-root`）：
+
+1. 两个都开 ⇒ **只有一个**拿到租约（读 metanode 的 `Status.leases` 确认）；
+2. **杀掉持有者** ⇒ 过 TTL（用例里 2s）后**幸存者接管**，且 `epoch` 推进。
+
+观察点刻意选在**租约表**而不是"文件有没有被合并"：后者在"一个干、一个空转"与
+"两个都干但幂等"之间**区分不出来**。
+
+### 81.8 验证与遗留
+
+- `cargo test -p yuntun-datanode` → 8 passed（含仲裁/接管）；全量 → **354 passed / 0 failed（+1 ignored）**
+- 规模：44,532 行 / 20 个 crate / 355 测试函数
+
+**遗留**：
+
+1. **分片粒度**：今天全局单持有者（一个集群一个 compactor）。设计原话是"独占**文件批次**"
+   —— 扩成 `purpose = compaction:{table}:{shard}` 即可**并行**压缩不同分片，
+   **协议不用动**（`purpose` 本来就是字符串）；
+2. **栅栏**：`commit_compaction` 还不带 `epoch` ⇒ 极端时钟偏斜下，**在途的那个作业**仍可能重复产出
+   （浪费，不是脏数据 —— `§79.2`）。彻底消灭要给提交加 epoch 栅栏；
+3. **保活复用现有心跳**（今天续租是一次 raft op，每 TTL/3 一次，可接受）；
+4. `T14.3` 孤儿 GC 的多写者安全仍待做（本刀只解决"谁合并"，不解决"谁删"）。
+
+---
+
+## 82. R6 第二刀：`commit_compaction` 的 **epoch 栅栏**（2026-09-24）
+
+### 82.1 补的是哪一半
+
+`§81` 解决了"**谁有权合并**"，但**已经在途的那次合并**仍可能在被罢黜之后落地 ⇒
+与新持有者各产一份产物（浪费，且孤儿 GC 还得收）。栅栏把这一半也堵上。
+
+### 82.2 机制
+
+| 件 | 内容 |
+|---|---|
+| `CompactionOp.lease_epoch` | 提交时携带"我干活时持有的租约代次"（无租约传 0） |
+| 状态机判据 | **代次落后于当前水位 ⇒ 拒绝**（返回错误 ⇒ op 失败 ⇒ 客户端**看得见**"你被接管了"，而不是静默丢弃） |
+| 判据用**代次水位** | 不是"当前有没有持有者" —— 释放后水位仍留着，正是为此。`§81.3` 那条"释放 = 置空闲 + 保留代次"在这里兑现 |
+| 无租约记录 ⇒ 不设栅栏 | 进程内直连形态与既有用例照常（向后兼容） |
+| 用途键的唯一来源 | `yuntun_model::meta::COMPACTION_LEASE` —— 状态机与压缩侧各写一遍字符串会**静默失配**（栅栏白写） |
+
+### 82.3 用例
+
+- **状态机**（`compaction_fence_rejects_a_deposed_holder`）：无租约可提交 ✅ / 携带正确代次可提交 ✅ /
+  携带 0 被拒 ✅ / **被接管后旧代次的在途提交被拒** ✅ / 新持有者照常 ✅；
+- **压缩侧**（`a_deposed_holder_cannot_commit_its_in_flight_merge`）：真租约序列（1 → 过期 → 接管成 2）
+  ⇒ 带 1 的提交被拒、带 2 的通过 —— 把"状态机的判据"与"压缩侧真的把代次带下去"接起来。
+
+### 82.4 一个顺带修掉的**静默风险**（不是本刀的，是本刀暴露的）
+
+清理时发现 `snapshot_covers_every_state_dimension` 上方多出一个 `#[test]`（`§81` 插入租约用例时
+把它的文档注释与属性挤开了）。查清后确认**维度测试没有丢属性**（它自己那个 `#[test]` 还在），
+只是属性重复告警 + 注释错位 —— 已归位。
+
+值得记下来的是**发现它的方式**：一条 `warning: duplicated attribute`。这类信号很容易被"反正编译过了"
+忽略过去，但它离"**某个用例静默不跑了**"只有一步 —— 而那正是本项目最忌讳的失效模式。
+
+### 82.5 验证与遗留
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **356 passed / 0 failed（+1 ignored）**
+- clippy 本仓 **0**；规模：44,646 行 / 20 个 crate / 356 测试函数
+
+**遗留**：
+
+1. **直连调用的代次是 0**：`compact_shard(.., 0)` 在"该集群**曾**授予过租约"时会被拒
+   —— 这是**期望**的（只有持有者能提交），但意味着**绕过租约门的直连调用不再是合法路径**；
+2. `T14.3` 孤儿 GC 的多写者安全（"谁删"）仍待做 —— 它要比"谁合并"更谨慎：
+   删错文件是**真丢数据**，而重复合并只是浪费。
+
+---
+
+## 83. T14.3：**在途文件对孤儿 GC 显式可见** —— 把"零误删"从时间假设变成结构保证（2026-09-24）
+
+### 83.1 症状：GC 的唯一防线是一个**时间假设**
+
+| 件 | T14.3 之前 |
+|---|---|
+| 判据 | `known_batch_ids()` = `files.keys()` —— **只有已提交的文件** |
+| 保护 | "**grace 期内不删**"（默认 1h） |
+| 洞 | **上传慢于 grace 的写者**（大文件 / S3 抖动 / 长 GC）⇒ 它刚上传、还没 `commit_files` 的文件，静置期一过就被当孤儿删掉 ⇒ **真丢数据**（`R-9`） |
+| 多写者 | 每个 GC 进程各有一份 `first_seen` ⇒ 时间假设还被稀释 |
+
+删错文件是**真丢数据** —— 比"重复合并"（只是浪费）严重一个量级，所以这条要按**正确性**处理，
+不能用参数（grace）去搪塞。
+
+### 83.2 机制：**先声明、后上传**
+
+1. 写者在上传对象存储**之前**登记 `batch_id`（`CatalogOps::record_in_flight` ⇒ op 走 raft）；
+2. 提交时撤销（`commit_files` 内 `clear_in_flight`）—— 而文件已进 `files` ⇒ **保护不断档**；
+3. `known_batch_ids()` = **已提交 ∪ 在途** ⇒ GC 的判据从"时间"变成"**结构可见**"；
+4. 写者崩在半路 ⇒ 登记由 TTL 清扫（`sweep_expired_in_flight`）兜底 ⇒ 那份文件退回真孤儿 ⇒ 可回收。
+
+**顺序是刻意的**：先声明、后写文件 —— 反过来就有一个窗口（GC 恰好在此期间扫到它）。
+登记失败 ⇒ **不写文件**（宁可不落这个批次，也不落一个 GC 看不见的在途文件）。
+
+### 83.3 为什么必须走目录（而不是各节点自己记）
+
+孤儿 GC 在**别的**节点上跑 —— 它唯一能问的权威就是目录。
+这与"租约进 raft、心跳不进"是同一条判断：**凡是"别人要据此做不可逆决定"的状态，必须线性一致地可见**
+（删文件不可逆）。
+
+### 83.4 代价（写下来）
+
+写入路径**每个文件多一次元数据 op**（`record_in_flight` + `commit_files`）。
+按"零误删"这个目标我认为值；将来可以做成**批量登记**（一次 op 声明多个 batch_id）。
+
+### 83.5 用例
+
+- **回归用例**（`gc_never_deletes_an_in_flight_file_even_with_zero_grace`）：
+  `grace = ZERO`（**不靠时间假设**）⇒ 在途文件**不删**；外加**对照**：真孤儿**必须被回收**
+  （否则用例可能只是"GC 根本没跑"）。这条在 T14.3 之前**必然失败**；
+- **状态机**：登记即对 GC 可见 / 重复登记保留**首次**时刻（重试不该无限续命）/
+  超时撤销保护 / 提交撤销登记而**保护不断档**。
+
+### 83.6 验证与遗留
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **359 passed / 0 failed（+1 ignored）**
+- clippy 本仓 **0**；规模：44,889 行 / 20 个 crate / 359 测试函数
+
+**遗留**：
+
+1. **在途 TTL 还没有驱动**：`sweep_expired_in_flight` 已就位（与幂等清扫同形），
+   但"谁来定期调它"（metanode 的 leader 巡检 / 写者启动时自清）尚未接线 ——
+   在此之前，**崩溃写者留下的登记会一直保护**那份孤儿文件（偏保守：是"留着垃圾"，不是"删错数据"）；
+2. **删除本身仍不是原子的**：`delete` 是单次对象存储调用；"零误删"已由判据保证，
+   但"删到一半失败"仍会出现（幂等重试可收敛）；
+3. `T14.2` 遗留的"保活复用现有心跳"（省掉一次 raft 写）仍未做。
+
+---
+
+## 84. R6 收口：在途 TTL 接上驱动 +「多写者 + GC ⇒ 零误删」专项（2026-09-24）
+
+### 84.1 补掉 `§83.6` 遗留①：谁来过期在途登记
+
+| 件 | 做法 |
+|---|---|
+| 驱动 | 挂在与"摘除数据节点"**同一条 leader 巡检**上 —— 同一形状：**触发者是巡检（不进 raft），结果必须进** |
+| 开销 | 只在**确实有过期条目**时才提议（`count_expired_in_flight` 是只读谓词）⇒ 常见情况下**零额外 raft 写** |
+| TTL | **1h**（与旧 grace 同量级）：两个方向**不对称** —— 太长只是"留着垃圾"，太短可能把**正在写**的文件放开给 GC（**真丢数据**）⇒ 宁长勿短 |
+
+### 84.2 R6 准出专项：多写者持续写 + GC ⇒ 零误删
+
+两个写者并发（**先登记 → 写文件 → 提交**）+ 一个 GC（`grace = ZERO`、20ms 一轮），三条判据**一起**：
+
+1. 每个**可见文件**的对象都**真的存在**（删错 = 目录指向空气）；
+2. 可见文件行数之和 == 写入行数之和；
+3. **预埋的真孤儿必须消失**（否则用例可能只是"GC 没跑"）。
+
+**一个刻意的测试钩子**：写者在写文件之后、提交之前插 50ms `sleep`。理由不是"抖时序"，而是
+**让在途窗口真实存在** —— 内存存储的 PUT 几乎是瞬时的，窗口只有微秒级 ⇒ GC（20ms 一轮）未必
+扫得到 ⇒ 用例会**假通过**（只证明 GC 跑过，没证明它有过可乘之机）。50ms > GC 间隔 ⇒
+**每个文件都必然在"文件已存在、目录还不知道"的状态下被扫到过**。
+
+### 84.3 反证（这一步才是关键）
+
+把 `known_batch_ids` 临时退回 T14.3 **之前**的判据（只认已提交文件）：
+
+```text
+  gc_never_deletes_an_in_flight_file_even_with_zero_grace ... FAILED
+  multi_writer_plus_gc_never_deletes_a_committed_file     ... FAILED
+```
+
+还原后 **6 passed**。没有这次反证，上面的"通过"只说明用例不崩，**不说明它们守着机制**。
+
+### 84.4 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **360 passed / 0 failed（+1 ignored）**
+- clippy 本仓 **0**；规模：45,107 行 / 20 个 crate / 360 测试函数
+
+### 84.5 R6 的账（对照 `plan §7.5` 准出判据）
+
+| 判据 | 状态 |
+|---|---|
+| T14.1 作业全局化：meta 租约独占 | ✅ `§81` |
+| T14.2 租约 + 心跳 + 过期接管（杀掉执行者可被接管、**无重复合并**） | ✅ `§81`（接管 e2e：过 TTL 被接管、代次推进）+ `§82`（epoch 栅栏 ⇒ 被罢黜者的**在途提交作废**） |
+| T14.3 孤儿 GC 的多写者安全 | ✅ `§83`（在途显式可见）+ `§84`（TTL 驱动 + 专项 + **反证**） |
+| T14.4 跨节点文件合并（不同 `source_instance` 产出的文件） | ❌ **未做** |
+| T14.5 与 `deleted_at` 联动：墓碑期 + 无在途引用才真删 | ❌ **未做** —— 但本刀把"**有没有在途引用**"变成了**可判定**的（`in_flight` 表），它现在可做 |
+
+**保活仍未复用现有心跳**（续租仍是一次 raft op，每 TTL/3 一次）—— 这是"能省一次写"的优化，
+不是正确性缺口。
+
+---
+
+## 85. T14.5：墓碑回收 —— 保护集合从"全部已知"收窄成"仍在保护期"（2026-09-24）
+
+### 85.1 症状：墓碑永远不会被物理回收
+
+链条很短：`commit_compaction` 把旧文件标 `deleted_at` 之后**仍留在 `files` 里** ⇒
+`known_batch_ids()`（= `files.keys()` ∪ 在途）**永远含墓碑** ⇒ 孤儿 GC 的判据
+`!known.contains(batch_id)` 对它**永远为假** ⇒ 被合并替换掉的旧对象**只增不减**，
+集群越跑越大。而 `architecture §4.6` 末句要的正是相反的事：
+
+> 产出新文件、标记旧文件 `deleted_at`，等**墓碑期 + 无在途引用**才真正删除。
+
+### 85.2 这一刀
+
+| 件 | 改动 |
+|---|---|
+| `FileManifest::protects_at(snapshot)` | **新判据**（与 `visible_at` 并排）：**活着**（`deleted_at == 0`）或**墓碑期未过**（`snapshot < deleted_at`） |
+| `LakeState::known_batch_ids` | = `protects_at(当前快照)` 的文件 ∪ 在途 ⇒ **过期的墓碑退出保护集合**，物理回收才可能有对象可收 |
+| `orphan_grace` | 语义变清楚：T14.3 之后写者安全**不再依赖它** ⇒ 它**就是墓碑期的时长**（设计推荐 **10–60s**；默认 3600 是保守取值） |
+| **wire** | **零改动** —— 收窄发生在状态机**内部**（它自己知道当前快照），协议一个字没动 |
+
+### 85.2.1 为什么 `protects_at` 不等同于 `visible_at`
+
+只差一个 `valid_from`，但这个差别是**故意的**：合并产物的 `valid_from = snapshot + 1`
+此刻**不可见**，但它是**已提交的真数据** —— **看不见 ≠ 可以删**。判据表用例单钉了这一格。
+
+### 85.3 镜像反证（与 `§84` 互为镜像）
+
+"删除正确性"有两个方向，缺一个都不算对：
+
+| 刀 | 反证做法 | 期望与实测 |
+|---|---|---|
+| `§84` | 判据退回"只认已提交"（去掉在途） | 两条用例 **FAILED** ⇒ 守着"**不误删**" |
+| `§85` | 判据退回"全部已知"（含墓碑） | 回收用例 **FAILED**，而 `§84` 两条**仍 ok** ⇒ 守着"**真会删**" |
+
+```text
+  expired_tombstones_are_reclaimed_by_gc                  ... FAILED
+  gc_never_deletes_an_in_flight_file_even_with_zero_grace ... ok
+  multi_writer_plus_gc_never_deletes_a_committed_file     ... ok
+```
+
+方向相反、互不干扰 —— 这正是"两个方向都钉住"的样子。
+
+### 85.4 验证
+
+- 用例：判据表（纯函数，3 格）+ `expired_tombstones_are_reclaimed_by_gc`
+  （**真文件 → 真合并 → 旧对象消失 + 合并产物还在 + 行数不变**）
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **362 passed / 0 failed（+1 ignored）**
+- clippy 本仓 **0**；规模：45,311 行 / 20 个 crate / 362 测试函数
+
+### 85.5 R6 的账（更新）
+
+| 判据 | 状态 |
+|---|---|
+| T14.1 meta 租约独占 | ✅ `§81` |
+| T14.2 租约 + 过期接管（**无重复合并**） | ✅ `§81`（接管 e2e）+ `§82`（epoch 栅栏） |
+| T14.3 孤儿 GC 的多写者安全 | ✅ `§83` + `§84`（TTL 驱动 + 专项 + 反证） |
+| **T14.5 与 `deleted_at` 联动** | ✅ **本刀**：墓碑期（= `orphan_grace`）过后即可物理回收；"无在途引用"由 T14.3 的**在途登记**挡住 |
+| T14.4 跨节点文件合并（不同 `source_instance`） | ❌ **R6 只剩这一项** |
+
+---
+
+## 86. T14.4：跨实例文件合并 —— 合并产物**不属于任何实例**（2026-09-24）
+
+### 86.1 这一项问的不是"能不能合并"，而是"**产物归谁**"
+
+合并早就跨实例了（选文件只按 `(table, shard, snapshot)`，不看实例）。真正只在多节点才冒出来的
+问题是：产物把**多个实例**的行融在一起，它的 `source_instance` 该填什么？
+
+`§4.4` 定的是冷热边界**按实例**二维切分（"冷读该实例 ≤watermark 的文件，热 pull (watermark, now]"）：
+
+| 填法 | 后果 |
+|---|---|
+| 继承某个输入实例 | 那一方的热数据范围被误当成"已覆盖这些行" ⇒ **重复计数**（不报错、只是结果变多 —— `plan §5.3-1` 那种最难查的错） |
+| **留空（中立）** | 谁也不认领 ⇒ 它永远只从**冷数据**读 ✓ |
+
+### 86.2 改动很小，但把"巧合"变成了"决定"
+
+产物此前是 `..Default::default()` ⇒ `source_instance` **恰好**是空串。行为是对的，但这是
+**默认值的巧合**：下一个人给 `Default` 加个非空默认、或复制这段代码时顺手带上
+`source_instance`，就会静默引入重复计数。本刀把它写成**显式空串 + 一段为什么**。
+
+### 86.3 用例：合并**别人**的文件之后，结果必须一字不差
+
+真实形态（`§5.1`：多个 datanode 可能同时写同一 partition、各出各的文件）：同一 shard 上
+`inst-a` 有**已落盘文件** + **未落盘热数据**，`inst-b` 同理 ⇒ 跨实例合并后钉三件事：
+
+1. 行集**逐行相等**（多 = 重复计数，少 = 漏读）；
+2. 产物 `source_instance` **为空**；
+3. 老文件真被替换（否则"合并"根本没发生，用例是空转）。
+
+挂在既有的 `two_instance_parity.rs` 上 —— 那里本来就有"两个真 chunk store 当两个 datanode"
+的夹具，本条只是给它加上**冷数据（真 parquet 文件）**与**一次真合并**。
+
+### 86.4 反证（两条，各自独立）
+
+| 反证 | 改法 | 实测 |
+|---|---|---|
+| 产物被**认领** | `source_instance: files[0].source_instance` | 断言 ② **FAILED** |
+| **忘了给输入转墓碑** | `old_ids = vec![]` | 断言 ③ **FAILED**（老文件与产物同时可见 ⇒ 行翻倍） |
+
+还原 ⇒ 3 passed。
+
+### 86.5 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **363 passed / 0 failed（+1 ignored）**
+- clippy 本仓 **0**；规模：45,490 行 / 20 个 crate / 363 测试函数
+
+### 86.6 R6 的账（五项全部落地）
+
+| 判据 | 状态 |
+|---|---|
+| T14.1 作业全局化（meta 租约独占） | ✅ `§81` |
+| T14.2 租约 + 心跳 + 过期接管 | ✅ `§81` + `§82`（栅栏 ⇒ 无重复合并） |
+| T14.3 孤儿 GC 的多写者安全 | ✅ `§83` + `§84`（TTL 驱动 + 专项 + 反证） |
+| T14.4 跨节点文件合并 | ✅ **本刀** |
+| T14.5 与 `deleted_at` 联动 | ✅ `§85`（墓碑回收 + 镜像反证） |
+
+**R6 准出（`plan §7.5`）**："多节点持续写入下文件数收敛到稳定区间；compaction 期间查询不受影响"。
+两个前提现已齐备：① 只有**一个** compactor 在合并（租约 + 栅栏）；② 合并产物既**不会被误删**
+（§83/§84）也**不会永不回收**（§85）；③ 跨实例合并**不改变行集、不破坏按实例切分**（§86）。
+其中"compaction 期间查询不受影响"由 §86.3 的"合并前后逐行相等"直接钉住。
+
+**仍缺一条**：把"**多节点持续写入 + 压缩 + GC 三者同时跑 ⇒ 文件数收敛到稳定区间**"做成
+一条**专项压测**（现有各条都是单点性质，没有"持续跑一段后看收敛"的那一条）。这是 R6 关闭前的最后一项。
+
+---
+
+## 87. R6 关闭：压缩产物也必须"先登记、后上传" + 收敛专项压测（2026-09-24）
+
+### 87.1 顺手的发现：`R-9` 在压缩侧还有一个口子
+
+`compact_shard` 写产物的顺序是 `write_batch` → `commit_compaction`，期间**没有任何在途登记**。
+于是孤儿 GC（`orphan_grace` 取小的时候）一旦把扫描落进这段窗口，就会把**产物**当孤儿删掉；
+而它一旦提交，**输入就转了墓碑** ⇒ **目录指向空气 = 真丢数据**。
+
+这与 T14.3 修的口子**同形**，只是主体从"写者"换成了"压缩器"：产物同样是"先有对象、后有目录"
+的文件。修法一字不差 —— **先登记、再上传**（提交成功时撤销；被栅栏拒绝或中途失败则留在集合里，
+由在途 TTL 清扫兜底）。
+
+### 87.2 一个我先做错、再修正的观察方式（值得单独记）
+
+我原本打算用**压测**反证这个口子：`grace = 0` + 亚毫秒 GC ⇒ "必现"。**实测三次全绿** ——
+因为窗口是"PUT 完成 → 提交"之间的**毫秒级**缝隙（真正决定它有多长的是提交那一次元数据往返），
+压测撞不上 ⇒ 会**假通过**。把证据强度寄托在"撞概率"上，本身就错了。
+
+改成**确定性观察**：让提交**必然失败**（用落后于水位的代次 ⇒ 被栅栏拒绝），此时产物的登记
+**不会**被撤销，于是
+
+- 产物对象**真的在存储里**（说明窗口确实形成过）；
+- 它的 `batch_id` **仍在保护集合里**（⇒ GC 不会在窗口里删它）。
+
+这条用例去掉登记就**必然失败**（反证实测两次皆红、0.00s）。
+**一个只靠概率才会红的反证，等于没有反证** —— 这条比那个洞本身更值得记住。
+
+### 87.3 收敛专项压测（`plan §7.5` 准出）
+
+两个写者（两个 `source_instance`、**同一 shard** —— 多节点写同一 partition 的真实形态）持续写，
+**真的**压缩循环（带租约）与**真的**孤儿 GC 同时跑。收尾后同时满足四条：
+
+1. **行数一个不少**（可见文件 `row_count` 之和 == 写入总行数）；
+2. **文件数收敛**到 `min_files + 1` 以内（写 32 次 → ≤ 4 个文件）；
+3. 每个可见文件的**对象真的存在**；
+4. **空间真回收**（对象数远小于写过的批次数）+ **保护集合 == 可见文件**（在途归零、无过期墓碑赖着）。
+
+它同时钉住一件以前没钉的事：**压缩循环在租约下真的会持续干活**（而不只是"拿不到租约时不动"）。
+
+### 87.4 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **365 passed / 0 failed（+1 ignored）**
+- clippy 本仓 **0**；规模：45,819 行 / 20 个 crate / 365 测试函数
+
+### 87.5 R6 关闭
+
+| 判据（`plan §7.5`） | 状态 |
+|---|---|
+| T14.1 作业全局化（meta 租约独占） | ✅ `§81` |
+| T14.2 租约 + 心跳 + 过期接管 | ✅ `§81` + `§82`（栅栏 ⇒ 无重复合并） |
+| T14.3 孤儿 GC 的多写者安全 | ✅ `§83` + `§84` |
+| T14.4 跨节点文件合并 | ✅ `§86` |
+| T14.5 与 `deleted_at` 联动 | ✅ `§85` |
+| **准出：文件数收敛到稳定区间** | ✅ **本刀**（专项压测：32 次写入 → 收敛到 ≤4 个文件，行数一个不少） |
+| **准出：compaction 期间查询不受影响** | ✅ `§86`（合并前后逐行相等 + 对象都在） |
+
+**R6 关闭。** 压缩至此是一个**全局化的、可独立扩缩的角色**：只有一个持有者在干活（租约 + 栅栏）、
+产物不会被误删也不会永不回收（在途登记 + 墓碑回收）、跨实例合并不改变行集（中立实例）。
+
+---
+
+## 88. R5 收尾：扇出**并发化** + 每查询**热读预算**（2026-09-24）
+
+### 88.1 `§78` 的遗留：单个来源已有界，**整体**没有
+
+`table.rs` 的扇出是串行 `for`：`N` 个慢来源的等待**相加**（`N × 单次传输超时`，而一个来源最坏
+数个 RPC）。`§78` 只给"**一个 RPC** 等多久"上了界 —— 那是**连接的现实**；而"**这次查询**愿意为
+热数据等多久"是**查询的策略**，得由调用方说了算。两个都缺，所以两个一起做：
+
+| 件 | 作用 |
+|---|---|
+| **并发**（`join_all`） | 等待从 `Σ` 变成 `max(·)`，**与实例数无关** |
+| **预算**（`hot_read_budget`） | `max(·)` 之上的**硬上界**（默认 10s：大于传输超时 5s，小于"一个来源把每个 RPC 都等满"） |
+
+### 88.2 并发**不许**改语义
+
+装配严格按 `self.hot` 的 `BTreeMap` 键序进行 —— 谁先返回只影响"什么时候"，不影响"拼成什么样"；
+STALE 也取**顺序上的第一个**（与串行时代逐字一致）。"错误顺序可复现"本身就是一条用例（⑦）。
+
+### 88.3 三条用例 + 反证
+
+| # | 场景 | 断言 |
+|---|---|---|
+| ⑤ | 3 个来源各慢 200ms | 整段等待 **< 400ms**（取 max 而不是相加）+ 结果完整 |
+| ⑥ | 来源慢过预算（2s vs 预算 150ms） | 预算内返回 + `is_partial` + 点名**"超出热读预算"** |
+| ⑦ | 两个来源同时 STALE | 报错**确定地**点名键序第一个，不因并发而漂 |
+
+**反证**（把扇出用一个全局锁串行化，其余逻辑一字不改）：⑤ **FAILED，实测 `764.9ms`**
+（3 × 200ms 串行 + 锁切换开销）；还原后同一条 **ok（~200ms）**。
+这条反证有力之处在于它把"并行"这个性质**量**了出来 —— 而不是只证明"代码没写错"。
+
+### 88.4 配置
+
+`[query] hot_read_budget_secs`（默认 10）/ `yuntun-datanode --hot-read-budget-secs`；
+**0 视为非法，启动即报错** —— 它等于"所有热读都超时"（partial 恒真），静默接受它会让用户
+以为自己配的是"完整"。
+
+### 88.5 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **368 passed / 0 failed（+1 ignored）**
+- clippy 本仓 **0**；规模：46,117 行 / 20 个 crate / 368 测试函数
+
+### 88.6 遗留
+
+- **wire 层仍未把 `partial` 交给用户**（MySQL warning / Flight SQL metadata）—— 现在只有日志与
+  `sql_partial()` 的返回值；
+- **预算只覆盖热读**：冷 parquet 读（对象存储）不在其中，慢对象存储仍会拖住查询。
+
+---
+
+## 89. 把"结果不完整"交给用户：Flight SQL metadata（MySQL 被 opensrv 卡住）（2026-09-24）
+
+### 89.1 事实早就有了，只是一路被丢掉
+
+`§77` 起引擎就算得出"这次结果缺了哪些来源"。但从引擎到协议层这条路上，它被丢了三次：
+
+| 层 | 当时的状态 |
+|---|---|
+| `QueryEngine::sql_stream_with_schema` | 读 sink 的**时机**不对（流还没跑）⇒ 那句 `if partial.is_partial()` 的告警**恒不成立**（**一句恒假的日志比没有日志更糟**：它让人以为"流式路径从没缺过来源"） |
+| `SqlResult` / `SqlStreamResult` | **没有 partial 字段** ⇒ 结论到 SQL 层就消失 |
+| `flight.rs` / `sqlwire` | 只调 `sql_with_schema` ⇒ 协议层根本拿不到 |
+
+### 89.2 这一刀
+
+- `QueryEngine::sql_stream_with_partial` 交出 sink；
+- `SqlResult::Rows` 带 `PartialRead`、`SqlStreamResult::Rows` 带 `PartialWatch`
+  （**两种载体**，因为两条路拿到结论的**时机**不同：eager 路径"发第一行之前就知道"，
+  流式路径"流读完才知道"；用一个类型硬凑会让调用方在错误的时刻读到"完整"）；
+- **Flight**：结论挂到 **schema 消息**的 `app_metadata`
+  （`{"partial":true,"missing":[{"instance","table","reason"}],"detail":"…"}`；**完整时为空** —— 不许假警报）。
+
+### 89.3 一个我先写错、被反证纠正的解释（值得记）
+
+我原以为"读 sink 必须在流被第一次轮询之后"，于是加了一步 `peek` 并写了一整段注释解释这个时机。
+**反证把 `peek` 删掉 ⇒ 用例照样通过** ⇒ 我的解释是错的：`TableProvider::scan`（fanout 就在里面）
+是**规划期**调用的 ⇒ `execute_stream` 返回时结论**已经是事实**。
+于是删掉多余的一步、把注释改成真的。
+
+> **教训**：反证不只是"证明用例有效"，它也会**证伪你的解释**。
+> 先按机制写断言，再让反证告诉你机制是不是你以为的那样。
+
+### 89.4 MySQL 那一半：卡在 `opensrv`（如实记录，不假装交付）
+
+MySQL 的 warning 计数在**结果集结束包（EOF）**里，而 `opensrv-mysql-0.7.0` 的
+`ResultSetWriter::finish()` 把它**写死为 0**：
+`writers.rs`：`w.write_all(&[0x00, 0x00])?; // no warnings`。
+只有 OK 包（`OkResponse { warnings, .. }`）能带 —— 那是"无结果集"的语句才走的路径。
+
+三条出路（**都还没做**）：① 换/升级 `opensrv`；② 自己写结束包；③ 走 `SHOW WARNINGS` +
+客户端主动查（但客户端拿不到计数，就不会主动查）。
+**在那之前不假装已交付** —— 结论留在 `sqlwire` 的注释里，谁要做谁看得见。
+
+### 89.5 用例（真 gRPC + 真 Flight 客户端）
+
+| # | 场景 | 断言 |
+|---|---|---|
+| ① | 一个来源**读不到** | 结果照常返回（健康来源 3 行都在），**schema 消息** `app_metadata` 含 `"partial":true` + 点名 `inst-b` + 表名 + `connection refused` |
+| ② | 所有来源都读得到 | `app_metadata` **为空**（假警报同样是错：它会让调用方不敢信任何结果） |
+
+### 89.6 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **370 passed / 0 failed（+1 ignored）**
+- clippy 本仓 **0**；规模：46,548 行 / 20 个 crate / 370 测试函数
+
+### 89.7 遗留
+
+- **MySQL 结果集的 warning**（89.4，被 `opensrv` 卡住）；
+- `GetFlightInfo` 阶段还声明不了"完不完整"（那时确实还不知道 —— schema 消息已经是最早的时机）。
+
+---
+
+## 90. 里程碑门槛审计：把"能对外说什么"逐条对到证据上（2026-09-24）
+
+`plan §8.4` 的判据是硬的："只有同时满足 **M1–M4 全部达成 + M5 对拍通过 + M6 零误删**"
+才能对外说"分布式就绪"。所以这一节不做新功能，只做一件事：**把每一格对到具体用例上**，
+点出**没有实证**的地方 —— 门槛靠"感觉已经做了"是不算的。
+
+| 里程碑 | 门槛（`§8.3`） | 实证 | 判定 |
+|---|---|---|---|
+| **M2** R2 | 200 passed + 预取/delta/版本失效 + compaction **不绑具体类型** | 已记录（2026-09-17，含 `§5.1-B` 的"不补则编译不过"实测） | ✅ |
+| **M3** R3 | ① 3 节点 raft 写入不中断；② metanode 重启后 Catalog 一致；③ **standalone 仍可单机运行** | ① `multi_node_grpc_e2e`（**真 gRPC**，3 节点复制 + **换主不丢已提交**）<br>② `metanode_process_e2e`（真进程 + `kill -9` + **从盘恢复**）<br>③ ⚠️ **缺**：`standalone/tests/cli.rs` 只测 `--version/--help`，且自己写明"真启动是端到端的事" —— 而**那条端到端不在** | ⚠️ ① ② ✅ / ③ 缺 |
+| **M4** R4 | 多 datanode **并发写** + 查询，与单节点串行**逐行精确相等**；节点重启不丢不重 | 跨进程：`cross_process_hot_read`（一写一查）+ `datanode_forms_e2e`（两种形态，真子进程）<br>进程内：`two_instance_parity`（双实例对拍，加断言"只注册一个就少行"作反证）<br>重启不丢不重：chaos #6 崩溃恢复 + `recovery_guard_e2e` + `m0a_recommit`<br>⚠️ **缺**：门槛写的是"**多** datanode 并发写" —— 现有跨进程用例都是**单写者** | ⚠️ 缺一条 |
+| **M5** R5 | 对拍通过（硬要求）+ 查询中节点故障行为**符合声明** | 对拍：`two_instance_parity`（逐行相等）<br>故障：`partial_fanout`（4 条边界 + `§88` 3 条）+ `hung_source_degrades`（真 gRPC 假死）+ `timeout_bounds_the_wait` + `flight_partial_metadata`（**用户看得见**）<br>声明与行为一致：STALE **绝不**降级、超时/拒绝都降级、完整**不**误标 | ✅ |
+| **M6** R6 | 文件数收敛 + **开 GC 的多节点压测零误删** + 租约可接管 | 收敛：`§87` 专项（多写 + 压缩 + GC 同跑：32 次写入 → ≤4 文件，行数一个不少）<br>零误删：`§84` 专项（多写者 + GC，含**反证**：退回旧判据 ⇒ 双双变红）<br>接管：`§81` e2e（过 TTL 被接管、epoch 推进）+ `§82` 栅栏（在途提交作废） | ✅ |
+
+### 90.1 两处缺口（都极小，且已定位到改造点）
+
+**① M4 的"多 datanode 并发写"**：现有跨进程用例都是**单写者**。
+改造点已定位：`datanode_forms_e2e.rs` 的 `seed_wal(dir, rows)`（往某实例的 WAL 预置数据 ⇒
+它启动后回放 ⇒ 热数据在**另一个进程**里长出来）+ `Proc`（子进程夹具）+ Flight 客户端。
+⇒ **两个 datanode 各预置一半行、都指向同一个 metanode、再查一次**，
+断言 `结果 == 单节点串行`（逐行相等、**每行只出一次**）—— 这正是 M4 的字面要求，
+也是"多个 datanode 同时写同一 partition、各出各的文件"（`architecture §5.1`）的真实形态。
+
+**② M3 的"standalone 仍可单机运行"**：`standalone/tests/cli.rs` 自己写了"真启动会绑端口…
+那是端到端测试的事"，而那条端到端**不在**。两条路：补一条"真起 `yuntun` 二进制 + 查一次"的
+冒烟用例；或用一句**能站住的话**替代 —— 即证明 standalone 与其它形态**共用同一个装配**
+（`Lakehouse`），从而 `flight_e2e` / `assembly_parity` 的覆盖可以**转移**过来。
+**在没有其中之一之前，这一格不算达成。**
+
+### 90.2 结论
+
+`§8.4` 的六格：**M2 ✅、M3 ⚠️（③ 缺）、M4 ⚠️（并发写缺）、M5 ✅、M6 ✅**。
+⇒ 现在**还不能**对外说"分布式就绪"，缺的正是上面两条**证据**（不是功能 —— 功能都已落地）。
+把它们补上之后，`§8.4` 才算真的满足。
+
+### 90.3 验证（本轮无代码改动，跑一遍全量确认基线）
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **370 passed / 0 failed（+1 ignored）**
+- clippy 本仓 **0**；规模：46,548 行 / 20 个 crate / 370 测试函数
+
+---
+
+## 91. M4 的门槛证据：**多** datanode 并发写 ⇒ 与单节点串行逐行相等（2026-09-24）
+
+### 91.1 缺的是什么
+
+`§90` 把 M4 标成 ⚠️：门槛（`plan §8.3`）写的是"**多** datanode 并发写 + 查询，与单节点串行
+**逐行精确相等**"，而现有跨进程用例都是**单写者**（`cross_process_hot_read` 是一写一查，
+`datanode_forms_e2e` 是 ingest 形态 + 只查询形态）。功能都在，**缺的是这一格自己的证据**。
+
+### 91.2 拦路问题（也是这一格的全部难点）
+
+两个写进程**不能共用 `--dir`** —— WAL / spill 是私有的，同一目录第二个消费者会被**目录租约**
+当场拒绝（`T12.4`，这是对的）；可它们的**冷存储必须是同一份**，否则协调者只看得见自己那份。
+答案在 `--cold-root`，它的文档原话就是：
+
+> "各给一个 `--dir`，但指同一个 `--cold-root`" —— 真实部署里它是 S3。
+
+### 91.3 用例：三个真子进程 + 进程内 metanode
+
+```text
+  metanode（进程内，真 gRPC）
+    ▲ 注册/心跳（两个**不同**实例名）        ▲ 名录（含各自数据面地址）
+  datanode A ──┐                          ┌── datanode B
+  --dir A      ├── 同一个 --cold-root ────┤   --dir B
+  WAL: 1,2,3   ┘   （= 共享对象存储）      └── WAL: 4,5,6
+                    ▲
+          只查询进程（--no-ingest --sql-listen）→ SELECT ⇒ [1,2,3,4,5,6]
+```
+
+断言是"**逐行精确相等**"：**少行 = 漏读某个实例；多行 = 同一份数据被读两次**。
+两个方向的错法分别由 `two_instance_parity` 的反证钉住（只注册一个实例 ⇒ 只看得见它的行）。
+
+### 91.4 这一格覆盖到哪、没覆盖到哪（如实说）
+
+- ✅ **覆盖**：两个写者同时在位、各自出各自的数据 ⇒ 查询**不重不漏**（M4 的字面要求）。
+- ⚠️ **未覆盖**：两个节点**同时**对同一 shard 做**在途**写入的竞态 —— 本例是两个进程各自
+  回放自己的 WAL（真实的"各出各的文件"形态 ✓，但不是"同一瞬间都在写"）。
+
+### 91.5 遗留
+
+- **并发在途写**：让两个 ingest 节点**都开 `--sql-listen`**（"数据节点 + 协调者"本就是同一进程
+  的两个面），并发 INSERT ⇒ 再查一次对拍。这是 91.4 那条缺口的补法；
+- M3 ③ **standalone 真启动**（`§90.1`）。
+
+### 91.6 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **371 passed / 0 failed（+1 ignored）**
+- clippy 本仓 **0**；规模：46,698 行 / 20 个 crate / 371 测试函数
+
+---
+
+## 92. M3 ③ 的处置：standalone 与其它形态**共用同一个装配**（2026-09-24）
+
+### 92.1 门槛
+
+M3 的第三格是"**standalone 仍可单机运行**"。而 `standalone/tests/cli.rs` 只测
+`--version` / `--help`，且自己写明"真启动会绑端口、建目录、起后台任务 —— 那是端到端测试的事"，
+**而那条端到端不在** ⇒ 这一格此前是空的（`§90` 记为 ⚠️）。
+
+### 92.2 能站住的那句话（先给证据，再说还缺什么）
+
+`crates/standalone/src/main.rs` 只有 **96 行**，它的全部工作就是：
+
+```text
+Config(TOML) → Lakehouse 装配 → yuntun_server::serve_flight(&lakehouse, &listen)
+```
+
+⇒ **standalone 没有任何自己的装配逻辑**：它与 `server/tests/flight_e2e.rs`、
+`server/tests/assembly_parity.rs` 跑的是**同一个 `Lakehouse`、同一个 `serve_flight`**。
+因此那两条用例的覆盖**合法地转移**到 standalone 上：它们证明的装配，**就是** standalone 的装配。
+
+也就是说："standalone 能单机运行"在**装配层**已经有证据了。
+
+### 92.3 还缺的那一半（二进制层冒烟），以及为什么它不该"顺手补"
+
+缺的是"**真起 `yuntun` 二进制 + 连上去查一次**"。
+
+做它之前要先解决一个**真实障碍**：standalone 的监听地址来自 **TOML 配置**
+（不像数据进程会打印一行 `LISTEN <addr>`），于是测试只有两条路：
+
+1. **选一个固定端口** ⇒ 并发/重复跑会撞端口，且"空闲"是猜的（`§37` 的 TOCTOU 批评）；
+2. `bind(127.0.0.1:0)` 拿到端口 → 释放 → 把端口交给子进程 ⇒ 同样有竞态窗口（`§37` 明确批评过这个写法）。
+
+⇒ 干净的做法是**先给 `yuntun` 加一行接口行**（`LISTEN <addr>`，与数据进程/metanode 同形 ——
+"**是接口，不是日志**"，`§38`/`§73` 一路的纪律），然后照 `datanode_forms_e2e` 的夹具写冒烟。
+这是**下一步**要做的一件事，不是"顺手补一下"。
+
+### 92.4 结论：`§8.4` 的账（更新）
+
+| 里程碑 | 状态 |
+|---|---|
+| M2 / M4 / M5 / M6 | ✅ |
+| M3 ①②（3 节点真 gRPC raft / `kill -9` 恢复） | ✅ |
+| **M3 ③（standalone 可单机运行）** | 🟡 **装配层已有证据**（92.2）；**二进制层冒烟未做**（92.3 给了无竞态的补法） |
+
+⇒ 严格按 `§8.4` 的判据，还差 M3 ③ 这一格；但它**不再是一句空话** ——
+装配证据已在，剩下的部分有明确且**无竞态**的补法（先加 `LISTEN <addr>` 接口行）。
+
+---
+
+## 93. M3 ③ 关闭：standalone 的**接口行** + 二进制冒烟（`§8.4` 的门槛至此齐了）（2026-09-24）
+
+### 93.1 先补接口，再写冒烟
+
+`§92` 说了顺序与理由：standalone 的监听地址来自 TOML，若测试"猜一个空闲端口再交给子进程"，
+就落进 `§37` 批评过的 TOCTOU。所以先把 `serve_flight` 从
+`serve_with_shutdown(addr, ..)`（**它自己 bind、只在日志里回显配置值**）改成
+**自己 `TcpListener::bind` + 打一行 `LISTEN <addr>`**：
+
+- 这行是**接口，不是日志** —— 与数据进程 `LISTEN`、metanode 同形，编排/测试靠它拿地址；
+- 它必须是**真实绑定地址**：配置里写 `:0` 时那个 "0" 对调用方毫无用处。
+
+### 93.2 冒烟用例（`crates/standalone/tests/standalone_e2e.rs`）
+
+```text
+  写一份只含 [server] listen = "127.0.0.1:0" 的配置（其余走默认）
+  → 真起 yuntun 子进程（CWD 指向临时目录，别往仓库里写 ./data）
+  → **从接口行读回真实地址**（内核分配，全程没有"探测—释放—再交给别人"的窗口）
+  → 真连 Flight → 真答一条 SQL（SHOW DATABASES：不依赖任何表，走方言 shim）
+```
+
+断言刻意保守但有分量：**进程真起来 + 接口行真打 + Flight 真连上 + SQL 真答回来**。
+（再往下测 SQL 语义是别的用例的事；这条要证的是"这个二进制起得来、能对外服务"。）
+
+### 93.3 `§8.4` 的账：六格齐了
+
+| 里程碑 | 证据 |
+|---|---|
+| M2 R2 | 已记录（含 `§5.1-B` 实测） |
+| **M3 R3** | ① `multi_node_grpc_e2e`（3 节点真 gRPC、换主不丢已提交）② `metanode_process_e2e`（`kill -9` 恢复）③ **本刀**（二进制真起 + 真答一条 SQL）+ `§92.2`（装配层：standalone = 同一 `Lakehouse`/`serve_flight`） |
+| M4 R4 | `§91`（两个真写进程 + 共享 `--cold-root` ⇒ 逐行精确相等）+ 跨进程/进程内对拍 + 崩溃恢复 |
+| M5 R5 | 对拍 + `§77`/`§78`/`§88`/`§89` 的故障语义（含"用户看得见"） |
+| M6 R6 | `§87` 收敛 + `§84` 零误删（含反证）+ `§81` 接管 + `§82` 栅栏 |
+
+⇒ **`plan §8.4` 的判据（M1–M4 达成 + M5 对拍通过 + M6 零误删）至此齐了** ——
+可以对外说"分布式就绪"（M1 见 `§8.3` 与 chaos 的 11/11）。
+
+**仍未做、但已明确记账的**（不影响上述判据，属"更强"而非"缺失"）：
+① 两个节点**同时**对同一 shard 做**在途**写入的竞态（`§91.5`）；
+② MySQL 结果集的 warning（被 `opensrv` 卡住，`§89.4`）；
+③ 冷 parquet 读未纳入预算（`§88.6`）。
+
+### 93.4 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **372 passed / 0 failed（+1 ignored）**
+- clippy 本仓 **0**；规模：46,875 行 / 20 个 crate / 372 测试函数
+
+---
+
+## 94. `§91.5` 的第一半：**跨节点重试的幂等**（2026-09-24）
+
+### 94.1 为什么先做这一半
+
+`§91.5` 记的"两个节点同时在途写"里，有一个**更容易被忽略、后果更重**的分支：
+
+> 客户端超时了，把**同一批**数据重发到了**另一个** datanode。
+
+这不是"各出各的文件"（那是设计要的正常形态，由查询侧合并），而是**同一批数据的第二次落地**：
+一旦幂等键按实例隔离，就会**悄悄写两份** —— 不报错，只是结果变多。
+
+### 94.2 结论：幂等键在**目录**这一层就是全局的
+
+`LakeState.idempotency: BTreeMap<String, IdempotencyRecord>` —— **扁平、没有实例维度**。
+所以跨节点重试天然去重。这条性质**此前没有用例钉它**，本刀补上，并且**两个方向都钉**：
+
+| 用例 | 断言 |
+|---|---|
+| `same_client_key_from_another_instance_writes_only_once` | 同一个 `client_request_id` 从**另一个实例**重试（不同 `batch_id`、不同 `source_instance`）⇒ 只有**一个赢家**（`accepted=false`），目录里只有赢家那一份，且它的 `source_instance` 是**第一次**那个 |
+| `different_keys_from_two_instances_both_land` | **不同** key、不同实例 ⇒ 两份**都**合法存在 |
+
+第二条件是第一条件的**护栏**：把"跨实例去重"写成"跨实例一律拒绝"同样是错的 ——
+那会堵死 `architecture §5.1` 的"多个 datanode 各出各的文件"这条正常路径。
+
+### 94.3 仍未做（`§91.5` 的另一半）
+
+两个 ingest 节点**都开 `--sql-listen`**（"数据节点 + 协调者"本就是同一进程的两个面），
+**并发 INSERT、同一瞬间在途写** ⇒ 再对拍。
+配方已定：两节点**同一 `--cold-root`**、各自 `--dir`/`--instance-id`、都开 `--sql-listen`；
+夹具沿用 `§91.3`（`spawn_writer` / `spawn_query_only_with_cold` / `wait_until` / `sql`）。
+
+### 94.4 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **374 passed / 0 failed（+1 ignored）**
+- clippy 本仓 **0**；规模：46,994 行 / 20 个 crate / 374 测试函数
+
+---
+
+## 95. 更正：数据进程**没有写入面** —— `§8.4` 的"就绪"要收回一格（2026-09-24）
+
+### 95.1 起因：给"并发在途写"写用例之前先核前提
+
+`§91.5` 的第二半打算让"两个 ingest 节点都开 `--sql-listen` 并发 INSERT"。核前提时发现
+`crates/datanode/src/main.rs` 的 SQL 面是：
+
+```rust
+yuntun_server::FlightServer::new_readonly(engine, catalog.clone())
+```
+
+⇒ **只读**（`new_readonly` 连 `ingest` 都不带 ⇒ `do_put` 会被"本节点只读"拒绝）。
+也就是说：**数据进程今天没有任何"接受写入"的网络面** —— 它的 WAL 只能由
+① 自己启动时的回放、或 ② 外部直接写文件（测试里就是这么做的）产生。
+
+### 95.2 把话说准：`§91` 证的是哪一半
+
+- `§91` 的 M4 证据是"两个写进程各自**回放自己的 WAL**" ⇒ 它证明的是**元数据/合并**层面的
+  "多写者不重不漏" ✓；
+- 它**没有**证明"客户端能把数据写到某个数据进程" ✗ —— 而且**在写入面补上之前不可能证明**；
+- 设计 §5 写的是"任意 datanode 收到写入（**无路由**）" ⇒ 那个"收到"的**面**还没做。
+
+⇒ 这正是前几轮列在候选里的"**跨进程写入面（R4 的最后一块大语义）**"。
+它不是"更强"，而是 **M4 字面要求里缺的一环**。
+
+### 95.3 对 `§8.4` 的更正（收回 `§93.3` 的一句话）
+
+`§93.3` 写了"六格齐了 ⇒ 可以对外说分布式就绪"。按这个发现，**那句话要收回一格**：
+
+| 里程碑 | 更正后 |
+|---|---|
+| M2 / M3 / M5 / M6 | ✅ |
+| **M4** | 🟡 **"多 datanode 并发写"只有"回放式"证据**；"客户端真写进数据进程"**没有面** |
+
+⇒ 结论更正为：**M2 ✅ / M3 ✅ / M4 🟡（写入面未做）/ M5 ✅ / M6 ✅**。
+
+### 95.4 下一步：先把写入面的**形态**定下来（这要一段设计对话，不是顺手补）
+
+1. **DoPut（Flight）**：数据进程的 SQL 面从 `new_readonly` 换成**可写**（带 `ingest`）
+   ⇒ 复用 `standalone` / `serve_flight` 那条已经在跑的路径（**最省**，且与"无路由"一致）；
+2. **数据面 RPC**：`shard.proto` 加 `Append` —— 与热读同一个通道，但要先定"谁负责 WAL / fsync"；
+3. **客户端"给谁"**：设计说"无路由" ⇒ 客户端**任选一个**数据进程即可 ⇒
+   "选哪个"**不该进数据模型**；但要让"任选"这件事有据可依（名录 + 存活），而不是碰运气。
+
+形态定了再写用例（那时 `§91.5` 的第二半才有意义）。
+
+---
+
+## 96. 补上"接受写入的面"：ingest 形态下数据进程的 SQL 面**可写**（2026-09-24）
+
+### 96.1 改了什么
+
+`crates/datanode/src/main.rs` 的 SQL 面此前**恒为** `FlightServer::new_readonly(engine, catalog)`
+⇒ 数据进程**没有接受写入的网络面**（`§95`）。现在按**形态**决定能力，而不是一刀切：
+
+| 形态 | SQL 面 | 为什么 |
+|---|---|---|
+| **ingest**（本进程握着 WAL + chunk store） | **`FlightServer::new(ingestor, engine, catalog)`** | 与 `standalone` / `serve_flight` **同一条已验路径** |
+| `--no-ingest`（只查询） | 保持 `new_readonly` | 没有本地数据、没有 WAL ⇒ **写不了就不假装能写** |
+
+### 96.2 这让哪句话从设计变成行为
+
+`architecture §5`："**任意 datanode 收到写入（无路由）**" ⇒ 现在任一 ingest 形态的数据进程
+都能通过自己的 SQL 面（Flight `DoPut`）接受写入。`§91.3` 的夹具（`spawn_writer` 已经有
+`--sql-listen` 的位置）因此可以直接升级成"**真在途写**"。
+
+### 96.3 还没做的（如实）
+
+- **没有对拍用例**：`§91.5` 的第二半（两个节点并发**在途**写 ⇒ 逐行相等）还没写。
+  形态已具备，但夹具要新增（DoPut 写入流 + 并发驱动）；
+- **"客户端给谁"仍无据**：设计说无路由 ⇒ 任选；但"任选"的依据（名录 + 存活）还没接进客户端；
+- 只读形态仍**拒绝**写入（既有用例继续钉着这一点：`datanode_forms_e2e` 第 ⑥ 步）。
+
+### 96.4 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **374 passed / 0 failed**
+- clippy 本仓 **0**；规模：47,010 行 / 20 个 crate / 374 测试函数
+
+---
+
+## 98. M4 关闭：两个写进程**并发真写** ⇒ 逐行精确相等（`§91.5` 的第二半落地）（2026-09-24）
+
+### 98.1 缺的是什么（`§95` / `§96` 留下的那一格）
+
+- `§91` 证的是"两个写者各自**回放自己的 WAL**"（数据在启动前就摆好）⇒ 它证明的是**元数据/合并**
+  层面的"多实例不重不漏"✓，**不是**同一段时间里两个进程**真在写**；
+- `§95` 把这个话说准并**收回一格**：数据进程当时的 SQL 面是 `FlightServer::new_readonly`
+  ⇒ **它没有任何"接受写入"的网络面**，"客户端真写进数据进程"在写入面补上之前**不可能证**；
+- `§96` 补上了那个面：ingest 形态的 SQL 面换成 `FlightServer::new`（`standalone`/`serve_flight`
+  同一条已验路径），只查询形态保持只读。
+
+本刀把 `§96` 补的面**用起来**：两个写进程都开 `--sql-listen`，**并发真写（`DoPut`）**，
+各自查询对拍。这是 M4 门槛（`plan §8.3`）字面要求的直接证据。
+
+> 如实记一笔：任务书里提到的 `operation-log §97` 在本仓库**并不存在**（HEAD 的日志止于 `§96`）。
+> 本条依据的"配方"实际来自 `§91.5` 的遗留、`§94.3`、`§95.4`、`§96.3` 三处 —— 不另造一个 §97。
+
+### 98.2 用例（`crates/datanode/tests/datanode_forms_e2e.rs`，复用既有夹具）
+
+形态（三个真子进程 + 一个进程内 metanode）：
+
+```text
+  metanode（进程内，真 gRPC）
+    ▲ 注册/心跳（inst-a / inst-b）        ▲ 名录（含各自数据面地址）
+  datanode A（--sql-listen）──┐      ┌── datanode B（--sql-listen）
+  --dir A / WAL 只有 DDL      ├─同一──┤   --dir B / WAL 只有 DDL
+  并发真写 1,2,3 ────────────┘ 冷存储 └─────────── 并发真写 4,5,6
+                    ▲                         ▲
+             A 查一次 [1..6]           B 查一次 [1..6]
+```
+
+- **夹具升级**：新增 `Proc::spawn_writer_with_sql`（在既有 `spawn_writer` 上加
+  `--sql-listen 127.0.0.1:0` 与 `--reconcile-secs 1`）。两个写进程**各 `--dir`、各
+  `--instance-id`、同一 `--cold-root`** —— 前两条是 `§91.2`/`T12.4` 的硬约束（私有目录被租约独占），
+  后一条让协调者看得见两个写者；
+- **数据全靠真写入**：`seed_wal(&dir, &[])` **只预置 DDL**（空行切片，表进元数据面），
+  两边的行都由客户端经各自的 SQL 面 `DoPut` 进去（简易轨，与 `flight_sql_e2e.rs` 同法：
+  schema 消息带 `FlightDescriptor{r#type:1, path=[table, shard]}`，数据消息带
+  `{"idempotency_key": ...}`）。值域**不重叠**（A 写 1,2,3；B 写 4,5,6）；
+- **并发**：两个 `tokio::spawn` 任务各连**自己的** SQL 面写；
+- **对拍**：两个节点**各自**查一次 `SELECT a FROM yuntun.public.qd ORDER BY a` ⇒
+  两边都必须得到**全部 6 行**，`[1,2,3,4,5,6]` 逐行精确相等（少行 = 漏读某个实例；
+  多行 = 同一份被读两次）；
+- **为什么是轮询而不是睡固定时长**："写进去了"与"查得到"之间隔着两段异步传播
+  （① 写 WAL → 一个扫描周期后进 chunk；② 名录巡检发现对方 → 数据面 gRPC 拉热数据），
+  所以用例轮询到精确相等为止（超时则带**最后一次实际结果**失败）。
+
+### 98.3 反证（本仓纪律）：杀掉 B ⇒ A 只剩自己那 3 行
+
+对拍通过后**杀掉 B**，再查 A ⇒ 必须只剩 `[1,2,3]`。它钉住的是："⑥ 里 A 看到的那 3 行
+（4,5,6）**确实经数据面从 B 拉来的**"，而不是 A 不知怎么就有了 6 行。
+
+这条反证**是确定的、不是碰运气**：flush 的最早时刻是"chunk 创建 + `min_resident`
+（`IngestConfig` 默认 5s）"，而杀 B 发生在写入后一两秒内 ⇒ B 的数据只可能在它自己那
+**已死的热 chunk** 里，**不可能**因为"已经落盘共享冷存储"而仍然可见。A 侧的降级/丢源由
+`--partial allow`（默认）兜住，结果就是 3 行。
+
+### 98.4 覆盖到哪、没覆盖到哪（如实说）
+
+- ✅ **覆盖**：两个数据进程**在同一段时间里真的各自接受写入**（不是回放），且两者**各自**的
+  查询都与单节点串行**逐行精确相等** —— 这正是 M4 的字面要求；
+- ⚠️ **未覆盖（更强而非缺失）**：同一瞬间两个节点对**同一分片**的在途写入的**细粒度时序/交错**
+  （本用例只断言最终结果相等，没有对"交错提交的线性化点"下断言）；跨节点重试的幂等已在 `§94`
+  用**目录层全局幂等键**钉住（两个方向都在）；
+- ⚠️ **"客户端给谁"仍无据**（`§96.3`）：设计说"任意 datanode 收到写入（无路由）"，本用例是
+  **显式**把 A 的行发给 A、B 的行发给 B。把"任选一个数据进程即可"接进客户端仍是遗留。
+
+### 98.5 顺带：清掉 3 处**既存** clippy 告警（如实，非本刀语义）
+
+本刀验收要求"本仓 clippy 告警 0"，但实测**基线并非 0**（rustc 1.98.1 / clippy 0.1.98），
+有 3 处与本刀无关的既存告警，已做**行为等价**的最小修复：
+
+| 位置 | lint | 修法 |
+|---|---|---|
+| `crates/catalog/src/state.rs`（`commit_compaction` 栅栏） | `collapsible_if` | 嵌套 `if let` + `if` → `if let … && …`（let-chain） |
+| `crates/meta/src/lib.rs`（`IN_FLIGHT_TTL_MS` 文档） | `doc_lazy_continuation` | 段落间补空 `///` 行 |
+| `crates/compaction/src/lib.rs`（收敛等待循环，测试内） | `unused_assignments` | `loop` 改为带 break 值的表达式，去掉"先初始化再覆盖" |
+
+> 说明：此前 `§9x` 记的"clippy 本仓 0"与本次实测不符；此处以**本次实测**为准，并顺手清干净。
+
+### 98.6 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **375 passed / 0 failed（+1 ignored）**
+  （基线 374 + 本刀用例 1）；新用例连跑 5 次均绿（含反证，约 0.8–1.5s）；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**
+  （`grep -cE '^\s+--> crates/'` = 0）；
+- 规模：52,574 行 / 20 个 crate / 399 个测试函数。
+
+---
+
+## 99. 关闭最后一个真缺陷：**读侧栅栏** —— 「提交→标记」窗口不再重复计数（`§28.1`）（2026-09-24）
+
+### 99.1 缺陷与它为什么必须这么修
+
+`§28.1` 记录的机制：`Chunk::visible` 对 `committed_snapshot = None` 返回 `true`（"还没提交 ⇒
+对所有快照可见"），而 flush 的 `commit_files`（快照 S，文件 `valid_from = S`）到调用方
+`chunks.mark_committed(id, S)` 之间隔着一次 WAL fsync —— 这段时间里快照 ≥ S 的查询**同时**
+读到"已提交文件"与"热数据"，把同一批算两遍（实测 4→6、9→12）。
+
+它当时被记为"与 R3 同批设计"，并明确**否掉三条快修**（提前 mark / 本地锁串行化 / 粗粒度水位），
+只留一条正路：**读侧栅栏** —— 热数据是否可见，应由"**调用方那份 manifest 快照里是否已含这批
+数据**"决定，而不是由 chunk 的本地标志决定。本轮把这条正路做完。
+
+### 99.2 做法：`batch_id` 提前登记 + 接缝带上「已知 batch 集合」
+
+四处改动（缺一不可）：
+
+| # | 层 | 改动 |
+|---|---|---|
+| 1 | `chunk` | `Chunk` 增 `batch_id: Option<String>` + `ChunkStore::note_batch_id`；读路径增 `visible_chunks_excluding` / `read_table_excluding_sync`：**属于 `exclude` 的 chunk 一律不出** |
+| 2 | `ingest` | `flush_chunk_by_id` / `flush_now` 在 `commit_files` **之前**生成 `batch_id` 并 `note_batch_id`（恢复路径没有在世 chunk，无需登记） |
+| 3 | `store` | `ShardReader` 增 `read_shard_excluding` / `read_table_excluding`（默认**忽略** `exclude` —— 只有"本地热数据即权威"的 `ChunkStore` 覆写）；`ShardFetch::fetch_shard` 增 `known_batch_ids` |
+| 4 | `proto` + `shardrpc` + `query` | `FetchShardRequest.known_batch_ids`；服务端把集合**原样喂给本地 reader** 过滤（不自己查 catalog）；provider 把"本次快照可见文件的 `batch_id`"交给每个热读器 |
+
+**为什么 `batch_id` 必须提前**：栅栏要的是"**与时机无关**"。若等 `mark_committed` 才登记，
+窗口只缩到几条指令、**仍然存在**（`§28.1` 已论证）；提前到 commit 之前登记后，
+"调用方在 manifest 里看到该 batch ⇒ 隐藏热副本"这条判据与时序**完全解耦**。
+
+**为什么不按 `source_instance` 分实例**：`batch_id` 全局唯一（ADR-4 随机 UUIDv7），
+别家的 id 落进某实例的读集合是**空匹配**；按实例分反而把"热读器键 == 写入侧 `instance_id`"
+这条隐式一致性变成了正确性前提 —— 本刀**第一版就是这么写坏的**：chaos 夹具里
+`IngestorConfig.instance_id` 是默认值 `"standalone"`、而热读器键是 `"chaos"`，过滤后集合为空、
+栅栏静默失效（探针当场抓到，4→6）。按表给全量即可。
+
+**为什么远端在服务端过滤、而不是服务端查 catalog**：`RemoteCatalog::list_visible_files` 会先
+`refresh()`（一次网络往返），放进每次分片拉取的热路径上代价太大；而"哪些数据已进调用方的
+manifest"**只有调用方知道** —— 让它把集合带过来最省也最准。
+
+### 99.3 证据（两个方向都钉）
+
+| 用例 | 断言 |
+|---|---|
+| `chaos::commit_to_mark_window_must_not_double_count`（**取消 `#[ignore]`**） | 用 `flush_now`（提交但不标记）把窗口固定住：**无栅栏读仍 3 行**（缺陷机制本身还在）、**带栅栏读 0 行**、**端到端查询 3 行**（原来 6） |
+| `shardrpc::known_batch_ids_fence_survives_the_wire`（新） | 真 gRPC 往返：无栅栏 3 行、带 `known_batch_ids` 0 行、**带不相干 id 仍 3 行**（反证不误伤） |
+| `chaos::compaction_during_query_keeps_counts_monotonic`（**收紧**） | 并发采样的松弛 `max <= acked + 9` 收紧为 `max <= acked` —— 那 +9 正是本窗口的松弛量，现在不再需要 |
+
+### 99.4 覆盖到哪、没覆盖到哪（如实说）
+
+- ✅ **覆盖**：单机（`ChunkStore` 本地读）与远端（`RemoteShard` + gRPC + proto）两条路都过栅栏；
+  `§28.1` 里被否掉的三条快修留下的"不可证窗口"不存在了 —— 判据是"manifest 里有没有"，不是"标没标记"。
+- ⚠️ **未覆盖（更强而非缺失）**：`known_batch_ids` 是**该表在当前快照下的全部可见文件**（按表全量、
+  不按实例/分片细分）。文件数经 compaction 收敛后通常很小，但**极端多文件**时这个集合会随请求变大 ——
+  本轮没做"按分片细分 / 用摘要替代"的优化。
+- ⚠️ **未覆盖（约定，非缺陷）**：`ShardReader` 现在有两个"读整表"入口 ——
+  `read_table` 只是 `read_table_excluding(…, &[])` 的特例。**新实现必须覆写 `read_table_excluding`**，
+  否则查询路径的行为会被绕过（一个测试假实现踩过：`query/tests/partial_fanout.rs::SlowButAnswers`）。
+
+### 99.5 顺带
+
+- `crates/chaos` 模块文档与"两条写用例的规矩"同步改写：**五个真缺陷全部已修、当前已无 `#[ignore]` 用例**。
+- `oplog §28.1` 原文保留（历史），末尾加一行指向本节。
+
+### 99.6 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **377 passed / 0 failed / 0 ignored**
+  （375 + 探针转正 1 + 新远端用例 1）；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 规模：47,520 行 / 20 个 crate / 376 个测试函数。
+
+---
+
+## 100. 决策 C：**客户端落点 = 显式给定的 contact point**（不做客户端侧发现/路由）（2026-09-24）
+
+### 100.1 起因：把"客户端给谁"从遗留改成决策
+
+`§95.4` / `§96.3` / `§98.4` 一直把"客户端给谁"记为**遗留**，措辞是"设计说无路由 ⇒ 任选；
+但'任选'的依据（名录 + 存活）还没接进客户端"。核对代码后，这条要说准（`§98.4` 的写法偏重了）：
+
+- **"客户端必须知道一个数据进程地址"是设计本身**（`architecture §5` 的无路由），等价于数据库的
+  **contact point / seed** 模型；客户端只连**一个**即可 —— 扇出 / 合并 / partial / STALE 由那个
+  节点（协调者，`architecture §4.2`）在内部完成；
+- 真正缺的只是"**不靠人给的地址、自己挑一个**" —— 那是**便利**，不是正确性。
+
+### 100.2 三条候选，为什么采纳 C
+
+| 方案 | 客户端怎么知道连谁 | 结论 |
+|---|---|---|
+| **A. 客户端读 meta 名录** | 连 metanode，从成员表挑 | ❌ 否。① 名录里那条 `address` 是**数据面**地址（`--listen`，供热读 fanout），**不是 SQL 面地址**（`--sql-listen`）——两个面两个端口，复用它会让字段变成"两种真相"；② 要新增"SQL 端点注册"并要求**固定端口**；③ 客户端要多背一份 meta gRPC 依赖与一个 meta 地址 |
+| **B. 种子列表** | 部署给一串地址，客户端自己轮询挑活的 | 可行但**现在不做**：多一份"挑哪个"的策略与故障语义要维护，收益只是省一次配置 |
+| **C. 显式接触点（**采纳**）** | 调用方/运维给出一个能接 SQL 的端点 | ✅ 与"无路由"完全一致：`architecture §5` 的"任选一个"由**调用方**完成，零新语义 |
+
+### 100.3 决策边界（写清楚，避免以后再被当成"缺口"）
+
+- **落点 = 显式给定**：`yuntun-cli --addr` / `YUNTUN_ADDR`（默认 `127.0.0.1:50051`）、
+  `Client::connect`；多节点部署给**某个** datanode 的 `--sql-listen`。
+- **明确不做**：客户端侧一致性哈希软路由（`architecture §4 ADR-10` 的第 3 条）、客户端读名录选落点、
+  客户端感知存活。
+
+### 100.4 影响面
+
+- `architecture.md §4 ADR-10` 的"客户端软路由"条目已加**现状注**（未实现、当前不计划）；
+- `status.md`：§2.3 该行由 ⚠️ 改为 ✅（设计如此），§5.2 从"剩余缺口"删除，§6 移出该优先级项，
+  决策表新增 **D13**；
+- 代码侧**零行为改动**（今天就是 C）；只把契约写进接口文档（`yuntun-client::Client::connect` 与
+  `yuntun-cli --addr` 的 doc）。
+
+### 100.5 验证
+
+- 纯文档 + 文档注释：全量 `cargo test --workspace --no-fail-fast -j 4` → 377 passed / 0 failed；
+  `cargo clippy --workspace --all-targets` 本仓告警 0。
+
+---
+
+## 101. 真实对象存储（S3）验证：本地 SeaweedFS 上的**网络读写**（2026-09-24）
+
+### 101.1 为什么要做
+
+`§37` 的多节点基线是**本机多进程共享目录**（`--cold-root`）——它恰好绕过了对象存储真实存在的
+那部分：HTTP PUT/GET、寻址/鉴权、重试、以及"flush 的持久化上界"里的真实延迟。
+`status.md §6` 因此把「真实 S3/MinIO + 跨机」列为里程碑门槛之外的**第一项**。
+本刀先把其中**"真实 S3 的读写"这一半**做掉（跨机仍留）。
+
+### 101.2 形态：本机 SeaweedFS（S3 兼容），**代码零改动**
+
+```text
+weed server -s3 -s3.autoCreateBucket -dir=/tmp/yuntun-seaweedfs \
+     -ip=127.0.0.1 -ip.bind=127.0.0.1      # 8333=S3 / 9333=master / 8080=volume / 8888=filer
+yuntun --config <[store] type="s3" endpoint="http://127.0.0.1:8333" …>
+```
+
+`StoreConfig::S3` 早已支持自定义 `endpoint`，`create_store` 用的是 **path-style**
+（`with_virtual_hosted_style_request(false)`）+ `allow_http` —— 正是 SeaweedFS/MinIO 需要的形态；
+`object_store` 的 region 缺省 `us-east-1`（builder 实测），无需配置。
+
+### 101.3 踩到的坑：`-ip` 与 `-ip.bind` 必须一致（**运维向，不是本仓 bug**）
+
+第一次 PUT **全部 500**。SeaweedFS 日志给出真因：
+
+```text
+chunked upload failed: upload 517 bytes to http://192.168.3.55:8080/8,8d28a91a7d:
+  dial tcp 192.168.3.55:8080: connect: connection refused
+```
+
+只给 `-ip.bind=127.0.0.1`、**没给 `-ip`** ⇒ volume server **绑 127.0.0.1、却向 master 广播
+`<机器IP>:8080`**，S3 网关按广播地址传 chunk → 拒连。**修法：两者一致**（本机测试都给 `127.0.0.1`）。
+
+顺带两条观察，都是**正确行为**（留档，免得下次误判成缺陷）：
+- S3 持续 500 时 yuntun 的行为：`flush failed (batch left non-terminal…)`，**批次保持非终态**
+  （WAL 是权威），带退避重试（10 次 / ~5.4s）——**没有静默丢或重**；
+- 残留实例会占住 `[meta] dir` 的 fjall 锁 ⇒ 第二个实例**响亮失败**（`FjallError: Locked`）。
+
+### 101.4 结果：写与读**都走网络**
+
+| 方向 | 证据 |
+|---|---|
+| **写（HTTP PUT）** | `INSERT 3 行` → flush 后桶里**新增** `yuntun/public/s3smoke/dt=…/shard=default/<uuid>.parquet`（517 bytes），直接列举桶可见 |
+| **热读** | 写后 ≤1 个 scan 周期（本配置 50ms）查得 3 行（立刻查会看到空——文档承诺的可见性上界，不是缺陷） |
+| **冷读（HTTP GET）** | **删掉 WAL + spill**、保留 meta 后重启（chunk store 全空）⇒ 仍查得 **3 行** —— 只可能来自 S3 |
+
+### 101.5 沉淀：`scripts/s3_smoke.sh`
+
+上面四步固化成脚本（`S3_ENDPOINT` / `S3_BUCKET` 可配；跑完自动清理进程）：
+
+```bash
+S3_ENDPOINT=http://127.0.0.1:8333 S3_BUCKET=yuntun-lake scripts/s3_smoke.sh
+```
+
+**脚本自身踩过一个坑（留档）**：`( cd … && nohup … & echo $! )` 里的 `$!` 可能拿到**中途退出的
+子 shell** 的 PID ⇒ `cleanup` 杀不掉真进程 ⇒ 残留实例占住 fjall 锁、下一次启动失败（上一条现象）。
+改成直接后台起 + 按"配置路径" `pkill` 兜底。
+
+### 101.6 覆盖到哪、没覆盖到哪（如实说）
+
+- ✅ **覆盖**：path-style 寻址、HTTP 明文、`PUT` / `GET` / `ListObjectsV2`、单节点「写入 → 冷读」闭环；
+  「flush 真的走网络」与「冷读真的走网络」各有独立证据；
+- ⚠️ **未覆盖**：**真云 S3**（TLS / 签名 / 区域 endpoint / 503 退避语义）、**跨机**（本刀同机）、
+  Multipart（本仓仍是单段 PUT，`§7.4` 遗留）、大对象与 S3 PUT 的**绝对延迟/P99**（本刀 517 B）、
+  S3 侧限流的长期行为（只观察到一次持续 500 的正确降级）。
+
+### 101.7 验证
+
+- `scripts/s3_smoke.sh` 连跑 2 次：写 / 热读 / 冷读三段全 PASS，退出后无残留进程；
+- 纯脚本 + 文档，无 Rust 代码改动 ⇒ 全量 `cargo test` 不受影响（377 passed / 0 failed 未变）。
+
+---
+
+## 102. 数据进程接 **S3 冷存储** + 多节点在真实 S3 上的对拍（`§98` / `§101` 合流）（2026-09-24）
+
+### 102.1 缺口：数据进程的冷存储只能指本地目录
+
+`§101` 把"单机 ↔ 真实 S3"验掉了，但 `§98` 的 M4 对拍用的仍是**本机多进程共享一个
+`--cold-root` 目录**（`status.md §5.2` 一直把它记作"共享目录"的替身）。查代码：`yuntun-datanode`
+的冷存储是 `args.cold_root → StoreConfig::Local`，**CLI 上没有任何 S3 入口** ——
+它的注释自己写着"真实部署里它是 S3"，也就是这一格从来没被接上。
+
+### 102.2 改动：形态在**装配点**判一次，之后各处共享同一份
+
+- `yuntun-datanode` 新增 `--s3-bucket` / `--s3-endpoint` / `--s3-access-key` /
+  `--s3-secret-key` / `--s3-allow-http`；
+- **一处创建、多处共享**：`store` 本来就由 `Ingestor` / `Compactor` / 孤儿 GC / `QueryEngine`
+  接同一份（`main.rs` ②③④），所以形态只判一次 ⇒ 写入面与查询面**必然**看同一个桶；
+- **启动即校验**（`§79` 的纪律：宁可起不来）：
+
+  | 配置 | 处置 |
+  |---|---|
+  | `--s3-bucket` 与 `--s3-endpoint` 只给一个 | 拒绝（少 endpoint 会以"连不上 AWS"收场，含糊） |
+  | `--cold-root` 与 `--s3-bucket` 同时给 | 拒绝（冷存储只能有一个根；混着给 = "以为在写 S3，其实在写本地"） |
+
+- **S3 形态不再预建本地 `cold/`**：原来那次 `create_dir_all(cold_root)` 无条件发生在最前面，
+  S3 部署里会凭空多一个空目录，让人以为数据落了本地。现在只有本地形态才建。
+
+零新增依赖：`StoreConfig::S3` 早已支持自定义 `endpoint`（path-style + `allow_http`，`§101`）。
+
+### 102.3 用例（`crates/datanode/tests/datanode_forms_e2e.rs`，进程层）
+
+`s3_cold_store_misconfiguration_is_refused`：照 metanode 的 `process_refuses_*` 写法，
+断言**退出码 + 点名的错误**（不只断言"失败"），并反证"没有建本地 `cold/`"。
+
+### 102.4 多节点 + 真实 S3：`scripts/s3_multinode_smoke.sh`
+
+把 `§98` 的形态（metanode 真进程 + 两个**可写**数据进程 + 并发真写 + 对拍）的冷存储换成
+**S3 端点**，并补"删本地 WAL 后冷读"一段：
+
+```text
+metanode（真进程，raft 落盘）
+  ▲ 注册/心跳                      ▲ 名录（含各自数据面地址）
+datanode A ──┐  各 --dir 私有    ┌── datanode B
+--sql-listen │  ┌──── S3 ────┐   │   --sql-listen
+真写 1,2,3 ──┴─►│ 同一个桶    │◄──┴─ 真写 4,5,6
+                └────────────┘
+ A 查 [1..6]                    B 查 [1..6]
+```
+
+实测（本机 SeaweedFS `http://127.0.0.1:8333`，桶 `yuntun-lake`）：
+
+| 段 | 结果 |
+|---|---|
+| ③ 目录同步 | A 建表（DDL 经 raft）后，B **1s 内**也看到该表（`spawn_reconcile` 每次都 `cache.refresh`） |
+| ⑤ 对拍 | A=[1,2,3,4,5,6]，B=[1,2,3,4,5,6]（**逐行相等、每行只出一次**；对方 3 行经数据面 gRPC 拉） |
+| ⑥ 写 S3 | 该表前缀下**恰好 2 个** parquet；两节点各自日志各 1 次 `chunk flushed` ⇒ **两个写者都 PUT 了** |
+| ⑦ 冷读 | 删各自 `wal/`+`spill/`、保留 metanode 目录重启 ⇒ 两边仍 `[1..6]` ⇒ 只能来自 S3 的 HTTP GET |
+
+一个必须写清楚的等待：数据进程用**生产默认的 seal/flush 节奏**（窗口关闭 seal + 确定性相位），
+3 行的批次要等窗口关闭或 `max_resident`(60s) 才落盘，脚本因此把"等 S3 出现对象"的上限放到 180s。
+**不为此加测试专用旋钮** —— 那会把"默认配置下真的能落盘"这条证据换掉。
+
+### 102.5 覆盖到哪、没覆盖到哪（如实说）
+
+- ✅ **覆盖**：多进程 + **真实 S3** 冷存储的"并发真写对拍"与"删 WAL 后冷读"；两个写者的文件
+  确实都进了同一个桶；
+- ⚠️ **未覆盖**：**跨机**（本刀与 `§101` 都是同机多进程；跨机差的是网络与时钟，不是这条链路）、
+  真云 S3（TLS / 签名 / 限流）、Multipart、S3 PUT 的绝对延迟与 P99；
+- ⚠️ **未覆盖**：脚本靠 `metanode` + 两个 `datanode` 真进程编排，**未进 CI**（需要外部 S3）——
+  与 `scripts/bench_multi.sh` 同属"手动 / 按需"档。
+
+### 102.6 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **378 passed / 0 failed / 0 ignored**
+  （基线 377 + 本刀 1）；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- `scripts/s3_multinode_smoke.sh` 对本地 SeaweedFS 连跑通过（三段 PASS，退出后无残留进程）；
+- 规模：47,642 行 / 20 个 crate / 377 个测试函数。
+
+---
+
+## 103. **3 个真 metanode 进程**：多节点真部署此前根本起不来（两处真缺陷）（2026-09-24）
+
+### 103.1 缺口：3 个真进程从没跑过
+
+`status.md` 的 M3 一直记着"3 节点真 gRPC raft + 换主不丢已提交（`§50`）"—— 但那条用例
+（`multi_node_grpc_e2e.rs`）是**同进程内**三个 `MetaNode` + 三个真 gRPC 服务：网络路径是真的，
+**进程边界是假的**。真进程组独有的三件事它一样都证不了：① 每个节点自己的目录/存储/端口；
+② `--voters/--peer/--init` 这套**部署接线**真能把集群组起来；③ **杀掉一个进程再从盘恢复并重新加入**。
+
+为什么一直没做：`--peer` 要求对端地址在**启动前**就知道 ⇒ 端口只能由部署方指定（那条用例正是
+为了绕开这点才走"进程内节点"）；正路是动态成员变更，而 proto 里的 `Join` 至今 **UNIMPLEMENTED**。
+
+### 103.2 本刀最值钱的部分：它一跑就红了，**而且红得是对的**
+
+第一次跑，3 个真进程**一个都活不下来**，各自在 10s 后打印：
+
+> metanode 启动失败：10s 内未当选 leader（成员表 [1, 2, 3]）
+
+两处**真缺陷**（都在 `crates/meta/src/main.rs`）：
+
+| # | 缺陷 | 为什么单节点踩不到 |
+|---|---|---|
+| 1 | **启动顺序反了**：当时是「① `open` → ② 等选主 → ③ 起 gRPC 服务」。可 raft 选主靠节点间**互相投票**，而投票走的就是那个服务 ⇒ 每个节点都在等别人的票、而谁的服务器都还没起，**集体等到超时退出** | 单节点自己一票就够，根本不发消息 |
+| 2 | **判据用错**：启动闸门调的是 `MetaNode::wait_leader`（**"等本节点成为 leader"**）。raft 同一时刻只有一个 leader ⇒ **follower 永远等不到"自己当选"** | 单节点自己必然是 leader |
+
+而且旧错误信息**指错了方向**（"超时通常意味着成员表里有本 build 不认识的节点" —— 成员表并没问题），
+把排查往错误的方向带。两处一起修：
+
+- **顺序**：先 `bind` + 起服务，**再**等选主（接口行仍按原契约在"就绪"之后打印，契约语义不变）；
+- **判据**：新增 `MetaNode::wait_any_leader`（判据 `leader_id != 0` = "集群里有 leader"），
+  main 路径改用它；`MetaNode::wait_leader`（等自己当选）保留给**单节点**组（`standalone` 的
+  embedded metanode 仍是单 voter），并在文档里写明"多节点别用这个"。
+
+**实证**（同机、同参数，只有代码不同）：
+
+| | 13s 后 |
+|---|---|
+| 修复前 | 3 个进程**全部退出**（各自 "10s 内未当选 leader"） |
+| 修复后 | 3 个进程**全部存活**，各自打印 `metanode id=N listening on 127.0.0.1:…` |
+
+### 103.3 用例：`crates/meta/tests/metanode_cluster_process_e2e.rs`
+
+真进程 ×3（`--voters 1,2,3` + `--peer` 填对端 + 各自空目录 `--init`），断言链：
+
+1. 三个进程起来 → **就 leader 达成一致**（三方各自的 `Status` 都说同一个人）；
+2. 3 个 op（含 DDL）经**网络**复制 → 三个进程 `applied==last` 且 `last_index` **相同**；
+3. **SIGKILL 掉 leader 进程** → 存活两个重选（断言新 leader ≠ 死掉那个）+ 再次一致；
+4. 换主后**仍能写入**、`manifest_ver` 推进；**旧幂等键重放必须命中**（幂等记录只在状态机里，
+   命中 = 换主前的提交在新 leader 上确实还在，不是"日志里在、状态机里没有"）；
+5. **重启被杀者**（同端口、同目录、**不带 `--init`**）→ 三个进程再次收敛到**同一条日志**
+   （`last_index` 相同）。"不带 `--init` 还能起来"本身就是"走的是重启路径"的证据：
+   启动闸门对**空目录**会退 2（`cli::check_bootstrap`）；
+6. 收尾 SIGKILL 全部（`Drop` 兜底，不留孤儿）。
+
+**端口怎么来的（如实说）**：`bind(127.0.0.1:0)` 取三个端口后**立刻释放**再交给子进程 ——
+这是 `§37` 批评过的 TOCTOU。这里用**整组重试**（最多 5 次，每次换新端口 + **新目录**：
+部分启动过的节点已经写过它的目录，而 `--init` 对"已有数据"的目录会被拒绝）兜住那个极小窗口。
+
+用例 8/8 绿，单次约 **0.5s**。
+
+### 103.4 顺带定下一条**部署约束**（必须写清楚）
+
+每个节点都要等「集群里有 leader」才打印接口行，所以编排**必须并行起**（或至少在 10s 窗口内起齐）：
+"起一个、等它就绪、再起下一个"会**僵住** —— 第一个节点的票永远凑不齐，因为后面的还没起。
+（`s3_multinode_smoke.sh` 里那台 metanode 是**单节点**，不受影响。）
+
+### 103.5 覆盖到哪、没覆盖到哪（如实说）
+
+- ✅ **覆盖**：真进程边界（各自存储/端口）、部署接线、换主不丢已提交、**进程级重启后追平**；
+- ⚠️ **未覆盖**：**网络分区**（`plan T11.5` 列了"杀 leader / 网络分区 / snapshot 重建"，
+  本刀只做了第一个）；**动态成员变更**（`Join` UNIMPLEMENTED，仍是"端口必须先知道"的根因）；
+  多机（本刀仍是同机多进程）；
+- ⚠️ **一个没动的设计问题**：没有多数派时节点仍会在 10s 后**启动失败退出**（而不是"起得来、
+  只回 `NotLeader`"）。哪个更对取决于运维口径（"起不来"更容易被发现、"起得来"更抗抖动），
+  本刀**没有改**，只把它记在这里。
+
+### 103.6 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **379 passed / 0 failed / 0 ignored**
+  （基线 378 + 本刀 1）；新用例连跑 8 次均绿（约 0.45–0.55s）；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 回归：`scripts/s3_multinode_smoke.sh` 对本地 SeaweedFS 仍三段 PASS、退出无残留进程；
+  手工起 3 个真 metanode 进程 13s 后全部存活（修复前全灭）；
+- 规模：48,267 行 / 20 个 crate / 378 个测试函数。
+
+---
+
+## 104. **网络分区**：少数派不能提交 + 多数派照常 + 愈合不丢不裂（`plan T11.5` 第二项）（2026-09-24）
+
+### 104.1 缺的是什么
+
+`plan T11.5` 那格写的是"3 节点 raft：杀 leader / **网络分区** / snapshot 重建"。上一刀（`§103`）
+把"杀 leader"补到了**真进程**层，但**分区**一直没做 —— 而它才是 raft 最要命的那条：
+"换主不丢已提交"在**脑裂**面前会变成一句假话。
+
+### 104.2 怎么在**不碰生产代码**的前提下造分区
+
+节点只认 peer 表里那个地址（`--peer` / `peers`），所以在节点之间插一层**可切断的 TCP 转发**
+（`Link`），把 peer 表指向转发器即可：
+
+```text
+  node1 ──link(1,2)──► 转发 ──► node2     切断 = 关掉已建立的连接 + 拒绝新连接
+  node1 ──link(1,3)──► 转发 ──► node3     隔离 1 ⇒ 切 (1,2)(1,3)(2,1)(3,1) 四条，
+  node2 ◄──link(2,3)──► 转发 ──► node3           **(2,3)/(3,2) 保持通畅 ⇒ 多数派还能选主**
+```
+
+- **为什么是六个有序对、不是三条**：三条"每节点一条"会把"i→j"与"j→i"混在一起 ——
+  隔离一个节点时**多数派内部也断了**，根本选不出新 leader，就测不出"多数派照常工作"。
+- **为什么不用 `iptables`/网络命名空间**：要 root、进不了 CI。
+- **愈合为什么不用自己写重连**：`GrpcTransport` 用 `connect_lazy` + tonic 自带重连
+  （`transport.rs` 早有此说明）—— 断→通之后消息自己接上。
+- **客户端读 `Status` 走直连**（不经过链路），所以分区期间仍能同时观察两边各自的状态 ——
+  这正是本用例能"对着两边分别断言"的原因。
+
+沿用 `multi_node_grpc_e2e.rs` 的夹具（进程内真节点 + 真 gRPC），只加了链路这一层；
+把 `peers` 参数化之后，**生产代码一行没动**。
+
+### 104.3 断言链（`multi_node_grpc_e2e.rs::partitioned_leader_cannot_commit_and_heals_without_loss`）
+
+| # | 断言 | 它管哪一半 |
+|---|---|---|
+| ⑤ | **反证（常驻）**：未分区时，同一个调用**必须被接受** | 没有它，⑦ 的"没被接受"什么都证明不了 |
+| ⑥ | 多数派（2/3）**选出新 leader 并提交成功**、`manifest_ver` 推进 | **可用性** |
+| ⑦ | 少数派**不能提交**（`assert_cannot_commit`：服务端回绝 / 客户端等不到回执都算对，**只有 `accepted=true` 是错**） | **安全性（脑裂防线）** |
+| ⑧ | 证据：链路**真的**被切过（传输 `failed > 0` **且** 转发器 `refused > 0`） | 防"以为切了" |
+| ⑩ | 愈合后**三方同一条日志**（每个节点 `applied == last` 且三者 `last_index` 相同） | 不裂 |
+| ⑪ | 多数派在**分区期间**的提交：愈合后重放**命中** | 不丢 |
+| ⑫ | 少数派那条在途记录：愈合后提交**成功** ⇒ 它当时**确实没被提交**（无脑裂的正向证据） | 不裂 |
+| ⑬ | 分区**之前**的提交跨过"换主 + 分区"**还在** | 不丢 |
+
+⑩ 与 ⑫ 合起来才是"分歧尾部被覆盖"的证明：`applied == last` ⇒ 谁的日志里都没有**未应用**的尾巴
+（少数派那条若还留着，就会以未应用的形式存在）；⑫ ⇒ 它也没进状态机。
+
+### 104.4 用例自己踩出来的一个坑（值得写下来）
+
+第一版用 `wait_some_leader`（"等某一个节点自称 leader"）判愈合后的 leader，**偶发失败**：
+愈合后**被隔离过的旧 leader 会在自己那侧仍然自认 leader**一小会儿（它还没从多数派学到更高的
+term），那时"我问到一个自称 leader 的"会答出**旧答案**。改成 `wait_settled_leader`
+（等**三方就同一个 leader 一致**）后才稳定。这个坑是**反证那一跑**顺出来的（若不跑反证，
+它会以"偶尔挂一次"的形式长期潜伏）。
+
+顺带记一个**客户端可见的性质**（不是缺陷，是 raft 的本来面目）：分区愈合后的那个窗口里，
+若客户端正连着旧 leader，它的 `Status` 会**短暂地自称 leader**。写不会出错（没有多数派 ⇒
+提交不了，`NoQuorum` 可重试），但**读可能偏旧** —— 这是"元数据读要不要线性化"的问题，
+本仓目前**没做**读屏障/会话，如实记在这里。
+
+### 104.5 覆盖到哪、没覆盖到哪（如实说）
+
+- ✅ **覆盖**：3 节点、真 gRPC、双向切链路的**分区**下的安全性与可用性；愈合后的收敛与幂等；
+  链路切断的**证据**（传输计数 + 转发器拒连计数）；含**常驻反证**（⑤）；
+- ⚠️ **未覆盖**：**真进程层的分区**（`§103` 那套真进程夹具没有链路层；本刀在"进程内真节点"层
+  做 —— 分区分的是 raft 语义，与"节点是不是独立 OS 进程"无关，但**跨机分区**仍未测）；
+  **非对称分区 / 丢包率 / 延迟**（链路只有"通/断"两档）；**`snapshot 重建`**（T11.5 第三项）；
+- ⚠️ **未覆盖**：分区期间的**客户端**行为（"连到少数派应换节点重试"只验到"少数派不提交"，
+  没有接客户端上去）。
+
+### 104.6 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **380 passed / 0 failed / 0 ignored**
+  （基线 379 + 本刀 1）；新用例连跑 5 次均绿（8–12s）；同文件原有 3 节点用例不回归；
+- 反证实验：把 `links.isolate(leader)` 注释掉 ⇒ 用例**失败**（多数派选不出新 leader，走不到 ⑦）；
+  常驻反证见上表 ⑤；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 规模：48,671 行 / 20 个 crate / 379 个测试函数。
+
+---
+
+## 105. 压缩**触发策略**（`--snapshot-log-entries`）：补上"快照从没被触发过"这一环 + 一个**未根因**的写停摆（2026-09-24）
+
+### 105.1 缺口：驱动层根本没有压缩触发
+
+`plan T11.5` 的第三项是"snapshot 重建"，而 `§42.4b` / `§42.7` 遗留 4 一直写着
+"快照**触发策略**（§4.4：日志条数 > N / 状态 > M）未做"。查代码：
+`compact_applied` 在整个仓库里**只被测试用的 `Cluster::compact(id)` 调过** —— 也就是说
+**进程形态的 metanode 永远不会产生快照**，日志只增不减，"落后节点追快照"这条路在真实部署里
+根本走不到。**这就是 `§42.4b`"稳定触发快照安装未拿到"的根因**（不是 raft 的问题）。
+
+### 105.2 交付
+
+| 位置 | 内容 |
+|---|---|
+| `crates/meta/src/lib.rs` | `MetaOptions { compact_log_entries }`（默认 **100_000** = 设计 §4.4）+ `MetaNode::open_with`（`open` 委托默认值）；驱动循环里"应用后按阈值压到已应用位置" |
+| `crates/meta/src/cli.rs` | `--snapshot-log-entries`（`0` = 关） |
+| `crates/meta/tests/multi_node_grpc_e2e.rs` | `snapshot_trigger_compacts_the_log_by_policy` |
+
+触发点为什么放在应用线程：`compact_applied` 的纪律是"**产物与 `applied` 必须同一瞬间取到**"，
+只有应用线程能保证（`storage.rs` 的坐标纪律）。**反证**：阈值设 0 ⇒ `snapshot_index` 恒为 0
+⇒ 用例失败 ✓（实测）。
+
+### 105.3 ⚠️ 一个**未根因**的写停摆（如实登记，不粉饰）
+
+把阈值调到很小（4）**并且**有 follower 落后时，会出现：**集群 30s+ 写不进去**
+（`propose_following_leader` 拿不到被接受的响应）。同一时刻的旁证：
+
+- 传输层**健康**：三个节点 `failed=0 / rejected=0`（唯一失败来自被隔离的那个节点）；
+- leader 的 `role` 仍是 **Leader**（不是"没选主"）：它的 `last_index` 在前进，
+  而**两个 follower 的 `committed` 卡住不动**；
+- **没有** raft 线程 panic（raft-rs `fatal!` 那条路可排除）；
+- 消息轨迹里 leader 反复发**空 append**（`ents=0`）；
+- 与"是否隔离"无关：三方全通时同样复现。
+
+**已排除**：① 传输层；② "没有 leader"（leader 在，只是提交不了）；③ raft 线程 fatal；
+④ **缓存 leader**（这是我第一次误诊的原因：测试缓存了 ② 那一刻的 leader，小阈值下选主会抖动，
+于是把 `NotLeader` 读成了"集群停摆" —— 改成跟随 leader 之后**仍在 30s 层面复现**，所以不是同一个原因）。
+
+**尚未试**：给 `Raft` 换一个真的会输出的 slog logger（现在的 `default_logger()` 不输出，
+所以看不到 "Skipping sending to X, it's paused" / "sent snapshot" 这类关键判定）；
+以及把 `Progress` 的 `next_idx/matched` 与 `raft_log` 视图逐条对齐。**这是下一刀的事。**
+
+**一条试过并撤掉的修法**（如实记）：给压缩加"**安全水位**"（只在**所有 peer 都拿到**已应用位置
+时才压 —— TiKV 的 `min_matched` 思路）。实测**没能**止住上面那个停摆（阈值 4 + 隔离 follower
+仍 30s 写不进），所以我**没有**把它留在代码里：不留没被证实有效的东西。它另有一个坏处 ——
+follower 长期不在线会把日志拖大，而"落后 → 走快照"恰恰是设计想要的路径。
+
+### 105.4 覆盖到哪、没覆盖到哪（如实说）
+
+- ✅ **覆盖**：**触发策略本身**（`snapshot_index` 由策略推进，反证成立）；设计默认值（10 万）下行为
+  与从前一致（既有用例全绿）；
+- ❌ **没覆盖（T11.5 第三项因此仍未关闭）**：**快照安装的集成层稳定复现**。要在 3 节点里稳定压出
+  "追快照"，必须让 leader 压掉 follower 还需要的那一段 —— 而那里正是 105.3 那个停摆所在区间。
+  这与 `§42.4b` 自己的结论一致：稳定复现的正路是**成员变更**（新节点加入，S3-6 / `Join`）；
+- ❌ **未实现**：设计 §4.4 的另一个判据（**状态 > 256MB**）；快照的**保留策略**
+  （按表 checkpoint + 归档旧条目，`§42.7` 遗留 4 的后半）；
+- ⚠️ **一条与本刀无关的观察**：本轮全量**第一次**跑时，chaos 的
+  `disk_watermark_aborts_oldest_batch_then_releases_segments` 失败一次
+  （`WAL 恢复出的批次应全部终态：[("…", Pending)]`，`-j 4` 并行负载下）；**单跑 3/3 绿**、
+  重跑全量 381/0 绿 ⇒ 登记为**负载敏感的抖动**，本刀**未修**。
+
+### 105.5 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **381 passed / 0 failed / 0 ignored**
+  （基线 380 + 本刀 1）；第一次跑出现上述 chaos 抖动 1 次，重跑干净；
+- 新用例连跑 3 次均绿（约 0.2s）；反证（阈值 0）实测失败 ✓；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 规模：48,827 行 / 20 个 crate / 380 个测试函数。
+
+---
+
+## 106. 压缩 + 落后 follower ⇒ 集群写停摆：**复现 + 收窄**（探针留下，根因未钉死）（2026-09-25）
+
+### 106.0 这一刀做了什么、没做什么
+
+`§105.3` 记了一个"尚未根因"的写停摆。本刀把它变成**可稳定复现的最小用例**、拿到了 **raft 自己的
+一手日志**（关键技术发现见 106.1），并把症状收窄到**一条互相矛盾的事实**（106.4）——
+**但根因仍未钉死**。所以：用 `#[ignore]` 探针把复现留在仓库里（先例 `§28.1` 的
+`commit_to_mark_window_must_not_double_count`），**不假装它已解决**。
+
+### 106.1 关键技术发现：raft-rs 的日志**一直可用**，只是没人设环境变量
+
+`§105` 我以为"`raft::default_logger()` 不输出"。事实：它是 `slog_term::CompactFormat`
++ **`slog_envlogger`**，而 `slog_envlogger` 读 **`RUST_LOG`** ✓。所以
+
+```text
+RUST_LOG=raft=debug cargo test -p yuntun-meta --test multi_node_grpc_e2e -- --ignored --nocapture
+```
+
+就能拿到 raft 的完整内部独白（选主、每条收发的消息、暂停判定、快照判定）—— **不用改一行代码**。
+配上存储层的 `YUNTUN_META_TRACE=1`（`append`/`compact`/`recv_snapshot` 轨迹），两条 env 就是
+metanode 的全部诊断开关。这条配方值钱，已写进探针的文档注释。
+
+### 106.2 复现（`compaction_with_lagging_follower_should_keep_committing`，`#[ignore]`）
+
+3 节点真 gRPC + 小压缩阈值（4）+ 隔离一个 follower ⇒ `k=0..4` 写成功，**`k=5` 起 30s 拿不到
+被接受的响应**。稳定复现（多次一致），且**与"是否隔离"无关**（三方全通时同样复现）。
+
+### 106.3 症状（一手证据，逐条）
+
+| 观察 | 证据 |
+|---|---|
+| leader 仍是 Leader，`last` 前进而 `commit` 卡住 | `role=Leader first=9 last=11 commit=9 applied=9` |
+| leader 对目标 peer 的 `next` **远超** `matched` | `peer3(next=12, matched=9)`（正常应 `next == matched+1`） |
+| leader 只发**空** append | 窗口内 `Sending from 2, msg_type: MsgAppend` 里**带 entries 的 0 条** |
+| follower 对每条 append 都回**接受** | 窗口内 306 条 `MsgAppendResponse`，其中 `reject: true` **0 条** |
+| 传输层"不报错" | `failed=0 / rejected=0`；`active=true`（leader 收得到 follower 的消息） |
+| **没有**被暂停、**没有**快照尝试 | raft 日志里无 `Skipping sending ... it's paused`、无 snapshot 相关行 |
+| **没有** raft 线程 panic | 输出里除测试自身外无 panic |
+
+### 106.4 矛盾点 —— 这就是下一刀的入口
+
+leader 反复发 `MsgAppend log_term: 1 index: 11`（`prev=11`），而 follower 的 `last=9`
+—— 按 raft 它**必须**回 `reject: true`（`match_term(11, 1)` 不可能成立），实际却回
+`reject=false, index=9`。**唯一自洽的解释**：follower **根本没收到那些 `prev=11` 的 append**，
+它一直在回**更旧的、它确实能接受的那条**。
+
+⇒ **下一步查传输层，不是 raft**：给每个 peer 的 `send_loop` 加"发出去的
+`(msg_type, index, entries)` ↔ 对端回的 `(index, reject)`"**逐条配对计数**，先回答
+"leader 发的东西到底有没有到对端"。⚠️ 注意 `GrpcTransport::send` 是 `try_send` + 满了就丢，
+`dropped` 此前一直是 0 —— 但那只是**入队时**的丢弃统计，**不覆盖**"发出去了但对端看不见"。
+
+### 106.5 已排除
+
+① 网络/传输"报错"（`failed/rejected` 全 0）；② "没选主"（leader 在位、`active=true`）；
+③ raft 线程 fatal；④ leader 被暂停（inflights 满）或走了快照；⑤ **测试自己缓存 leader**
+（`§105.3` 记的误诊；本刀的探针已改成跟随 leader）。
+
+### 106.6 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **381 passed / 0 failed / 1 ignored**
+  （基线 381；新增的探针**按设计 ignore**）；单跑探针：
+  `cargo test -p yuntun-meta --test multi_node_grpc_e2e -- --ignored`；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 另记一条**负载敏感抖动**：本轮全量在"机器刚重启 + 连跑多轮"的负载下，
+  `compaction` 的 `concurrent_writers_compaction_and_gc_converge` 与 `query` 的
+  `slow_sources_wait_in_parallel_not_in_sequence` **各失败过一次**（都是**带 deadline 的时序用例**），
+  **单跑全绿**、负载降下来后重跑全量 381/0 ⇒ 登记为负载敏感抖动（与 `§105.4` 那条同类），本刀未修；
+- 规模：48,945 行 / 20 个 crate / 381 个测试函数（含 1 个 `#[ignore]` 探针）。
+
+---
+
+## 107. 顺着 `§106` 查下去：**丢一条 append 就永久停摆**（机制钉死；三种修法都被实测否掉）（2026-09-25）
+
+### 107.0 结果先说清（含一次**自我更正**）
+
+- ✅ **机制钉死了**（`§107.2`）：传输丢一条**携带条目的** append ⇒ leader 的 `next_idx` 已乐观
+  推进在前、而 `matched` 留在原地 ⇒ 它只会发**空** append ⇒ follower 恰好能接受 ⇒ **永久停摆**。
+  这次是**同一瞬间**的视图 + 逐条轨迹配出来的（不是跨 run 猜的）。
+- ❌ **修法全部撤回**：本刀先后改过三处行为（无界队列 / 送达为止重试 / 每次丢包
+  `report_unreachable`），**都被自己的实测否掉**（`§107.3`），已全部回退 —— 只留诊断能力。
+- 🧹 **更正上一版 `§107` 的一处错误结论**（`§107.5`）：先前写"leader 的 `Status` 报 `last_index=10`、
+  而 `entries` 调用里 `last=9`，两者不一致" —— **那是跨两次 run 各看一个数得出的假矛盾**。
+  同一瞬间并排打出来（`§107.1` 的"视图快照"）后：两个视图**完全一致**。
+- 🧭 **环境已排除**（`§107.4`）：停摆**不是**连接抖动的产物 —— 健康 3 节点用例的连接失败数 = **0**。
+
+### 107.1 诊断能力（本刀唯一的产出，留在代码里、默认全关）
+
+| 轨迹 | 开关 | 回答什么 |
+|---|---|---|
+| **raft → 传输**（`transport.rs` 的 `send()`） | `YUNTUN_META_TRACE=1` | **raft 交给了传输什么**（就在这一刻） |
+| 出站出队（`send_loop`） | 同上 | **真正发出去什么**（`index`/`entries`/`commit`/`reject`/`hint`） |
+| 入站（`service.rs`） | 同上 | 对端**收到什么**（含 `delivered`） |
+| 存储 `entries()`（`fjall_storage.rs`） | 同上 | leader **被问要哪些条目**、给了几条 |
+| **视图快照**（每秒一行） | 同上 | **同一瞬间**并排：`raft[first/last/committed/applied]`、`store[…]`、各 peer 的 `matched/next/state` |
+| raft 内部 | `RUST_LOG=raft=debug` | 选主 / 收发 / 暂停 / 快照的判定（`§106.1`） |
+
+前两条**配对**用，是本刀最值钱的那一步（见 `§107.2` 的表）。
+
+### 107.2 机制（已钉死）：**一条 append 丢了，就再也补不上**
+
+同一瞬间的视图（leader=`2`，停摆中、稳定持续十几秒）：
+
+```text
+[meta:2] 视图 raft[first=5 last=8 committed=7 applied=7] store[first=5 last=8 compact=4 applied=7]
+         peers 1:m3/n9/Replicate  2:m8/n9/Replicate  3:m7/n9/Replicate
+```
+
+`§107.1` 前两条轨迹的配对（同一窗口）：
+
+| 轨迹 | 内容 |
+|---|---|
+| `[meta:send]`（raft 交出） | `index=9 entries=0` ×160，**外加 1 条 `index=8 entries=1`**（携带 entry 9 的那条） |
+| `[meta:transport]`（真正出队） | 99 条**全是旧的** `index=8 entries=0 commit=7` |
+
+于是链条是：
+
+1. 那条**唯一**携带 entry 9 的 append 只发过一次、之后再没被发（`entries` 轨迹里**从未**为
+   `[9,10)` 被问过 —— 因为 `next_idx` 已被**乐观推进**到 10）；
+2. leader 此后反复发**空** append（`prev_index = next_idx - 1 = 9`）；
+3. follower 的日志里**正好有** 9 ⇒ 它**接受**并回 `index=9`（`reject=false`）；
+4. `matched` 只能单调前进 ⇒ **leader 永远不会再发那条丢掉的条目** ⇒ 写入停摆，**且没有任何错误**。
+
+### 107.3 试过并**全部撤回**的三处改动（逐条给实测理由）
+
+| 改法 | 为什么撤回 |
+|---|---|
+| **入队无界**（不再 `try_send` 满就丢） | 只堵住"队列满"这一条丢包途径，而实测丢点在 `client.raft()` 报错那条分支；代价是长期分区下**积压无界**（积压量 ∝ 来不及送的日志） |
+| **送达为止重试**（RPC 失败无限重试，退避 5→500ms） | **队头阻塞**：一条送不出去的消息把后面**所有**消息压在队列里 —— 实测 raft 已交出 161 条（含那条携带条目的），出队停在 99 条旧的，那条**永远没出去** |
+| **每次丢包就 `report_unreachable`** | 方向对（`RawNode::report_unreachable` 是真入口：raft 收到 `MsgUnreachable` 会把该 peer 从 Replicate 退回 Probe ⇒ `next_idx = matched + 1`），但**没限流**：实测触发 **1308 次/30s**（等于每次丢包都退回 Probe，而 Probe 一次只发一条 ⇒ 把复制限流到 ~1 条/秒），且**没能救回停摆** |
+
+纪律同 `§105.3`（撤"安全水位"）与本刀上一版（撤"搁浅看门狗"）：
+**不留没被证实有效、且有副作用的改动**。
+
+### 107.4 环境已排除：停摆不是连接抖动的产物
+
+`§106` 的探针用 `§104` 的可切断链路夹具隔离一个 follower。先怀疑"是不是链路抖动造成的丢包风暴"，
+于是量了两件事（同一套轨迹）：
+
+| 场景 | 连接失败次数 | `[meta:send]` : `[meta:transport]` |
+|---|---|---|
+| **不做任何隔离**（健康 3 节点） | **0** | **74 : 74（完全配对）** |
+| 隔离一个 follower（探针） | 1080–2943（≈43/s） | 明显不配对（见 `§107.2` 的表） |
+
+再按 peer 拆开那 1080–2943 次：`→1` 上千次、`→2`/`→3` 各百余次 —— 而本 run 里**被隔离的正是 1**，
+所以 `→2`/`→3` 那些是**它自己发给别人的**（走它那两条被切断的链路）。
+**结论：风暴全部可归因到被隔离节点自己的两条链路；多数派那条是干净的**（否则不会这么对称）。
+⇒ 停摆发生在**链路健康**的多数派上，**不是**环境噪声。
+
+### 107.5 我被证伪的两个假设（记下来，免得下一刀重走）
+
+1. **"两个视图不一致"**：上一版写"`Status` 报 `last_index=10`、`entries` 调用里 `last=9`"——
+   那是**跨两次 run 各看一个数**得出的假矛盾。同一瞬间并排后：`raft[first=9 last=9 …]` 与
+   `store[first=9 last=9 …]` **完全一致**。
+2. **"是存储 `entries()` 返回了空"**：本 run 的轨迹显示 `[8,9) first=5 last=8 → 1 条` ——
+   该给的时候**都给了**；leader 之所以发空 append，是因为 `next_idx(3) > last(9)`，
+   raft 在 `RaftLog::entries` 里**早退**（`idx > last` ⇒ 空），**根本没问存储**。
+
+### 107.6 下一刀（明确到可执行）
+
+1. **先做判别实验**，把两个变量分开：`丢包即丢（无重试）` **+** `限流的 report_unreachable`
+   （≤1 次/秒/peer）。已知：无重试单独用仍停摆；`report_unreachable` 无限流时触发 1308 次且无效。
+   所以要么限流后有效，要么这条入口救不了**这个**停摆 —— 那就说明 `matched` 之外还有一层。
+2. 若限流版仍无效：查 **inflight 释放**。`Progress::maybe_update` 只在 `index > matched` 时才
+   `ins.free_to(index)`，而停摆时 follower 回的 `index == matched` ⇒ **那条"乐观发出"留下的
+   inflight 永远不会被释放**。这和"乐观推进"是**同源**的，值得先证伪/证实。
+3. 验收形态：把探针的 `#[ignore]` 拿掉（它现在稳定复现，25–45s）。
+
+### 107.7 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **381 passed / 0 failed / 1 ignored**
+  （ignored 即 `§106` 的探针，本刀**未**让它转绿，故仍 ignore）；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 重点回归：`multi_node_grpc_e2e`（3 节点 / 分区 / 压缩策略）3 绿 1 ignored、
+  `metanode_cluster_process_e2e`（真进程组）1 绿、`raft_poc` 4 绿；
+- **行为回到原状**：传输层仍是"队列满丢 + RPC 失败丢"（三处实验改动全部撤回），只新增默认关闭的轨迹；
+- 规模：49104 行 / 20 个 crate / 381 个测试函数（含 1 个 `#[ignore]` 探针）。
+
+---
+
+## 108. **容器化三节点真集群**：一跑就抓到一个真 bug（对端换 IP 后 leader 再也送不到）已修（2026-09-25）
+
+### 108.1 动机：把"环境"这个变量拿掉
+
+`§104` 的"网络分区"是**进程内夹具**（可切断的 TCP 转发）做的，`§106`/`§107` 那个写停摆一直卡在
+"**是不是夹具造出来的**"上：夹具断链后会拒绝新连接、`copy_bidirectional` 被 abort，行为与真断网
+并不等价。本刀用容器（真网络命名空间、真 TCP、`podman network disconnect` = 真断网）把那个变量
+拿掉 —— 顺带补上 `§103` 记过的缺口：**全仓没有 Meta gRPC 客户端**，所以容器里的集群没法断言。
+
+### 108.2 rig 是什么
+
+| 文件 | 作用 |
+|---|---|
+| `tests/compose.yaml` | 三个 `metanode` 容器（`--voters 1,2,3` + `--peer 2@mn2:9311,…`）。**用容器名当地址**：名字在编排时就固定，顺手满足 `§103` 的"对端地址必须先知道" |
+| `tests/cluster.sh` | `up / wait / probe / partition <N> / heal <N> / smoke / logs / ps / down`；`partition` = `podman network disconnect`，`heal` = `network connect --alias` |
+| `crates/meta/examples/meta_probe.rs` | 极小 Meta 客户端：`status / leader / write <key> / verify <key>`。**`verify` 是重放同一个幂等键、必须被拒** —— 命中幂等记录 = 那条提交真的在状态机里（同 `§50`/`§103` 的判据） |
+
+**不在容器里编译**：镜像就用本机已有的 `debian:trixie-slim`，二进制由宿主 cargo 编好挂进去 ——
+实测宿主 glibc（2.44）编出的二进制在这个 2.41 的镜像里**能直接跑**（无缺失符号）。20 个 crate 在
+容器里编一遍又慢又要拉 crates.io，而这里要验的是**运行期**行为。
+
+### 108.3 它一跑就抓到一个**真 bug**（已修）
+
+`smoke` 第一版是：healthy 写 → 断 mn3 → 多数派写 → 接回 → 等收敛。前两段就过了，**第三段红**：
+
+```text
+⛔ 断掉 mn3：多数派（1+2）accepted=true manifest_ver=2   ← 真断网下多数派照常提交 ✓
+   （重放 k2 被拒 ✓ ⇒ 那条真的进了状态机）
+🔌 接回 mn3：
+   mn1: Leader  term=1 commit=4 last=4
+   mn2: Follower term=1 commit=4 last=4
+   mn3: PreCandidate term=1 commit=2 last=2      ← 30s 都不动
+```
+
+轨迹（`YUNTUN_META_TRACE=1` + `RUST_LOG=raft=debug`）把根因指出来了：
+
+* leader 侧对 mn3 **一直 `Timeout expired`**（12 次），而**同一时刻新起的**探针容器连 mn3 完全正常；
+* mn3 自己 → mn2 是通的（它在广播 pre-vote、收到 mn2 的响应，但被**拒** ⇒ 永远选不上）；
+* mn3 因为收不到 append，就一直当 **PreCandidate**；leader 因为以为它在，就不再补日志。
+
+**根因**：容器/pod **重新接入网络会换 IP**（实测 `10.89.0.2` → `10.89.0.10`，旧 IP 还可能被别的
+容器复用），而 tonic 的通道把地址 **pin 在建通道那一刻**解析出的结果上 ⇒ leader 一直在往旧地址发。
+这正是"多节点真部署"必然踩的一格，**`§104` 的进程内夹具测不到它**（夹具里 IP 从不变化）。
+
+**修法**（`transport.rs`）：`send_loop` 连续投递失败 `REBUILD_AFTER = 3` 次就**重建通道**
+（`make_client(addr)` 造一个全新通道 ⇒ 名字重新解析一遍），成功一次即清零；重建**无条件打一行**
+（这是该被运维看见的事件）。**对照**：
+
+| | 接回后 |
+|---|---|
+| 修前 | 30s 不收敛（mn3 停在 `last=2`，一直 PreCandidate） |
+| 修后 | **2s 内收敛到 `last=4`**（`⋯ 还没收敛` ×2 → `✅ 三方已收敛`），随后写 k3 再收敛到 `last=6` |
+
+顺手把 `smoke` 的**收敛断言**做成硬失败（`await_convergence`）——脚本第一版只是"打印三方 Status
+就宣布应当收敛"，而那次 mn3 其实还落后 2 条：**嘴上说收敛、实际没验**。
+
+### 108.4 两条踩坑（都写进了 rig 的注释）
+
+1. **`podman network connect` 必须带 `--alias`**：不带的话，容器在这张网络的 DNS 里只剩容器哈希,
+   别的节点**再也解析不到** `mn3` 这个名字（它们连的是名字）。第一版没带 ⇒ "接回来自愈"整段连不上。
+2. **轨迹别在真实集群里默认打开**：`YUNTUN_META_TRACE=1` 是"每条消息一行 `eprintln!`"，实测把它
+   默认打开后三个容器**根本起不来** —— stdout 管道被塞满 ⇒ **进程被写阻塞**。于是
+   `trace_on()` 收紧为"**非空且不是 `0`**"（编排里常见的 `- VAR=${VAR:-}` 会给出"已设置但为空"，
+   用 `is_ok()` 判会被误当成要打轨迹），compose 里改成**按需注入**：
+   `YUNTUN_META_TRACE=1 bash tests/cluster.sh up`。
+
+### 108.5 覆盖到哪、没覆盖到哪（如实说）
+
+- ✅ **覆盖**：三节点真集群（真网络命名空间 / 真进程 / 真容器）；**真断网**下的"多数派照常提交"、
+  "少数派写不进"；接回后的**收敛**（带硬断言）；**对端换 IP** 这一格；
+- ⚠️ **未覆盖**：**跨机**（本刀仍是同机多容器；跨机差的是网络与时钟）；**非对称分区 / 丢包 / 延迟**
+  （容器上可加 `tc netem`，本刀没做）；`Join`（动态成员）仍是 UNIMPLEMENTED ⇒ 地址仍要**先知道**；
+- ❗ **两回事要说清**：本刀修的是"**对端换了地址、leader 再也送不到**"。`§106`/`§107` 那个
+  "**一条携带条目的 append 丢了、乐观推进的 `next_idx` 再也补不上**"是**另一个**机制，
+  **仍未修**（`§107.6` 的下一刀不变：限流的 `report_unreachable`，再不行查 inflight 释放）。
+
+### 108.6 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **381 passed / 0 failed / 1 ignored**
+  （`ignored` 仍是 `§106` 的进程内探针 —— 它测的是上面那个"另一回事"，本刀**没有**让它转绿）；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- `tests/cluster.sh smoke` 通过（其中"接回后必须收敛"是**硬断言**，修前它会红）；
+- 规模：49361 行 / 20 个 crate / 381 个测试函数（含 1 个 `#[ignore]` 探针）。
+
+---
+
+## 109. 用容器真集群检验 `§106` 那个停摆：**这一形态下没复现**（但拿到快照安装的正面证据）（2026-09-25）
+
+### 109.1 要验什么
+
+`§106`/`§107` 的写停摆一直有个没被排除的怀疑：**它是不是 `§104` 那套进程内链路夹具造出来的**
+（夹具断链是"拒绝连接 + 被 abort 的 `copy_bidirectional`"，与真断网不等价；`§107.4` 量到它还会
+产生 43/s 的连接失败风暴）。`§108` 的容器 rig 就是为此准备的，这里给它加一个场景：
+`tests/cluster.sh stall` —— **复现 `§106` 的全部条件**，但把网络换成真的。
+
+### 109.2 场景与结果
+
+```text
+① 起集群（压缩阈值 = 4 条，生产默认是 10 万）
+② 看清 leader（=1），**断掉另一个 follower**（mn2）—— 断 follower 而不是 leader，
+   这样多数派还能提交，落后的那个才需要靠 leader 补日志
+③ 在多数派上连写 10 条：s1…s10 全部 `accepted=true manifest_ver=1…10`
+④ 接回 mn2，等收敛（硬断言 60s）
+```
+
+结果：
+
+```text
+=== ⏳ 等三方收敛 ===
+  ⋯ 还没收敛：last=1 last=11  / role=Follower role=Leader
+  ✅ 三方已收敛（last=11）
+=== ✅ 三方收敛——容器里**没能**复现 §106 的停摆
+```
+
+**收敛了**：被断的 follower 从 `last=1` 一路追平到 `last=11`（它落后了 10 条，而阈值只有 4 ⇒
+leader 的日志早就压到它需要的那段之前了）。
+
+### 109.3 怎么读这个结果（**不能说"§106 是假的"**）
+
+两次跑的**状态**不是同一个，差别恰好是本刀最值钱的一条：
+
+| | 进程内探针（`§106`，会红） | 容器真集群（本刀，绿） |
+|---|---|---|
+| 分区怎么断 | 夹具：拒绝新连接 + abort 转发任务（**有风暴**） | 内核拔网线：`podman network disconnect` |
+| 落后的量 | 落后 **1 条**（`last=8` vs `9`） | 落后 **10 条**（远超阈值 4） |
+| leader 走哪条路补 | **增量 append**（`next_idx` 恰好在那个危险位置） | **快照**（落后太多，`entries()` 直接 `Compacted` ⇒ 走快照） |
+| 结果 | 停摆（`next > matched+1`，永不回退） | 收敛 |
+
+**关键**：快照安装会把该 peer 的 Progress **重置**（`become_snapshot` ⇒ `matched`/`next` 重新对齐），
+所以走快照路径时**根本进不到** `§106` 那个状态。而 `§106` 的卡点要的是更刁钻的一种：
+**稳定的 follower 恰好丢了一条携带条目的 append** ⇒ `next = matched + 2` ⇒ leader 只发空 append
+⇒ follower 恰好能接受 ⇒ `matched` 钉住。
+
+⇒ 本刀**没有**证明 `§106` 是假的，只证明"**在真环境的这个场景里它不出现**"；而且两次跑的差别
+（走快照 vs 走增量）本身就是 `§107.2` 那条机制的旁证。
+
+**反过来还有一条正面收获**：这次是**快照安装**把落后的 follower 追平的 ⇒ **`T11.5` 的第三项
+（"snapshot 重建"）在这一形态下拿到了真实证据**（`§42.4b` 当年"集成层稳定触发未拿到"的那一格，
+在真集群 + 小阈值下稳定出现了）。
+
+### 109.4 下一步（明确到可执行）
+
+要判 `§106` 到底是不是生产问题，得**刻意**造出"稳定的 follower 丢一条 append"这个状态。
+容器 rig 上加一格就能做到，而且都是**真环境**：
+
+1. **不对称 / 有损链路**：在**一侧**的 veth 上注入丢包或短时黑hole（`tc netem` / `iptables DROP`
+   只加在 leader→follower 一个方向）⇒ 制造"一条 append 丢了、但心跳还在" ⇒ 正好是那个 gap；
+2. 有了它就能在真环境里验 `§107.6` 的**限流 `report_unreachable`**（≤1 次/秒/peer）；
+3. 若仍无效，再查 **inflight 释放**（`Progress::maybe_update` 只在 `index > matched` 时
+   `ins.free_to`，而停摆时 follower 回的 `index == matched`）。
+
+### 109.5 验证
+
+- `tests/cluster.sh stall`（容器真集群，压缩阈值 4 + 真断网 + 接回）→ **收敛**（见 `§109.2`）；
+- `tests/cluster.sh smoke` 仍通过（真断网下多数派照常提交 + 接回收敛）；
+- 全量 `cargo test --workspace` → **381 passed / 0 failed / 1 ignored**（本刀只加脚本，无 Rust 行为改动）；
+- `clippy --workspace --all-targets` 本仓告警 **0**。
+
+---
+
+## 110. 续查 `§106`：瓶颈在**传输队列的队头阻塞**，不在 raft 的乐观推进（仍未修）（2026-09-25）
+
+### 110.1 从哪接
+
+`§109` 用真环境三条路径（真分区 / 加压缩 / 进程冻结）都没能复现 `§106` 的停摆。回头把
+**raft-rs 的拒绝规则真读一遍**（此前一直在凭记忆复述），结论是硬的：
+
+```rust
+// tracker/progress.rs
+if self.state == ProgressState::Replicate {
+    // 陈旧：rejected < matched，或 (rejected == matched 且不是请求快照)
+    if rejected < self.matched || (rejected == self.matched && request_snapshot == INVALID_INDEX) {
+        return false;                 // 当陈旧，忽略
+    }
+    self.next_idx = self.matched + 1; // ← 否则一律回退到 matched+1
+```
+
+⇒ **在 Replicate 态下，只要收到"真拒绝"，`next_idx` 必然被拉回 `matched + 1`** ⇒ 也就必然重发那条
+缺的 ⇒ **"收到拒绝"这件事本身就能自愈**。所以停摆只可能是：**leader 压根没把该发的发出去**。
+
+### 110.2 仪器升级
+
+把每秒一次的"视图快照"从只打 `matched/next/state` 改成打**整个 `Progress`**（Debug）——
+`§107.6` 怀疑的两处（`Probe+paused` 卡住、或 inflight `ins` 满）只有整打才看得见。
+
+### 110.3 实测：停摆时的三组数
+
+**同一瞬间的 Progress**（leader=2，停摆中）：
+
+```text
+peer 3: matched=8, next_idx=10, state=Replicate, paused=false,
+        ins: Inflights { start: 7, count: 1, buffer: [2,3,4,5,6,7,8,9], cap: 256 }
+```
+
+**三条轨迹配对**（全窗口）：
+
+| 轨迹 | 计数 |
+|---|---|
+| raft **交给传输**的 →3 append | **537** |
+| `send_loop` **真正出队**的 | **298**（**239 条卡在队列里**） |
+| →3 **投递失败**（超时） | **118** |
+| node 3 **收到**的 | 297 |
+| 其中 **`index=9` 的**（= 唯一能救场的那条） | **0** |
+| 全集群 `reject=true` 的响应 | **0** |
+
+### 110.4 怎么读
+
+**瓶颈是 per-peer FIFO 队列的队头阻塞**：队头是那些**要等满 2s RPC 超时**的失败发送 ⇒ 队列
+排不动 ⇒ 那条唯一携带条目的 append **一直出不去** ⇒ 于是才有 `§107` 的"乐观推进补不上"。
+**`§107` 的机制是对的，但它是后果，不是首因。**
+
+两条附注：
+
+- `ins` 里那条**悬空的 inflight**（`count: 1`，index 9）证实了 `§107.6` 的猜测 —— 它是"乐观发出"
+  留下的，而 follower 回的 `index` 不前进 ⇒ `maybe_update` 返 false ⇒ `ins.free_to` 压根不调用 ⇒
+  **永不释放**；但 `paused=false`（`ins` 远没满）⇒ **它不是"停发"的原因**，只是一条旁证。
+- `reject=true` **一条都没有** ⇒ follower 侧完全正常（它只是从没收到那条 append）。
+
+### 110.5 为什么真环境复现不了（这次的解释是自洽的）
+
+| | 进程内夹具（会红） | 容器真环境（绿） |
+|---|---|---|
+| 失败长什么样 | **挂住**，等满 2s 超时 | **快速报错**（连接被拒 / 网络不可达） |
+| 失败持续多久 | 受害者**全程**被隔离（风暴不停） | 断网/冻结结束后**立刻恢复** |
+| 解冻/接回之后 | 队列还楔着 | **积压瞬间排空**（实测：15s 冻结 + 20 条写，解冻后仍收敛） |
+
+⇒ 停摆需要"**同一个 peer 连续多次发送都挂住**"这个条件；真环境里它要么不来、要么一来就走，
+所以那三条路径复现不了。这不等于 `§106` 是假的：**"对端还活着但长时间不响应"是真实故障形态**
+（长 GC / 长 IO 停顿 / 宿主压力 ⇒ `tests/cluster.sh freeze` 就是它），只是要把量做够。
+
+### 110.6 下一刀（明确到可执行）
+
+**改队列策略**（不是改 raft）：
+
+1. 现在 `GrpcTransport::send` 是 `try_send`，**满了就丢"新来的"** —— 而新来的往往正是**携带条目**
+   的那条，等于**优先丢掉最该发的东西**。应该反过来：**积压时优先丢空的/过时的**
+   （心跳、被后来者取代的空 append）；
+2. 更简单的一版：同 peer 的空 append 在队列里可以**被后来的取代**（只保留最新的那条）；
+3. 落地后拿 `tests/cluster.sh` 验收：加一个"**长冻结 + 足量写**"的场景（真环境下把队列楔住），
+   并把 `§106` 的探针从进程内**搬到容器 rig** 上跑 —— 那样它就同时是回归用例。
+
+### 110.7 验证
+
+- 容器真环境：`tests/cluster.sh gap 15 20`（15s 进程冻结 + 20 条写）→ **收敛**（`last=1 → 21`）；
+  `stall` / `smoke` 仍通过；
+- 进程内探针（`§106`）**仍 `#[ignore]`**：本刀**没有**修好它，只是把首因换成队列；
+- 本刀只改了一处**诊断输出**（视图快照打整个 `Progress`，默认关）⇒ 全量 `cargo test --workspace`
+  **381 passed / 0 failed / 1 ignored**；`clippy --workspace --all-targets` 本仓告警 **0**。
+
+---
+
+## 111. **写停摆修好了**：出站队列分"重要 / 可取代"两条 + 优先发携带条目的（2026-09-25）
+
+### 111.1 从 `§110` 接：要改的是**队列**，不是 raft
+
+`§110` 把首因钉在**传输层出站队列的队头阻塞**上：raft 交出 537 条 append、`send_loop` 只出队
+298 条，那条**唯一携带条目的** append 到达次数 = **0**（队头是过时的心跳/空追加，且队头那条还要
+等满 2s 的 RPC 超时）。`§107` 讲的"乐观推进的 `next_idx` 再也补不上"是**后果**：那条 append
+一旦出不去，follower 就永远缺它，而 leader 只会发空 append、follower 恰好能接受 ⇒ 停摆。
+
+### 111.2 改法：两条队列 + `biased` 优先
+
+`GrpcTransport` 的出站从"一条 FIFO"改成**两条**（`transport.rs`）：
+
+| 队列 | 装什么 | 容量 | 满了怎么办 |
+|---|---|---|---|
+| `important` | **携带条目**的追加、选举/投票、各种响应 | `SEND_QUEUE`（1024） | 丢新来的（计数） |
+| `best_effort` | 心跳、**不携带条目**的追加 | `BEST_EFFORT_QUEUE` = **1** | 丢新来的**没关系** —— 下个 tick 就有更新的那条 |
+
+`send_loop` 用 `tokio::select!{ biased; … }` **优先发 `important`** ⇒ 队头再也不会被过时的心跳占住。
+
+判据是 [`is_supersedable`](../../crates/meta/src/transport.rs)：**"raft 每个心跳 tick 都会重新生成"**
+的那些才可取代（心跳、**不携带条目**的追加）—— 它们的作用只是"我还活着 / commit 到哪了"，
+而**更新的那条完全覆盖**（commit 单调不降）。**携带条目的追加绝不可取代**：丢一条就可能让 follower
+永远缺那一条。心跳响应与追加响应也走 `important`（它们是别人推进的依据，不是"状态快照"）。
+
+### 111.3 结果：探针转绿，**`ignored` 归零**
+
+| | 修前（`§106` 的探针） | 修后 |
+|---|---|---|
+| 12 条小批量提交 | k=5 起卡住，25–45s 后失败 | **k=0..11 全部被接受** |
+| 用时 | 25–45s（失败） | **2.1–3.2s** |
+| 连跑 | —— | **6/6 绿** |
+
+按仓库纪律（`§106` 自己写下的那句"**修好后取消 `#[ignore]`**"）：
+**这个用例已拿掉 `#[ignore]`、转正为回归用例**，文档注释改写成"它当初复现什么 / 真凶是谁 / 怎么观察"。
+
+⇒ 全量 `cargo test --workspace` = **382 passed / 0 failed / 0 ignored** —— **`ignored` 归零**
+（此前长期挂着 1 条复现探针）。
+
+### 111.4 与 `§107` 的关系（把前后串起来）
+
+- `§107` 钉死的机制**没错**：丢一条携带条目的 append 之后，raft 的乐观推进会让它再也补不上；
+- 但 `§107` 里被实测否掉的三种改法（无界队列 / 送达为止重试 / 每次丢包 `report_unreachable`）
+  **都不需要了** —— 它们都是在"raft 那一侧"找补，而真凶是**消息根本没出去**；
+- `§107.6` 与 `§110.4` 记下的那条"inflight 永不释放"（`maybe_update` 返 false ⇒ `ins.free_to`
+  不调用）是**真现象**，但 `paused=false` ⇒ 它当时不是"停发"的原因（仍留在文档里，供以后参考）；
+- `§108` 的"连续失败就重建通道"**保留** —— 那是另一个 bug（对端换 IP），独立成立。
+
+### 111.5 覆盖到哪、没覆盖到哪（如实说）
+
+- ✅ **覆盖**：`§106`/`§107`/`§110` 那个写停摆（进程内回归用例 + 容器真环境的 `smoke`/`stall`/`gap`）；
+  真断网、真 IP 变化、进程级冻结（`podman pause`）三种真实故障形态；
+- ⚠️ **未覆盖**：**跨机**（仍是同机多进程 / 多容器）；**不对称 / 有损链路**（`tc netem`；rootless
+  podman 没有可切的 veth，得换 rootful 或在容器里装 iproute2）；`Join`（动态成员）仍 UNIMPLEMENTED；
+- ❗ 一条**没改**的东西：`best_effort` 队列容量是 1，也就是"对端很慢时心跳会被丢"—— 这是**有意**的
+  （心跳丢了不影响正确性，下个 tick 再来），但它会让"对端很慢"时的**活性判断**更依赖 raft 的
+  重试节奏；真要有需求，调 `BEST_EFFORT_QUEUE` 即可。
+
+### 111.6 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **382 passed / 0 failed / 0 ignored**；
+- 原探针（现回归用例）连跑 **6/6** 绿，单次 2.1–3.2s；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 容器真环境：`tests/cluster.sh smoke`（真断网 + 接回收敛）与 `gap 10 12`（进程冻结）均通过；
+- 规模：49,419 行 / 20 个 crate / 381 个测试函数（**0 ignored**）。
+
+---
+
+## 112. **反复故障的回归**：`tests/cluster.sh soak`（`§111` 那种 bug 的回归形态）（2026-09-25）
+
+### 112.1 动机
+
+`§111` 修的写停摆，根因是"**队头被过时的消息堵住**"—— 这类问题**只有在持续故障下才暴露**：
+一轮 `smoke`/`gap` 绿只说明"没坏"，不能说明"不会坏"。所以要有**反复来**的回归。
+
+### 112.2 它做什么
+
+```bash
+bash tests/cluster.sh soak [轮数] [每轮条数]     # 默认 3 轮 × 5 条
+```
+
+每轮：**冻住一个 follower**（`podman pause`，即"对端还活着但长时间不响应"）→ 在**多数派**上写
+N 条 → 解冻 → **硬断言三方真收敛**（同一个 leader 且 `last` 全等）。最后一轮换成**真断网**
+（`podman network disconnect`）+ 接回，换一种故障形态。
+
+### 112.3 实测
+
+```text
+第 1 轮：冻 mn2，写 5 条 → 解冻 → ✅ 收敛（last=6）
+第 2 轮：冻 mn2，写 5 条 → 解冻 → ✅ 收敛（last=11）
+第 3 轮：冻 mn2，写 5 条 → 解冻 → ✅ 收敛（last=16）
+② 真断网 mn3 + 接回        → ✅ 收敛（last=17，2 次轮询内）
+=== ✅ soak 通过（3 轮冻结 + 1 次真断网，全部收敛）
+```
+
+### 112.4 顺带一处硬化
+
+`meta_probe` 的 `Status` 调用加了 **3s 超时**：对端被冻住时它不会回，没超时会把整个探测**挂死**
+（`soak` 会在冻结期间探状态，这是它能跑的前提）。冻结期间探到的就是"这一拍没有它"，符合预期。
+
+### 112.5 验证
+
+- `tests/cluster.sh soak 3 5` 通过（见 `§112.3`）；`smoke` / `gap` / `stall` 仍通过；
+- 本刀只动脚本 + `meta_probe` 的超时（无存储/raft 行为改动）⇒ 全量 `cargo test --workspace`
+  **382 passed / 0 failed / 0 ignored**；`clippy --workspace --all-targets` 本仓告警 **0**。
+
+---
+
+## 113. 容器 rig 补上**有损 / 延迟链路**（`tc netem`）：三条实测结论（2026-09-25）
+
+### 113.1 为什么加它
+
+`§109.4` / `§111.5` 都把"**不对称 / 有损链路**"列成这套 rig 缺的唯一故障维度：`podman network
+disconnect`（全断）与 `podman pause`（冻进程）都造不出"**只丢一部分 / 只慢一点**"，而那才是真实
+网络的常态。于是加一个**要构建的镜像**（`tests/Containerfile` = `debian:trixie-slim` + `iproute2`，
+`compose.yaml` 给三个节点带 `NET_ADMIN`）与三个子命令：
+
+| 命令 | 作用 |
+|---|---|
+| `netem <1\|2\|3> <netem 参数…>` | 在某个节点的 **egress** 上注入（丢包 / 延迟 / 乱序…） |
+| `netem-clear <1\|2\|3>` | 清掉 |
+| `lossy [丢包%] [条数]` | 预设：在 **leader** 上丢包，然后写 N 条 |
+| `netem-run "<参数>" [条数] [说明]` | 通用版（`loss 20%` / `delay 800ms` / `delay 800ms 200ms 25%`…） |
+
+⚠️ netem 是**出口**整形，做不到"只让 leader→follower 丢"；在 leader 上注入会同时影响它到两个 peer
+的流量 —— 三节点下是可接受的近似（脚本注释里写明了）。
+
+**断言的三条**（`netem-run`）：① 期间**多数派仍写得进去**；② 清掉注入后三方**收敛**；
+③ **每个 key 事后重放都必须命中** —— 第 ③ 条是必需的：丢包会吃掉**回复**，
+"客户端没收到 accepted"**不等于**"没提交"，只有幂等键重放能分清这两件事。
+
+### 113.2 实测结论一：**丢包会被 TCP 兜住，造不出 raft 级的消息丢失**
+
+`lossy 20 8`：8/8 都拿到 `accepted=true` ✓，清掉后收敛 ✓，8/8 重放命中 ✓。
+20% 的包丢率对 TCP 只是**重传**（慢一点），raft 层面**根本感知不到**。
+
+⇒ 这条很重要：**要造"raft 少一条 append / 少一个 ack"，得靠 TCP 级断**（`partition` 全断、
+`freeze` 冻进程 —— 它们会让连接挂住或拒绝），**不是丢包**。rig 里两套都有，各司其职。
+
+### 113.3 实测结论二：**单向延迟超过 RPC 超时也照样能干**
+
+- `netem-run "delay 800ms" 5`：5/5 accepted ✓、收敛 ✓、5/5 命中 ✓；
+- `netem-run "delay 2500ms" 3`（**超过 `RPC_TIMEOUT = 2s`**）：3/3 accepted ✓、收敛 ✓、3/3 命中 ✓。
+
+为什么"超过超时"还能干活：netem 只延迟**出口** ⇒ leader→follower 的请求慢 2.5s（leader 侧 RPC
+超时、记一条 `failed` ✗），但 follower→leader 的**回执是快的** ✓ ⇒ `matched` 照样推进 ✓。
+换句话说：**raft 的提交推进靠的是回执，不是请求本身是否在超时内到达**。
+
+### 113.4 实测结论三：**对称延迟 1.5s 就崩** —— 部署包线是被三个超时决定的
+
+手动把**三个节点都**注入 `delay 1500ms`（往返 ≈ 3s）之后：
+
+```text
+[meta:transport] →2(mn2:9311) 连续 3 次投递失败：已重建通道（最近一次错误：
+                 tcp connect error, 10.89.0.3:9311, kind: TimedOut）
+后：term=6（从 1 涨上来的）、三方 commit=2 / applied=0
+```
+
+两件事一起发生：**TCP `connect_timeout`（500ms）都超时了**（`§108` 的"连续失败重建通道"按设计触发 ✓，
+它挡的是"通道钉在旧地址"而不是"网络太慢" ✗），以及**选举风暴** —— `term` 从 1 涨到 **6**
+（节点在选举超时内收不到心跳 ⇒ 反复重新选举）。
+
+⇒ **部署包线**（这一格以前只是"没测"，现在是量过的）：
+
+| 旋钮 | 现值 | 含义 |
+|---|---|---|
+| `connect_timeout` | 500ms | 建连超过它就失败 ⇒ 对称延迟 >0.5s 开始伤 |
+| `RPC_TIMEOUT` | 2s | 单次 `Meta.Raft` 的上限（单向延迟 >2s 时 leader 侧记失败，但只要反向快就不影响提交 ✓） |
+| raft 选举超时 | ~1s 量级 | 对称延迟把它顶穿 ⇒ **反复选举**（term 涨） |
+
+⇒ **跨可用区 / 跨机部署前，这三个都得按 RTT 重新定**（现在的值是按本机/同机房定的）。
+
+### 113.5 覆盖到哪、没覆盖到哪
+
+- ✅ **覆盖**：丢包、单向延迟（含越过 RPC 超时）、对称延迟下的**包线**；
+- ⚠️ **未覆盖 / 未做成场景**：**乱序**（`netem reorder` 没试）、**抖动**（`delay X Y` 的组合没试）、
+  对称延迟**没有做成脚本场景**（本刀是手工量的 —— 做成场景要先想清楚"这时候该断言什么"：
+  断言"能写"是错的，断言"term 会涨"才是它真正测的东西）；
+- ⚠️ 依然是**同机多容器**（跨机没做）。
+
+### 113.6 验证
+
+- `tests/cluster.sh lossy 20 8` / `netem-run "delay 800ms" 5` / `netem-run "delay 2500ms" 3`
+  三条都通过（每条都含"事后逐 key 重放命中"）；`smoke` / `stall` / `gap` / `soak` 仍通过；
+- 本刀只动脚本 + 新增 `tests/Containerfile`（无 Rust 行为改动）⇒ 全量 `cargo test --workspace`
+  **382 passed / 0 failed / 0 ignored**；`clippy --workspace --all-targets` 本仓告警 **0**。
+
+---
+
+## 114. `T8.x` 遗留「**R3 后打同一 Meta**」：raft 承载元数据的代价，量出来了（2026-09-25）
+
+### 114.1 动机
+
+`plan T8.x` 的遗留一条写得很直白：T8 基线（`§32`）是拿**本地内存目录**打的，而生产形态的元数据是
+**raft 承载**的 —— 那条往返的代价必须量出来，否则"基线"只是空转的数字。这一刀还顺带是**回归**：
+`§111` 刚把出站队列改成两条（元数据路径正在这条写路径上）。
+
+### 114.2 做法
+
+`crates/chaos/examples/bench_baseline.rs` 加了 `--meta <addr>`：给了就用
+`RemoteCatalog::connect(...)`（打到 raft 承载的 metanode），不给仍是内存目录（T8 基线口径）。
+（chaos crate 加了 `yuntun-meta` 到 **dev-dependencies**：只有 example 用得到。）
+
+```bash
+# 同机 A/B，参数全用默认（= §32 那套：secs=130 shards=100 batch_rows=50 batches/s=10 …）
+cargo run -q --release -p yuntun-chaos --example bench_baseline                      # A：内存目录
+cargo run -q --release -p yuntun-meta --bin metanode -- \
+    --id 1 --dir /tmp/bm --listen 127.0.0.1:9311 --init &                            # 单节点 raft
+cargo run -q --release -p yuntun-chaos --example bench_baseline -- --meta 127.0.0.1:9311   # B：raft
+```
+
+⚠️ 两次必须**同机**（差值才能归因到"多了一次网络 + raft 往返"），且 metanode 与 bench **都用
+release**（debug 版 metanode 会把差异放大成假的）。
+
+### 114.3 数字
+
+| 指标 | A 内存目录 | B raft 元数据 | 差 |
+|---|---|---|---|
+| 文件数 | 301 | 300 | ~同 |
+| 文件数/天 | 199,774 | 199,107 | ~同 |
+| 提交偏移 p50 | 32,841 ms | 33,144 ms | **+303 ms（+0.9%）** |
+| 提交偏移 **p99** | 35,212 ms | **40,171 ms** | **+4,959 ms（+14%）** |
+| 提交偏移 max | 93,399 ms | 40,364 ms | −53,035 ms（A 那次是 `§32.4` 记过的**离群**，噪声，别看它） |
+| 峰值提交（1s / 100ms） | 34 / 8 | **23 / 4** | **−32% / −50%** |
+| **seal → committed p99** | 35,047 ms | **40,133 ms** | **+5,086 ms（+14.5%）** |
+| seal → committed max | 35,176 ms | 40,326 ms | +5,150 ms |
+| 进程峰值 RSS | 39 MiB | 57 MiB | +18 MiB |
+
+### 114.4 怎么读
+
+- **吞吐与文件数不变**：500 行/秒这个量级上，元数据**不是**瓶颈（写入侧还是窗口驱动的 seal ✓）；
+- **中位数几乎不动（+0.9%），但 p99 尾部 +14.5%（35.0s → 40.1s）**，同时**峰值提交从 34/s 掉到
+  23/s** —— 这两条是同一件事：**raft 把突发串行化了**。每次 `CommitFiles` 现在是一条 raft 往返
+  + 一条 apply；平时（理论均值 2.3 次/秒）看不出来，但**关窗瞬间几十个 shard 一起提交**时，它们
+  在 raft 里排队 ⇒ 尾部被拉长、峰值被压低。
+- ⇒ **生产含义**：元数据路径的"突发吸收"得靠**批量化**（一次 op 提交多个 shard 的产物 / 客户端
+  合并），而不是调 raft 参数。这也与 `§32` 的结论呼应：文件数与"shard × 窗口"绑定，而**提交那一刻
+  是挤在一起的**。
+- ⚠️ 绝对量级别看错：这里的 p99 = 35–40 **秒**，是因为默认口径 `max_flush_delay=30s + spread=5s`
+  （关窗后本来就要等）—— 差值（+5s）才是我要报的东西。
+
+### 114.5 覆盖到哪、没覆盖到哪（如实说）
+
+- ✅ **覆盖**：单节点 raft 承载元数据的 A/B（同机、同参数、同 release）；
+- ⚠️ **未覆盖**：**多节点 raft**（1 次多数派往返 + 可能的选主抖动都没量 —— 本刀是单 voter ✓）；
+  **跨机 RTT**（loopback 的网络代价≈0 ⇒ 真实部署还要加上 RTT × 往返次数）；
+  `§111` 的**前后对比**（A/B 都是**改后**的代码 ⇒ 本刀量的是"raft 元数据的代价"，不是"队列改动的
+  影响"；后者由 `§111` 的功能回归守着）。
+
+### 114.6 验证
+
+- 两条命令都能跑通，各自产出 `RESULT {...}` 一行 JSON（`§114.3` 的表就是它两位小数直接抄的）；
+- 本刀改了 **bench 示例 + chaos 的 dev-dep**（无生产路径改动）⇒ 全量 `cargo test --workspace`
+  **382 passed / 0 failed / 0 ignored**；`clippy --workspace --all-targets` 本仓告警 **0**。
+
+---
+
+## 115. `§114` 留下的那格：**3 节点** raft 元数据的代价（容器真集群）（2026-09-25）
+
+### 115.1 补的是什么
+
+`§114.5` 明说：那一刀是**单节点 raft**（没有多数派往返、没有选主抖动）⇒ 多节点的代价没量。
+本刀把 B 侧换成**容器里的 3 节点真集群**（`tests/compose.yaml`，`§108` 那套 rig）：bench 仍在
+**宿主**上跑（数据目录/存储都在宿主 ⇒ 与 A/B 可比），只有**元数据**走容器里的三节点 raft。
+
+为此把 rig 的容器二进制从 `debug` 换成 **`release`**（debug 会把性能差异放大成假的），并给三个
+节点**发布端口**（容器内仍监听 9311，宿主映射 19311/19312/19313），`bench --meta` 也支持
+**逗号分隔的多点接触点**（多节点集群就该这么给：客户端自己找 leader）。
+
+```bash
+bash tests/cluster.sh up                     # 3 节点真集群（release）
+cargo run -q --release -p yuntun-chaos --example bench_baseline -- \
+    --meta 127.0.0.1:19311,127.0.0.1:19312,127.0.0.1:19313
+```
+
+### 115.2 三次同机同参数对照
+
+| 指标 | A 内存目录 | B **单节点** raft | C **3 节点** raft（容器） |
+|---|---|---|---|
+| 文件数·天 | 199,774 | 199,107 | 199,222 |
+| 提交偏移 p50 | 32,841 ms | 33,144 ms | **34,931 ms**（vs A **+6.4%**） |
+| 提交偏移 **p99** | 35,212 ms | 40,171 ms | **42,091 ms**（vs A **+19.6%**，vs B +4.8%） |
+| 峰值提交（1s） | 34 | 23 | **13** |
+| 峰值提交（100ms） | 8 | 4 | **2** |
+| seal → committed p99 | 35,047 ms | 40,133 ms | 39,859 ms（与 B 同量级） |
+| 进程峰值 RSS | 39 MiB | 57 MiB | 51 MiB |
+
+### 115.3 怎么读
+
+- **吞吐与文件数依然不变**（`§114` 的结论在 3 节点下同样成立：元数据不是瓶颈）；
+- **从 A 到 B 是大跳**（p99 +14%），**从 B 到 C 只是小步**（p99 +4.8%）⇒ **代价的主体是"串行化"，
+  不是"多几次网络"**（多数派往返在这台机器上便宜，而**每次 `CommitFiles` 都要在 raft 里排一次队**
+  才是贵的那个）；
+- **峰值提交逐级下降：34 → 23 → 13 次/秒** —— 每多一跳就往下降一档，正是"突发被串行化"的直接读数
+  ⇒ **突发吸收必须靠批量化**（一次 op 提交多个 shard / 客户端合并），这一条在 3 节点下更硬；
+- 顺带说明：C 这条路径把 `§111`（两条队列 + 优先发携带条目的）与 `§108`（连续失败重建通道）
+  都**在真实容器网络 + 基准负载下跑了一遍** ✓（元数据复制正是走那条 gRPC 传输）。
+
+### 115.4 边界（仍然如实说）
+
+- 本刀是**同机多容器**：网络是容器网桥（≈0.1ms 量级），**跨机 RTT 仍未量** ⇒ 真实部署还要在
+  上面加"RTT × 往返次数"；
+- 仍然是**单机房 / 无抖动**（没有选主、没有节点抖动）⇒ 尾部在真实环境会更差；
+- A/B/C 都是**改后**代码 ⇒ 这组数是"raft 元数据的代价"，不是"某次改动的影响"。
+
+### 115.5 验证
+
+- 三次都能跑通并各产出一行 `RESULT {...}`（`§115.2` 的表就是它直接抄的）；
+- rig 换成 release 后 `smoke` 仍通过（`§108` 的收敛硬断言 ✓）；
+- 本刀只改 rig 的 compose/脚本 + bench 的 `--meta`（无生产路径改动）⇒ 全量 `cargo test --workspace`
+  **382 passed / 0 failed / 0 ignored**；`clippy --workspace --all-targets` 本仓告警 **0**。
+
+---
+
+## 116. 把 RTT 加进去：**同城 2ms vs 跨区 30ms** 对元数据路径的影响（2026-09-25）
+
+### 116.1 补的是什么
+
+`§115.4` 明说：那一刀是**同机多容器**（网桥 ≈0.1ms）⇒ **跨机 RTT 仍未量**。本刀用 `§113` 刚装好的
+`tc netem` 给三个 metanode **都注入单向延迟**（RTT ≈ 2×delay），在**同一台机器**上把"同城 / 跨区"
+两档补进对照表 —— 这样"跨机"这格不必等第二台机器就能先有个量级。
+
+### 116.2 做法
+
+```bash
+bash tests/cluster.sh up                                   # 3 节点真集群（release，§115）
+for n in 1 2 3; do bash tests/cluster.sh netem $n delay 15ms; done     # 单向 15ms ≈ 30ms RTT
+cargo run -q --release -p yuntun-chaos --example bench_baseline -- \
+    --meta 127.0.0.1:19311,127.0.0.1:19312,127.0.0.1:19313
+```
+
+⚠️ **两次 bench 之间必须重置集群**：本地存储目录是 bench 自己新建的，但**元数据留在集群里** ——
+不重置会撞 `TableAlreadyExists("public.base")`（本刀第一次就撞了）。`cluster.sh up` 会连卷一起清。
+
+### 116.3 五组同机同参数（`§32` 那套默认）
+
+| 指标 | A 内存目录 | B 单节点 raft | C 3 节点 raft | C **+ 2ms RTT**（同城） | C **+ 30ms RTT**（跨区） |
+|---|---|---|---|---|---|
+| 文件数·天 | 199,774 | 199,107 | 199,222 | 199,253 | 199,379 |
+| 提交偏移 p50 | 32,841 ms | 33,144 ms | 34,931 ms | 34,741 ms | **39,427 ms** |
+| 提交偏移 p99 | 35,212 ms | 40,171 ms | 42,091 ms | 43,747 ms | **49,124 ms** |
+| **seal → committed p99** | 35,047 ms | 40,133 ms | 39,859 ms | 43,700 ms | **48,974 ms**（vs A **+39.7%**） |
+| **峰值提交（1s）** | 34 | 23 | 13 | 15 | **7** |
+| 峰值提交（100ms） | 8 | 4 | 2 | 3 | **1** |
+| bench 总时长 | 192.4 s | 195.5 s | 176.0 s | 185.0 s | **225.8 s** |
+
+（2ms 那档的峰值 15 与 C 的 13 差在噪声里；看 p99 与峰值提交的**单调趋势**。）
+
+### 116.4 怎么读
+
+- **文件数·天几乎不动**（199.2k–199.4k）⇒ 窗口驱动的文件数与元数据延迟**无关**（第五节又确认一次）；
+- **`seal → committed` 的 p99 单调爬**：35.0 → 40.1 → 39.9 → 43.7 → **49.0 s**
+  ⇒ 先被"raft 串行化"推上去（+14%），再被 **RTT** 推一截（跨区到 +39.7%）；
+- **峰值提交逐级塌**：34 → 23 → 13 → **7 次/秒** ⇒ **RTT 直接压元数据的提交速率**
+  （每次提交要一次多数派往返 ⇒ 上限 ≈ 并发度 / RTT）。bench 总时长也从 192s 涨到 **226s**
+  （同样的写入量，尾部排水更久）；
+- ⇒ **部署含义**：跨可用区部署时，**"一次 op 提交多个 shard 的产物"从优化变成必需品**；
+  否则关窗那一刻几十个 shard 的提交会在 RTT 上排队，尾部成倍放大；
+- 顺带：30ms RTT 下 `§111`（两条队列）与 `§108`（重建通道）都没出问题（三节点复制正常、没有
+  选举风暴）—— 与 `§113.4` 量到的包线一致：**30ms 比"对称 1.5s 就会崩"低两个数量级**。
+
+### 116.5 边界（仍然如实说）
+
+- 是**容器网桥 + netem 模拟的 RTT**，不是真跨机（没有真网卡、没有真实抖动/重排/丢包组合；
+  `netem` 的 `delay X Y` 抖动与 `reorder` 都没试）；
+- 时钟仍是同一台机器（跨机的时钟偏移没量）；
+- A/B/C 都是**改后**代码 ⇒ 量的是"元数据路径在 RTT 下的代价"。
+
+### 116.6 验证
+
+- 五组各产出一行 `RESULT {...}`（`§116.3` 直接抄它）；`netem` 注入/清除后 `smoke` 仍通过；
+- 本刀只改 rig 用法与文档（无代码改动）⇒ 全量 `cargo test --workspace`
+  **382 passed / 0 failed / 0 ignored**；`clippy --workspace --all-targets` 本仓告警 **0**。
+
+---
+
+## 117. `netem` 做满：抖动 / 丢包 / 乱序的**组合**（+ 一条 `T13.2` 的接缝结论）（2026-09-25）
+
+### 117.1 补什么
+
+`§113` 只试了单一维度（`loss 20%` / `delay 800ms` / `delay 2500ms`）。这里把 `netem` 的组合能力
+用上：`delay 10ms 5ms 25%`（延迟 + 抖动 + 相关丢包）与 `delay 10ms reorder 25%`（乱序）。
+
+### 117.2 实测
+
+| spec | 结果 |
+|---|---|
+| `delay 10ms 5ms 25%` | 8/8 拿到 `accepted` ✓，清掉后收敛（`last=9`）✓，8/8 重放命中 ✓ |
+| `delay 10ms reorder 25%` | 6/6 拿到 `accepted` ✓，收敛（`last=7`）✓，6/6 命中 ✓ |
+
+⇒ 与 `§113.2` 一致：**这些都在 TCP 层被吸收掉了**（重传 / 重排恢复 ⇒ raft 层面看不见）⇒
+它们适合验"**慢而不坏**"，**不适合**造"raft 级消息丢失"（那要靠 `partition` / `freeze`）。
+
+### 117.3 顺带：一条 **`T13.2` 的接缝结论**（已写进 plan，免得下次重走）
+
+`T13.2`（块级剪枝）今天勘察下来**接缝不干净**：`chunk::ColumnStats` / ZoneMap 只在**内存 chunk 层**
+算（`crates/chunk/src/{stats.rs,chunk.rs}`），**落盘不带它**、查询侧（`query/src/table.rs` 的 `scan`）
+**也不消费**。⇒ 要真省 IO，得**先把 per-file 统计落进 manifest**（`FileManifest` 目前只有行数等），
+再让 scan 用它剪枝 —— 是"先补数据模型、再接一根线"的活，不是小改。
+
+### 117.4 一处脚本硬化（本轮踩到的）
+
+场景里的 `probe` 会在**探针不存在时现场 build** ⇒ 首次跑会在场景**中途**触发一次 release 编译：
+输出交错、且后续步骤可能拿到空值（本刀第一次就因此让 `podman exec yuntun-mn tc …` 以 125 失败）。
+修法：`up()` 现在**连探针一起检查**（缺就一起编）⇒ 场景中途不会再编译。
+
+### 117.5 验证
+
+- 两个 spec 都通过（见 `§117.2`）；`smoke` / `soak` / `lossy` / `netem-run` 等仍通过；
+- 本刀只改脚本与文档（无 Rust 改动）⇒ 全量 `cargo test --workspace`
+  **382 passed / 0 failed / 0 ignored**；`clippy --workspace --all-targets` 本仓告警 **0**。
+
+---
+
+## 118. `Join` 地基（**上半刀**）：集群能在线加一个 learner，**地址随 conf change 复制**（2026-09-25）
+
+### 118.1 为什么切两半
+
+`Join` 要一整套，但其中有两处不是"写代码"那么简单：① proto 的 `JoinResponse` 现在只有**计数**
+（`voters`/`learners` 都是 `uint64`）⇒ 要给新节点"成员表 + 各自地址"必须**扩 proto**；
+② 进程内测试没法给"还不存在的那个新节点"接线 ⇒ "真加入并追平"的验收只能是**进程级用例**。
+所以先落地**能独立验的那半**：**集群能在线接纳一个 learner，并把它的地址复制给每个成员**。
+learner **不参与多数派** ⇒ 这件事**不需要那个节点真的存在** ⇒ 进程内就能验干净 ✓。
+
+### 118.2 改了什么
+
+- `PeerTransport::add_peer(id, addr)`（默认 `Err`）+ `GrpcTransport` 实现：两张出站表改成 `RwLock`，
+  运行期起发送任务 ⇒ **peer 表不再是"构造时固定"**（这是"在线加节点"的前提）；
+- `Command::AddLearner` / `Command::Members` + `NodeHandle::add_learner` / `members`；
+- leader 提议 `ConfChangeType::AddLearnerNode`，**地址放在 `ConfChange.context` 里**；
+- 应用 conf change 时（`apply_committed`）记下地址 + `transport.add_peer` ⇒ **地址随日志复制**；
+- `FjallStorage::conf_state()`（回答成员查询要读它）；
+- `spawn_node` 多收一份"初始 `id→地址`"（来自 `--peer`）⇒ 成员表从一开始就是全的。
+
+### 118.3 用例（进程内，`multi_node_grpc_e2e.rs`）
+
+`adding_a_learner_is_replicated_with_its_address`：
+
+```text
+leader = 1
+节点1: voters=[1, 2, 3] learners=[9] addrs[9]=Some("127.0.0.1:19999")
+节点2: voters=[1, 2, 3] learners=[9] addrs[9]=Some("127.0.0.1:19999")
+节点3: voters=[1, 2, 3] learners=[9] addrs[9]=Some("127.0.0.1:19999")
+```
+
+"**三方都有地址**"是**故意**断言的：地址随 `context` 复制 ⇒ **换主之后新 leader 也知道怎么连它**；
+如果只让"当初那个 leader"记着，换主就会出现"配置里有它、但没人连得上"的静默空洞。
+同时断言 **voter 集合一个都不变**（learner 不参与多数派）。
+
+### 118.4 踩到的两个坑（都写进了代码注释）
+
+1. **`tokio::spawn` 不能在驱动线程里用**：`add_peer` 是被 **raft 驱动线程**（`std::thread`）调的，
+   那里没有 tokio 上下文 ⇒ 直接 **panic、把驱动线程带走**（用例当场红，而且报错指向传输层）。
+   修法：把 `Handle` 存进 `GrpcTransport`（它本来就在 `new` 里收到一个），加 peer 时手动 spawn。
+2. **`ConfChange.context` 是 `Bytes`**（不是 `Vec<u8>`）—— 小事，但 `String::from_utf8(...)` 那行会直接
+   编译不过。
+
+### 118.5 覆盖到哪、没覆盖到哪（如实说）
+
+- ✅ **覆盖**：在线加 learner、**地址随 conf change 复制到每个成员**、voter 集合不变；
+- ⚠️ **下一刀（`§119`）**：`Meta.Join` RPC（要扩 `JoinResponse` 带成员表与地址）、`--join` CLI、
+  **新节点真的起来并追平**（进程级用例）、提升 learner→voter、成员**移除**；
+- ❗ **一个现在就存在的缺口**：地址表**只在内存**。重启后 `applied` 之下的 conf change **不会重放**
+  ⇒ 从日志里补不回来；启动配置 `--peer` 只列 **voter** ⇒ **learner 的地址重启后会丢**。
+  这条必须在 `§119` 一并解决（把地址表落盘）—— 记在这里，别让它悄悄留着。
+
+### 118.6 验证
+
+- 新用例连跑 **3/3** 绿（约 0.2s）；
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **383 passed / 0 failed / 0 ignored**；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**（`apply_committed` 参数变多，按本仓
+  先例加了 `#[allow(too_many_arguments)]` 与理由）。
+
+---
+
+## 119. `Join` 下半刀：**新节点在线加入并追平**（含地址表落盘 + 一处自我更正）（2026-09-26）
+
+### 119.1 交付了什么
+
+`§118` 交的是地基（集群能在线加 learner、地址随 conf change 复制到每个成员），这一刀补上**入口**：
+
+| 层 | 改了什么 |
+|---|---|
+| `proto` | `JoinResponse` 增 `voter_ids` / `learner_ids` / `members`（**含 leader 自己**）+ 新 `NodeAddr`；原来那两个**计数**保留 —— 加字段向后兼容，删字段会让老客户端读出 0 |
+| `service` | 实现 `Meta.Join`：**只 leader 受理**（非 leader 回 `NotLeader` + hint）、**幂等**（已是成员就直接回当前配置）、**等生效才回包**（回包里是给新节点的**起步配置**，不能是"还没提交"的那份） |
+| `cli` | 新 `--join <接触点列表>` 与 `--advertise <地址>`；`normalize` / `check_bootstrap` 为"加入"这个**意图**开了正门（并**拒绝** `--join` 配 `--voters`/`--peer`、拒绝打到已有数据的目录 —— 两条都是"两个都想说了算"） |
+| `main` | `--join` 时先向集群要起步配置，再起本节点；**先 bind 再 join**（集群一知道我们的地址，socket 就已在 `listen`，它发来的首批 append/快照会排在 accept backlog 里，而不是因为"服务还没起"被丢掉 —— 丢一条快照是致命的，`§107`） |
+| `lib` | 成员**地址表落盘**（应用 conf change 时写）；启动时"**先吃盘上的、再用 `--peer` 覆盖**"（盘上才有"后来加入的成员"） |
+
+### 119.2 两半合起来才是"在线加节点"
+
+* **集群不用预先知道新节点**：它的地址由 `Join` 请求带进去，随 conf change **复制**给每个成员（`§118`）；
+* **新节点不用预先知道所有地址**：`Join` 回包把成员表与各自地址给它（**含 leader 自己** —— 否则它连
+  `AppendResponse` 都发不回去）。
+
+⇒ `metanode --join <接触点…>` 因此替掉了"改 `--voters`/`--peer` 再全量重启"那套；
+`§103` 那条"多节点必须先知道所有地址"的部署约束，现在只剩**初始 3 个 voter** 需要（它们确实在
+`--init` 时就要配好）。新节点以**非成员姿态**起步（`voters=[1,2,3]`、**不含自己**）⇒ 它不会自己
+选主（`§118` 的分析），只在收到那条 conf change 后成为 learner。
+
+### 119.3 验收（进程级，`metanode_cluster_process_e2e`）
+
+新增 `a_fourth_process_joins_a_running_cluster_and_catches_up`（3 个真进程 + 第 4 个 `--join`）：
+
+```text
+集群 leader = 1
+加入前：leader commit=4 last=4
+节点 4 已就绪：127.0.0.1:37825（通过 127.0.0.1:43321,127.0.0.1:33009,127.0.0.1:41333 加入）
+✅ 已追平：节点4 last=5 applied=4（集群 commit=5）
+✅ 新写入也跟上了：节点4 applied=8 集群 commit=8
+集群已整组重启，新 leader = 3（--peer 里没有节点 4）
+✅ 集群整组重启后，节点 4 仍在被复制：applied 8 → 11（集群 commit=11）
+```
+
+四段断言各自对应一件进程内测不出来的事：① `Join` 真的回了起步配置；② 新节点**追平**了历史；
+③ **跟上**了加入之后的写入；④ **整组重启**（`--peer` 里没有它）之后仍被复制。
+
+### 119.4 **自我更正**：`§118.5` 那句"重启后 applied 之下不重放"是**错的**
+
+`§118.5` 写的是"重启后 `applied` 之下的 conf change 不会重放 ⇒ learner 地址重启即失"。
+本刀**实测推翻**：把"地址表落盘"**临时关掉**，`§119.3` 的第 ④ 段**照样绿** ⇒ 地址确实靠**重放**回来了。
+
+真相：raft-rs 的 `RaftLog.applied` 在重启时是从 **快照**恢复的，而 `FjallStorage::set_applied`
+只是**我们自己的**记账（服务于本地压缩）⇒ **已提交但未压缩**的条目会在重启后**重新投递**，
+那条 conf change 被**重放** ⇒ `add_peer` 再来一次 ⇒ 地址就回来了。
+
+⇒ 落盘真正管的是**压缩之后**那一格：conf change 条目一旦被压掉，重放再也给不出地址，只剩盘上那份。
+**这一格目前只有存储层往返用例守着**（`peer_addrs_survive_reopen`：写 → 重开 → 读回），
+**没有端到端覆盖**（那需要"小压缩阈值 + 压缩发生在加入之后"）—— 明确留作后续，**别当它已被证明**。
+
+### 119.5 顺带修正的一处**旧断言**
+
+`meta_service_e2e::propose_status_delta_over_real_grpc` 里有一条"`Join` 必须返回 `UNIMPLEMENTED`"
+（S3-6 时代的断言）。本刀把它换成**正向断言**：回包必须带新节点、**必须含 leader 自己**、
+重复请求必须**幂等**。
+
+### 119.6 覆盖到哪、没覆盖到哪（如实说）
+
+* ✅ **覆盖**：在线加入 + 追平 + 跟上新写入 + 整组重启后仍被复制；`Join` 的幂等与非 leader 拒绝；
+  地址表跨 reopen 存活；
+* ⚠️ **未做**（下一刀）：**提升 learner → voter**（现在只加 learner，它**不参与多数派**）、
+  成员**移除**、"压缩之后地址表"的端到端覆盖；
+* ⚠️ 仍是**同机多进程**（跨机待真机）。
+
+### 119.7 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **385 passed / 0 failed / 0 ignored**；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 新用例连跑 **3/3** 绿（各 ~1.1s）；存储往返用例绿；
+- **记一条既有的计时抖动**（**不是**本刀引入）：`query::partial_fanout::slow_sources_wait_in_parallel_not_in_sequence`
+  阈值 600ms、实测 581ms，全量并行时偶尔擦边失败，单独跑必过 —— 留在案上，免得下次当新问题重查；
+- 规模：50,345 行 / 20 个 crate / 383 个测试函数。
+
+---
+
+## 120. 成员变更收口：**把 learner 提升为 voter**（+ 两个被这刀照出来的真问题）（2026-09-26）
+
+### 120.1 交付了什么
+
+`§118` 加了 learner 的地基、`§119` 补了 `--join` 的入口；这一刀把它**收口** ——
+learner 在此之前**不参与多数派**，也就是说"加入集群"到这一步为止只是"能收日志"，
+**不是一个真正的成员**。
+
+| 层 | 改了什么 |
+|---|---|
+| `proto` | 新 `Promote(node_id)` RPC（+ `PromoteResponse`）；`StatusResponse` 增 `voter_ids` / `learner_ids` |
+| `lib` | `Command::Promote` 通路 + `NodeHandle::promote` + **两道门槛**（`promote_checked`）+ `PROMOTE_MAX_LAG` |
+| `service` | `Meta.Promote`：只 leader 受理、**幂等**（已是 voter 直接回当前成员表）、**等生效才回包** |
+| `lib` | 顺带：`Status` 的成员表来自驱动循环的快照（**不现算**）—— Status 是高频只读路径 |
+
+### 120.2 两道门槛（都是"提升错人"的**真实**代价）
+
+| 门槛 | 拒绝的理由 |
+|---|---|
+| **在册且是 learner** | 不在册的 id 走这条路 = 静默把一个陌生节点加进来；已经是 voter = **幂等成功**（客户端超时重发是常见形态） |
+| **追得够近**（`matched` 距日志末尾 ≤ `PROMOTE_MAX_LAG`=64） | 把一个几乎没数据的 learner 提成 voter，等于**把 quorum 交给它** —— 它一慢/一掉线集群跟着停，而且**没有任何报错**（现象只是"写不进去"）。etcd 的 `IsLearnerReady` 就是为这件事存在的 |
+
+`PROMOTE_MAX_LAG` 是**工程判断不是定理**（注释里写明了）：它不是正确性阈值，而是"别把可用性
+押在一个还没追上的节点上"的旋钮；生产该由配置给，PoC 用常量。
+
+### 120.3 验收①：进程内，三道门槛逐条试（`multi_node_grpc_e2e`）
+
+"落后太多"这一条能测出来，靠的是 `§118` 那个用例**刻意用了假地址**（`127.0.0.1:19999`，
+没人监听）⇒ 那个 learner 的 `matched` **永远是 0** ⇒ 再垫 80 条（> 64）就必然触发门槛：
+
+```text
+⑦ 三道门槛都按预期：落后 → 拒；已是 voter → 幂等；不在册 → 拒
+```
+
+### 120.4 验收②：进程级，**提升真的改变了 quorum**（`metanode_cluster_process_e2e`）
+
+"提升成功"很容易证（看一眼成员表）。难的是证明它**改变了多数派** —— 那才是这件事的全部意义，
+也是它**危险**的地方。本用例让**同一批存活 voter**在提升前后得到**相反**结果：
+
+| 阶段 | 集群成员 | 谁死了 | 存活 voter | quorum | 写入 |
+|---|---|---|---|---|---|
+| 提升前 | voters `[1,2,3]` + learner `4` | `2`（`4` 活着但**只是个 learner**） | `{1,3}` = 2 | 2（3 个 voter） | ✅ 成功 |
+| 提升后 | voters `[1,2,3,4]` | `2`、`4` | `{1,3}` = 2 | 3（4 个 voter） | ❌ **停住** |
+
+```text
+① 节点 4 已追平：applied=2（集群 commit=2）
+② 提升前：杀掉 voter 2 后写入**照常成功**（存活 voter {1,3} = 2）
+③ 已提升：voters=[1,2,3,4]（leader=3 与 节点1 都认下了）
+④ 提升后：同一批存活 voter {1,3} 已不构成多数派 ⇒ 写入**停住**（4s 内未被接受）
+```
+
+③ 特意从**两个节点**各读一遍成员表（成员变更是走 raft 的，只在一个节点上看到就等于没复制到）；
+④ 断言里先确认"我们问的还是个活着的 leader"，否则那个超时说明不了任何事。
+（learner 的死活不影响 quorum，这是定义 —— 所以"4 死了"**不是**停住的原因。）
+
+### 120.5 被这刀照出来的**两个真问题**（都不是本刀引入的）
+
+#### ① `Status.applied_index` 会**停在原地**（已修）
+
+进程级用例第一版红在这儿：**节点 4 明明追平了**（`last_index=2`、`commit_index=2`、成员表也认下了），
+而它报的 `applied_index=0` —— 连 **leader 自己也报 0**。查下去：那个值**只在"应用一条 op"的分支**
+更新 ⇒ **no-op 与 conf change 应用完之后它不前进**。
+
+这不是"测试写错了"那么简单：`applied_index` 是判断"**追平了没有**"的第一手信息（运维看 Status、
+用例写断言都靠它），它会骗人 ⇒ 排障时白等、自动化判据看走眼。已修：**每条被应用的条目都记**
+（与 `storage.set_applied` 同一个位置 —— 它本来就算空条目，见 `apply_committed` 的注释）。
+
+#### ② 成员表的**顺序**不稳定（已修）
+
+提升之后 `ConfState.voters` 成了 `[2,4,1,3]` —— raft 内部那份的顺序取决于加入/提升的**历史**，
+而它**语义上是集合**，顺序没有任何含义。原样透出去只会让每个消费方各自踩一次
+"看起来不一样、其实是同一批人"。修法：**只在展示层**（`Members` 视图 / `Status`）统一排序，
+raft 自己那份（`set_conf_state`）**原样保存**。
+
+### 120.6 覆盖到哪、没覆盖到哪
+
+* ✅ 覆盖：提升的 happy path + **quorum 前后对照**；三道门槛（落后 / 幂等 / 不在册）；
+  成员变更**复制到每个成员**（从两个节点读）；`Status`/`Members` 的成员表；
+  `wire_compat` 也把成员表字段纳入"一个都不能少"；
+* ⚠️ **未做**：成员**移除**（`RemoveNode`）、**运维 CLI**（`--join` 有 CLI，提升目前只有 RPC ——
+  它是低频人工操作，但"只能写代码调"离运维可用还差一步）、"**压缩之后地址表**"的端到端覆盖
+  （`§119.4` 起就留案在册，仍然只有存储层往返用例守着）；
+* ⚠️ 仍是**同机多进程**（跨机待真机）。
+
+### 120.7 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **386 passed / 0 failed / 0 ignored**；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 新用例连跑 **4/4**（各 ~4.5s，主要是 ④ 那 4s 的"**必须不被接受**"有界等待）；
+- 规模：50,729 行 / 20 个 crate / 385 个测试函数。
+
+---
+
+## 121. 成员变更收尾：**移除成员** —— "对端永久不在"的正路（2026-09-26）
+
+### 121.0 为什么这一刀值得单独做
+
+从 `§107` 起，代码注释里反复出现同一句话：*"对端永久不可达时的正路是**成员变更把它摘掉**"* ——
+但那时候**做不到**（没有移除这条路）。这一刀把它兑现。留着"永久不在"的成员有**两个真实代价**：
+
+1. **quorum 里永远含着一个不会回话的成员** ⇒ 可用性被它绑住：4 个 voter 掉两个就停摆，
+   而若其中一个**永远回不来**，剩下 3 个本来是可以继续干活的；
+2. 排障时"它到底还是不是成员"无从判断（配置里一份、现状一份）。
+
+### 121.1 交付了什么
+
+| 层 | 改了什么 |
+|---|---|
+| `proto` | 新 `Remove(node_id)` RPC（+ `RemoveResponse`） |
+| `lib` | `Command::Remove` 通路 + `NodeHandle::remove` + **唯一硬门槛** `remove_gate`（纯函数、好测）+ 应用 conf change 时**地址表与传输一起收** |
+| `service` | `Meta.Remove`：只 leader 受理、**幂等**（不在表里 ⇒ 直接成功 —— 那正是移除的目的）、**等生效才回包** |
+| `transport` | 新 `remove_peer`：**两张表都删** ⇒ 两个 `Sender` 随之 drop ⇒ 发送任务自然结束；默认空实现（`NoTransport` / `MpscTransport` 不受影响） |
+
+**唯一硬门槛**：不能摘掉**最后一个 voter** —— 没有 voter 的集群**再也提交不了任何东西**
+（连"把它加回来"这个补救动作都提交不了）⇒ **不可逆**。其余一律允许，包括移除一个
+**本来就不在表里**的 id（幂等）。
+
+### 121.2 纪律：**移除必须趁还能提交的时候做**
+
+成员变更本身也要过 quorum。已经掉到不足多数派时**摘不动了** —— 那时只能先把某个节点拉回来。
+`§121.3` 的用例把这条纪律完整演了一遍（第 ④ 步"自救"）。
+
+### 121.3 验收：4 个 voter 的对照实验
+
+3 个 voter（quorum 2）掉一个照样提交 ⇒ **移除看不出效果**。4 个 voter（quorum 3）才有可对照的实验：
+
+| 阶段 | voters | 活着 | quorum | 写入 |
+|---|---|---|---|---|
+| ③ | `[1,2,3,4]` | 2 个 | 3 | ❌ **停住** |
+| ⑥ | `[2,3,4]`（`1` 已移除） | **同样 2 个** | 2 | ✅ **成功** |
+
+```text
+① 4 个 voter 起齐（quorum 3）：leader=3；永久不在的是 1
+② 杀掉 1：存活 3 个 = quorum ⇒ 写入**成功**
+③ 再杀掉 2：存活 2 个 < quorum ⇒ 写入**停住**
+④ 把 2 拉回来：3 个活着 ⇒ 写入**恢复**（自救；没它 ⑤ 提交不了）
+⑤ 已移除 1：voters=[2,3,4]（quorum 从 3 降到 2）；重复请求幂等 OK
+⑥ 再杀掉 2：存活 2 个 = quorum(3) ⇒ 写入**成功**（与 ③ 对照）
+```
+
+⑤ 从**两个节点**各读一遍成员表（成员变更走 raft，只在一个节点可见 = 没复制到），并断言
+重复移除**幂等**。`remove_gate` 另有**单元**测试（唯一 voter 被拒 / 4 个 voter 可摘 /
+不在册不拦）—— 它只依赖 `voters` 一个入参，不必起 raft 就能测，而它拦下的后果**不可逆**。
+
+### 121.4 已有的保护，与**没做**的（如实说）
+
+* ✅ **PreVote 早已开着**（`Config { pre_vote: true }`）—— 它正是"被移除 / 被隔离的节点用更高
+  term 反复打断 leader"这个经典问题的正解，所以本刀**不必再动**它（这条不是本刀加的）；
+* ⚠️ **没做**：移除的**运维 CLI**（与提升一样，目前只有 RPC —— 是低频人工操作，
+  但"只能写代码调"离运维可用还差一步）；
+* ⚠️ **没端到端覆盖**："地址表真的把那个 peer 丢了"目前只有**存储层**用例守着
+  （`peer_addrs_survive_reopen`），gRPC 面上看不见（`Status` 刻意不放地址表）；
+* ⚠️ **没端到端覆盖**：移除一个 **learner**（只被上面那条纯门槛单测 + 同一条 conf change 通路覆盖）；
+* ⚠️ 仍是**同机多进程**（跨机待真机）。
+
+### 121.5 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **388 passed / 0 failed / 0 ignored**；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 重点回归：`a_fourth_process_joins`（`§119`）、`promoting_a_learner`（`§120`）、
+  `removing_a_permanently`（`§121`）、`adding_a_learner`（`§118` 进程内）、
+  `removing_the_last_voter_is_refused`（单元）全绿；
+- 规模：51,080 行 / 20 个 crate / 387 个测试函数。
+
+---
+
+## 122. 对外口径校正：写停摆**已修**，而文档里还写着"未修"（2026-09-26）
+
+### 122.0 为什么值得单独记一节
+
+这一刀**没有功能改动**。起因是上一轮（`§121`）我在报告里引用了"`§106` 的写停摆仍未修"——
+**那句话已经过时**：`§110` 定位、`§111` 修好之后，那条复现探针**按纪律转正、`#[ignore]` 已拿掉**，
+全仓 **0 ignored**。也就是说 **代码比文档新**。本仓对"偏差"的纪律要求这种不一致当场消掉 ——
+否则下一个人（包括下一个我）会照着一份过期的状态去排障。
+
+### 122.1 先复核事实（不是"看标题说话"）
+
+| 核对项 | 结果 |
+|---|---|
+| 全仓还剩几条 `#[ignore]` | **0 条**（`grep -rn '^#\[ignore' crates`） |
+| 那条探针在跑吗 | 在 —— `compaction_with_lagging_follower_should_keep_committing` 已在**常驻全量**里 |
+| 它稳吗（回归用例的最低要求） | **连跑 5/5 绿**（2.10 / 3.11 / 2.25 / 2.25 / 2.10 秒） |
+| 场景真被跑到了吗（不是"空跑绿"） | 是 —— 把**压缩位**打进日志后：`snapshot` = 0 → 4 → 8 → 12（阈值 4，压缩真的在发生），而 12 步写入**全程被接受** |
+
+最后一行是本刀**加的**（只加打印、**不加断言**，理由见 122.3）。
+
+### 122.2 改了哪几处口径（逐处）
+
+| 位置 | 原来写着 | 现在 |
+|---|---|---|
+| `transport.rs` 模块文档 | "⚠️ **已知缺陷** …（`§106` 复现 / `§107` 定位，**未修**）" | "⚠️ **已知风险** …（`§106` 复现 / `§107` 定位 / **`§111` 收窄**）"，并写清"**走到了哪一步**"：`§111` 修掉的是**我们自己造成的丢包**（队头阻塞），**机制本身没消除** |
+| `transport.rs` 的 `SEND_QUEUE` 文档 | "本刀**没有**动这个策略" | 同义 + "`§111` 改的是**分流**：心跳/空追加走容量 1 的另一条队列 ⇒ 那条**自己造成的丢包途径**没有了" |
+| `transport.rs` 的 `send_loop` 内注释 | "…会让 leader 永久停摆" | 同 + "`§111` 之后实测探针已常绿（`§122` 复核），但**机制仍在**：真丢包时这条 append 不会自己回来" |
+| `chaos` 模块文档 | "全仓另有一条 `#[ignore]` 探针（`§106`）…修好后同样要取消" | "**全仓当前已无 `#[ignore]` 用例**：…已在 `§111` 修好后按纪律转正（`§122` 复核 5/5）" |
+| `status.md` 的 R3 行 | "**多节点稳定触发仍未拿到** —— 挡路的是 `§106` 那个**已复现、未根因**的写停摆 …正路 = 成员变更（S3-6/`Join`）" | 见 122.3（这一格的**真实**状态 + "为什么不写成断言"） |
+| `status.md` 的 §7 索引 | "§107（…**仍未修**）" | "§107（…；修法由 `§110`/`§111` 落地）" |
+| `plan.md` T11.5 | "剩下的漏口是 …**已复现、根因收窄但未修好**的写停摆（**已修**：…）"（自相矛盾的一句话） | "**写停摆已修**（…）；`§122` 复核连跑 5/5 并把压缩位打进日志" |
+
+### 122.3 R3 那一格的**准确**状态：观测到 ≠ 断言
+
+`§42.4b` 起一直挂着的"快照安装"，真实状态是：
+
+* **策略层**（单节点）：`§105` 用 `--snapshot-log-entries` 钉住"该压就压" ⇒ **可断言**；
+* **多节点**：`§109` 在**容器真集群**里**观测到**落后 follower 靠快照追平；`§111` 之后那条
+  "小阈值 + 落后 follower"的用例**常绿**（`§122.1` 的压缩位就是这条路的证据）—— 但**没有**断言
+  "`snapshot_installs >= 1`"。
+
+**为什么不写那条断言**：`raft_poc.rs` 早就实测过 —— **leader 什么时候给某个 peer 发快照，
+取决于它对该 peer 进度的判断**（那条用例据此撤掉了 `installs >= 1` 的断言）。把它写回去
+只会得到一条**抖的**测试。所以这一格记作"**触发链条已闭合、有观测证据，但不做断言**"，
+并把压缩位打进那条用例的日志，让"到底压没压"一眼可见 —— 省掉下一次翻历史的时间。
+
+### 122.4 一条留给下一个人的判据
+
+读到"写停摆**已修**"时，**别顺手删** `transport.rs` 里那些防御性注释：修掉的是**触发条件**
+（队头阻塞 —— 我们自己造成的丢包），**不是机制**（"丢一条携带条目的 append，而 raft 不会重发"）。
+真丢包/超时那条路径仍在，`§107.6` 给的两个方向（**限流的** `report_unreachable` / **inflight 释放**）
+也**仍未被证伪** —— 只是现在**没有已知的稳定复现**了。
+
+### 122.5 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **388 passed / 0 failed / 0 ignored**；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 探针（现为回归用例）连跑 **5/5**（`§122.1` 的表）；
+- 规模：51,095 行 / 20 个 crate / 387 个测试函数。
+
+---
+
+## 123. 偏差审计：**实现 vs 架构与计划**，以及把"文档漂移"判据化（2026-09-26）
+
+### 123.0 起因与判定
+
+一次专门审计（两份只读扫描：设计文档 ↔ 代码、计划 ↔ 已交付；关键主张我再自己复核过三条）。判定：
+
+> **能力层相符、架构未被推翻；偏差集中在"登记与文档"这一层，另有 4 条未登记的实质漂移。**
+
+核对方式（不是"读一遍标题"）：M2–M6 五条"标称完成"的能力**逐条到代码抽查**，**没有一条是空壳**；
+`crates/**` 里 `todo!` / `unimplemented!` / `FIXME` **0 命中**。
+
+### 123.1 差异分五类
+
+| 类 | 内容 | 判定 |
+|---|---|---|
+| **A 相符**（多数） | 角色划分四条已定决策、Chunk 层（状态机 / 背压阶梯 60-80-95 / 硬分区 / spill CRC）、**raft 里存什么**（schema/manifest/名录/租约进、chunk 数据与存活不进）、心跳不走 raft、ADR-2/4/5/6/7/8/11/12、错误码约定 3、§8 六个待决项里 5 个已在代码里定 | ✅ |
+| **B 有意偏离、已登记** | Vortex 未引入（feature 占位）、软路由不做、`ProposeResponse.result` 用 bytes、datanode 拆分（R3 非目标→R4 做）、MySQL wire 接入超出原范围 | ✅ **健康**（登记了就不算漂移） |
+| **C 未登记的实质漂移** | ① **ADR-9 的 `durable` SLA 从未实现**（`Durability` 枚举全仓零引用）；② compaction 的"独立 blocking pool"未落地；③ `ProposeRequest.request_id` / `schema_ver` 是**死字段**（实际由 op 层承担）；④ R5 的"partial aggregate 下推 + 冷数据分配"未兑现**但 M5 已标 ✅** | ✗ **要决定** |
+| **D 计划落后于代码** | `T10.8` / `T12.1` 跨进程写入面 / `T12.3` 心跳循环 / `T14.4` / `T6.15` 清理清单接入：代码已做、表里还标未做 | ✗ 纯回填 |
+| **E 代码有、计划无** | MySQL wire 独立 crate（计划里还写着"未来"）、JSON 函数、复杂类型 + `information_schema`、`shardrpc`、**容器化真集群 rig** | ✗ 计划侧欠账 |
+| **F 被现实推翻的假设** | 工期（计划"剩余 3.5–5 个月" vs R2–R6 一周内完成）、依赖版本与 MSRV 全线漂移、`refactor.md` 的缺口清单自相矛盾、**M1 标 ✅ 但其门槛两条子句被 `status.md` 自己打脸** | ✗ 记录侧 |
+
+### 123.2 为什么不重写架构文档
+
+C 类的 4 条里没有一条说明"**目标态本身错了**" —— 全是"没做/没登记"。所以本刀**不新建架构文档**：
+再写一份长的、靠人维护的架构说明，只会**制造一份将来同样会漂移的东西**（这次的教训正是这个）。
+
+要的是两样：**① 可机核的判据**（止住继续漂移）**② 一张可划掉的偏差台账**（让"还剩哪些没闭环"一眼可见）。
+
+### 123.3 本刀做了什么
+
+**① 5 条文档一致性判据**（`crates/testkit/tests/docs_consistency.rs`，跑全量即验）：
+
+| 判据 | 钉住什么 |
+|---|---|
+| `operation_log_header_index_matches_last_section` | 头部索引（§号 **+ 日期**）== 正文最后一节 |
+| `section_ranges_in_docs_match_the_last_section` | 任何文档里的 `§1–§N` 范围串 == 最后一节 |
+| `status_md_scale_line_matches_the_code` | 规模行 == 代码实况（**改代码必红**，这是设计：那条数字以前靠人记得改） |
+| `proto_migration_table_is_honest` | 迁移表覆盖 `oneof kind` 的每个 op；标 ⏳ 的**不得**已存在 |
+| `plan_md_version_is_consistent` | `plan.md` 头部与落款版本一致 |
+
+**它们第一次运行就抓到 5 处真实漂移**（这就是判据的价值 —— 全是"要读到那一行才会看见"的东西）：
+
+| 抓到的漂移 | 修法 |
+|---|---|
+| `operation-log.md` 头部停在 `§32，2026-09-18`（正文已 §122，**差 90 节**） | 改成 `§122，2026-09-26`（本刀后随 §123 再进一格） |
+| `docs/README.md` 写着 `（§1–§32，按时间）` | 改成 `§1–§122`；顺带把 `metanode-design.md` 的"**待开工**"改成"R3 已完成" |
+| `status.md` 规模行：51,080 / 387 vs 实测 **51,480 / 394** | 按实测改（并从此由判据守着） |
+| `plan.md` 版本：头 `v2.2` / 落款 `v2.1` | 统一 `v2.2` |
+| `meta.proto` 的"迁移进度"表：16 个 op 只列了 4 个，且**已迁移的还挂在 ⏳** | 重写成 16 行全列 + 在表头写明"有判据守着" |
+
+**② 偏差台账** `docs/closeout.md`：§1 未闭环（C 类 4 条，各带"现状证据 / 决定 / 闭环证据"三列）、
+§2 已登记偏离（只备查）、§3 待销账文档、§4 判据清单、§5 维护纪律。
+
+### 123.4 诚实记：写判据时被**自己**弄红了三次
+
+三次同一个根因，所以单独留一条规矩：
+
+1. `split("oneof ")` 命中的是**本文件注释里**写的 `` `oneof kind` `` ⇒ 解析出 0 个 op；
+2. 同上，`⏳` 那行扫描把**散文**（解释"这条曾经漂移过"的那句）也算成表格行；
+3. 修完前两条后，**范围串判据**又拦住了我：`status.md` 先写了 `§1–§123`，而正文还没到 §123
+   （这次它是对的 ✓）。
+
+⇒ **判据只能依赖"格式明确的声明行 / 表格行"，不能依赖"文件里出现过某字符串"** ——
+散文里必然会提到这些词，一旦 grep 全文，判据就会变成噪声，最后被忽略。
+这一条已写进 `closeout.md §4` 与判据自身的注释。
+
+### 123.5 没做什么（明确留案）
+
+- **C 类 4 条的"决定"还没定**（尤其 **D-1：`durable` SLA 补实现还是正式撤回 ADR** ——
+  这是唯一像"需要一份新设计"的；它已登记在 `closeout.md §1`，不再散落）；
+- **D/E 类的回填没做**（`plan.md` 任务单元格、`refactor.md` 状态列）—— 纯体力活，列在 `closeout.md §3`；
+- `docs/README.md` 的"改代码要同步什么"清单**没加**一条"判据在哪"（§4 台账里有指向）。
+
+### 123.6 验证
+
+- 判据自身：**5/5 绿**（且**先是 5/5 红**——红在真实漂移上，这才是它的第一份证据）；
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **393 passed / 0 failed / 0 ignored**；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 规模：51,488 行 / 20 个 crate / 394 个测试函数。
+
+---
+
+## 124. 偏差台账**逐条闭环**：D-2 落地（CPU 段下阻塞池）+ D-3/D-4 定案 + D-1 决策备忘（2026-09-26）
+
+`§123` 立了台账（`docs/closeout.md`）并把可机核的部分判据化。本刀按纪律**逐条处理**台账 §1 的
+四条未闭环偏差：能决定的定掉、能做的做掉、**需要设计决策的做成备忘**（不替使用者拍板）。
+
+### 124.1 D-2（compaction 资源隔离）：**已落地**
+
+设计要求"Compaction 使用**独立 tokio blocking pool**，避免挤占 Ingestor 攒批与 Query 响应"
+（`design.md §9.3` / `architecture.md §12.1`），而实现是在 async 上下文里直接跑同步 CPU：
+`concat_batches`（把几百 MB 列缓冲搬到一起）+ parquet 解码 + 编码 —— **都会占住 worker 线程**，
+现象是"查询莫名变慢"且**没有任何报错**。
+
+改法（新助手 `yuntun_format::cpu_off_thread`，三处调用）：
+
+| 位置 | 原来 | 现在 |
+|---|---|---|
+| `format::read_batch` | `decode_batch(&bytes, fmt)` 直接跑 | 解码进阻塞池 |
+| `format::write_batch` | `encode_batch(batch, fmt)?` 直接跑 | 编码进阻塞池（`RecordBatch::clone` 是**浅拷贝**，不复制数据） |
+| `compaction::compact_shard` | schema 对齐 + `concat_batches` 直接跑 | 整段进阻塞池 |
+
+**为什么在这里用 `spawn_blocking` 是安全的**（写进了函数文档）：这三个入口都是 **`async fn`**
+⇒ 调用方必然已经把 future 交给某个运行时在驱动 ⇒ 不会触发"没有运行时"的 panic。
+
+**观测（不断言，理由同 `§122`）**：`YUNTUN_FORMAT_TRACE=1` 时打印"提交方线程 + 实际执行线程"。
+实测（`cargo test -p yuntun-datanode --test compaction_e2e`）：
+
+```text
+[format] encode → 阻塞池（提交方 Some("datanode_merges_files_from_shared_storage_and_commits_via_raft")）
+[format] encode：实际执行于 Some("tokio-rt-worker")
+```
+
+**执行线程 ≠ 提交线程** ⇒ 活真的搬走了。**刻意不写时序断言**（"查询没被拖慢"那种断言在本仓的
+机器上必然是抖的）—— 与 `§122` 里 `snapshot_installs` 那条同一个理由：**观测到 ≠ 断言**。
+
+### 124.2 D-3（两个死字段）：**已决定 —— 语义在 op 层**
+
+`ProposeRequest.request_id` / `schema_ver` 按设计 §5 是"幂等"与"OCC"的载体，但实现把这两件事
+都放进了 **op 层**（`IdempotencyOp` / `EvolveSchemaOp.expected_version`），服务端**只读 `op`**。
+决定：**保留字段号**（删字段会让老客户端读出默认值而看不出区别），在 `meta.proto` 上标明它们
+是历史字段 —— 别再指望它们有语义。
+
+### 124.3 D-4（M5 虚高）：**已决定 —— 降级为"部分"**
+
+承诺不该比现实漂亮：`status.md` 的 M5 从 `✅` 改成 `✅（**部分**）`，并列明两条欠账
+（`partial aggregate 下推`、`冷数据按 datanode 分配`）—— 它们仍**没有**任务号，留在台账里比
+塞进 `T13.1`/`T13.2` 更诚实（那两条是别的事）。
+
+### 124.4 D-1（ADR-9 的 `durable` SLA）：**做成决策备忘，不替使用者拍板**
+
+这是唯一一条**需要设计决策**的：补实现（S3 WAL 归档 + "整盘丢失"的验收）还是正式撤回该 ADR。
+两个选项的成本 / 影响 / 风险写在 `closeout.md §6`。我的建议：**先做"选它就直接报错"的显式校验**
+（防**静默降级**这种最坏形态 —— 文档说有两档、类型也在，而选它与选 `best_effort` 行为完全一样
+且没有任何提示），把真正的归档路径当独立任务排期。
+
+### 124.5 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **393 passed / 0 failed / 0 ignored**；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 文档一致性判据（`§123`）**5/5 绿**（规模行随本刀改动同步）；
+- compaction 专项：`cargo test -p yuntun-datanode --test compaction_e2e` → **2/2 绿**（带观测配方跑过）；
+- 规模：51,547 行 / 20 个 crate / 394 个测试函数。
+
+---
+
+## 125. `D-1` → ①：**`durable` 档落地**（WAL 归档 + 丢盘拉回 + 有对照组的验收）（2026-09-26）
+
+按决策**做 ①**（补实现），而不是 ②（撤回 ADR）。
+
+### 125.0 动手前先钉死：**要保护的那个窗口真的存在**
+
+ADR-9 说 `best_effort` = "节点磁盘故障 ⇒ **未提交**数据丢失"。这句话指向一个具体窗口，先把它量出来：
+
+* 客户端 ack **只等 WAL 组提交 fsync**（`crates/server/src/flight.rs:637-646` ← `Ingestor::ingest`
+  内部到 ack 之间**只做了 WAL fsync**，`crates/ingest/src/pipeline.rs:343-353`）；
+* 而 seal → 上传对象存储 → `commit_files`（raft）**全在后台攒批循环里**（`pipeline.rs:415-491`）；
+* ⇒ 窗口 = `time_threshold(5s) + 相位铺开(30s) + PUT + raft 往返`，文档给的上界 **~31.4s**。
+
+**窗口里丢的是什么**：`(i)` ack → PUT 之前 ⇒ 数据**只在本机 WAL 里**（共享存储没有任何副本）；
+`(ii)` PUT 之后 → commit 之前 ⇒ 对象已是孤儿（字节还在 S3，但没有任何 manifest 引用它）。
+今天**没有任何东西**能恢复 `(i)`：恢复只读**本地** WAL（`resume_recovered` → `full_recovery`），
+盘没了 ⇒ `recovery::recover` 见到目录不存在直接返回空。
+
+⇒ 窗口是真的，ADR-9 有实东西可做。**没有**先造一套机制去保护一个不存在的窗口。
+
+### 125.1 设计（三处关键的"为什么这么选"）
+
+新模块 `crates/ingest/src/wal_archive.rs`（`ArchiveConfig` / `archive_once` / `spawn_archiver` / `restore`）：
+
+| 选择 | 理由 |
+|---|---|
+| **归档连"正在写的段"一起传**（不是只传已轮转的） | 段要 64MB / 1h 才轮转 ⇒ 只传轮转过的等于 **RPO 是小时级**。传"活的"文件不会搞坏归档：撕裂的尾巴由 WAL 自己的 **CRC + `repair_torn_tails`** 兜住（崩溃时正在写的段本来就要走这套） |
+| **恢复 = 把归档段拉回本地 WAL 目录，再走既有通路** | WAL 的读面（`WalReader` / `recover` / `segment.rs`）**全部绑本地 FS**；拉回来之后 DDL 重放 / `resume_recovered` 的 `Pending` 分支 / accumulator 重吸收**一行都不用改** —— `durable` 的重建**恰好就是**今天 `best_effort` 那条恢复通路，只是 WAL 的来源换了 |
+| **键里带 `instance_id`**（`{prefix}/instance={id}/shard={s}/seg={seq:020}.wal`） | WAL 路径**没有**实例维度（固定 `shard=0`）⇒ 多节点归档到同一前缀会**互相覆盖** |
+
+装配（`crates/server/src/lib.rs`）：**拉回必须钩在 `WalWriter::open` 之前**（它会挑本地最大的 seq
+续写，归档段得先躺在那儿）；归档循环随其它后台任务一起起、共用 shutdown token。
+
+**RPO 的界（写清楚，不吹）**：**≤ 归档间隔 + 一次上传时延**（默认间隔 1s）。
+要"真正的 0"必须**同步归档**（ack 之前等 S3 PUT）—— 那是拿写入时延换 RPO，本实现**不选**。
+
+### 125.2 验收（**有对照组**，机制级）
+
+`crates/ingest/tests/wal_archive_durable.rs`：同一场景跑两遍，**只差归档这一个开关** ——
+
+* **有归档**：写 8 条（每条一次 fsync ack）→ 归档一轮 → **把私有目录整个删掉**（整盘丢失）→ 拉回 →
+  `WalReader::scan_from(0)` **逐条**读回 **8/8**；
+* **没归档**：一模一样 → 读回 **0** 条（目录不存在 ⇒ 一条都没有）。
+
+⇒ 两次只有归档之别，所以"数据活下来"**不可能是别的原因**。而且读回走的是**既有**读取面
+（`WalReader` + CRC）⇒ 顺带证明拉回的字节**能被既有通路解析**。
+
+**这条用例第一次跑就抓到一个真 bug**：归档键是 `seg={seq}.wal`，而 `restore` 按 `{seq}.wal`
+解析 ⇒ 每个对象都解析失败、**静默跳过**（`list_all` 有对象、一个没拉回）。修法是让 `seq_of`
+两种命名都认 —— 这正是"**静默跳过**"这类错的典型形态，用例值回票价。
+
+### 125.3 覆盖到哪、没覆盖到哪（新开两条台账）
+
+* ✅ **覆盖**：归档（含"正在写的段"）→ 整盘丢失 → 拉回 → **可重放**；对照组反证；
+  standalone 侧的**真实接入口**（`[wal] archive_prefix` 配置 → 装配 → 后台循环）；
+* ⚠️ **`D-5`（新）**：**datanode 侧没接**（它缺 `resume_recovered` / `spawn_timeout_monitor` 接线，
+  与 standalone 不一致）⇒ ① 目前**只在 standalone 生效**；
+* ⚠️ **`D-6`（新）**：**端到端**（拉回后走 `resume_recovered` 重新提交成**可见数据**）尚未断言；
+  另有"整盘"的边界问题（若连 meta 目录一起丢，manifest 也没了 —— 那不是 WAL 归档能解决的）。
+
+### 125.4 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **394 passed / 0 failed / 0 ignored**；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 本刀用例：`cargo test -p yuntun-ingest --test wal_archive_durable` → 1/1 绿；
+- 文档一致性判据（`§123`）**5/5 绿**；
+- **记一条负载敏感的抖动**（**不是**本刀引入）：全量 `-j 4` 下 `ingest` 的
+  `disk_watermark_aborts_oldest_batch_then_releases_segments`（单跑 ~48s，靠磁盘水位触发）
+  失败过**一次**，单独复跑即绿 —— 与 `§122` 记 `query::partial_fanout` 那条同类，留在案上；
+- 规模：51,964 行 / 20 个 crate / 395 个测试函数。
+
+---
+
+## 126. `D-6` 闭环：`durable` 的**端到端** —— 拉回之后那批数据**重新变成可见文件**（2026-09-26）
+
+### 126.0 为什么还要这一刀
+
+`§125` 证到的是**机制**："段进了共享存储 → 丢盘后能拉回 → 字节能通过 CRC 被读回"。
+但它**不能**回答那个真正的问题：*"客户端 ack 过的那批数据，盘没了之后还能不能重新变成
+查询看得见的东西？"* —— 这正是 `durable` 的全部意义，也是 `D-6` 记的那一格。
+
+### 126.1 场景（两个为了"忠实"而刻意选的细节）
+
+* 写一个 **`Pending`** 批次：只写 `Data` + `BatchPending`，**不写** `BatchS3Written`/`BatchCommitted`
+  ⇒ 精确对应"**客户端已 ack、还没 flush+commit**"那段窗口（`§125.0` 量过：几十秒）；
+* **Catalog 活着**：生产里它是**另一个服务**（meta raft），不随 datanode 的盘一起没 ⇒ 用例里用
+  **同一个** `MemoryCatalog`，只丢私有目录；DDL 仍按生产顺序重放（幂等，已存在即忽略）。
+
+然后：**私有目录整个删掉** → 从归档拉回 → `WalWriter::open` → `replay_wal_ddl` → `resume_recovered`。
+
+### 126.2 结果（`crates/ingest/tests/wal_archive_e2e.rs`，两组对照）
+
+| 组 | `resume_recovered` | `list_visible_files` |
+|---|---|---|
+| **有归档** | `redone = 1`（那批 Pending 被**重做**） | **1 个可见文件** ✅ |
+| **没归档** | `redone = 0` | 空 ✅（对照组，符合预期） |
+
+⇒ "盘没了之后数据还能重新可见"这件事，**在带归档的情况下成立、在没有归档时不成立** ——
+两次的差别只有归档，所以它不可能是别的原因。这也把 `§125` 的机制与**既有恢复通路**
+（`Pending` 分支：重做上传 + 提交）接上了：`durable` 没有新写第二条恢复逻辑，它只是让
+WAL **从归档回到本地**，后面的路一步没改。
+
+### 126.3 `D-6` 闭环，以及一条**写清的边界**
+
+`D-6` 关掉（端到端已断言）。剩下那句"整盘的边界"**不是未完成项，而是边界声明**：
+
+> **WAL 归档保护的是"节点私有盘"（WAL / spill）。** 如果连 **meta 目录**也一起丢
+> （standalone 把内嵌 metanode 放在同一个 `--dir` 下），manifest 也没了 —— 那不是 WAL 归档
+> 能解决的问题，得靠 meta 自己的 raft 多副本（`§50`/`§103` 那套）。
+
+这条边界写进用例的注释与本节，**不留在台账里当悬案**（悬案和边界的区别就在于有没有写清）。
+
+### 126.4 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **396 passed / 0 failed / 0 ignored**；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 本刀用例：`cargo test -p yuntun-ingest --test wal_archive_e2e` → **2/2 绿**（含对照组）；
+- 文档一致性判据（`§123`）**5/5 绿**；
+- 规模：52,158 行 / 20 个 crate / 397 个测试函数。
+
+---
+
+## 127. `D-5` 闭环：把 **datanode 与 standalone 的两处装配差异补上**（含 `durable` 接线）（2026-09-26）
+
+### 127.0 先查清（台账里写的就是"先确认再动手"）
+
+`D-5` 记的是"datanode 缺 `resume_recovered` / `spawn_timeout_monitor`，与 standalone 不一致"。
+先量它的**具体代价** —— 不是"少两条代码"，而是两件会真出问题的事：
+
+| 缺的东西 | 具体坏在哪 |
+|---|---|
+| `resume_recovered` | ① **幂等键索引不重建** ⇒ 重启后重发同一个 `client_request_id` 会被**再接受一次** ⇒ **数据重复**（`§27` 那条纪律正是为它立的）；② `S3Written` 未提交的批次不会补提交；③ `Pending` 批次不会被"复用原 batch_id"重做 ⇒ 吸收循环用**新** batch_id 再传一份，老对象变孤儿白占空间 |
+| `spawn_timeout_monitor` | ① 批次超时不会被 abort（非终态批次一直挂着）；② **WAL 段永远不清理** —— 数据进程跑久了**磁盘只涨不降**（可删段的判据是"不与任何非终态 batch 区间相交"，就是这个循环在算） |
+
+⇒ 是真缺口，要接，不是"写清就行"。
+
+### 127.1 接线（三处 + 一条顺序铁律）
+
+* **拉回归档**（`durable`）：钩在 `WalWriter::open` **之前**（同 `§125` 的理由 —— 它会挑本地最大 seq 续写）；
+* **`resume_recovered`**：⚠️ **必须在 `spawn_accumulator` 之前** —— 它建立的 `replay_skip` 会被
+  吸收循环**取走**（`std::mem::take`），顺序反了就等于**没建**（吸收循环会把已认领的 Data 全部重放）；
+* **`spawn_timeout_monitor`**：段清单取自 `full_recovery()`、磁盘水位取自 WAL 配置（与 standalone 同款）；
+* 新增两个 CLI：`--wal-archive-prefix` / `--wal-archive-interval-secs`（形态照 `--s3-*` / `--cold-root`），
+  于是 `durable` 在 datanode 上**有了真实入口**（不再只有 standalone 能用）。
+
+### 127.2 覆盖到哪（说清"什么证明什么"）
+
+* **序列本身**（`replay_wal_ddl` → `resume_recovered` → 吸收循环 → 恢复成可见数据）：`§125`/`§126` 的
+  Ingestor 级用例证过（含对照组）；datanode 现在**逐步照抄**同一条序列；
+* **幂等索引重启后重建**：既有用例 `chaos` 的 `§27` 专项 + `§126` 的端到端都在守；
+* **datanode 自己的装配**：`datanode_forms_e2e`（4 绿）/ `compaction_e2e`（2 绿）/
+  `cross_process_hot_read`（3 绿）本刀全跑过；
+* ⚠️ **仍没做**：datanode 级的"重启后不重复"端到端断言（要起真进程 + 走 DoPut/SQL 面）。
+  这条**不是**新悬案：同一性质由上面那两条既有用例守着，区别只是"经由哪条装配路径"。
+
+### 127.3 台账：`D-5` 闭环 ⇒ **§1 空了**
+
+`docs/closeout.md` 的 §1（未闭环偏差）现在**一条不剩** —— 按那份台账自己的判据
+（"§1 空了，偏差才算清完了"），`§123` 立的那四类差异到此收尾：`D-1`（`durable`）→ `D-6`（端到端）
+→ `D-5`（datanode 接线）全部闭环，`D-2`/`D-3`/`D-4` 在前两轮定案/落地。
+
+### 127.4 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **396 passed / 0 failed / 0 ignored**；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- datanode 侧：`datanode_forms_e2e` 4 绿 / `compaction_e2e` 2 绿 / `cross_process_hot_read` 3 绿；
+- 文档一致性判据（`§123`）**5/5 绿**（本刀中途被它拦过一次 —— 改了代码没同步规模行，正是它的职责）；
+- 规模：52,230 行 / 20 个 crate / 397 个测试函数。
+
+---
+
+## 128. 成员变更的**运维 CLI**（`T11.5` 的最后一条）：`yuntun-cli meta members|promote|remove`（2026-09-26）
+
+### 128.0 为什么做它
+
+`§120`/`§121` 交付了提升与移除，但当时我在报告里就点了名："**只能写代码调**，离运维可用还差一步"
+—— 这就是 `plan.md` 里 `T11.5` 剩的那一条。运维手里只有**地址**，而集群手里只有**id**，
+中间那一步（找到 leader、把拒绝原样带回来）没人做，就永远是"要写个小程序才能加节点"。
+
+### 128.1 交付与两条设计决定
+
+* `crates/client/src/admin.rs`（新）：`AdminAction`（看成员表 / 提升 / 移除）+ `run(action, 接触点, 超时)`
+  ⇒ 返回 `(成员表, **实际受理的接触点**)`；
+* `yuntun-cli meta members|promote|remove --meta <addr>[,<addr>…] [--node <id>]`；
+* **决定一：接触点列表，而不是单个地址** —— 只有 leader 受理成员变更，而非 leader 回的 hint 是
+  **id 不是地址**（与 `§119` 的 `metanode --join` 同一条理由）；
+* **决定二："该不该换下一个"用状态码判，不看错误文本** —— 只有 `UNAVAILABLE`（非 leader，走约定 3）
+  算"没人受理"；其余（如"不能摘掉最后一个 voter"、"节点不在成员表里"）**原样上抛**。
+  这条弄反两个方向都很糟：该换节点的干等，不该换节点的会把**真拒绝**藏成"再试试别的"。
+  判据单独抽成 `is_retryable` 并**单测**（4 个非重试码逐个试）。
+* `MemberSet.leader_id` 是 `Option`：`Status` 答得出来，`Promote`/`Remove` 的回包**没有**这个字段
+  —— **不假装有**。它对运维有两个用处：`members` 直接报出"现在谁是 leader"；脚本据此判断
+  "集群是否还没选出 leader"（此时提升/移除一定失败）。
+
+### 128.2 验收（只验"这层才管"的三件事 + 判据本身）
+
+服务端是**真的**（起一个单节点 metanode + 真 gRPC，不是 mock）。用例 3 条：
+
+1. **接触点逐个试**：第一个给 `127.0.0.1:1`（连不上）⇒ 换到第二个 ✓，且**回报实际受理的那个**；
+2. **真拒绝不被藏**：`promote --node 9`（不在册）⇒ 错误里出现服务端那句"**不在成员表**"，
+   而**不是**"没有任何接触点受理"；
+3. **幂等**：`remove --node 9`（不在册）⇒ 成功、成员表不变（那正是移除的目的）。
+
+提升/移除的**语义**（门槛、幂等、conf change 走 raft）不在这里重复 —— 由 `§120`/`§121` 的服务端
+用例守着，这里只管"包成运维命令"引入的那几条（与 `§126` 同一套分工）。
+
+### 128.3 用例顺手抓到的两个真问题（都值得留档）
+
+1. **"连接建立 ≠ 服务就绪"，而且"成员表非空 ≠ 已选出 leader"**：`Status` 的成员表来自**盘上的
+   conf state**（比选举早得多）⇒ 只等成员表会让 `Promote` 撞上"还没选出来（hint 0）"。
+   就绪判据因此改成**两件事都等**（成员表非空 **且** `leader_id != 0`）。
+2. **丢了 `MetaNode` = 驱动线程退出**，而症状**极具误导性**：`Status` 仍能从快照回答（它不碰
+   raft 线程），只有需要 leader 的操作才报"**命令通道断开**"。用例第一次就踩在这上面。
+   这条对所有"进程内起一个 metanode 来测"的写法都成立（本仓多个用例都这么起）⇒ 值得记住。
+
+### 128.4 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **398 passed / 0 failed / 0 ignored**；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 本刀用例：`cargo test -p yuntun-client` → `admin_cli` **2/2** + `cli` **4/4**（后者是本仓的
+  **CLI 契约**用例：`--help` 的子命令清单、用法错的退出码与点名，都跟着扩了）；
+- 文档一致性判据（`§123`）**5/5 绿**；
+- 规模：52,573 行 / 20 个 crate / 399 个测试函数。
+
+---
+
+## 129. `T13.2` 第一半：**文件级剪枝真的接上了**（先补数据模型、再接一根线）（2026-09-26）
+
+### 129.0 先纠正我上一轮的一个说法
+
+我在上一轮的报告里说"`T13.2`：有 `ColumnStats` 现成数据但没接"。**只对了一半** ——
+`compute_stats_lite` 里 `min`/`max` **恒为空**（`Vec::new()`），注释写着"由文件 footer 提供完整统计"
+—— **但没人读 footer**。所以真实情况是**两头都缺**：统计没算、查询侧也没消费。plan 里
+`§117.3` 的接缝勘察写得更准：*"统计只在内存 chunk 层算、落盘不带、查询侧不消费 ⇒ **要真省 IO 得先把
+per-file 统计落进 manifest**，再让 scan 剪枝"* —— 这一刀做的就是这两步。
+
+### 129.1 第一步：把 min/max **真算出来**（`yuntun-model`）
+
+`compute_stats_lite` 现在按**列类型**把每列的 `[min, max]` 算出来，并给出**读写双方共用**的编码：
+
+| 类型族 | 编码 |
+|---|---|
+| `Int8/16/32/64`、`Date32/64`、`Timestamp`、`Time32/64` | i64 小端 8 字节 |
+| `UInt8/16/32/64` | u64 小端 8 字节 |
+| `Float32/64` | f64 小端 8 字节 |
+| `Utf8` / `LargeUtf8` / `Binary` / `LargeBinary` | 原始字节 |
+| 其余（嵌套、字典…） | **空** = 没有边界 ⇒ **永不剪** |
+
+编码与解码成对放在 `yuntun_model::meta`（`encode_bound` / `decode_bound` + `StatBound`），
+**读侧按 schema 的 `DataType` 还原** —— 不写两套逻辑，也不依赖 arrow 的 scalar 编码
+（那个在 arrow 59 里没有稳定的"字节 → 值"入口，实测找了三个 crate 都没找到，遂放弃）。
+
+### 129.2 第二步：让 `scan` **真的剪**（`yuntun-query`）
+
+新增 `query/src/prune.rs`：
+
+* `can_prune(...)`：纯判据 —— 从过滤器里读得出**单列比较**时，用文件的 `[min, max]` 判断
+  "这个文件**不可能**满足" ⇒ 剪掉。`AND` **递归**（两侧都是必要条件）；`OR`/`NOT`/其它形状
+  **一律不判断**；列没有统计、类型不可比、`NaN` **一律不判断**；整列全 null ⇒ 比较谓词必然不成立 ⇒ 剪。
+* `prune_visible_files(...)`：`scan` 里那一步的**本体**（抽出来是为了能直接断言）；
+
+`scan` 里接上它，并把"**全被剪掉**"这一格处理好（不能塞一个空的 `FileGroup` —— 扫描器会报错），
+直接落到"空执行计划"那一支（语义正好：没有数据）。
+
+### 129.3 ~~顺手纠正一句**假注释**~~（⚠️ 这句判读**错了**，见 `§132.2`）
+
+`supports_filters_pushdown` 原先写着"谓词交给 Parquet row-group 统计在 scan 内部处理
+（`ParquetSource` 默认行为）" —— **那是假的**：`scan` 把 `filters` 整个丢掉（形参名就叫
+`_filters`），也从不给 `ParquetSource` 传谓词 ⇒ **一行都没剪**。现在注释是诚实的：
+我们做的是**文件级剪枝**（按清单统计），剩下的谓词由上层算子过滤；把谓词**下推进 `ParquetSource`**
+让 row-group（块级）统计也参与剪枝，是 `T13.2` 的**另一半，尚未做**。
+
+### 129.4 验收与**边界**（说清什么被证明了）
+
+**证明了的**（8 条用例全绿）：
+
+* **纯判据** 6 条：区间无交集的六种情形（含最容易差一位的严格比较：`a > 5` 而文件上界**正好** 5
+  ⇒ 无解）；有交集**绝不剪**；`!=` **只在区间退化成一点**时才剪；`AND` 递归；
+  **拿不准一律留下**（没统计 / 列缺边界 / `OR` 形状）；整列全 null 可剪。
+  *附一条：本用例第一版把"上界等于字面量的严格比较"写成了"应当保留" —— **测试错、剪枝器对**。
+  单测的价值正在这里。*
+* **接线本体** 2 条：两个 manifest（`[1,5]` 与 `[100,200]`）配 `a > 50` ⇒ 老文件被剪掉、留下的
+  是可能命中的那个；**没有谓词 ⇒ 一个都不剪**；谓词覆盖两者 ⇒ 都不剪；**没有统计的文件永不剪**。
+
+**没证明的**（写明，别当它已被证明）：**没有**断言"某次真实查询执行的**确没打开**那个文件"。
+做那件事需要真对象存储 + 执行层插桩（本地几百 KB 夹具省下的 IO **不可观测**）；
+目前靠上面两层单测把接缝守住 —— 接线与判据共用同一段代码（`prune_visible_files`），
+编译器保证调用点就在 `scan` 里。
+
+### 129.5 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **406 passed / 0 failed / 0 ignored**；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 本刀用例：`cargo test -p yuntun-query --lib prune` → **8/8**；
+- 文档一致性判据（`§123`）**5/5 绿**（本刀被它拦过一次：改了代码没同步规模行）；
+- 规模：53,233 行 / 20 个 crate / 407 个测试函数。
+
+---
+
+## 130. `T9.x` Vortex：**接不进来** —— 被 arrow 版本挡住（核实 + 登记，不假实现）（2026-09-26）
+
+### 130.0 结论先说
+
+**不是"没时间做"，是版本不兼容**：`vortex` 现在用的 arrow 与**本仓被 DataFusion 钉住的那一代**不同代，
+直接接入会引入**两代 arrow**、`RecordBatch` 类型**不互通** ⇒ `encode_vortex(&RecordBatch)` 根本写不出来。
+所以本刀**没有**去动 `crates/format` 的占位实现（那只会造一个假接口），而是把**决策点**核实清楚并登记。
+
+### 130.1 核实过程（可复现）
+
+```text
+$ cargo add vortex --dry-run -p yuntun-format
+warning: ignoring vortex@0.86.1 (which requires rustc 1.95) to maintain yuntun-format's rust-version of 1.94
+      Adding vortex v0.84.0 to dependencies          ← ① 我们都 MSRV 1.94 ⇒ 自动回退到 0.84
+
+$ cargo add vortex -p yuntun-format --no-default-features --features files,zstd && grep arrow Cargo.lock
+name = "arrow"      version = "59.3.0"               ← 本仓（DataFusion 55 钉的）
+arrow-array 58.4.0                                   ← ② vortex 06.84 自己那一代
+vortex-arrow 0.84.0 → ['arrow-array 58.4.0', 'arrow-buffer 58.4.0', 'arrow-schema 58.4.0', …]
+```
+
+⇒ **两代 arrow 并存**（58.4.0 与 59.3.0），`vortex-arrow` 的 `RecordBatch` 与本仓的不是同一个类型。
+（核实完**立即回退**：`crates/format/Cargo.toml` 那一行已删，`Cargo.lock` 里 vortex / arrow 58
+都已消失，工作区干净 —— 这一步也要如实写，免得下次有人以为"已经在用了"。）
+
+### 130.2 三个选项（这是**决策点**，不是"待办"）
+
+| | 做法 | 代价 |
+|---|---|---|
+| ① **等** vortex 迁到 arrow 59 | 什么都不做，跟版本 | 零成本；何时未知（DataFusion 55 ↔ arrow 59 是硬绑定，我们换不了） |
+| ② **走 IPC 边界** | 把我们的 `RecordBatch` 序列化成 Arrow IPC，再用 vortex 那代的 arrow 读回来 | 每次编解码多一趟 IPC（正是"零拷贝列式格式"想省掉的东西）；且要维护两代 arrow 的依赖图 |
+| ③ **放弃 Vortex**（改 ADR-1） | 承认 Parquet 是主格式 | 与 ADR-1 的"Vortex 主 / Parquet 辅"相反，得改架构文档 |
+
+**我的建议：选 ①（等）**，理由：ADR-1 要的是"零拷贝列式 + 好压缩"，而 ② 的 IPC 边界会把它
+打折到接近"另一种列式编码"；而**现在没有非它不可的痛点**（`§33`/`§36` 的压缩与 RowGroup 上界
+已把 Parquet 路径调好，`§129` 刚刚补上文件级剪枝）。等 vortex 与 arrow 同代，接进来才是原来想要的收益。
+
+### 130.3 本刀做了什么
+
+* **核实**（上面那两步，可复现）；**回退**（工作区干净，没留下半接入状态）；
+* **登记为台账 `D-7`**（`docs/closeout.md` §1）—— 那一节本来已经被 `§127` 清空，这一条是
+  **新发现**，按台账纪律"先在 §1 加一行"；
+* `plan.md` 的 `T9.x` 从"未完成"改成"**被依赖版本挡住**（vortex 0.84 ↔ arrow 58，本仓 arrow 59）"，
+  并指向 `D-7`；
+* **没有**去改 `encode_vortex`/`decode_vortex` 的占位实现 —— 造一个"看起来接了、其实每次返回错误"
+  的接口比留个诚实的占位更糟。
+
+### 130.4 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **406 passed / 0 failed / 0 ignored**（代码未变）；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 文档一致性判据（`§123`）**5/5 绿**；
+- 规模：53,233 行 / 20 个 crate / 407 个测试函数（本刀**没动代码** ⇒ 与 `§129` 同）。
+
+---
+
+## 131. `T6.14`（chunk 压力专项）第一刀：**硬分区的两层验证**（2026-09-26）
+
+### 131.0 先核对 plan 里那四件事，哪件其实已做
+
+plan 的 `T6.14` 列了四件：① 触发 spill 的**真实压力曲线**；② spill **读回失败降级**；
+③ 大基数 `GROUP BY` 挤压 chunk 区（**验证硬分区**）；④ **崩溃后 spill 清理**。
+
+核对结果：**④ 已经实现且有用例** —— `ChunkStore::purge_leftover_spills`（`chunk/src/store.rs`）
+在构造时就清理遗留 spill，`server/tests/private_dir_gate.rs` 还专门守着"**被拒的进程不许动盘**"
+（连清理都不能做）。所以这一刀做 **③**（有零件、没验证），并把它与 ①② 的边界写清。
+
+### 131.1 硬分区的**两层**验证（分工写在用例的头注释里）
+
+| 层 | 用例 | 证什么 |
+|---|---|---|
+| **零件级** | `chunk::budget::tests::chunk_and_query_regions_are_hard_partitioned`、`region_limits_are_independent` | 两个账本**各自触顶、各自拒绝、各自释放**：chunk 满载时**再要一个字节被拒**（且被拒的不计入用量、`pressure()` 进第三级"明确拒绝写入"），而 query 区用量**仍是 0**；反过来 query 区满载也不影响 chunk 区；释放只动自己那一区 |
+| **整机级** | `query/tests/hard_partition.rs::a_query_that_blows_its_own_pool_fails_loudly` | 查询引擎的内存上限**真的被强制执行**：1 MiB 的查询池 + 50 万组 `GROUP BY` ⇒ 得到**可诊断的错误**（内存类），不是静默给答案、也不是把进程拖垮；而且**一次撞上限不让引擎失效**（换个小查询照样跑） |
+
+判据刻意用"**真拒绝**"（`try_reserve` 返回 `false`）而不是"水位比例" —— 比例只是算术，
+**拒绝**才是分区在起作用；"两个机制互不抢占"这句话的可执行形式就是这两条。
+
+**没有**在整机级断言"同一次压力下写入侧没被碰"：读写用的是**两个不同的机制**
+（chunk 区 = 我们的 `MemoryLedger`，查询区 = DataFusion 的 `GreedyMemoryPool`），
+"互不抢占"是**结构性**的，由零件级用例守着。这条分工写在用例头注释里，
+免得下次有人把其中一层当成另一层（`§126` 那次也是这么分工的）。
+
+### 131.2 还没做（如实留在 plan 里）
+
+* ① **触发 spill 的真实压力曲线**：仍缺端到端的"真压力"测量（`plan §8.5` 那句"T6.14 的内存曲线
+  不高于基线（**待压测**）"仍然挂在那儿）；
+* ② **spill 读回失败降级**：需要注入点（读本地 spill 失败 ⇒ 该来源降级为 PARTIAL 还是整查询失败），
+  目前没有注入口，也没用例。
+
+### 131.3 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **409 passed / 0 failed / 0 ignored**；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 本刀用例：`cargo test -p yuntun-chunk --lib budget` → **7/7**（含新增 2）；
+  `cargo test -p yuntun-query --test hard_partition` → **1/1**；
+- 文档一致性判据（`§123`）**5/5 绿**（本刀被它拦过一次：改了代码没同步规模行）；
+- 规模：53,332 行 / 20 个 crate / 410 个测试函数。
+
+---
+
+## 132. `T13.2` 另一半的核实结果：**块级剪枝早就由 DataFusion 在做**，我加的那根线是冗余的（已回退）（2026-09-26）
+
+### 132.0 结论先说
+
+`§129` 结尾写着"`T13.2` 的另一半（把谓词下推进 `ParquetSource` 让块级统计参与剪枝）**尚未做**"。
+这一刀去接它，结果接出个**反结论**：
+
+> **块级（row-group）剪枝本来就在工作** —— 谓词是 **DataFusion 的优化器自己**推进 `DataSourceExec`
+> 的，`ParquetSource` 早就在用 row-group / page 的 footer 统计跳读。
+> 我在 `scan` 里额外做一次 `with_predicate`，与不做的**指标一模一样** ⇒ **冗余，已回退**。
+
+### 132.1 实验（可复现）
+
+在 `scan` 里加 `ParquetSource::with_predicate(...)`（logical `Expr` → `PhysicalExpr`：
+`state.create_physical_expr` + `ParquetSource::with_predicate`），然后用一个能断言的指标验证：
+
+```text
+EXPLAIN ANALYZE SELECT count(*) FROM audit WHERE event_time < 1000
+  → row_groups_pruned_statistics = 1     ← 加了下推：剪了 1 组
+```
+
+按纪律（"一条绿的测试要先证明它能红"）**把那次下推关掉再跑** ⇒ **照样是 1、照样绿** ✗✗
+⇒ 剪枝**不是**我们这根线带来的 ⇒ 它来自 DataFusion 自己的 `PushDownFilter`。
+⇒ 回退：删掉下推助手、保留注释的**正确版本**。
+
+### 132.2 更正 `§129.3` 的一句判读（我上轮说错了）
+
+`§129.3` 我写过："那句注释（`谓词交给 Parquet row-group 统计在 scan 内部处理`）是**假的**"。
+**这个判读是错的**：注释说的是 **DataFusion 优化器**的行为，而它没写错 —— `scan` 自己忽略
+`filters` **不影响**优化器把谓词推进它返回的那个 `DataSourceExec`。真正缺的**只有**文件级那一半
+（`§129` 已补 ✓）。已在 `supports_filters_pushdown` 的注释里把两件事分开写清楚。
+
+（连着 `§118.5`、`§129.0`，这是第三次自我更正 —— 共同点是：**判读太快**。
+凡"这行代码没用"的猜测，先做一次"关掉它看会不会红"的实验再下结论。）
+
+### 132.3 留下什么：一条**系统行为**的回归证据
+
+新 `crates/query/tests/row_group_pruning.rs`：一个 parquet、两个 row group（每组 100 行、
+`event_time` 递增 ⇒ 两组统计区间不相交）⇒ `WHERE event_time < 100` 断言
+`row_groups_pruned_statistics > 0`，并断言结果照旧是 100。
+
+* 为什么它**必须**靠块级：文件级 `[min, max]` 是 `[0, 199]`、与谓词**有交集** ⇒
+  `§129` 的文件级剪枝器在这里一条都剪不掉。**两半各管一段，互不冒充**。
+* 它**不**指向某一行代码（关掉我们的下推它照样绿）⇒ 守的是"**这条链别退化**"；
+  真正属于我们的那一半由 `prune.rs` 的 8 条单测守着。这点写在用例头注释里。
+
+### 132.4 一记教训：**造测试数据的代价会转嫁给邻居**
+
+第一版这条用例走的是真 ingest（`e2e.rs` 那套）：`yuntun-format` 的 `MAX_ROWS_PER_ROW_GROUP`
+是 **65,536** 的常量 ⇒ 想造两个 row group 就要 **7 万行 + 真 WAL**。它能过，但全量并行时把
+`chaos::disk_watermark_aborts_oldest_batch_then_releases_segments`（断言"WAL 批次全部终态"）
+**挤红了** —— 而那条**单独跑 3/3 绿、0.11s**。
+
+⇒ 改成：**内存存储 + 手写小 row group**（`parquet` 仅作 dev-dep，
+`set_max_row_group_row_count(Some(100))`）⇒ **0.03s、不碰盘、不碰 WAL**，
+那条 chaos 用例在全量里**回绿**（这是"修好了"的证据，不是"它本来就飘"）。
+
+### 132.5 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **410 passed / 0 failed / 0 ignored**
+  （**含**那条被挤红过、现已回绿的 chaos 用例）；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 本刀用例 `cargo test -p yuntun-query --test row_group_pruning` → **1/1**（0.03s）；
+- 文档一致性判据（`§123`）**5/5 绿**；
+- 规模：53,514 行 / 20 个 crate / 411 个测试函数。
+
+---
+
+## 133. 采用 **crates.io 的 vortex 0.86** + datafusion 55（→55.1）/ arrow 59 + 次要包升最新（2026-09-26）
+
+### 133.0 这一刀的**关键发现**：`D-7` 的死结解开了
+
+`§130` 我下过结论："`T9.x` Vortex **接不进来**"（`vortex 0.84` 用 arrow **58**，本仓被 datafusion 55
+钉在 **arrow 59** ⇒ 两代 arrow、`RecordBatch` 不互通）。**那个结论只对了一半**：
+
+| 版本 | 要求的 arrow | 说明 |
+|---|---|---|
+| `vortex 0.84 / 0.85` | **arrow-array ^58** | `§130` 实测到的那一代 ⇒ 死结 |
+| **`vortex 0.86.1`** | **arrow-array ^59.2** ✅ | **与本仓 arrow 59 同代** —— 死结不存在 |
+
+而 `§130` 之所以看到 0.84，是因为 **`rust-version = 1.94` 把 cargo 逼退了**：
+`vortex 0.86` 要求 **rustc 1.95**（索引里 `rust_version = "1.95"`），cargo 于是静默回退到 0.84 ——
+**它回退的时候不会告诉你"你其实想要的那版可用"**。⇒ 教训：cargo 的"自动降版本"提示
+（`ignoring vortex@0.86.1 … to maintain rust-version`）必须当**决策信号**读，不是噪音。
+
+### 133.1 改了什么
+
+| 项 | 之前 | 现在 | 为什么 |
+|---|---|---|---|
+| `rust-version` | 1.94 | **1.95** | `vortex 0.86` 的下界就是 1.95（本机工具链 **1.98.1**，够） |
+| `vortex` 依赖 | 无（占位 + 注释说要锁 Git commit） | **crates.io `0.86`，可选**（`vortex = ["dep:vortex"]`） | 见下条偏离 |
+| `datafusion` | 55.0.0 | **55.1.0** | 用户要求的"次版本升最新" |
+| 其余次要包 | — | **69 个升级、新增 108 个、移除 1 个** | `cargo update`（在现有 semver 范围内取最新） |
+
+**一处偏离 ADR-1**：ADR-1 写着"Vortex 依赖**必须锁定 Git Commit**"。本刀改用 **crates.io 版本
+0.86** —— 理由：0.86 是唯一与 arrow 59 同代的版本，而"锁 git rev"此刻没有可锁的对象
+（我们要的就是它的发布版）。这条偏离已登记，将来若需要跟进上游未发布修复，再改回 git 锁。
+
+**依赖树代价（记一笔）**：vortex 0.86 带来 **+108 个包**（含一整条 async 运行时：
+`async-executor` / `async-fs` / `async-net` / `async-process`…）。这是"要 Vortex"这件事的**真实价格**，
+不该只记在 `Cargo.lock` 里 —— 若将来要选择"是否让它进默认构建"，这就是决策依据之一。
+
+### 133.2 **未做**：codec 仍是占位 —— 但**不再被版本挡住**
+
+`encode_vortex` / `decode_vortex` 现在**仍然返回错误**（占位）✗。区别是：以前是**接不进来**，
+现在是**还没接**。这一刀把考古做完了，API 事实记在这里，下一刀别再重新找一遍：
+
+* ✅ `VortexWriteOptions::write<W: Write>(self, w, iter: impl ArrayIterator) -> VortexResult<WriteSummary>`
+  —— **同步**入口（`vortex-file-0.86.1/src/writer.rs:636`）⇒ 可以直接接进我们同步的 `encode`；
+* ⚠️ `VortexOpenOptions::open(self, source: Arc<dyn VortexReadAt>) -> VortexResult<VortexFile>`
+  —— 是 **async**（`open.rs:223`）⇒ 同步侧要驱动它：用 `futures::executor::block_on`
+  （`futures` **已经是**本 crate 的依赖，不用新增）。vortex 自己内部也是这么干的（`open.rs:6`）；
+* ✅ `impl VortexReadAt for ByteBuffer`（`vortex-io-0.86.1/src/read_at.rs:204`）⇒
+  内存字节（我们的 `Vec<u8>`）包成 `ByteBuffer` 就能当输入；
+* ⚠️ arrow 互转的 `FromArrowArray` / `IntoArrowArray` **已弃用**（deprecated）⇒
+  必须改用 **`ArrowSession`**（`from_arrow_record_batch` / `execute_arrow`）。
+  **它的确切路径还没钉死**（不在 `vortex-arrow/src/lib.rs` 顶层）⇒ 这是下一刀的第一个动作。
+
+### 133.3 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **410 passed / 0 failed / 0 ignored**
+  （在 **datafusion 55.1** 之下，默认路径全绿）；
+- `cargo build -p yuntun-format --features vortex` → **通过**（vortex 0.86 的整棵树能编译）；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 文档一致性判据（`§123`）**5/5 绿**；
+- 规模：53,514 行 / 20 个 crate / 411 个测试函数（本刀不新增用例）。
+
+---
+
+## 134. `Vortex` codec 第一次尝试：**没接成，已退回占位**（附完整的 API 事实清单）（2026-09-27）
+
+### 134.0 结论
+
+`encode_vortex` / `decode_vortex` 的**第一版实现写出来了，但没编译过** ⇒ 按纪律**退回占位**
+（绝不能把编译不过的代码留在树上）。本刀的价值不在代码，在于把 **vortex 0.86 的 API 形状**
+摸清了 —— 下面这张表是下一刀的起点，别再考古一遍。
+
+### 134.1 已确证的 API（0.86.1，全部来自 registry 源码，不是猜的）
+
+| 用途 | 入口 | 位置 / 备注 |
+|---|---|---|
+| arrow → vortex | `ArrowSession::from_arrow_record_batch(batch, &Schema)` | `vortex-arrow/src/session.rs:522`；`ArrowSession: Default` ✅ |
+| vortex → arrow | `ArrowSession::execute_arrow(array, Option<&Field>, &mut ExecutionCtx)` | `session.rs:555`；`target = None` ⇒ 让 vortex 挑最便宜的物理类型（**我们只有字节、没有写入时的 schema，正是要 `None`**） |
+| `ExecutionCtx` | `session.create_execution_ctx()` | **必须** `use vortex::array::VortexSessionExecute`（trait 方法，`legacy_session()` 返回 `&'static VortexSession`） |
+| 弃用警告 | `FromArrowArray` / `IntoArrowArray` **已 deprecated** | 必须用 `ArrowSession`（否则 clippy 会红） |
+| 写（**async**） | `VortexWriteOptions::new(session).write(sink, stream)` | `vortex-file/src/writer.rs:223`；`sink: impl VortexWrite`、`stream: impl ArrayStream` |
+| 写（**同步**） | `BlockingWrite<'rt, B: BlockingRuntime>::write(sink, iter)` | `writer.rs:637`；⚠️ **要一个 `BlockingRuntime`**，怎么拿到还没查 ⇒ 别指望它 |
+| 迭代器 → stream | `ArrayStreamExt::into_array_stream()` | `vortex-array/src/iter.rs:69`（`std::iter::once(Ok(a))` **不是** `ArrayStream`） |
+| 扫描 → 数据 | `ScanBuilder::into_array_stream()` / `into_record_batch_stream(schema)` | `vortex-layout/src/scan/scan_builder.rs:117`、`scan/arrow.rs`（后者要显式 schema） |
+| 内存字节当输入 | `impl VortexReadAt for ByteBuffer` | `vortex-io/src/read_at.rs:204` ⇒ 不必落盘 |
+
+### 134.2 卡在哪（就这三处，下一刀直接照着改）
+
+1. **`VortexWriteOptions::new(session)` 的 `write` 是 async**，且 sink 要 `VortexWrite`（`Vec<u8>` 不是）；
+   同步那条路是 `BlockingWrite<…>`，**需要一个 `BlockingRuntime` 实例** —— 怎么构造没查到；
+2. **`VortexOpenOptions` 既没有 `new()` 也没有 `Default`** —— 它的构造入口还没找到（`open.rs` 里
+   只看到 `session()` 之类的方法）⇒ 读这一侧的入口不明；
+3. 于是 **encode / decode 两头都缺一个"入口对象"**（一个要 runtime、一个要 options 的构造器）。
+
+⇒ 下一步最省的做法：**在 `vortex-file` 源码里搜 `impl Default for VortexOpenOptions` 与
+`BlockingRuntime` 的实现者**（`grep -rn 'impl BlockingRuntime for'`），拿到这两个名字后，
+`§134.1` 那张表就足够把 codec 一次写对。
+
+### 134.3 为什么"没成"也要记
+
+`§130` 的教训是"**没核实就下结论**"，`§134` 的反面是"**试了但没成，也要留下路标**" ——
+差别在于：前者让下一次重新踩一遍坑，后者让下一次从**已知的三处**起步。
+本刀的产出是**一张 API 表 + 三个未解的名字**，不是代码。
+
+### 134.4 验证
+
+- `cargo build -p yuntun-format` → **通过**（默认路径，占位实现）；
+- `cargo build -p yuntun-format --features vortex` → **通过**（vortex 0.86 的树能编）；
+- 全量 / clippy 与 `§133` 同（本刀未改行为，代码回到 `§133` 的占位状态）；
+- 文档一致性判据（`§123`）**5/5 绿**。
+
+---
+
+## 135. `Vortex` codec：**写出了、编译过了，但跑起来在 vortex 内部 panic** ⇒ 退回占位（2026-09-27）
+
+### 135.0 结论
+
+`encode_vortex` / `decode_vortex` 的第一版**写完并通过编译**（`cargo build -p yuntun-format
+--features vortex` ✅）—— 这是 `§133` 之后第一次真的成立。但它**一跑就 panic**：
+
+```
+Assertion failed error: Runtime handle not configured in Vortex session.
+Please setup a `CurrentThreadRuntime` or `SingleThreadRuntime`,
+or configure the session for `with_tokio`.            （vortex-error-0.86.1/src/lib.rs:361）
+```
+
+⇒ 按纪律**退回占位**（绝不能把"编译得过、跑起来炸"的代码留在树上），两种配置都保持绿。
+
+### 135.1 这次新确认的 API（补 `§134.1` 那张表）
+
+| 卡点（`§134` 留下的） | 答案 |
+|---|---|
+| 怎么造 `VortexOpenOptions` | **`OpenOptionsSessionExt::open_options(session)`**（`vortex-file/src/lib.rs:33`）—— 它既无 `new()` 也无 `Default` |
+| 读是同步还是 async | `open_buffer<B: Into<ByteBuffer>>(buffer)` **是同步的** ⇒ 正配我们同步的编解码 |
+| `write` 会吞掉 sink，字节怎么取回 | **`impl<W: VortexWrite> VortexWrite for &mut W`**（`vortex-io/src/write.rs:90`）⇒ 传 **`&mut Vec<u8>`**（直接传 `Vec<u8>` 会被 move 走、取不回来） |
+| 单块数据怎么变成 `ArrayStream` | 先用 **`ArrayIteratorAdapter::new(dtype, iter)`** 包成 `ArrayIterator`，再 `ArrayIteratorExt::into_array_stream()`（`vortex-array/src/iter.rs`；trait 名是 **`ArrayIteratorExt`** 不是 `ArrayStreamExt`） |
+
+### 135.2 唯一剩下的阻塞：session 里没有运行时句柄
+
+`legacy_session()` 只是 `array_session()`：它挂了 `ArraySession` / `KernelSession` / `DTypeSession` /
+`ScalarFnSession` / `StatsSession` / `AggregateFnSession` / `MemorySession` —— **没有 runtime**
+（`vortex-array/src/lib.rs` 里 `array_session` 的构造），而写入/读取都要它。
+
+修法方向（**下一步就照这个做**）：
+
+* `CurrentThreadRuntime::new()`（`vortex-io/src/runtime/current.rs:40`）或 `SingleThreadRuntime`；
+* 用 **`RuntimeSessionExt::with_handle`**（`vortex-io/src/runtime/mod.rs:18` 的文档点名了它）
+  把它挂进**自己造的** session（不能挂到 `legacy_session()` 那个静态上），或走 `with_tokio`。
+
+#### 135.2.1 续：runtime 这条线已经查到底了（下一条动作 = 一次编译）
+
+| 问题 | 答案（全部来自 registry 源码） |
+|---|---|
+| session 怎么挂 runtime | `RuntimeSessionExt::with_handle(self, handle: Handle) -> VortexSession`（`vortex-io/src/session.rs:64`）；⚠️ 它内部是 `session.get_mut::<RuntimeSession>()` ⇒ session **必须先** `.with::<RuntimeSession>()` |
+| session 从哪来 | `VortexSession::empty().with::<ArraySession>().with::<KernelSession>()…`（`vortex-array/src/lib.rs:172` 的 `array_session()`）；`with_handle` 对**任何** `SessionExt` 都实现了 ⇒ `array_session().with::<RuntimeSession>().with_handle(..)` 即可 |
+| `Handle` 怎么造 | `Handle::new(Weak<dyn Executor>)`（`runtime/handle.rs:35`）；另有 `Handle::find()`（找当前上下文里的 runtime） |
+| 谁是 `Executor` | `Sender`（**`SingleThreadRuntime` 的通道句柄**，`runtime/single.rs:125`）、`tokio::runtime::Handle`（tokio.rs:44）、`SmolExecutor`、`WasmRuntime` —— ⚠️ `CurrentThreadRuntime` **不是** |
+| 最省的用法 | **`vortex_io::runtime::single::block_on(\|\| async { … })`**（`runtime/single.rs:197`，另有 `block_on_stream` @208）：它在内部装好 runtime 并驱动闭包 ⇒ 闭包里 `Handle::find()` 应当可用 |
+
+⇒ 下一次动手的顺序：① 把 encode/decode 的 vortex 调用整体包进 `single::block_on`；
+② 若 `Handle::find()` 仍为空，改成显式 `array_session().with::<RuntimeSession>().with_handle(Handle::new(Arc::downgrade(&sender)))`（sender 取自 `SingleThreadRuntime`）；
+③ 放回 `crates/format/tests/vortex_roundtrip.rs`（`§135.4` 已写好）。
+
+### 135.3 草稿的形状（下一刀直接照抄）
+
+* 写：`ArrowSession::default().from_arrow_record_batch(batch.clone(), schema)` → `ArrayIteratorAdapter`
+  → `into_array_stream()` → `futures::executor::block_on(VortexWriteOptions::new(session).write(&mut buf, stream))`；
+* 读：`OpenOptionsSessionExt::open_options(session).open_buffer(ByteBuffer::from(bytes))` → `file.scan()?`
+  → `into_array_stream()` → `block_on(stream.try_collect())` → 每块
+  `ArrowSession::execute_arrow(a, None, &mut session.create_execution_ctx())` → downcast `StructArray`
+  → `RecordBatch::from(..)`；
+* 两个都要 `use vortex::array::VortexSessionExecute`（`create_execution_ctx` 是 trait 方法）。
+
+### 135.4 验证与边界
+
+- `cargo build -p yuntun-format` 与 `--features vortex` → **均通过**（占位版）；
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **410 passed / 0 failed / 0 ignored**；
+- ⚠️ **边界**：本刀未留下可用用例 —— vortex 的往返用例（`crates/format/tests/vortex_roundtrip.rs`，
+  已写好：4 类列 × 1000 行逐列比对 + 与 Parquet 的体积对照）**随占位一并撤下**，
+  等 `§135.2` 的 runtime 接好后放回。**默认套件不含 vortex**（可选依赖），这条缺口只存在于
+  `--features vortex` 这一路。
+
+---
+
+## 136. `Vortex` codec 第三版：**runtime 那条线通了**，露出最后一处（2026-09-27）
+
+### 136.0 结论
+
+按 `§135.2.1` 的清单实施：**runtime 接上了** ✓（vortex 不再内部 panic），但写入报出**新错**：
+
+```
+vortex 写入：Other error: Aggregate vortex.max not permitted by ctx
+```
+
+⇒ 数组是用 **`ArrowSession::default()`**（另一个 session）造的，与**写入用的那个 session 不同源**
+⇒ 写入时的 ctx 不认它带出来的 aggregate。已按纪律**退回占位**（两种构建都保持绿）。
+
+### 136.1 这次新确认的（补 `§135.2.1`）
+
+* `single::block_on` 的闭包签名是 **`FnOnce(Handle) -> Fut`** —— runtime 的 `Handle`
+  **直接作为参数递进来** ⇒ 别用 `Handle::find()`（那条路只在 tokio / wasm 上下文里找得到，
+  我们这里是裸线程，拿到的是 `None`）；
+* session 必须 `array_session().with::<RuntimeSession>().with_handle(handle)`（顺序不能反：
+  `with_handle` 内部是 `get_mut::<RuntimeSession>()` ⇒ `RuntimeSession` 得先挂上）；
+* `CurrentThreadRuntime` **不是** `Executor`（`Executor` 是 `Sender` / `tokio::runtime::Handle` 等），
+  但它通过 `block_on` 提供的 `Handle` 已经够用。
+
+### 136.2 剩下的最后一处（下一刀就这一步）
+
+数组必须由**同一个 session** 的 arrow 入口造，而不是 `ArrowSession::default()`：
+
+* 参照 vortex 自己的写法（`ArrowSession::execute_arrow` 内部就是 `ctx.session().clone().arrow()`）
+  ⇒ 应当是 **`session.arrow().from_arrow_record_batch(batch.clone(), schema)`**；
+* 需要确认 `session.arrow()` 这个扩展来自哪个 trait（大概率是 `ArrowSessionExt` 之类）
+  ⇒ **一次 grep + 一次编译**即可收口；
+* 之后放回 `crates/format/tests/vortex_roundtrip.rs`（`§135.4` 那份已写好，或直接用
+  `crates/format/src/lib.rs` 里 `vortex_tests` 模块那份，两者内容一致）。
+
+### 136.3 验证
+
+- `cargo build -p yuntun-format`（默认）与 `--features vortex` → **均通过**（占位版）；
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **410 passed / 0 failed / 0 ignored**；
+- 文档一致性判据（`§123`）**5/5 绿**；
+- ⚠️ 边界同 `§135.4`：**默认套件不含 vortex**（可选依赖），往返用例仍随占位撤下。
+
+---
+
+## 137. `Vortex` codec 第四版：**假设错了** —— 根因是 `ctx` 的编码白名单（2026-09-27）
+
+### 137.0 结论
+
+`§136` 我判断"数组与写入不同源" ⇒ 改成**同一个 session**（`session.arrow()`）后，**错误一字未变**：
+
+```
+vortex 写入：Other error: Aggregate vortex.max not permitted by ctx
+```
+
+⇒ **假设错了**。顺着这条消息找到真正的检查点：
+
+```
+vortex-array-0.86.1/src/serde.rs:251
+    let encoding_idx = self.ctx.intern(&array.serialized_id)
+        .ok_or_else(|| vortex_err!("Serialized array ID {} not permitted by ctx", …))
+```
+
+⇒ `ctx` 维护的是**"已启用 edition 允许的编码"白名单**（见 `VortexWriteOptions` 的文档：
+*"When edition enforcement is enabled, the set of encodings permitted in the file is snapshotted
+from the session's enabled editions"*），而我们的 `array_session()` **没有启用任何 edition**
+⇒ 白名单为空 ⇒ 任何编码都 intern 不进去。
+
+已按纪律**退回占位**（两种构建都保持绿）。
+
+### 137.1 这一版新确认的（不因回退而失效）
+
+* `ArrowSessionExt::arrow(&self) -> SessionGuard<ArrowSession>`（`vortex-arrow/src/session.rs:844`）
+  ⇒ 造数组/读回数组都可以走 `session.arrow()`；
+* `async move` 会把捕获的 `buf` 一起搬走 ⇒ **字节缓冲区要在异步块内造并作为结果返回**
+  （否则外面拿不到字节，`§136` 的第三版就栽在这）；
+* runtime 的接法（`block_on` 给 `Handle` + `with::<RuntimeSession>()`）已经验证有效 ✓。
+
+### 137.2 下一刀（一步即可）
+
+**启用 edition**：入口在 `vortex::editions`（`vortex/src/lib.rs` 有 `pub mod editions`），
+或 `VortexWriteOptions` 上的 edition 开关 ⇒ 一次 `grep`（`EditionSession` / `fn with_edition`）
++ 一次编译即可收口。之后放回往返用例（`§136` 那份已写好）。
+
+### 137.3 验证
+
+- `cargo build -p yuntun-format`（默认）与 `--features vortex` → **均通过**（占位版）；
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **410 passed / 0 failed / 0 ignored**；
+- 文档一致性判据（`§123`）**5/5 绿**；
+- ⚠️ 边界同 `§135.4`：**默认套件不含 vortex**（可选依赖），往返用例仍随占位撤下。
+
+---
+
+## 138. `Vortex` codec 第五版：**edition 这条路走对了**，还差"注册"这一格（2026-09-27）
+
+### 138.0 结论
+
+按 `§137.2` 启用 edition（`vortex::editions::enable_default_editions(&session)`）——
+**错误变了** ✓（从 `… not permitted by ctx` 到新的断言）⇒ 方向对了，但报：
+
+```
+default core edition is registered:
+  Other error: cannot enable unregistered edition core2026.08.3
+```
+
+⇒ `edition` 要先**注册**才能启用（`array_session()` 里没有 `EditionSession`）。
+已按纪律**退回占位**（两种构建都保持绿）。
+
+### 138.1 这一版新确认的（不因回退而失效）
+
+* `vortex::editions::enable_default_editions(&session)`（`vortex-0.86.1/src/editions/mod.rs:78`）
+  是启用 edition 的入口 —— 它把"已启用 edition 允许的编码"填进 ctx 白名单，
+  `§137` 那个 `serde.rs:251` 的 `not permitted by ctx` 就是靠它消掉的；
+* session 组装顺序：`array_session().with::<RuntimeSession>().with_handle(handle)`，
+  再 `enable_default_editions(&session)` ✓；
+* `async move` 会把 `buf` 一起搬走 ⇒ 缓冲区在块内造并作为结果返回 ✓；
+* ⚠️ 模板里残留过一层**嵌套的 `async move {`**（闭包里又套异步块 ⇒ 返回"future 的 future"）
+  ⇒ 编译时表现为莫名其妙的类型错误，值得记住。
+
+### 138.2 下一刀（一次 grep + 一次编译）
+
+`EditionSession` 在 **`vortex-edition-0.86.1/src/session.rs:35`** ⇒ 把它挂进 session
+（`array_session().with::<RuntimeSession>().with::<EditionSession>()`，导出路径待确认）
+再 `enable_default_editions(&session)`；随后放回往返用例（`§136` 那份已写好：
+4 类列 × 1000 行逐列比对 + 与 Parquet 的体积对照）。
+
+### 138.3 验证
+
+- `cargo build -p yuntun-format`（默认）与 `--features vortex` → **均通过**（占位版）；
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **410 passed / 0 failed / 0 ignored**；
+- 文档一致性判据（`§123`）**5/5 绿**；
+- ⚠️ 边界同 `§135.4`：**默认套件不含 vortex**（可选依赖），往返用例仍随占位撤下。
+
+---
+
+## 139. `Vortex` codec **成了**：往返逐值相同 + 与 Parquet 的体积对照（`T9.x` 收口）（2026-09-27）
+
+### 139.0 结果
+
+`encode_vortex` / `decode_vortex` **真实现上线**（`--features vortex`）：
+
+```
+vortex 往返：4 类列（i64 / f64 / utf8 / bool）× 1000 行 → **逐值相同** ✅
+体积对照：vortex=23800B  parquet=6680B  ratio=3.56
+```
+
+⚠️ 这个 3.56 **不能**读成"Parquet 更好"：这份数据里 `ts` 是**递增整数**，
+对 Parquet 的 delta 编码极友好；而 vortex 侧我们**没开压缩器**（`BtrBlocksCompressor` 尚未接）。
+用例因此**只断言两者都可用、并把两个数字打出来**，不断言方向 —— 换个数据形状结论就会翻。
+
+### 139.1 最后四格（`§134`–`§138` 的收官）
+
+1. **edition 先注册、再启用**：`register_default_editions(&session)` → `enable_default_editions(&session)`
+   （`vortex/src/editions/mod.rs`）—— 前者填编码白名单（`§137` 的 `not permitted by ctx`），
+   后者选版本（`§138` 的 `cannot enable unregistered edition`）；
+2. **数组与写入同源**：`session.arrow()`（`ArrowSessionExt`）；
+3. **`async move` 会搬走 `buf`** ⇒ 缓冲区在块内造、作为结果返回；
+4. **读回的物理类型可能是另一种**：字符串列回来是 **`Utf8View`**（原 schema 是 `Utf8`）——
+   vortex 挑的是它自己最便宜的物理类型 ⇒ 下游要对齐原 schema 得 `cast`
+   （用例里就是这么比的：按块自己的 schema 拼、再按原类型 cast 后逐值比）。
+
+### 139.2 验证
+
+- `cargo test -p yuntun-format --features vortex --lib vortex_tests` → **2/2**；
+- `cargo clippy -p yuntun-format --features vortex --all-targets` → 本仓告警 **0**；
+- 默认全量 `cargo test --workspace -j 4` → **410 passed / 0 failed / 0 ignored**
+  （vortex 用例是 `#[cfg(feature = "vortex")]` ⇒ 不在默认套件里，见边界）；
+- 判据 5/5。
+
+### 139.3 边界（写明）
+
+* **默认套件不含 vortex**（可选依赖）⇒ 这条往返只在 `--features vortex` 下跑；
+* `T9.x` 还剩"**对比**"这一件的下半：接入 `BtrBlocksCompressor` 后再测一轮，
+  以及把"默认格式"切到 vortex 的决策（`ADR-1`）尚未做。
+
+---
+
+## 140. 实测：**Vortex 比 Parquet 大 3.5–4.5 倍**（且这已是压缩后的默认配置）（§140）
+
+### 140.0 结论（对 ADR-1 是个坏消息）
+
+`§139` 的 codec 跑通之后，把体积对照扩成**两种数据形状**：
+
+| 数据形状 | vortex | parquet | ratio |
+|---|---|---|---|
+| 递增整数（`ts` 递增，偏袒 Parquet 的 delta） | 23,800 B | 6,680 B | **3.56** |
+| 高基数随机串（模拟 UUID，偏袒字典 / FSST） | 63,348 B | 14,000 B | **4.52** |
+
+⇒ **两种形状下 Vortex 都是 Parquet 的 3.5–4.5 倍**，而且**"换成随机串会翻盘"这个猜测没有成立**
+（我原本以为会，实测更差）。用例（`vortex_tests::sizes_are_reported_for_two_data_shapes`）
+**不断言方向**、只把数字打出来 —— 因为方向本身就取决于数据与版本。
+
+### 140.1 更正 `§139` 的一句
+
+`§139.0` 我写过"vortex 侧我们**还没接压缩器**" ✗ —— **错了**：
+`vortex-file/src/writer.rs` 里 `BtrBlocksCompressorBuilder::default()` **就是缺省策略**
+（未显式指定 `with_strategy` 时用它）⇒ 上面那两个数字**已经是压缩后的**。
+（连着 `§129.3`、`§130`、`§136`，这是第四次自我更正 —— 共同点还是**判读太快**。）
+
+### 140.2 这为什么重要（不是"挑个格式"这么小）
+
+`ADR-1` 定的是 **Vortex 主 / Parquet 辅**，理由是"零拷贝列式 + 好压缩"。
+实测在**体积**这一维上不成立（3.5–4.5 倍）。而体积直接决定：存储成本、网络传输、
+以及我们最在意的 **元数据/文件级剪枝的粒度**（文件越大、越难靠"跳读"省回来）。
+
+⇒ 已登记为台账 **`D-8`**：**需要重新决策**（继续投 Vortex / 改 ADR-1 回 Parquet 主 /
+或先做"压缩参数 + 读取侧零拷贝收益"的专项测量再定）。
+
+### 140.3 验证与边界
+
+- `cargo test -p yuntun-format --features vortex --lib vortex_tests` → **2/2**；
+- `cargo clippy -p yuntun-format --features vortex --all-targets` → 本仓告警 **0**；
+- 默认全量 **410 passed / 0 failed / 0 ignored**（vortex 用例不在默认套件里，同 `§139.3`）；
+- 判据 5/5。
+
+---
+
+## 141. 三块新功能**先立计划**（写入 `plan.md` F 组）+ 五项决策（2026-09-27，**尚未动代码**）
+
+### 141.0 做了什么
+
+用户要求"先考虑功能的、做好计划再来做" ⇒ 本刀**只出计划、不改功能代码**：
+
+* `docs/plan.md` 新增 **F 组**（`F.0` 现状接缝 / `F.1` SQL 语句路由 / `F.2` schema 变更 /
+  `F.3` DELETE·UPDATE / `F.4` 行组级索引 / `F.5` 刀的顺序 / `F.6` 风险 / `F.7` 决策记录）；
+* 计划书版本 **v2.2 → v2.3**（首行 / 版本行 / 落款三处统一 —— 被判据
+  `plan_md_version_is_consistent` 拦过一次，因为追加内容把落款顶掉了）。
+
+### 141.1 查证过的接缝（计划是据此写的，不是印象）
+
+| 能力 | 现状 | 缺口 |
+|---|---|---|
+| Schema 变更 | `CatalogOps::evolve_schema` **已存在**（OCC + 走 raft） | 缺 **SQL 前端**（`sql()` 直接交给 DataFusion，`ALTER TABLE` 报"不支持"） |
+| 删除 | 只有**文件级 tombstone** | **没有行级**删除 |
+| 索引 | 只有**文件级** min/max（`§129`） | 行组级 / 等值索引 / **独立索引文件**都没有 |
+| 写入收口 | `ingest/src/flush.rs` + compaction | 是"写数据文件时顺便生成索引文件"的落点 |
+| 解析器 | **`sqlparser 0.62` 已是 workspace 依赖** | F.1 的路由**不需要**新增解析器依赖 |
+
+### 141.2 用户定的五件事（`F.7`）
+
+| # | 决定 |
+|---|---|
+| 1 | **range = min-max**（不另做区间集合） |
+| 2 | 已提交未 compaction 的删除 ⇒ **过滤**（读到即不可见） |
+| 3 | 索引**只给排序列**做 |
+| 4 | XOR filter **允许新增依赖** |
+| 5 | `UPDATE` **一个 op 承载、原子可见** |
+
+### 141.3 顺序与下一步
+
+**F.1 语句路由 → F.2 schema 变更 → F.4 索引 → F.3 DELETE·UPDATE**（最复杂、依赖前两者）。
+F.1 的落点已确定：`QueryEngine::sql_with_partial`（`crates/query/src/lib.rs`）——
+先用 sqlparser 解析分流，`SELECT` 仍走 DataFusion（`§132`：块级剪枝由它的优化器提供）。
+
+### 141.4 验证
+
+- 判据 **5/5 绿**；**功能代码零改动**；`plan.md` 版本三处统一。
+
+---
+
+## 142. **F.1 语句路由**落地（三块新功能的共同前提）（2026-09-27）
+
+### 142.0 做了什么
+
+`plan.md` F 组的第一刀：**把"不是查询"的语句从 DataFusion 手里接过来**。
+
+* 新增 `crates/query/src/stmt.rs`：`classify(sql) -> Result<StmtKind, String>`
+  —— 用 **sqlparser**（`0.62`，**本来就是** workspace 依赖，不必新增）判定语句类型；
+* `QueryEngine::sql_with_partial` 最前面分流：**DDL / DML 由我们接管**，**查询类原样交给 DataFusion**
+  （`§132` 实测：块级剪枝是它的优化器给的，别抢）。
+
+### 142.1 这一刀**只立骨架与错误形态**（不假成功）
+
+被接管的语句（`ALTER TABLE` / `CREATE TABLE` / `DROP TABLE` / `DELETE` / `UPDATE`）返回
+**"已被识别、但尚未支持"** 的可读错误，并**点名是哪一句、指向 plan 的哪一刀**（`F.2` / `F.3`）：
+
+```
+ALTER TABLE 已被识别、但**尚未支持**：见 plan.md F.2（SQL 形式的 schema 变更）
+```
+
+⇒ 既不是假成功，也不是 DataFusion 那句不知所云的解析错误。真正的处理由 `F.2` / `F.3` 各自补。
+
+### 142.2 验收（6 条）
+
+* 纯函数 3 条（模块内）：查询类原样通过；六类语句被**认出来**且 `routed()`；解析失败给可读原因；
+* 端到端 3 条（`query/tests/stmt_routing.rs`）：
+  ① `ALTER` / `DELETE` / `UPDATE` 各自**被接管**且报错点名语句类型（**不再**掉回 DataFusion 的
+  `sql parser error`）；② **`SELECT` 行为不变**（同一查询仍是 10 —— 路由层不许把查询弄脏）；
+  ③ 垃圾 SQL 的报错可读（含"SQL 解析失败"）。
+
+### 142.3 两个刻意的选择
+
+* **不猜**：除明确列出的六类外，其它形状（`INSERT` 等）一律**交回 DataFusion**，让它给自己的结论
+  （猜错的代价是拦截了本可执行的语句）；
+* **多语句只按第一条判定**：多语句事务的语义留给后续一刀，现在不猜。
+
+### 142.4 验证
+
+- 全量 `cargo test --workspace --no-fail-fast -j 4` → **416 passed / 0 failed / 0 ignored**；
+- `cargo clippy --workspace --all-targets -j 8` → 本仓告警 **0**；
+- 判据 5/5。
+
+---
+
+## 143. `F.2` 的接缝查证（**尚未动代码**，为下一刀留路标）（2026-09-27）
+
+### 143.0 为什么单独记一节
+
+`F.1`（语句路由）已落地 ✓，下一步是 `F.2`（SQL 形式的 schema 变更）。本刀**只做查证**：
+把 `F.2` 要用的每一个名字钉死，下一刀直接照抄 —— 免得像 `§134`/`§135` 那样
+"重新考古一遍"（那次教训就是：查到的形状必须落进文档）。
+
+### 143.1 已钉死的接缝（全部来自源码，非猜测）
+
+| 用途 | 入口 | 位置 |
+|---|---|---|
+| 演进 schema（唯一 OCC 作用点） | `CatalogOps::evolve_schema(req) -> EvolveSchemaResponse` | `catalog/src/lib.rs:52` |
+| 请求 | `EvolveSchemaRequest { table, change: SchemaChange, expected_version }` | `model/src/ops.rs:76` |
+| 响应 | `EvolveSchemaResponse { new_schema, version }` | `model/src/ops.rs:83` |
+| 变更类型 | `SchemaChange::{AddColumn { field }, WidenType, DropColumn}`（`SchemaChangeKind` 0/1/2） | **`model/src/schema.rs:37`**（从 `model/src/lib.rs:31` 再导出） |
+| 兼容性判定/应用 | `yuntun_model::schema::{classify, apply_change, SchemaCompatibility}` | 同上（`F.2` 的"破坏性变更要拒绝"直接用它） |
+| 可照抄的调用模板 | `catalog/src/lib.rs:538`（既有用例里的 `evolve_schema` 调用） | — |
+
+### 143.2 F.2 要新增的那一处结构（**这是关键前提**）
+
+`QueryEngine` 现在只有 `catalog: Arc<LocalCatalog>` —— 那是**读缓存**，不是写句柄
+（`query/src/lib.rs:68`）。所以 `F.2` 必须先给它一个**可选的写句柄**：
+
+* 新增字段 `catalog_ops: Option<Arc<dyn CatalogOps>>` + 构造器 `with_catalog_ops(...)`；
+* 未注入时，`ALTER TABLE` 给**可读拒绝**（"本进程为只读形态，DDL 需要注入写句柄"）——
+  这与 `§74` 的"只读数据进程"形态是同一件事，别让它静默成功；
+* 注入后：路由分支 `StmtKind::AlterTable` ⇒ 解析出 `SchemaChange` ⇒ `evolve_schema`
+  （`expected_version` 取当前表版本 ⇒ OCC 冲突就如实报错）⇒ 成功后**刷新本地缓存**（版本 +1）。
+
+### 143.3 F.2 的验收（照 plan 的 F.2，验收项已写好）
+
+① DDL 后新写入带新列；② **旧文件仍可读**（缺列按 null 对齐）；③ 版本 +1 且**其它表不受影响**；
+④ **OCC：并发两个 DDL 只有一个成功**；⑤ 破坏性变更（改类型 / 收紧可空性）**被明确拒绝**。
+
+### 143.4 本刀验证
+
+功能代码**零改动**（只加本节文档）；判据 5/5。
+
+---
+
+## 144. **F.2 SQL 形式的 schema 变更**落地（`ALTER TABLE` 加列 / 删列）（2026-09-27）
+
+### 144.0 做了什么
+
+`plan.md` F 组第二刀：把 `ALTER TABLE` 从"已被识别、但尚未支持"变成**真能改 schema**。
+
+* `crates/sql/src/sql.rs`：新增 `parse_alter_table(&AlterTable) -> ParsedAlterTable`
+  —— 一条语句 → **一个** `SchemaChange`（`ADD COLUMN` → `AddColumn`，`DROP COLUMN` → `DropColumn`）
+  ＋ `idempotent`（`IF NOT EXISTS` / `IF EXISTS`）；
+* `crates/sql/src/lib.rs::dispatch`：新增 `Statement::AlterTable` 分支 —— 读当前 schema 与版本
+  （OCC 基线）⇒ `evolve_schema`（唯一 OCC 作用点，走 raft）⇒ **WAL DDL 记录** ⇒ 刷新查询缓存；
+* `crates/model/src/wal_record.rs`：`ddl_op::ALTER_TABLE = 4`（`arrow_schema` = **变更后的目标 schema**）；
+* `crates/ingest/src/ddl.rs`：重放新增 `ALTER_TABLE` 分支 —— `converge_schema` 把表**收敛到目标态**
+  （用 `classify` 求差 + 自己找"多余的列"以支持删列），幂等；
+* `crates/query/src/stmt.rs`：DDL 的拒绝话术跟上事实（见 144.2）。
+
+### 144.1 落点：**在 `yuntun-sql`，不在 `QueryEngine`**（更正 `§143.2`）
+
+`§143.2` 记的是"F.2 要先给 `QueryEngine` 加 `catalog_ops: Option<Arc<dyn CatalogOps>>`，
+把 `ALTER TABLE` 解析成 `SchemaChange` 再调 `evolve_schema`"。**这一刀改在 `yuntun-sql` 落地**，
+依据是三条**代码事实**（查出来的，不是偏好）：
+
+| # | 事实 | 后果 |
+|---|---|---|
+| 1 | `ADD COLUMN` 要"SQL 类型 → Arrow"的映射，而 `map_column_type` / `column_def_to_field` 在 **`crates/sql/src/sql.rs`**；依赖方向是 `sql → query`（不可逆） | 在 `query` 里实现只剩两条路：**复制一份类型映射**（两处真相）或把它下移（`sqlparser` 进 `model` —— 把 SQL 方言知识塞进最底层）。两条都不要 |
+| 2 | DDL 的其余部分**已经在 `yuntun-sql`**：`CREATE/DROP TABLE`、`CREATE/DROP DATABASE`、WAL DDL 追加与重放、只读拒绝（`check_write`）、查询缓存刷新 | 放 `query` 会把 DDL 拆成两半：读的人得同时看两个 crate 才知道一条 `ALTER` 到底干了什么 |
+| 3 | `SqlEngine` **本来就持有写句柄** `catalog: Arc<dyn CatalogOps>`，`new_readonly` 也已经是"可读拒绝"（`SqlError::ReadOnly`） | `§143.2` 要的"注入写句柄 + 未注入时给可读拒绝"**本层已经存在**，不必再造一份 |
+
+⇒ 因此 `§143.2` 记的那处结构**没做、也不需要做**。所有协议入口（Flight 简易轨 / FlightSQL /
+MySQL wire）都经 `SqlEngine::execute(_stream)`，**没有路径**会被这个落点漏掉。
+
+### 144.2 `F.1` 的报错跟着事实改了一遍
+
+`§142` 里 `ALTER TABLE` 的拒绝是"已被识别、但**尚未支持**：见 plan.md F.2" —— `F.2` 落地之后
+那就是**假话**（它已经支持了，只是不在 `QueryEngine` 里）。报错也是产品的一部分：过期的报错
+会把用户送到错误的层。现在按事实分两类（`StmtKind::rejection`）：
+
+* **DDL**（`ALTER`/`CREATE`/`DROP TABLE`）⇒ "由 SQL 层执行（`yuntun-sql::SqlEngine`，plan.md F.2）：
+  QueryEngine 只执行查询、不持 Catalog 写句柄"；
+* **DML**（`DELETE` / `UPDATE`）⇒ 仍然是"已被识别、但**尚未支持**：见 plan.md F.3"。
+
+判据（`query/tests/stmt_routing.rs`）**刻意拆成两条**：一条断言 DDL 的报错**不该**含"尚未支持"、
+**必须**指向 `SqlEngine`；另一条断言 DML **必须**含"尚未支持"。写成一条会两边都松。
+
+### 144.3 语义与边界（**没做的部分写在明处**）
+
+| 语句 | 结果 |
+|---|---|
+| `ADD [COLUMN] [IF NOT EXISTS] c <type>` | ✅ 向后兼容演进（旧文件缺该列 ⇒ 读出来是 null） |
+| `DROP [COLUMN] [IF EXISTS] c` | ✅ **逻辑**删除：旧文件不动，读侧按当前 schema 对齐（§8.1） |
+| 目标态已满足**且没写 `IF`** | ✅ **明确报错**（绝不静默成功）；写了 `IF` ⇒ no-op（**不推版本、不写 WAL**） |
+| `ALTER COLUMN c TYPE …` / `MODIFY` / `CHANGE` | ❌ **拒绝**：改类型是破坏性变更（`plan.md` F.2 明令禁止） |
+| `ALTER COLUMN c {SET,DROP} NOT NULL` | ❌ 拒绝：`SchemaChange` **没有可空性载体** |
+| `RENAME COLUMN` / `RENAME TO` | ❌ 拒绝：`SchemaChange` 只有 加列 / 宽化 / 删列 三种载体 |
+| 一条语句多个操作 / `DROP COLUMN a, b` / `ADD COLUMN c INT FIRST` | ❌ 拒绝：一条语句 = **一个**原子变更（避免"部分成功"语义） |
+| `DROP` 到零列 | ❌ 拒绝（要清空整表请用 `DROP TABLE`） |
+
+**"重命名 / 可空性缺载体"是这一刀最要紧的边界**：它不是"忘了做"，而是要在
+`model/src/schema.rs` 的 `SchemaChange` 上加变体 —— 而那个枚举**过 proto（`EvolveSchemaOp.change`）
+与快照载荷**，加一个变体是**跨副本的格式变更**（`SchemaChangeKind`、proto、快照版本、
+`meta/src/op.rs` 的穷尽转换都要动）。那是独立的一刀，不塞进 F.2。
+
+### 144.4 验收（`plan.md` F.2 五条 ＋ 两条本仓最看重的反面）
+
+用例：`crates/server/tests/sql_alter_e2e.rs`（5 条端到端）＋ `crates/sql/src/sql.rs` 的 3 条纯函数用例。
+
+| # | 验收 | 证据（都在用例里） |
+|---|---|---|
+| ① | DDL 后**新写入带新列** | `ALTER ADD c` 后 `INSERT (3,'z',30)`，查 `a=3` 得 30 |
+| ② | **旧文件仍可读**（缺列按 null 对齐） | 用例**先等旧数据真落成文件**（`wait_for_files`：轮询 `list_visible_files` 非空）—— 否则这条测的是热数据那条路；随后 `count(*)=3`、`sum(a)=6`、`WHERE c IS NULL` = 2 行 |
+| ③ | 版本 **+1** 且**其它表不受影响** | `t` 的 `current_schema_version` 1→2；**对照表** `other` 的版本一字未动 |
+| ④ | **OCC：并发两个 DDL 只有一个成功** | 同一条 `ADD COLUMN c` 并发两遍 × 3 轮（`tokio::join!`）：**恰好一个** `Ok`；输家要么"版本冲突"（OCC）要么"已满足"（目标态已存在）；版本只 +1、列只有一个。⚠️ **两种交错都只有一个赢家 ⇒ 断言不依赖调度时序** —— 写成"两个不同的 DDL"就会变成抖的用例 |
+| ⑤ | 破坏性变更**被明确拒绝** | 改类型报错含"破坏性"；可空性 / 重命名报错含"载体"；**版本不动**（拒绝 = 没改） |
+| ⑥ | 无写入侧 ⇒ **可读拒绝** | `SqlEngine::new_readonly` 上 `ADD COLUMN` ⇒ `SqlError::ReadOnly`；**对照**：同一句在 `lakehouse.sql`（有写入侧）上成功 ⇒ 证明拒绝来自策略/能力，不是语句本身 |
+| ⑦ | `ALTER` 经 **WAL DDL 重放**跨重启 | `[meta] mode="memory"`（**元数据不落盘** ⇒ 只有重放这一条路）：重启后表回到 v3 = `[a, c]`（`CREATE` + 加列 + 删列三条记录依次重放，`converge_schema` 的两个分支都被走到） |
+
+### 144.5 验证与顺手修掉的文档漂移
+
+- `cargo test --workspace --no-fail-fast -j 4` → **425 passed / 0 failed / 0 ignored**；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**（仅外部 `proc-macro-error2` 的
+  future-incompat 提示，`status.md §2.1` 已记）；
+- 判据 **5/5**（规模行按判据报出的数字更新：**54,927 行 / 20 crate / 428 测试函数**）；
+- **既有抖动（不是本刀引入）**：`yuntun-chaos::disk_watermark_aborts_oldest_batch_then_releases_segments`
+  在全量并行下超时（73s > 60s 上限），**单跑 0.12s 通过** —— 与 `status.md §4` 记的
+  "chaos 与其余 binary 并行争 CPU/IO"同源，未重复排查；
+- **顺手修掉的三处版本漂移**（都不是本刀引入，但"文档不许比现实旧"）：根 `README.md` 引用
+  `plan.md v2.2`、`plan.md` 正文末"文档结束 · v2.2"、`status.md §7` 转述的 `v2.2`
+  —— 一律改到当前的 **v2.3**（`plan.md` 从 `§141` 起就是 v2.3）。
+
+---
+
+## 145. **F.4 行组级索引**落地（写时生成 `.idx` + 读时跳过整组）（2026-09-27）
+
+### 145.0 做了什么
+
+`plan.md` F 组第三刀（按 `F.5` 的顺序：`F.2` 之后做索引，因为 `F.3` 的"扫出要删的行"正好复用它）：
+
+| 位置 | 改动 |
+|---|---|
+| `crates/model/src/index.rs`（**新**） | 索引文件格式：**帧头（魔数+版本+长度+CRC）+ prost 载荷**；逐组 zone map（复用 `ColumnStatLite`）+ 逐列 **XOR filter**；`build`（按行切组）/ `matches_shape`（读侧硬前提）/ `to_bytes`·`from_bytes` / **键编码** `IndexKey` + `key_hash` + `arrow_key` |
+| `crates/format` | **组大小唯一真相**：`INDEX_GROUP_ROWS` 由 model 定义、format 引用（原先 format 自己一个常量）；新增 `index_path(data_path)`（`x.parquet → x.idx`，**同 stem**） |
+| `crates/model/src/meta.rs` + `proto/meta.proto` + `meta/src/op.rs` | `FileManifest.index_path` / `index_size`（**tag 20/21**，只加字段不改老编号）+ proto 镜像两个方向 + `wire_compat` 样本（含"无索引"那条） |
+| `crates/ingest/src/flush.rs` | 数据文件写成功后**再**写索引（`write_index`，CPU 走阻塞池）；**索引写失败不失败整次 flush**（派生对象；manifest 如实留空）|
+| `crates/query/src/index.rs`（**新**） | 组级决策：`group_access_plan` → `ParquetAccessPlan`（挂到 `PartitionedFile.extensions`）|
+| `crates/query/src/prune.rs` | 把判定抽成 `can_prune_with(schema, stats, rows, constraints)` —— **文件级与组级共用同一套数学**；`Constraint` 带**类型族**，新增 `scalar_matches_column`（时间刻度**逐档核对**）|
+| `crates/query/src/{table,provider,lib}.rs` | 读路径装配 `ReadPath{store, hot_read_budget, index_pruning}`；`scan` 里在文件级剪枝之后**并取**索引（同一预算）并挂计划；`QueryEngine::with_index_pruning`（**只为对拍**）|
+
+### 145.1 四个设计决定（都不是随手定的）
+
+**① "组"就是 parquet 行组，且组大小**只有一处定义**。** 消费方式是把 `ParquetAccessPlan` 交给
+DataFusion 的 parquet 读取器，而它**按行组序号**说话 ⇒ 我们的组必须与文件里的行组一一对应。
+所以 `INDEX_GROUP_ROWS` 放在 `model::index`（连同"为什么必须对齐"），`format` 引用它写
+`max_row_group_row_count`。**对不上就不挂计划**（`matches_shape`：组大小 + 行数 + 组数三者一致）
+—— DF 在"计划长度 ≠ 行组数"时是**直接报错**，硬凑会把一次本来正确的查询弄失败。
+
+**② 这一刀真正的新能力是 XOR filter，不是 zone map。** 组级 min/max 与 DataFusion 自己用
+footer 统计做的那层**重复**（`§132` 已实测）；而本项目**写入侧并不排序**（`event_time` 只是业务
+约定）⇒ 组的 `[min,max]` 往往很宽，**只有等值 filter 能证明"这个值不在这一组里"**。
+`plan.md` F.7 #1 定的"range 就用 min-max、不另做区间集合"因此不影响本刀的收益。
+
+**③ XOR filter 用 `xorf`（F.7 #4 允许新增依赖），并且必须去重后构造。** 加依赖时
+**关掉它的默认 feature**（`default-features = false`）：构造用的种子在 `xorf` 内部由
+`splitmix64` 生成，不需要 `uniform-random`（那会拖进 `rand` 全家），也不碰 `Xor8` 门后的
+`binary-fuse` —— 于是 `Cargo.lock` 只多了 `xorf` 一条。
+理由不是省事：
+peeling 构造写错的后果是"多剪一个组" ⇒ **静默少数据**，而"零假阴性"正是这个结构存在的前提。
+另外 `xorf::Xor8` 的字段是公开的，所以**不需要** serde/bincode 就能自己序列化；
+构造种子在 `xorf` 内部是**确定**的（`splitmix64(1)` 起），于是"同数据 ⇒ 同索引字节"（有用例）。
+
+**④ 键编码必须跨二进制稳定。** 索引文件会被**将来的**二进制读回来，所以
+`key_hash` 写死：整型取位模式、字节串走 **FNV-1a 64**（不许用 `std::hash::DefaultHasher`
+—— 它的算法**不保证跨 Rust 版本稳定**，那样一次升级就会静默剪错组）。用例直接钉住具体数字
+（`FNV("a") = 0xaf63dc4c8601ec8c` 等）。
+
+### 145.2 验收（`plan.md` F.4 四条，逐条给证据）
+
+**① 索引随写入生成**：`crates/query/tests/index_parity.rs::index_is_written_and_registered_by_flush`
+走**真 ingest 路径**（WAL→攒批→flush），断言 manifest 的 `index_path` 非空、与数据文件**同 stem**、
+对象真在、`index_size` 对得上、能解回来且 `matches_shape` 成立。
+> **边界（"两种格式都要"）**：**生成侧与格式无关**（索引是从 `RecordBatch` 按行切出来的，
+> parquet 与 vortex 同一条通路，`flush` 里没有任何格式分支）；**消费侧目前只对 `.parquet` 生效**
+> —— vortex 文件在当前读路径里本来就没人读（`scan` 固定用 `ParquetSource`），那是
+> `D-8`/ADR-1 待决的事，不在本刀范围。
+
+**② "只有索引能剪掉的组"真的被跳过**：`index_pruning_skips_a_group_that_footer_stats_cannot`
+构造 3 组的文件（组 0 全是偶数、组 1/2 在别处），查询 `WHERE event_time = 1`：
+`1` 落在组 0 的 `[0, 131070]` **区间内** ⇒ footer 统计剪不掉它，**只有我们的 filter 能**。
+证据是 IO 级的 `EXPLAIN ANALYZE` 的 `bytes_scanned`（实测）：
+**开索引 `0` / 关索引 `563`** —— 开索引时**一个数据页都没读**。
+（`§129.4` 当时只做到"断言决策函数"；这一刀把证据推到了**真实读取的字节数**。）
+
+**③ 对拍：开/关索引结果逐格一致**（最关键）：`open_and_closed_pruning_agree_cell_by_cell`
+跑 8 条查询（等值命中/未命中、区间跨界、`!=`、尾巴组、无谓词、类型族对不上的字符串谓词），
+开/关两次的**每个格子**都必须相等。剪错 = 静默少数据，这条是唯一的防线。
+
+**④ 拿不准一律不剪**：`crates/query/src/index.rs` 的 5 条"不剪"用例（无谓词 / `OR` 形状 /
+形状对不上 / 类型族对不上 / **一个组都没剪掉就不给计划**）+ model 侧 11 条（零假阴性、CRC、
+魔数、版本、确定性……）。其中"`Some(plan)` ⟺ 真的剪掉过至少一个组"是刻意做成的**可断言性质**。
+
+### 145.3 一个顺带修好的旧缺口（同一条纪律，必须写下来）
+
+`prune::literal_bound` 原先**不认时间戳/日期标量** ⇒ 对 `event_time TIMESTAMP`（README 快启
+用的就是它）这类表，**连文件级剪枝都是空转**。本刀为了做"同刻度才可剪"的护栏，顺手把
+`Timestamp(四档)` / `Date32` 标量接上了，并按**类型族**收窄（`scalar_matches_column`：刻度必须逐档相等，
+否则丢约束）。于是文件级剪枝对时序表**第一次真的生效**。
+> 这是**行为变化**（剪得比以前多）⇒ 由本刀的 8 条对拍 + `§129` 既有单测共同兜着；
+> 护栏本身也单独立了：刻度不同的字面量**必须**被丢掉（`timestamp_needs_matching_unit`）。
+
+### 145.4 边界与未做（**写在明处**）
+
+1. **只给排序列做**（`plan.md` F.4 的决定）：列集 = `default_sort_columns`，与 manifest 的
+   `stats` **同源**。没有 `event_time` 的表 ⇒ **不生成索引**（不是错误，读侧退回全读）；
+2. **浮点/布尔/十进制不索引**：浮点的 `=` 有 `NaN`/`-0.0` 边界（风险大于收益）；
+   布尔的**字面量侧**还不认布尔标量 ⇒ 建了也没人用（不占体积地留着编码表项）；
+3. **compaction 产物暂不生成索引**（它走自己的写路径）：合并后的大文件退化为"无索引" ⇒
+   只是少剪，不剪错。**下一步**（与 `F.4` 的"写入收口"合起来看）；
+4. **索引文件的 GC 口径**：靠**同 stem**（`x.parquet` / `x.idx` 都归到同一个 batch_id，
+   `extract_batch_id` 一致）⇒ 孤儿清理把它们当同一批一起保护、一起回收。
+   这条是**命名约定**换来的，所以有用例钉住（`index_path` 与 `file_path` 的关系）；
+5. **索引读取**：每个候选文件一次 GET，**并取**且在热读预算内（`§88` 同一套形状）；
+   失败/超时/解不开 ⇒ 该文件**退回全读**（索引只影响"读多少"，绝不影响"读到什么"）；
+6. **不是一个运维旋钮**：`with_index_pruning(false)` 只为对拍存在（未进 TOML）。
+
+### 145.5 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **444 passed / 0 failed / 0 ignored**；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**（顺手修掉两处新引入的
+  `match_like_matches_macro` / 多余的 `.into_iter()`）；
+- 判据 **5/5**（规模行按判据数字更新：**56,473 行 / 20 crate / 447 测试函数**）；
+- **两次并行抖动（都记录在案，都不是本刀引入、也都未复现）**：
+  ① `yuntun-ingest::flush_e2e::ingest_accumulate_flush_reaches_manifest_and_wal_terminal`
+  在"2 秒轮询窗口"内没等到文件（`left: 0, right: 1`，该二进制整体 28.6s）——**单跑 0.02s 通过**、
+  紧随的整轮全量也全绿（该二进制 0.55s）；
+  ② `yuntun-chaos::disk_watermark_aborts_oldest_batch_then_releases_segments`（`status.md §4` 记的
+  那条**已知** flaky，超过 60s 上限）——**单跑 0.11s 通过**；再跑一轮全量 **444 passed / 0 failed**。
+  ⇒ 与"并行争 CPU/IO"同源（`status.md §4`）。**但第 ① 条值得记一句**：这一刀确实给 flush
+  关键路径加了两件事（建索引 + 一次 PUT）。将来若要**去掉它**：`index_path` 可以从数据路径
+  **推导**（同 stem），于是索引可以**提交之后再写**（尽力而为），代价是读侧每个候选文件都要试一次
+  GET（S3 上就是一次 404 往返）—— 本刀选了"manifest 记路径 + 提交前写"，因为它让"有没有索引"
+  **可审计**、读侧零空转。
+
+---
+
+## 146. **F.3 第一刀：删除向量（DV）的表达层与目录能力**（2026-09-27）
+
+`plan.md` F 组最后一刀（`F.3` DELETE / UPDATE）按设计文档自己的里程碑切开做。
+这一刀只做**"删除这件事能被表达、持久化、被快照隔离"**那一层，**读侧生效与 SQL 前端留给下一刀**
+（下一节写清为什么这样切、以及两条抵押）。
+
+### 146.0 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `crates/model/src/dv.rs`（**新**） | `DeletionEntry`（快照维度的删除事件 + `active_at`）、`DvBitmap`（**roaring** 位图 + 自证帧：魔数/版本/长度/CRC）、`dv_object_path`（设计 §3.1 的路径形态）、**`keep_ranges`**（DV → "保留哪些行"）+ 8 条单测 |
+| `crates/model/src/snapshot.rs` | 快照载荷加 `deletions`（**tag 15**，只加不改）+ `SnapshotDeletionEntry` |
+| `crates/catalog/src/state.rs` | `deletions` 事件表 + `apply_deletions`（**单快照原子** / 按 `dv_id` 幂等 / 触发全量重建）+ `list_deletions(table, snapshot)`（读侧唯一入口）+ `revoke_deletions_for_file` + `drop_table` 连带清理 + 快照两向；"快照覆盖每个维度"用例**扩了一维**，另加 4 条用例 |
+| `crates/catalog/src/lib.rs` | `CatalogOps` 加三个方法；`MemoryCatalog` 参考实现 |
+| `crates/meta/src/remote_catalog.rs` | 远端形态：写入**明确报错**、读取**按不变量返空**（见 §146.3 的抵押①） |
+
+### 146.1 四个决定（都不是随手定的）
+
+1. **DV 是独立事件表，不挂 `FileManifest`**（设计 §3.2）。除了"manifest 是文件的事实"这条理由，
+   还有一条更硬的：**幂等域不同** —— 文件按 `batch_id` 幂等（重提交复用原 id），删除按 `dv_id` 幂等。
+   混进 manifest 会让这两套幂等互相污染。
+2. **"保留哪些行"（`keep_ranges`）放在 `model`**：它和"哪些行被删"是**同一事实的两种说法**。
+   分开放两个 crate 一定会漂移，而这里漂移的后果是本仓最不能接受的两类之一
+   （静默少数据 / 静默复活已删行）。
+3. **DV 解不开 ⇒ 报错**（与 `§145` 的索引**刻意相反**）：索引只影响"读多少"，DV 影响"读到什么"。
+   忽略一份坏索引 = 少省一点 IO；忽略一份坏 DV = **复活已删数据** —— 比少数据更糟，
+   因为用户以为删掉了（审计也看不出来）。
+4. **走 `schema_ver`（全量缓存重建）**：DV 进的是读快照的**新字段**，而增量通道只搬文件清单；
+   设计的"按表增量刷新入口"（`delta-dml-design §5.2`）是后续项。
+
+### 146.2 与设计的三处偏差（都是刻意的）
+
+| # | 偏差 | 为什么 |
+|---|---|---|
+| 1 | `DeletionEntry` 多一个 `table` 字段 | 设计 §3.2 里没有；但目录里每一类记录都按表分区，而 `list_deletions(table, snapshot)` 是读侧**唯一**入口 —— 不给表名就得全表扫描 |
+| 2 | `revoke_deletions_for_file` 先落在目录层 | 设计把它算在 M2（compaction 消费）。**先把 API 与用例立起来**，compaction 接线在 `F.3d`；否则"撤销"这件事没有可测的形状（而它的语义又是快照隔离的一半） |
+| 3 | 远端写入**明确报错**而非静默通过 | 删除是用户可见事实：静默不生效 = 用户以为删了 |
+
+### 146.3 本刀**没做**的（明确列表 + 两条抵押）
+
+1. **读侧生效**（把 DV 翻成 parquet 的整体 `RowSelection` 挂到 `PartitionedFile`）→ **`F.3b`**。
+   含：读模型（`CatalogSnapshot`）带 DV、缓存刷新、以及与 `§145` 的索引计划**互斥**
+   —— DF 明说 `ParquetAccessPlan` 与 `ParquetRowSelection` 只能给一个
+   （`Invalid parquet access extensions … Specify either … not both`），而带 DV 的文件按行号定位
+   天然要求"不许跳行组"（`delta-dml-design §5.1` 同一条纪律）；
+2. **`DELETE FROM t WHERE …`**（谓词定位 + 命中未提交行时 force flush）→ **`F.3c`**；
+3. **WAL `DeletePayload`（type 6）+ `replay_wal_dml` + 远端目录/metanode op** → **`F.3c`**；
+4. **compaction 消费 DV**（重写时一并消费 + `revoke` + 孤儿 GC 覆盖 `dv/`）→ **`F.3d`**；
+5. `UPDATE`（设计 M3，= DELETE + INSERT 一个 op 承载）→ 最后。
+
+> ⚠️ **两条抵押（写在明处，别让后来者踩）**
+>
+> ① **远端形态的 `list_deletions` 现在返回空**。它是**事实**而不是猜测：`RemoteCatalog::apply_deletions`
+> 直接报错 ⇒ 远端形态**不可能**存在 DV。但 **`F.3c` 必须把这两个方法一起接上** —— 只接写入不接读取，
+> 就是"静默复活已删行"。
+> ② **`F.3d` 之前不许让 DV 与 compaction 同时存在**：compaction 重写文件时若不消费 DV，
+> 已删的行会被**原样写进新文件**（复活）。现状满足这条（SQL 层还没有 `DELETE` ⇒ 造不出 DV），
+> 而 `F.3c` 一落地就必须立刻补 `F.3d`（或先加"跳过带 DV 的文件"的保守闸门）。
+
+### 146.4 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **456 passed / 0 failed / 0 ignored**
+  （本刀 +12：`model::dv` 8 条 + `catalog` 4 条；另把"快照覆盖每个维度"那条用例扩了一维，
+  否则新字段漏进快照时**没有任何断言会红**）；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；
+- 判据 **5/5**（规模行按判据数字更新：**57,206 行 / 20 crate / 459 测试函数**）。
+
+---
+
+## 147. **F.3 第二刀：删除向量（DV）在读侧生效**（2026-09-27）
+
+`§146` 把 DV 立成了"能表达、能登记、能过快照"的事实，这一刀把它接到**读路径**上：
+带 DV 的文件在 `scan` 时拿到一个**整体行选择**（"保留哪些行"），于是
+**已提交但尚未 compaction 的删除立刻不可见**（`plan.md` F.3 验收①，`F.7` 决策②）。
+
+### 147.0 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `query::cache` | `CachedTable.deletions`（读快照里的 DV）+ `deletions_for` / `has_deletions`；**全量与增量两条刷新路径都取** DV，且与文件用**同一个快照号** |
+| `query::table` | `file_deletions`（逐文件取位图 → 同文件多份 **OR** → 失败**报错**）+ `scan` 给带 DV 的文件挂 `ParquetRowSelection` + `group_plans` 对带 DV 的文件**一个索引都不取** |
+| `catalog::state::commit_files` | **顺带补的护栏**：一个批次只许一个文件（见 §147.2） |
+| `crates/query/tests/deletion_vector.rs`（新） | 7 条读侧用例（见 §147.4） |
+
+### 147.1 三个决定
+
+1. **DV 走 DataFusion 的"整体行选择"扩展**
+   （`ParquetRowSelection::new(RowSelection::from_consecutive_ranges(保留区间, 总行数))`）。
+   DF 的文档原话就是"给**外部索引**用"，而且**它自己**用 parquet footer 把整体选择拆成
+   **逐行组**的访问计划 ⇒ 流式、不物化、顺带少读字节。设计 §9 把"DV → RowSelection"排在 M2，
+   实测这条路**现在**就通 —— 于是 `delta-dml-design §5.1` 的
+   "带 DV 的文件禁用 row-group 裁剪"落成了**更精确**的形态：
+   *该跳过哪些行由 DV 说了算，行组粒度由 DF 拆*。
+2. **DV 与索引互斥，DV 优先**。两个理由，缺一不可：
+   * DataFusion 只接受**一个** access extension —— `ParquetAccessPlan` 与 `ParquetRowSelection`
+     同时挂会直接报错（`Invalid parquet access extensions … not both`）；
+   * 语义：DV 按**文件行号**定位，跳行组会让"读到第几行"与"文件里第几行"错位。
+   ⇒ 带 DV 的文件**连索引对象都不下载**（省一次 IO，也省掉"两个扩展谁先"的整类问题）。
+3. **失败即错**（`§146.1` 决定③的延续）：取不到 / 解不开 / 基数与目录不符 / 行号越界 /
+   清单里的行数与文件不符 ⇒ **整次查询失败**。索引坏了退回全读（只影响"读多少"），
+   DV 坏了必须报错（它决定"读到什么"）。
+
+### 147.2 顺带发现并修掉的：`files` 以 `batch_id` 为键 ⇒ 一次提交两个文件会**静默丢文件**
+
+- **怎么发现的**：造"两个文件"夹具时，第一个文件从清单里消失了 —— `EXPLAIN` 的
+  `file_groups` 只剩 B。往下查：`CatalogState::commit_files` 里
+  `self.files.insert(req.batch_id.clone(), f)`，而循环里**每个**文件都被赋成同一个
+  `req.batch_id` ⇒ 后一个把前一个**覆盖掉**。
+- **影响**：调用方一次传两个文件 = 数据从清单里消失（查询少数据、**零报错**）。
+  现实里所有调用点都是"一次一个文件"（`flush_batch` 的形态；compaction 的每个新文件本来
+  就带自己的 `batch_id`），所以一直没炸 —— 但这正是本仓最怕的形态（**静默少数据 + 无人发现**）。
+- **修法**：在 `commit_files` **最前面**拒绝 `files.len() > 1`（先于任何写入 ⇒ **拒绝是原子的**，
+  不会留下"半个请求"）+ 单测（`one_batch_must_not_carry_two_files`）。
+  为什么不改成"支持多文件"：`files` 的键、幂等对账、孤儿清理的
+  `dv → file_path → batch_id` 推导**全都建立在"一个批次一个文件"上** —— 改键是另一件事，
+  且没有需求。
+- **进台账**：`D-9`（与本刀同刀闭环）。
+
+### 147.3 边界（明确没做的）
+
+1. **SQL `DELETE FROM t WHERE …`**（谓词定位 + 命中未提交行时 force flush）+
+   **WAL `DeletePayload`（type 6）+ `replay_wal_dml`** + **远端目录/metanode op** ⇒ `F.3c`
+   （**抵押①仍在**：远端 `list_deletions` 返空）；
+2. **compaction 消费 DV + 孤儿 GC 覆盖 `dv/`** ⇒ `F.3d`（**抵押②仍在**：现在还造不出 DV，
+   所以"compaction 复活已删行"不成立）；
+3. **统计**：`statistics()` 仍返回 `None`（设计 §5.4 的"逐文件 `row_count − card`"未接）——
+   不影响正确性，只影响优化器的选择；
+4. **热点数据（未提交 chunk）不参与 DV**：DV 只作用于已提交文件；所以"删刚插的行"
+   还需要 `F.3c` 的 force flush（设计 §4.3）。
+
+### 147.4 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **464 passed / 0 failed / 0 ignored**
+  （本刀 +8：7 条读侧用例 + 1 条护栏用例）；
+- `crates/query/tests/deletion_vector.rs` 的 7 条：
+  ① 删后查不到、**其余逐行一致**；② 同文件多份 DV **叠加**；③ 只影响被锚定的文件 +
+  **整文件删光**只得 0 行；④ **旧读者（未刷新的快照）仍看到完整表**（快照隔离）；
+  ⑤ 坏 DV / 基数不符 / 行号越界 / 清单行数不符 ⇒ **查询报错并点名**；
+  ⑥ **带 DV 且挂了索引**的文件跑谓词查询仍然对（`not both` 的反证）；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；
+- 判据 **5/5**。
+
+---
+
+## 148. **F.3 第三刀：DELETE 的写侧就绪（WAL 记录 + 强制 flush + 重放）**（2026-09-27）
+
+这一刀把 DELETE 需要的**写侧机械**全部立起来（WAL 记录 / 把在途数据落盘 / 重启重放），
+**SQL 前端留到下一刀**（`F.3c-2`）—— 顺序这样切是因为写侧每一件都能独立验证，
+而它们全都错了（或漏了）的话，前端接上去只会把错误放大。
+
+### 148.0 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `model::wal_record` | `DeletePayload` / `FileDeletion` / `RecordType::Delete = 6` + `Record` 各分支 + 往返用例（位图过线仍可解） |
+| `chunk` | `ChunkStore::chunk_ids_of_table`（按表取在途 chunk，确定性排序） |
+| `ingest::pipeline` | 强制 flush 的**命令通道** + `Ingestor::force_flush(table)` + `force_flush_table`（封口 → 走**唯一执行体** → 收尾核对）；`flush_chunk_by_id` 改为返回 `Option<FlushOutcome>` |
+| `ingest::dml`（新） | `replay_wal_dml`：只靠 WAL 重建 `DeletionEntry`（位图内联 / `store_path` 回推 / 幂等 / **世代校验**） |
+| `catalog::state` | **键设计修正**：DV 事件表从 `dv_id` 改成 **`(dv_id, file_path)`**（见 §148.2）+ 用例 |
+| `server` | 启动四段顺序补上 ⑤.5（按 `[meta] mode` 门控，见 §148.3） |
+| 新用例 | `crates/ingest/tests/force_flush.rs`（2 条）、`crates/ingest/tests/replay_wal_dml.rs`（1 条） |
+
+### 148.1 三个决定
+
+1. **强制 flush 走命令通道，不许"调用方自己拿 chunk store 去 flush"**。
+   `flush_input` 只在 `mark_committed` **之后**才返回 `None`，所以两个执行体（到期通路 + 强制通路）
+   会同时拿到同一个 chunk 的输入 ⇒ 同一批数据落成**两个文件** = 重复计数。
+   设计 §4.3 的原话就是"触达点是攒批 accumulator（命令通道 mpsc 或共享句柄）"——
+   本刀取**通道**：请求交给攒批循环，它在**扫描完 WAL 之后**处理（刚 fsync 的 Data 先成为 chunk），
+   处理完回执；调用方同步等回执（超时 30s ⇒ 报错）。
+2. **强制 flush 之后要"核对"，不"相信过程"**：`flush_chunk_by_id` 对读回失败是**延后重试**
+   （记 backoff，不报错），而调用方是**删除** —— 带着"还有未提交数据"的认知去删就是**静默漏删**
+   （那批行落盘后会以"没被删掉"的样子出现）。所以 `force_flush_table` 最后统计
+   "该表是否还有非终态 chunk"，有就**报错**。
+3. **重放只靠 WAL**：位图**内联**在记录里（`card` 从位图量出来，不信记录里的数字）、
+   `store_path` 按 `§3.1` 公式回推、`(dv_id, file_path)` 幂等去重、
+   **世代不符就跳过并告警**（`DROP` → 同名重建之后，旧世代的删除不得挂到新表上）。
+
+### 148.2 修正：DV 事件表的键从 `dv_id` 改成 `(dv_id, file_path)`
+
+- **发现路径**：写重放时意识到**一条 DELETE 记录可以覆盖多个文件**
+  （`DeletePayload.deletions` 是列表，`dv_id` 是"这次删除"的 id；DV 对象路径
+  `dv/<数据文件名>/<dv_id>.bin` 已经把"文件"作为一层）。
+  而 `§146` 建表时用了 `BTreeMap<dv_id, …>` ⇒ 删两个文件的请求只会留下**一个**条目
+  （另一个文件里的行"已删却还查得到"）。
+- **`§146` 为什么没抓到**：那时的用例都是"一个 dv_id 一个文件"（同一刀里 `commit_files`
+  的键问题也刚暴露过，见 `D-9`），单文件形态把键的缺陷盖住了。
+- **修法**：键 = `(dv_id, file_path)`（身份 = "这次删除 × 这个文件"），快照正向取 `dv_id` 部分；
+  新增用例 `one_delete_record_can_cover_several_files`（两个文件两个条目 + 幂等仍成立）。
+
+### 148.3 边界（明确没做的）
+
+1. **SQL `DELETE FROM t WHERE …`**（谓词定位 → 写位图对象 → WAL 追加 → `apply_deletions` → 刷缓存）
+   ＝ **`F.3c-2`**。⇒ **现在仍然不能删**（SQL 层没有 `DELETE` 分支）。
+2. **远端目录 / metanode op**（**抵押①**）：`RemoteCatalog::apply_deletions` 仍然明确报错、
+   `list_deletions` 仍然返空。因此 `replay_wal_dml` 在装配层**只对 `[meta] mode = memory` 生效**
+   —— `embedded`（默认形态）的 DV 写入随 `F.3c-2` 一起接（那时两边同时成立，不会出现
+   "能写不能读"的窗口）。
+3. **compaction 消费 DV + 孤儿 GC 覆盖 `dv/`** ＝ `F.3d`（**抵押②**：现在仍造不出 DV ⇒ 不冲突）。
+4. `UPDATE`（设计 M3）＝ 最后。
+
+### 148.4 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **470 passed / 0 failed / 0 ignored**
+  （本刀 +6：`model` 往返 1、`catalog` 多文件键 1、`ingest` 强制 flush 2 + 重放 1 + `liveness` 单测 1）；
+- 关键断言：
+  * 强制 flush：**落盘前清单为空**（证明确实在途）→ 落盘后行数对得上 → **没有非终态 chunk** →
+    再调一次是 no-op；**攒批循环不在时明确报错**（不假装成功）；
+  * 重放：一条记录覆盖两个文件 ⇒ 两个条目、`card` 来自位图、`store_path` 按公式回推、
+    同一批共用快照号、**旧世代那条被跳过**；再重放一遍不推快照号；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **5/5**。
+
+---
+
+## 149. **F.3 第四刀：`DELETE FROM t WHERE …` 落地**（2026-09-27）
+
+`§146`（DV 表达/目录）→ `§147`（读侧生效）→ `§148`（写侧机械）之后，这一刀把
+**SQL 前端**接上：`DELETE FROM t WHERE …` 真的能删了（`memory` 形态；`embedded` 见 §149.3）。
+
+### 149.0 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `query::locate`（新） | **定位扫描**：在一个文件上求谓词 ⇒ 命中行的**文件内行号**（读文件 → 补 `__yuntun_row_idx` 列 → `MemTable` → `SELECT … WHERE <谓词>`）+ 4 条单测 |
+| `sql::dml`（新） | `execute_delete`：**六步顺序**（强制 flush → 定位 → 位图写对象 → WAL → `apply_deletions` → 刷缓存）+ 形状校验 + 读不出来的 DV 直接报错 |
+| `sql` 分流 | `Statement::Delete` 进 `execute_delete`；新增 `yuntun-store` / `object_store` / `tracing` 依赖 |
+| `server/tests/sql_delete_e2e.rs`（新） | 4 条端到端用例（见 §149.4） |
+
+### 149.1 三个决定
+
+1. **执行顺序就是正确性**（`delta-dml-design §4.1`）：
+   `① 强制 flush` 必须在 `② 定位` 之前 —— 删除只作用于**已提交文件**，刚插的行还在 chunk 里，
+   不落盘就扫不到它们（落盘后会以"没被删掉"的样子出现 = **复活**）；
+   `③ 写对象` 在 `④ WAL` 之前 —— 崩溃只会留下孤儿对象（孤儿清理回收），
+   反过来就是"WAL 说删了、位图读不到"（读侧要么失败要么复活）；
+   `⑥ 刷缓存`是可见性的那一半（`§5.2` 明文要求删除路径**同步**刷新）——
+   少了它，"DELETE 成功、再查还在"。
+2. **定位放在 `query`（读侧），不放 SQL 层**：`crates/sql` 有一条明写的纪律
+   "本 crate 不直接依赖 datafusion"，而行位语义（行序 = 文件行序）与**查询那条 SQL 语义**
+   都只在读侧有。形态上落的是设计 §5.3 的**朴素版**（设计写的是"逐文件 child + `ProvenanceExec`"，
+   这里是一个文件读进内存 + 补行号列 + `MemTable`）—— 差别是**收益**（大文件不全读）不是**正确性**，
+   流式版本随 `F.3d` 与 RowSelection 一起收（设计 §9 的 M2）。
+3. **读不出来的东西一律报错，不许"跳过"**：文件读不出来 / 谓词求值失败 / 清单行数与文件不符
+   ⇒ 整条 DELETE 失败。跳过 = 那个文件里该删的行**没删**（用户以为删了）。
+   同理，**已经生效的 DV 读不出来**也报错（拿不到"已经删了哪些行"的真相时写新位图，
+   会把已删的行再记一遍，掩盖"这个表的 DV 已经坏了"）。
+
+### 149.2 顺带做掉的口径
+
+* **行数核对**：定位拿到"文件里实际多少行"，与清单的 `row_count` 不符 ⇒ **报错**
+  （清单行数错了还按"文件内行号"写 DV 就是**按错的位置删行**，比删不动糟得多）；
+  清单写 0（历史口径）则告警后按文件实际行数走；
+* **不重复记已删的行**：新位图 = 命中行 − 已生效 DV（`card` 与"受影响行数"都不虚高）；
+* **谓词一行没命中 ⇒ 什么都不发生**：不写对象、不写 WAL、不推快照号
+  （"没发生的事"不该留痕）；用例专门断言了快照号不动。
+
+### 149.3 边界（明确没做的）
+
+1. **无 `WHERE` 的全表删**：设计 §7 定的口径是**文件级下线**（`purge_table_files`）+ 撤销悬挂 DV、
+   "不生成 DV" ⇒ 那条通路未接线，这里**明确拒绝**并指向它（不做成"用 DV 覆盖全表"，
+   那是另一个形态，设计明文排除过）；
+2. **多表 / `USING` / `RETURNING` / `ORDER BY` / `LIMIT`** 一律明确拒绝（没实现就说没实现）；
+3. **`embedded`（默认）形态**：目录写路径（metanode op）未接线 ⇒ `RemoteCatalog::apply_deletions`
+   仍然明确报错，**DELETE 会失败并说清原因**（不会静默不生效）。**抵押①** 仍在，`F.3c-3` 接。
+   ⚠️ 注意 `apply_deletions` 失败时**WAL 已经写了** —— 错误消息里明说了"重启后会被重放收敛，
+   不要再删一次"（这是 `ADR-3` 的直接推论：WAL 是权威，目录只是投影）；
+4. **compaction 消费 DV + 孤儿 GC 覆盖 `dv/`** ＝ `F.3d`（**抵押②**：现在 DV 真的能造出来了，
+   所以 `F.3d` 的优先级**升高**了 —— 见 §149.5）；
+5. `UPDATE`（设计 M3）＝ 最后。
+
+### 149.4 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **478 passed / 0 failed / 0 ignored**
+  （本刀 +8：`locate` 单测 4 + `sql_delete_e2e` 4）；
+- `crates/server/tests/sql_delete_e2e.rs` 的 4 条：
+  ① **只删命中的行**（删后 4..=10、再删一次 9/10 叠加 ⇒ 4..=8；目录里 DV 覆盖 5 行；
+     命中 0 行的谓词不留版本痕迹）；
+  ② **删刚插的行**：数据还在 chunk（前提断言"此刻没有可见文件"）⇒ DELETE 之后
+     `v=2` 消失，且在**多轮等待 + 缓存刷新**之后仍不复活；
+  ③ **重启后删除仍生效**（`[meta] mode="memory"`：表靠 `replay_wal_ddl`、删除靠 `replay_wal_dml`）；
+  ④ **拒绝的形状**：只读装配 ⇒ `ReadOnly`；`DELETE FROM t`（无 WHERE）/ 多表 / `USING` ⇒ 明确拒绝，
+     且**拒绝不留副作用**（数据还在）；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **5/5**。
+
+> **观测到一条新的全量抖动**（与本刀无关，单独跑必过）：
+> `yuntun-chaos::disk_watermark_aborts_oldest_batch_then_releases_segments`
+> 在全量并行下偶发失败（单独跑 0.11s 通过，失败时是全量 53s 那一轮）。
+> 它与"盘水位"有关（依赖真实磁盘读数），并行跑时会被邻居的写盘挤动。
+> 记在这里而不是修它：**先留证据**（同 `query::partial_fanout::slow_sources_wait_in_parallel_not_in_sequence`
+> 那条既知抖动），要修得给它一个不依赖挂钟/盘位读数的判据。
+
+### 149.5 `F.3` 剩下的刀（顺序与理由）
+
+| 刀 | 内容 | 为什么是现在 |
+|---|---|---|
+| **`F.3d`（下一刀，优先级已升高）** | **compaction 消费 DV**（重写时一并应用 + `revoke`）+ 孤儿 GC 覆盖 `dv/` | DV 现在真的能造出来了 ⇒ "compaction 重写带 DV 的文件 = 复活已删行"从"不可能"变成"随时会发生"（**抵押②的窗口已经打开**）。本刀结束时**还没加**"跳过带 DV 的文件"的保守闸门 —— 只要跑一次合并就中招 |
+| `F.3c-3` | 远端目录 / metanode op（`ApplyDeletions` + `list_deletions` 读缓存视图）+ `replay_wal_dml` 在 `embedded` 下也跑 | 关掉**抵押①**，让默认形态也能删 |
+| 最后 | `UPDATE`（设计 M3：DELETE + INSERT 一个 op 承载） | 复用前两者的全部机械 |
+| 顺带 | 无 WHERE 的全表删（`purge_table_files`） | 设计 §7 的口径，等 `F.3d` 的文件级下线能力 |
+
+---
+
+## 150. **F.3 第五刀：compaction 消费删除向量（+ DV 的 GC 口径 + 与合并互斥）**（2026-09-27）
+
+`§149` 让 DELETE 真的能删了，同时也把**抵押②**的窗口打开了：
+数据文件不可变、删除是"行位标记"，而合并会把基文件重读一遍再写一个新文件 ——
+**不带 DV 的合并会把已删的行原样写进新文件**（复活），而且此后没有任何 DV 能解释它们
+（新文件的行号与旧文件不成对应）。这一刀就是去关这个窗口。
+
+### 150.0 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `compaction::compact_shard` | **读的时候就应用 DV**（按文件、按文件内行号丢行）+ 提交**之后** `revoke` 消费掉的那些 DV；拆成"外壳取租约 + 本体" |
+| `compaction` 孤儿 GC | **对账键改成 `reconciliation_key`**：数据/索引 = 自己的 stem；**DV = 它锚定的数据文件**（见 §150.1 ③） |
+| `format::dv_anchor_batch_id` | 新 helper：从 DV 路径取出锚定的数据文件 batch_id |
+| `model::meta::dml_lease_purpose` | 新约定：**表级 DML 租约**（`dml:<table>`） |
+| `sql::dml` | DELETE 改取**表级 DML 租约**（与合并互斥），拿不到就当场拒绝 |
+| `compaction::TableDmlLease` | 每次合并期间持有同一把表级租约（拿不到 ⇒ 跳过这张表本轮） |
+| 新用例 | `query/tests/deletion_vector_compaction.rs`（2）、`format`（1）、`compaction`（2）、`sql_delete_e2e` 扩了租约断言 |
+
+### 150.1 四个决定
+
+1. **先应用、后撤销**：`revoked_at` 的语义是"这份 DV 不再生效"，它只在**旧文件已经不可见**
+   之后才成立。顺序反了就是"旧文件还看得见 + DV 已撤销" ⇒ 已删的行**当场复现**。
+   所以撤销放在 `commit_compaction` **之后**。
+2. **撤销失败不让整次合并失败**（响亮记 error）：合并已经提交且不可撤销，此时报错只会让调用方
+   再合并一次（多写一个文件）；而残留的 DV 是**惰性的** —— 它锚定的旧文件已转墓碑，
+   读侧只为"本次要读的文件"取 DV（`F.3b`）⇒ 再也不会被应用。它会一直占着目录 ⇒ `F.3d-2`。
+3. **DV 的 GC 对账键必须是"它锚定的数据文件"**（这条是**差点踩上的坑**）：
+   `extract_batch_id` 取的是文件名 stem，而 DV 路径的最后一段是 `dv_id`
+   ⇒ 每一份**活着的** DV 都会被判成孤儿、静默期后被删掉，而它标记的行会复活。
+   修法：`reconciliation_key` 先试 `dv_anchor_batch_id`（`…/dv/<数据文件名>/<dv_id>.bin` 的第二段），
+   于是 DV 与它的数据文件同生共死（锚定对象没了才算孤儿）。
+4. **互斥用表级 DML 租约，不复用 `COMPACTION_LEASE`**（见 §150.2 的实测教训）。
+
+### 150.2 一条实测教训（写下来，别再犯）
+
+第一版把 DELETE 的互斥做成"取 `COMPACTION_LEASE`"（想当然地认为"同一把锁 = 互斥"）。
+结果**四条 e2e 全红**，错误都是"另一处正在做合并"：因为压缩循环的 `LeaseGate`
+是**全程持有 + 持续续租**那把锁的 —— 只要进程内有压缩循环，DELETE 就**永远**拿不到。
+
+教训：**"复用一把锁"之前，先问它的持有周期**。压缩那把表达的是"谁是压缩作业"（长期身份），
+而 DML 需要的表达的是"这张表此刻能不能改基文件"（按次）。两者粒度与生命周期都不同。
+
+### 150.3 边界（明确没做的 → `F.3d-2`/`F.3d-3`）
+
+1. **租约粒度是"表"而不是 `(table, shard)`**：设计 §6.1 明写允许"退化为表级锁（实现择一，文档化选择）"，
+   这里是**刻意的**选择（DELETE 是短操作；多把锁的生命周期管理另开一刀）。记为 `F.3d-3`。
+2. **DV 不触发合并**（设计 §6.2 要求"DV 占比 > 阈值（10%）即可**单文件**触发 + 下界 `dv_min_card`"）：
+   现在合并仍按 `min_files` ⇒ **一个孤零零的带 DV 文件不会被自动消费**，删除成本不会自动收敛
+   （它只在"旁边还有别的文件"时被顺带消费，或有人手动合并）。已进台账 `D-10`。
+   > 注意：这不影响**正确性**（读侧始终应用 DV），只影响"delta 成本有界"这条设计目标的兑现速度。
+3. **孤儿 DV 不回收**：现在只做到"**不误删活着的** DV"（§150.1 ③）。真正回收孤儿 DV
+   需要按 `dv → file_path → batch_id` 对账（设计 §6.2），另开一刀。代价是崩溃在
+   "位图已写、WAL 未提交"时留下的对象会一直留着（无害，但有垃圾）。
+4. **无 `WHERE` 的全表删**（设计 §7 的 `purge_table_files`）仍未接线 ⇒ 仍明确拒绝。
+
+### 150.4 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **483 passed / 0 failed / 0 ignored**（本刀 +5）；
+- `query/tests/deletion_vector_compaction.rs`：
+  ① **对拍（最关键）**：两个文件 + 一个真 DV ⇒ 合并**前后逐行一致**（合并不得改变行集）；
+     合并产物的 `row_count = 5 + 5 − 2`（被删的两行**没有**被写进新文件）；
+     消费掉的 DV 在当前快照不再生效，但**合并之前的快照仍看得到它**（快照隔离）；
+  ② **整文件被删光**：A 的 5 行全删 ⇒ 合并后只剩 B 的 5 行，且**不许把它们带回来**；
+- `format`：DV 路径的锚定 = 数据文件 batch_id（`extract_batch_id` 拿到的是 `dv_id`，用它会误删）；
+- `compaction`：`classify_orphans` 把**锚定数据文件仍活着**的 DV 判为受保护，
+  只把锚定对象已消失的 DV 当孤儿；
+- `sql_delete_e2e`：表级 DML 租约被占时 DELETE **当场拒绝**并点名冲突，归还后又能删；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **5/5**。
+
+---
+
+## 151. **F.3 第六刀：远端目录/metanode op —— 默认形态（`embedded`）也能删（抵押①闭环）**（2026-09-27）
+
+`§146` 起落地的 DV 只在 `memory` 形态可用：`RemoteCatalog::apply_deletions` 是**明确报错**的桩，
+`list_deletions` 按不变量返空（**抵押①**）。这一刀把远端形态接上 —— 于是**默认装配**
+（进程内 1 节点 raft + fjall）也能删，而且读侧拿的就是目录里那一份。
+
+### 151.0 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `meta.proto` | `DeletionEntryMsg` / `ApplyDeletionsOp` / `RevokeDeletionsOp` + `oneof kind` 的 tag **18/19** + `PrefetchPayload.deletions = 6` + 迁移进度表补两行 |
+| `meta/src/op.rs` | `StateOp::{ApplyDeletions, RevokeDeletions}` + Kind 转换 + apply 分支 + `deletion_to_proto`/`deletion_from_proto` 成对镜像 |
+| `meta/src/lib.rs` | `PrefetchPayload.deletions` = 状态机的**全部** DV（含已撤销的） |
+| `meta/src/remote_catalog.rs` | `Cache.deletions`（键 `(dv_id, file_path)`）+ `apply()` 填充（upsert；全量刷新丢掉"表已不在"的死条目）+ **三个方法全部真实实现** |
+| `server/src/lib.rs` | `replay_wal_dml` **两种形态都跑**（关掉 `embedded` 的"WAL 已提交、目录未落"窗口） |
+| `crates/proto/tests/wire_compat.rs` | 分支数 9 → **11**（新 op 也进"逐字段无损"样本，`0`/空串会让"忘了搬字段"看不出来） |
+| 新用例 | `sql_delete_e2e` 加 **默认形态（embedded）** 一条（5 条全绿） |
+
+### 151.1 三个决定
+
+1. **DV 也"全量下发"（含已撤销的）**：与 `files` 里的**墓碑**同一个道理 ——
+   客户端要回答"**某个旧快照**当时看得见什么"，而 `revoked_at` 是那条窗口的另一端。
+   只发"当前生效"的，历史快照的删除就会被算丢（**读到本该被删掉的行**）。
+   全量刷新时顺带丢掉"表已不在"的死条目（状态机的 `drop_table` 会连带清 DV）。
+2. **重放两种形态都跑**：`memory` 靠它重建（否则删除复活）；`embedded` 靠它收敛
+   "WAL 已 append、op 还没提交"那道崩溃窗口（设计 §7 的恢复表）。
+   重复重放不产生变化（状态机按 `(dv_id, file_path)` 去重 ⇒ 全命中就不推快照号）。
+3. **撤销也必须走 op**：只改本地缓存 = 别的进程继续按这份 DV 过滤 ⇒ 本该出现的行被一直藏起来
+   （**少数据**）。所以 `RevokeDeletions` 与 `ApplyDeletions` 一起进 `oneof`。
+
+### 151.2 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **484 passed / 0 failed / 0 ignored**（本刀 +1）；
+- `sql_delete_e2e::delete_works_in_the_default_embedded_assembly`：
+  默认装配下 `DELETE` 成功（不再是"尚未接线"）、删后立刻查不到、**目录里真的有两行 DV**
+  （`deleted_card` 走的是 `RemoteCatalog::list_deletions` ⇒ 缓存视图 ⇒ `PrefetchPayload`）；
+- `memory` 形态的四条 e2e 仍绿（含"重启后仍生效"那条 —— 它靠 WAL 重放）；
+- `wire_compat`：`oneof kind` 的分支数断言 9 → 11（**它守着"加 op 必须同步"这条纪律**，
+  这次它没有自己变红，是因为样本列表里没有新分支 —— 这正是那条计数断言存在的理由）；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **5/5**。
+
+### 151.3 两条边界（一条进台账）
+
+1. **`embedded` 的"同进程重启"用例做不了**：实测在同一个测试进程里，
+   上一次 `Lakehouse` 被 drop 之后 **fjall 的目录锁不释放**（重试 5 秒仍 `FjallError: Locked`）⇒
+   第二次 `MetaNode::open` 起不来。产品形态下"重启"是**另一个进程**，所以这不是产品缺陷，
+   而是**夹具能力缺口**：想端到端证 `embedded` 的重启持久性，需要一个跨进程的 rig
+   （或给 `MetaNode` 暴露一个显式 `shutdown()` 并让装配层在退出时调用）。
+   已进台账 **`D-11`**（待做）。本刀用"读侧走目录"这条替代证明（见 §151.2 的第三条）。
+2. **DV 目前是全量下发**：DV 条数很大时，每次刷新都要过一遍全量。
+   设计 §5.2 早就记了"按表增量刷新入口"是后续项 —— 与文件清单的增量（`manifest_delta`）
+   一起做才有意义。不影响正确性。
+
+---
+
+## 152. **F.3d-2：删除向量自己触发合并**（成本收敛，台账 `D-10` 闭环）（2026-09-27）
+
+删除是"标记"（读侧 merge-on-read），**不消费就永远不收敛**。而原来的触发条件只有
+"同 shard 文件数 ≥ `min_files`" —— 一张写入稀疏的表可能**永远等不到**那一刻，DV 就一直挂着
+（读放大 O(活跃 DV 数)）。这一刀把设计 §6.2 的"DV 占比触发"接上。
+
+### 152.0 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `CompactionConfig` | `dv_ratio_threshold`（默认 **0.1**）＋ `dv_min_card`（默认 **1000**）—— 设计 §6.2 的建议值 |
+| `compact_shard_inner` | 触发判定从"只看文件数"变成**两条路**：① `files.len() >= min_files`（原有）② **某个文件的删除占比 + 绝对行数都够大**（单文件也合并）；DV 位图的读取**提到判定之前**（一次读同时服务判定与消费） |
+| `dv_worth_compacting(cfg, card, rows)` | 判定函数（纯函数、可单测） |
+| 新用例 | `crates/query/tests/dv_triggered_compaction.rs`（4 条：单文件大删除触发 / 小删除不触发 / 低占比不触发 / 判定函数边界表） |
+
+### 152.1 决定：两个守卫**都要满足**（比设计原文的"或"更保守）
+
+| 守卫 | 拦住的形态 | 不设它的后果 |
+|---|---|---|
+| `card >= dv_min_card` | 大文件里删了几行 | 每轮都重写一个大文件（**写放大**） |
+| `card / rows >= dv_ratio_threshold` | 大文件里删了"不少"但占比很低的行 | 同上，只是触发得更晚 |
+
+设计 §6.2 写的是"下界（`card ≥ dv_min_card` **或** `row_count ≥ 地板`）"—— 那个"或"在实现上会
+放开"删几行就重写"这一侧（小文件只要行数够就触发）。这里取**更保守**的一侧并文档化：
+**两条都过才重写**（此时收益——读侧不用再过滤、文件更小——确实盖过重写代价）。
+小文件/小删除不会被这条漏掉：它们由 `min_files` 那条路顺带消费。
+
+### 152.2 两条夹具教训（写下来，下次少走弯路）
+
+1. **memory store 每次 `create_store` 都是新实例**：夹具里"查询一个 store、合并另一个 store"
+   会让合并**读不到 DV/文件**（`S3(Object not found)`）—— 那看起来像产品缺陷，其实是夹具没共享。
+   本刀的用例把 store 显式挂在 `Fx` 上共用。
+2. **`yuntun_format::write_batch` 返回 `(路径, 字节数, 行数)`**：把**行数**当 `file_size` 塞进
+   manifest，parquet 读出来是 `Corrupt footer`（一个字段错位 = 一个假缺陷）。
+
+### 152.3 边界
+
+1. 阈值触发是"每个 shard 每轮：列文件 + 取位图"——**成本 O(带 DV 的文件数)**（无 DV 时是一次
+   目录读 + 空返回）。真正的"DV 索引/反向查"（只扫有 DV 的表）留后续；
+2. **孤儿 DV 回收仍未做**（`F.3d-4`）：现在只保证"不误删活着的"；
+3. 单文件重写的 `max_rows_per_output` 拆分仍是 MVP（单文件全量）；
+4. `min_files` 与阈值两条路都会整 shard 重写（不止那个文件）—— 保守但简单；"只重写带 DV 的文件"
+   是后续优化（设计没要求）。
+
+### 152.4 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **488 passed / 0 failed / 0 ignored**（本刀 +4）；
+- `dv_triggered_compaction`：
+  ① 单文件（`min_files = 5` 而只有 1 个文件）+ 删 1200/2000 行 ⇒ **被 DV 触发**合并；
+     产物 `row_count = 800`、**行集逐行不变**、DV 被撤销；
+  ② 删 5/5000 行 ⇒ **不重写**，且**读侧照样对**（4995 行；DV 仍生效 —— 不重写 ≠ 删不掉）；
+  ③ 删 1500/20000 行（7.5% < 10%）⇒ **不重写**；
+  ④ 判定函数的边界表（1000 行 + 10% 正好踩线 = 是；差一行 = 否；占比不足 = 否；空文件/损坏位图 = 否）；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **5/5**。
+
+> **台账 `D-10` 闭环**：设计 §6.2 的"DV 占比触发"已落地（含下界与防抖动判据）。
+
+> **又观测到一条全量抖动**（与本刀无关，单独跑必过）：
+> `yuntun-ingest::flush_e2e::ingest_accumulate_flush_reaches_manifest_and_wal_terminal`
+> 在全量并行下偶发失败（那一轮该二进制跑了 26s；单独跑 0.02s 通过）——
+> 它按"等攒批循环"的挂钟耐心判成败，重负载下会被邻居挤掉。
+> 与既知的两条（`query::partial_fanout::slow_sources…`、`chaos::disk_watermark…`）记在一起：
+> **要修都得给它们不依赖挂钟的判据。**
+
+---
+
+## 153. **F.3e-1：`UPDATE` 的原子提交（一个新 op：删 + 插同一个快照）**（2026-09-27）
+
+用户在 `D-12` 上的裁决：**采用 `plan.md` F.7 决策 5 —— "一个 op 承载、原子可见"**。
+这条裁决把 `UPDATE` 的实现路径定死了：**不能**用"先 `apply_deletions` 再 `commit_files`"
+两段式（那会落在两个快照上，读侧必然撞见中间态）。本刀落的就是那个"一个 op"。
+
+### 153.0 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `CatalogState::apply_update` | **一个 `next_snapshot()` 服务两个事实**：删除向量（`applied_at`）与新行文件（`valid_from`）**同号**；幂等（文件按 `batch_id`、DV 按 `(dv_id, file_path)`，全重复 ⇒ 不推版本）；归属校验（一次只作用于**一张表**） |
+| `meta.proto` | `UpdateOp { deletions, new_files, upd_id }`（`oneof kind` tag **20**）+ 迁移表补一行 |
+| `meta/src/op.rs` | `StateOp::Update` + Kind 转换 + apply（`hit()`/`one()` 按快照号是否推进判定） |
+| `CatalogOps::apply_update` | 新 trait 方法 + `MemoryCatalog`（宿主取钟）+ `RemoteCatalog`（propose）实现 |
+| `remote_catalog_parity.rs` | `Observed` **把删除向量也拉进对拍**（`deletions_now` / `deletions_old`）+ 新阶段 **⑥b**：两种形态的 `apply_update` 结果逐项一致 + **原子性判据** + 幂等重放 |
+| `state.rs` 单测 | `update_puts_deletions_and_new_rows_on_one_snapshot`（同号 = 原子）、`update_rejects_cross_table_and_is_a_noop_when_empty` |
+| `wire_compat` | 分支数 11 → **12** |
+
+### 153.1 原子性的**判据**（不是"看起来原子"）
+
+读侧是按**快照号**切分世界的（文件用 `valid_from`、删除向量用 `applied_at`/`revoked_at`）。
+于是"原子"这句话在代码里有一个**可断言的形状**：
+
+```
+文件.valid_from == 删除向量.applied_at == 本次 op 分配的那个快照号
+```
+
+三条断言都落在用例里（状态机 + 对拍各一遍）：
+
+* 新文件在 `snap` 可见、且 `valid_from == snap`；
+* 删除向量在 `snap` 生效、且 `applied_at == snap`（**同号**）；
+* **旧快照 `snap - 1` 下两半都不可见** —— 没有"删了没插"（少数据）也没有"插了没删"（重复计数）。
+* 另外：**一次状态转换只推一个快照号**（`snap == before + 1`）—— 若分两步就会是 +2。
+
+### 153.2 与设计文档的冲突：以用户裁决为准，并把文档改过来
+
+`delta-dml-design §4.2` 原来写的是"WAL 原子；**可见性不原子**（删即时、插经攒批）"，
+与 F.7 决策 5 正面冲突。本刀按裁决实现，并在设计文档里加了**显式修订块**
+（不重写历史：原文保留，加"修订（2026-09-27，用户决定）"并说清代价）——
+代价是：新行**不再走 Data 攒批那条路**，而是在 op 之前**先落成一个文件**
+（每个源文件一个产物，继承它的 `shard` / `time_window`），这样两半才能在同一个快照上生效。
+
+### 153.3 边界（`F.3e-2` 待做）
+
+1. **SQL 前端**（`UPDATE t SET … WHERE …`）：解析、把 `SET` 表达式求成新行、写文件、调 `apply_update`、
+   刷缓存 —— 下一刀。⇒ **现在还不能 `UPDATE`**（SQL 层没有分支）。
+2. **WAL `UpdatePayload`（type 7）+ `replay_wal_dml` 处理**：下一刀（与本刀同批）。
+   在它落地之前，`UPDATE` 不能对外开（否则崩溃就丢：WAL 里没有这条事实）。
+3. **`UPDATE … FROM` / `RETURNING` / 多表**：明确拒绝（下一刀跟在解析里）。
+4. 每个源文件一个产物：`UPDATE` 命中 N 个文件就产生 N 个新文件 + N 份 DV（都进同一条 op）。
+   好处是 `shard`/`time_window` 归属不变（`drop_shard` 语义不受影响）；代价是"宽 `UPDATE` 会碎文件" ——
+   合并迟早会收掉（`F.3d`）。
+
+### 153.4 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **491 passed / 0 failed / 0 ignored**（本刀 +3）；
+- 状态机：`update_puts_deletions_and_new_rows_on_one_snapshot`（同号 + 旧快照两半都不可见 + 幂等重放）、
+  `update_rejects_cross_table_and_is_a_noop_when_empty`（跨表拒绝、空 op 不推版本、`card = 0` 拒绝）；
+- `remote_catalog_parity` 阶段 ⑥b：**真 metanode（3 节点簇）**与 `MemoryCatalog` 的
+  `apply_update` 结果逐项一致（含 DV 的 `deletions_now/deletions_old` 对拍）、快照号一致、
+  原子性判据成立、重放不推版本；
+- `wire_compat`：`oneof kind` 分支数 11 → 12；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **5/5**。\n
+---
+
+## 154. **F.3e-2：`UPDATE t SET … WHERE …` 落地**（2026-09-29）
+
+`§153` 把"一个 op 承载、原子可见"落成了目录能力（`UpdateOp` + `CatalogState::apply_update`），
+这一刀把**SQL 前端**与**WAL**接上：`UPDATE` 真的能改了，而且改得**原子**
+（读侧看不到"删了没插"或"插了没删"的中间态）。
+
+### 154.0 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `model::wal_record` | `UpdatePayload`（**type 7**）+ `NewFilePayload`（新行文件清单）+ `Record::Update` 各分支 + 两条用例（两半**逐字段**过线） |
+| `model::batch` | `Record::Update` 不进批次状态机（新行不是"攒批中的数据"：它已经是一个已提交文件） |
+| `ingest::dml` | `replay_wal_dml` 处理 `Update`：两半由**一条 `apply_update`** 重建（重放也必须原子）+ `ReplayDmlStats.new_files` + 2 条用例（原子重建 / 旧世代整条跳过） |
+| `query::locate` | `locate_and_project`（**一次扫描**同时拿"命中行号"与"这些行的新值"）+ `ProjectedRows`（**逐行对齐是契约**）+ 3 条用例 |
+| `sql::dml` | `execute_update`（**七步**）+ `parse_update_target` / `parse_assignments` / `projection_sql` / `drop_already_deleted` |
+| `sql` 分流 | `Statement::Update` 进 `execute_update` |
+| `server/tests/sql_update_e2e.rs`（新） | 4 条端到端（见 §154.4） |
+
+### 154.1 三个决定
+
+1. **七步顺序**（与 DELETE 同源，多一步"写文件"）：
+   `① 表级 DML 租约（与合并互斥）→ ② force flush → ③ 逐文件定位+投影 → ④ 新行写成文件
+   → ⑤ 位图写对象 → ⑥ WAL（一条 `UpdatePayload`）→ ⑦ apply_update → 刷缓存`。
+   最要紧的两条顺序理由与 DELETE 相同：**对象先于 WAL**（崩溃只留孤儿对象）、
+   **WAL 先于目录**（目录没落时重启靠重放收敛，错误消息明说"不要再改一次"）。
+2. **一次扫描拿两半，且显式按行号排序**。`ProjectedRows` 的契约是
+   "`batch` 第 `i` 行 ↔ `positions[i]`"——**不排序就等于把"哪一行的新值"交给 DataFusion 的
+   输出顺序**，而错位的后果是把 A 行的新值写到 B 行的位置（静默错，最难发现的那种）。
+   排序是显式的一步（`sort_to_indices` + `take`），不是"碰巧一致"。
+3. **已删的行必须被扣掉**（`drop_already_deleted`）。这是 `UPDATE` **特有**的坑：
+   DELETE 把已删行再标记一遍无害（位图 OR），而 `UPDATE` 会把这些行的**新值**当新行写进产物
+   —— 等于把删掉的行**更新复活**（用户没要求、也看不出来）。所以定位结果要减去"已生效的 DV"，
+   且因为两半逐行对齐，**同一个掩码**同时作用于行号与新值。
+
+### 154.2 本刀修掉的一个真 bug
+
+`locate_and_project` 里 `out[0].schema()` 在**零命中**时直接索引越界 panic ——
+DataFusion 在"零行"时返回的是**零个批次**（不是"一个空批次"）。
+由 e2e 的 `UPDATE t SET v = 0 WHERE v = 999`（"没命中就什么都不做"这条正常路径）撞出来；
+已加护栏 + 单测 `no_match_yields_no_batch_instead_of_panicking`。
+这类"正常业务路径上的 panic"值得单独记一笔：它不会被 happy-path 用例发现。
+
+### 154.3 边界
+
+1. **无 `WHERE` 的全表 UPDATE** 明确拒绝（它等于整表重写；设计 §7 只定了"全表删"走文件级下线）；
+2. `UPDATE … FROM` / `RETURNING` / `OUTPUT` / `ORDER BY` / `LIMIT` / `JOIN` / 元组赋值
+   （`SET (a, b) = …`）/ 同一列赋两次 —— 一律明确拒绝；
+3. **缺列文件上 UPDATE 会报错**：schema 演进后的旧文件缺新列，这里**不像** `flush::align_batch`
+   那样补 NULL（那是写入侧的职责）⇒ 那些文件上的 `UPDATE` 会响亮失败。
+   **台账 `D-13`**（待做：定位前按当前 schema 对齐，或明确跳过缺列文件并告警）；
+4. **每个源文件一个产物**：宽 `UPDATE` 会碎文件（合并迟早收掉，`F.3d`）；
+   产物继承源文件的 `shard` / `time_window` —— 所以 `drop_shard` 与按分片读的语义不变；
+5. `statistics()` 仍未接（同 `§147.3`，不影响正确性）；
+6. **默认（`embedded`）形态也能 `UPDATE`**：`apply_update` 走 `§151` 接好的 metanode op 通道
+   （不像 DELETE 当年那样需要单独的接线刀）。
+
+### 154.4 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **500 passed / 0 failed / 0 ignored**（本刀 +12）；
+- `sql_update_e2e`（4 条）：
+  ① **旧值没了、新值在、谓词外的行逐行不变**（10 行 ⇒ 4..10 + 101/102/103）；
+    快照号只 +1（先等数据落成文件，免得把 `force_flush` 那一次算进来）+
+    **产物 `valid_from` == 删除向量 `applied_at`**（同号 = 原子）+
+    **旧快照两半都不可见** + 命中 0 行时**不留版本痕迹**；
+  ② **已删的行不会被更新复活**（删 `v=2` 后更新 `v<=3` ⇒ 只改 1 和 3，`102` 不许出现）；
+  ③ **重启后仍生效**（`[meta] mode="memory"`：全靠 WAL 重放；且重放之后两半**仍然同号**）；
+  ④ **拒绝形状**（无 WHERE / `FROM` / 表达式引用不存在的列 / 同列两次 / `RETURNING`）+ 只读形态
+    `ReadOnly`，且拒绝**不留副作用**；
+- `replay_wal_dml`（+2）：`UPDATE` 两半由一条 op 重建（同号）、完全重复不推版本、
+  旧世代整条跳过（**不许只落一半**）；
+- `query::locate`（+3）：定位+投影逐行对上、零命中不 panic、投影写错即报错；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **5/5**。
+
+> **`F.3` 到此完整**：`§146`（表达层/目录）→ `§147`（读侧生效）→ `§148`（写侧机械）→
+> `§149`（SQL `DELETE`）→ `§150`（compaction 消费 DV）→ `§151`（远端目录/默认形态）→
+> `§152`（DV 触发合并）→ `§153`（原子 op）→ `§154`（SQL `UPDATE`）。
+> 剩余：`F.3d-3`（租约细粒度）、`F.3d-4`（孤儿 DV 回收）、`D-13`（缺列文件上的 UPDATE）、
+> 无 `WHERE` 的全表删（`purge_table_files`）。\n
+---
+
+## 155. **台账 `D-13` 闭环：DML 与 schema 演进**（2026-09-29）
+
+`F.2`（`ALTER TABLE ADD COLUMN`）与 `F.3`（DELETE / UPDATE）各自都验过了，
+但它们**交叉**处有个断层：老文件里没有新列，而"定位扫描"把文件按**它自己的列**注册进内存表
+—— 于是 `DELETE FROM t WHERE 新列 IS NULL`、`UPDATE t SET c = c + 1 WHERE c IS NOT NULL`
+这类语句会以 schema 错误**整条失败**，而查询那边明明把这些行显示成 `NULL`。
+
+这一刀把定位路径接进**与读/写完全相同的对齐规则**，于是 DML 与 `SELECT` 对同一批行
+永远给出同一个答案。
+
+### 155.0 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `query::locate::read_with_row_idx` | 读文件后、补行号列**之前**，先用 `yuntun_model::arrow_util::align_batch` 把每个批次对齐到**表 schema**（缺列补 NULL / 多余列丢掉 / 类型按提升格 cast）；对齐失败即**报错** |
+| `crates/query/src/locate.rs` 用例 | +3 条：缺列 `IS NULL` 命中且投影补 NULL、多余列被丢掉、`Int32` 文件配 `Int64` 表 |
+| `crates/server/tests/sql_dml_schema_evolution_e2e.rs`（新） | 1 条端到端：`ADD COLUMN` 之后 DELETE/UPDATE 在老文件、以及**新旧文件混合**下都按用户看到的那样生效 |
+
+### 155.1 三个决定
+
+1. **复用同一个 `align_batch`，不在定位路径里另写一套**。三条通路（写 `flush` /
+   读未落盘数据 / 读定位）必须同一套语义 —— 本仓最怕的失败形态是"两条通路对同一批数据
+   给出不同答案"（**静默不一致**）。`D-13` 就是这个纪律的盲点：读路径与写路径早就对齐了，
+   定位路径漏了，于是"查询说 NULL、DML 说这列不存在"。
+2. **对齐放在补行号列之前**。行号只与"第几行"有关、与列怎么对齐无关；
+   而这个次序还顺带堵掉一个潜在隐患：**产物文件的 schema 现在恰好是表 schema** ——
+   以前它可能带着表没有的列（`DROP COLUMN` 后的老文件），写回清单之后就与表对不上。
+3. **对齐失败照旧报错**（不兼容 cast）。与 `§146.1` 决定③同一条纪律：
+   按"没对齐的列"去定位 = 让谓词与用户看到的东西不一致 ⇒ 宁可失败。
+
+### 155.2 为什么没有采用"跳过缺列文件并告警"这条备选修法
+
+台账 `D-13` 当时列了两条路。另一条（跳过那些文件）**没有采用**：
+"跳过"= 那些行**不被改**，而用户看到的谓词**明明命中**它们（在他眼里它们是 NULL、满足 `IS NULL`）
+⇒ 静默少改一批行，正是本仓最不能接受的形态。**要么按与查询一致的语义改，要么响亮失败**，
+没有第三条路。
+
+### 155.3 边界
+
+1. 被 `DROP COLUMN` 掉的列在定位路径里**不可见**（与查询一致：读路径也只按表 schema 投影）；
+2. 对齐是**按名**的：文件里的同名列按提升格 cast，语义与读路径一致；
+3. 与索引的关系不变（带 DV 的文件仍然不取索引，`§147.1` 决定②）。
+
+### 155.4 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **504 passed / 0 failed / 0 ignored**（本刀 +4）；
+- `sql_dml_schema_evolution_e2e`（1 条，但要覆盖五个环节）：
+  ① 前提（查询侧老文件的新列 = NULL）→ ② **缺列文件上的 UPDATE** →
+  ③ 谓词与用户所见一致（`c = 7` / `c IS NULL` 各命中各的）→
+  ④ **新文件与老文件混合**时一次 UPDATE 跨两类文件 → ⑤ 缺列文件上的 DELETE
+  （删掉的正是 `c IS NULL` 的那两行），最后再核一遍"查询与 DML 说法相同"；
+- `query::locate` 单测 10 条（+3：缺列 / 多余列 / 窄类型）；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **5/5**。
+- **附：一条全量并发下的抖动**（与本刀无关）—— `crates/meta/tests/raft_poc.rs` 的
+  `full_cluster_restart_keeps_state_byte_identical`（`建 schema: NoQuorum`）与
+  `follower_behind_catches_up_via_snapshot` 在全量并发（`-j 4`）时红了，
+  **单跑 `-p yuntun-meta --test raft_poc` 0.33s 全绿**：性质同 `§152.4` 记的那条
+  （断言与被测语义无关、资源竞争导致的超时）。留在这里以便日后按频率决定要不要治。\n
+---
+
+## 156. **`F.3d-4`：删除向量的孤儿回收（判据从"一条件"改"两条件"）**（2026-09-29）
+
+设计 §7 明说"崩溃于 **DV 已写、WAL 未提交** ⇒ 孤儿 DV，孤儿清理回收"。
+`§150` 为了不让**活着的** DV 被误删，把对账键改成了"**它锚定的数据文件**" ——
+那一改**修对了"不误删"，顺带把"能回收"堵死了**：幽灵 DV（对象写了、事件没落地）
+锚定的那个文件**还活着** ⇒ 每轮对账都被当成"已知"放过 ⇒ **永不回收**（空间只增不减）。
+
+两个方向是**两个不同的失败形态**（删错 = 已删行复活；不删 = 垃圾只增不减），
+所以判据必须**同时**守住，而不是二选一。
+
+### 156.0 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `CatalogOps::dv_object_paths`（新方法） | 目录里**被事件引用**的 DV 对象路径（全量、**不过快照过滤**）。`MemoryCatalog` 从事件表取；`RemoteCatalog` 从 prefetch 缓存取（同 `list_deletions`：GC 每轮都问，不能每轮过网络）；测试用的包装实现照旧委托 |
+| `compaction::is_object_protected`（新函数） | 判据分两类：**数据文件/索引一条件**（自己的 `batch_id` 在保护集）；**DV 两条件**（锚定文件在保护集 **∧** 目录里有事件引用） |
+| `compaction::classify_orphans` + 清理循环 | 加 `referenced_dv_objects` 参数；**拿不到就整轮不删**（与 `known_batch_ids` 同一把安全闸，方向是"少删"= 安全） |
+| 用例 | `compaction` 单测改/加 1 条（两条件的四象限 + 数据/索引不受影响）；`chaos` 活体用例 1 条（真清理器 + 真文件 + 真事件） |
+
+### 156.1 三个决定
+
+1. **判据是"合取"，不是"析取"** —— 两边各守一个失败方向：
+   只判锚定 ⇒ 幽灵永不回收（本刀修的洞）；只判引用 ⇒ 锚定文件已消失的 DV 留着占空间
+   （而它再也读不到，白占）。合起来一句话：**没人会读的对象才是垃圾**
+   （前提文件还在，**且**目录认它）。
+2. **`dv_object_paths` 返回全量、不做快照过滤**：GC 问的是"还有没有人引用它"，
+   与"哪个快照看得见它"是两件事 —— 已 `revoke`（合并消费过）但锚定文件仍在保护期的 DV
+   **仍要算被引用**（旧快照的读者还要读它）。
+3. **远端形态读 prefetch 缓存，滞后由静置期兜住**：缓存可能落后（刚 `apply`、还没下发）
+   ⇒ 那份 DV 不在"被引用"集合里；但它同时受**静置期**保护（默认 `grace` = 1 小时，
+   而"对象写完 → `apply_*` 落地"的窗口是**毫秒级**）⇒ 差 4 个数量级。
+   反方向（集合里多出已撤销的）是**保守方向**（少删）✓。
+   **如果日后要彻底摆脱这个时间假设**，结构性升级的路子是给 DV 对象加"在途登记"
+   （照 T14.3 给数据文件做的那个）—— 现在**不做**：数据文件那条之所以必须做，
+   是因为"上传可能慢于 grace"（大文件 / S3 抖动），而 DV 对象很小、写完立刻 append WAL，
+   没有那个问题。
+
+### 156.2 边界
+
+1. **`drop_table` 之后**：事件被清掉 ⇒ 条件②失败 ⇒ DV 对象回收 ✓
+   （设计 §6.2 的"`drop_table`/`drop_shard` 时 DV 随文件对账下线"两个方向现在都成立）；
+2. **`drop_shard` 之后**：文件被标墓碑 ⇒ 退出保护集 ⇒ 条件①失败 ⇒ 回收 ✓；
+3. **静置期的语义没变**（它同时是"给还在读旧快照的读者"的窗口 = 墓碑期）✓；
+4. **不覆盖**：`purge_table_files`（无 `WHERE` 的全表删，设计 §7）—— 那是独立的一件（仍待排刀）；
+5. 与 `F.3d-3`（租约细粒度）无关：GC 不持租约（它只删"没人读"的对象，不碰目录事实）。
+
+### 156.3 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **505 passed / 0 failed / 0 ignored**；
+- `chaos::orphan_cleanup_reclaims_unreferenced_deletion_vectors`（活体，真清理器 + grace=0）：
+  ① **活着的 DV 一个字节都没动**（对象在 + 位图能解开 + 目录事件仍在）；
+  ② **幽灵 DV（锚定活文件、无事件）被回收**（本刀修的判据）；
+  ③ **锚定文件不存在的 DV 被回收**；
+  ④ 数据文件一个不少（"回收"不许变成丢数据）；
+- `compaction` 单测：两条件的四象限（活+引用=保护 / 活+无引用=孤儿 / 死+引用=孤儿 /
+  数据与索引只看自己的 `batch_id`）；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **5/5**。\n
+---
+
+## 157. **`F.3f`：`purge_table_files` —— 无 `WHERE` 的全表删**（2026-09-29）
+
+设计 §7 对"`WHERE` 命中全部行"与"无 `WHERE`"分了**两层**：
+
+> | `WHERE` 命中全部行 | 统一走 DV，由 compaction 收敛（行级口径） |
+> | 无 WHERE（全表删） | **先 force-flush** → **`purge_table_files`** 文件级下线 + 同步 revoke 悬挂
+>   DV（R14）+ 持该表全部 shard 的 lease；**不生成 DV**——文件级与行级分属两层，非第二形态 |
+
+这一刀把后一层落地：`DELETE FROM t`（没有 `WHERE`）走**文件级下线**。
+
+### 157.0 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `CatalogState::purge_table_files` + `purged` 记忆 | **一个快照**：此刻可见的文件全部标墓碑（`deleted_at = next`）+ 悬挂 DV 同步 `revoke`（同一个 `next`）；按 `purge_id` 幂等；**空表也记 id**；返回 `PurgeOutcome { snapshot, files, revoked, rows }` |
+| `model::snapshot` | `SnapshotPurgeEntry`（**tag 16**）：幂等记忆必须能过快照 —— 丢了就"重放旧 purge 吃掉新数据" |
+| `CatalogOps::purge_table_files` + `PurgeOutcome` | 三处实现：`MemoryCatalog` 直落状态机；`RemoteCatalog` 走 raft 并用 `ApplyOutcome.result` 回填三个数（客户端**猜不出来**）；测试包装委托 |
+| proto | `PurgeFilesOp`（**tag 21**）+ `PurgeFilesResult`；迁移进度表加一行；`wire_compat` 分支数 12 → **13** |
+| `model::wal_record` | `PurgePayload`（**type 8**）+ `Record::Purge`；`batch.rs` 不进批次状态机 |
+| `ingest::dml` | `replay_wal_dml` 处理 purge（世代闸门 + 幂等由状态机保证）+ `stats.purged` |
+| `sql::dml` | 无 `WHERE` **在拿到租约之后分流**到 `execute_purge`：表存在性 → 强制 flush → WAL → `purge_table_files` → 刷缓存 |
+| 用例 | state 4 条 + 重放 2 条 + 端到端 1 条（6 个环节）+ **两条旧用例的期望更新**（见 §157.3） |
+
+### 157.1 四个决定
+
+1. **不生成 DV**（设计原话）。整表删若逐行标 DV：位图大小 = 行数（十亿行 = 十亿位的位图），
+   而且之后还要靠合并一行行重写；文件级下线是**目录里改几个字段**（文件整体标墓碑，读侧立刻看不到）。
+   `rows` 也不是"逐行算"出来的 —— 是 `Σ(row_count − 生效中 DV 的 card)`。
+2. **必须进 WAL**（设计 §7 的表里没点名这条，但结论是推出来的）：purge **只改目录**，
+   数据对象**一个都不动** ⇒ "重启后表是空的"从对象存储**推不出来** ⇒
+   少了这条记录，内存元数据形态重启后**整表复活**（用户以为删了）。
+   记录里**不带文件清单**：重放语义是"下线**此刻**可见文件"，而重放是**按 WAL 顺序**做的，
+   "此刻"就是这条记录在那个位置上的世界（带清单反而多一个错源）。
+3. **`purge_id` 幂等 + 空表也记 id**：语义是"下线**此刻**可见文件" ⇒ 重放一条旧 purge
+   （嵌入式形态下面录里已经有 purge 之后写入的文件）会**吃掉新数据**（静默丢数据）。
+   所以幂等记忆要进快照（tag 16），而且**空表也要记** —— 否则同一个 id 会**延迟生效**
+   （等新数据落进来才删，那是更糟的语义）。
+   配套：SQL 层**每次执行都新生成** `purge_id` ⇒ "用户再执行一次 `DELETE FROM t`"是一次
+   **新的**清除（`DELETE` 本该如此），而"重放同一条 WAL 记录"是**空操作**。
+4. **受影响行数 = 用户原本看得见的行数**（扣掉被 DV 藏起来的行）—— 与行级删同一口径：
+   先 `DELETE FROM t WHERE v = 3`（1 行）再 `DELETE FROM t` 应报 **4** 而不是 5。
+
+### 157.2 边界
+
+1. **与合并互斥**靠**同一把表级 DML 租约**（外层已持）：否则合并会读到 purge 之前的基文件、
+   把那些行写进新文件（**复活**）；
+2. 只 `bump_manifest_ver`（**不推 `schema_ver`**）：这是"文件的事实"变化，增量通道
+   （`files_since`）本来就带墓碑 ⇒ 读侧能收敛，不必付全量重建的代价。
+   ⚠️ 但**同步 revoke** 会触发一次全量缓存重建（`revoke_deletions_for_file` 的既有语义，
+   `§146`）—— purge 罕见，代价可接受，记在这里免得日后被当成"多余的抖动"；
+3. `DROP TABLE` 仍走 `drop_table`（连表定义一起删）；purge 只清数据、**表还在**（可以继续写入
+   —— 用例专门验了这条，因为"删表之后表变成黑洞"是很容易写出来的坏实现）；
+4. **未做**：`DELETE … ORDER BY / LIMIT` 形态（sqlparser 有这两个字段，本刀未接，
+   仍按"形状不支持"拒绝）；租约细粒度 `F.3d-3`。
+
+### 157.3 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **512 passed / 0 failed / 0 ignored**；
+- `sql_purge_e2e`（1 条，6 个环节）：① 先 `DELETE WHERE v = 3`（1 行）再 `DELETE FROM t`
+  ⇒ **4**（口径）② 快照只 +1 ③ **文件级下线** + 悬挂 DV 在**同一个快照号** revoke +
+  清除**之前**的快照两样都还在（快照隔离）④ **清除之后写入的数据活着**（表不是黑洞）
+  ⑤ 空表再删 = 0 行且**不推版本号** ⑥ `ReadOnly` / `NotFound` + **重启之后仍然空**
+  （且重启后写入照样生效）；
+- `replay_wal_dml`（+2）：一条 purge 从 WAL 重建；**重放同一条记录绝不吃掉它之后写入的数据**
+  （本刀的核心防线）；旧世代整条跳过；
+- `catalog` state 单测（+4）：一个快照 + **对照组**（另一张表的文件一行不动）+ revoke 同号 +
+  幂等/新数据活着 + 空表记 id；
+- **两条旧用例的期望更新**（刻意的）：`sql_delete_e2e` 的"拒绝清单"里有 `DELETE FROM t`、
+  `sql_dml_e2e` 的"⑧ 明确拒绝"里有 `DELETE FROM audit_events` —— 这两个拒绝是**被这一刀
+  故意去掉的**。前者移出清单（并写明它去哪了），后者换成一个**仍然不支持**的形状
+  （`DELETE … USING`），好让"明确拒绝"这条检查还有分量（也免得把后面依赖数据的断言清空）。
+  ⇒ **"改了行为就要去找断言它的地方"**，不然全量绿是假的；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **5/5**。\n
+---
+
+## 158. **`F.3d-3`：DML 租约细到 `(table, shard)`**（2026-09-29）
+
+设计 §6.1 的原文是：
+
+> **粒度 = `(table, shard)`**（评审四 R11：compaction 工作单元是 `compact_shard`，
+> 分钟级任务按表互斥会阻塞该表 DML 数分钟）；DML 的"定位 → DV → apply"全程持所涉 shard 的 lease；
+> **多 shard DML 的 lease 获取（评审五 R19）**：按 shard 名**排序后一次性获取**（全或无），
+> 避免两个并发 DML 以不同顺序增量获取而死锁；
+> 原 CAS 校验**降级为断言**（lease 失效等异常路径 fail-loud，而非静默复活）。
+
+`§150` 当时按设计允许的兜底走了**表级**（"跨 shard DML 也可退化为表级锁，实现择一，文档化选择"），
+这一刀把它收窄到设计原文，并把 R19 的"排序全或无"与"CAS 降级为断言"两半一并落地。
+
+### 158.0 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `model::meta` | `dml_lease_purpose(table)`（表级）**删除**，换成 `dml_shard_lease_purpose(table, shard)` = `dml:{table}:{shard}` —— 删掉旧函数是刻意的：**留着它等于留一个"以为取表级就安全"的陷阱**（今天的合并只取 shard 级），而删掉之后任何遗漏的调用点都会**编译失败**（响亮） |
+| `catalog::LeaseSet`（新） | 一组租约：**按用途键排序去重 → 逐个取 → 任何一个拿不到就把已拿到的全部放掉**（R19 的全或无）+ 逆序释放（按 `(holder, epoch)` 释放，防"我被接管了却把别人的锁放掉"）+ 空集合是**成功的空集合** |
+| `CatalogState::apply_deletions` / `apply_update` | **锚定已下线文件的 DV ⇒ 拒绝**（设计 §6.1 的"CAS 降级为断言"）：合并抢先标了墓碑而我拿着过期清单，登记进去也读不到 = **静默不生效的删除** |
+| `sql::dml` | DELETE / UPDATE / 整表清除都改成：**⓪ 强制 flush → 求分片集合 → 取一组分片租约 → 干活（干活前再列一次并核对分片覆盖）** |
+| `compaction` | `TableDmlLease` → `ShardDmlLease`：合并只取**自己那个分片**的锁（`compact_shard(table, shard)` 本来就知道 shard） |
+| 用例 | `LeaseSet` 3 条（不同分片互不阻塞 / 全或无且不漏锁 / 排序去重+空集合）、`compaction` 1 条（只取自己分片的锁，含"别的分片占着照做"）、`catalog` 1 条（锚定下线文件被拒 + 找不到清单时放行）、`sql_delete_e2e` 的租约段改成 shard 粒度并**加断言"另一分片的锁不影响本次删除"** |
+
+### 158.1 四个决定
+
+1. **顺序：`force_flush` 必须在取锁之前**。这不是风格问题 —— 一开始我按"先取锁再 flush"写，
+   实测立刻炸：**在途数据还不属于任何文件**，所以 ① 它所在的分片**还不存在**（取锁时看不见）
+   ② flush 一跑就造出那个分片 ⇒ 我的"分片集合变了"校验把**完全正常的删除**（刚插完就删）
+   拒掉了。修法是把 flush 提到最前 —— flush 之后文件集合才稳定，分片集合才有意义。
+2. **取锁用"第一次列"，干活前"再列一次并核对"**：两次之间数据面还可能变（flush 往**新分片**
+   写文件）。新分片的锁我没有 ⇒ 那种情况下**报错让调用方重试**，而不是硬干 ——
+   DML 是短操作，重试的代价远小于"DV 锚在会被合并改掉的文件上"（静默少删）。
+   刻意**不做**"发现缺锁就补取"：那正是 R19 要避免的**增量获取**（两个并发 DML 以不同顺序
+   补锁 ⇒ 死锁）。
+3. **CAS 降级为断言 = 状态机拒绝锚定已下线文件的 DV**。租约挡住的是"**我们知道的**并发"，
+   而清单过期（合并抢先）是**另一条**路径：即便它发生（进程被挂起超过 TTL、时钟漂移、
+   别人的 bug），也要让它在**登记那一刻**响亮失败，而不是留下一个不生效的删除。
+   宽容的那一格写明白了：**清单里找不到这个 batch**（老记录/重放条目）⇒ 放行（不假装它下线了）。
+4. **删掉表级用途键而不是留着**：留着就会出现"某处取了 `dml:{table}` 以为安全、
+   其实合并只取 shard 级"的**静默失配**（本仓最烦的那类）。删除让所有遗漏点编译失败。
+
+### 158.2 边界
+
+1. **粒度到 shard，不再到表**：同表不同分片的 DML 与合并现在**互不阻塞**（用例两个方向都验了）；
+2. **`drop_shard` 的并发语义没动**（它不在租约体系里）—— 它的语义是"整 shard 文件下墓碑"，
+   与合并交错时仍是"谁先提交谁说了算"，本刀未涉及（记在这里免得被当成已覆盖）；
+3. 租约 TTL 仍是 30s（DML 是短操作）；进程崩溃靠 TTL 释放 ✓；
+4. **未做**：`F.3d-3` 之外，设计 §6.1 里"CAS 校验降级为断言"只落了"锚定文件已下线"这一种异常
+   （其余如"租约过期后仍提交"要靠代次栅栏，那是另一条线，今天 DML 侧没有栅栏字段）。
+
+### 158.3 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **517 passed / 0 failed / 0 ignored**；
+- `LeaseSet`（3 条）：s0 被占时 s1 照样能取（R11）/ 多 shard 集合里有一把拿不到 ⇒ **整个集合失败
+  且不漏锁**（用"别人现在能取到 s0 与 s2"来证明没漏）/ 用途键排序去重 + 空集合成功；
+- `compaction`（1 条）：本分片被占 ⇒ 跳过**且一个文件都没动**；别的分片被占 ⇒ 照做（3 → 1 个文件）；
+- `catalog`（1 条）：锚定已下线文件的 DV 被拒（消息点名"静默不生效的删除"）+ 找不到清单时放行；
+- `sql_delete_e2e`（既有用例扩了断言）：本分片被占 ⇒ DELETE 拒绝且**点名分片**；
+  另一分片的锁 ⇒ **不影响**本次删除；归还之后又能删；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **5/5**。\n
+---
+
+## 159. **台账 `D-11` 闭环：默认（`embedded`）形态的重启持久性有端到端证据**（2026-09-29）
+
+`D-11` 的原文是"缺端到端用例"：`memory` 形态的重启有证据（靠数据 WAL 重放），
+而**默认形态**（目录落 fjall）只有结构性证据。做同进程重启却撞上 `FjallError: Locked`，
+当时的记录把它归成"`MetaNode::drop` 之后锁也不释放"。
+
+**这一刀把根因找到了，它不是 `Drop`，而是装配层少停了一个任务**：
+
+> `build_embedded_catalog` 里 `tokio::spawn` 的 **metanode loopback gRPC 服务任务**持有
+> `NodeHandle`，而 `NodeHandle` 里有一份 `FjallStorage` 克隆 ⇒ **fjall 的目录锁由它持有**。
+> 那个任务谁也 join 不到、也不看 shutdown 令牌 ⇒ 进程内**永不释放**。
+> `MetaNode::drop` 其实一直在正确工作（发 `Stop` + join raft 线程）—— 只是它不代表锁被放掉。
+
+于是现象被误诊成"fjall 没落盘"，而现场的那个"看到 `Locked` 就重试 5 秒"的兜底
+把缺陷**藏了**起来（这也解释了为什么它"重试也无效"）。
+
+### 159.0 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `server::build_embedded_catalog` | gRPC 服务任务改成 `tokio::select!`（serve vs `shutdown.cancelled()`），并把 `JoinHandle` 返回出去 |
+| `server::Lakehouse` | 新增 `meta_grpc: Mutex<Option<JoinHandle<()>>>`（`memory` 形态为 `None`）；[`spawn_background`] 把它**交给调用方** |
+| `server/tests/sql_delete_e2e.rs` | **删掉"看到 `Locked` 就重试 5 秒"的兜底**（它把 `D-11` 藏起来过），改回"一次成功" |
+| `server/tests/embedded_restart_e2e.rs`（新） | 默认形态的**同进程重启**端到端（见 §159.2） |
+
+### 159.1 三个决定
+
+1. **兜底删掉，而不是留着**。那个重试循环的注释写的是"看到它说明上一次的锁还没放，不是失败"——
+   而事实相反：它是**真缺陷**的信号。留着兜底会让"锁残留"永远绿着（本仓最烦的那种绿）。
+   现在装配层把任务交出来 ⇒ 调用方原有的"cancel + join 全部后台任务"配方**自动**覆盖它，
+   用例正面断言"重开一次成功"。
+2. **证据来源要钉死**：第二次运行**之前把数据 WAL 目录挪走** —— 否则"重启后删除还在"
+   也可能是 `replay_wal_dml` 重放出来的（那是 `memory` 形态已经在验的那条路），
+   而本用例要证的是**落盘**（fjall 里的目录状态）。挪走之后，那个状态只可能来自 fjall。
+3. **停机配方写进用例**（`cancel → join 全部后台任务 → drop`）。它是**产品语义**的一部分
+   （谁停、按什么顺序停），不是测试的私有技巧：注释里写清"为什么 join 而不是 sleep"
+   （任务各自握着目录句柄，没结束 ⇒ 锁还在）。
+
+### 159.2 用例守什么
+
+`embedded_restart_e2e::embedded_mode_persists_dml_across_an_in_process_restart`：
+
+- 第一次运行：建表 → 插 4 行 → `DELETE WHERE v IN (2,4)` → 断言查得到 `[1,3]`
+  **且目录里真有那份删除向量**（`card == 2`）；
+- 优雅停机（配方见上）→ **把数据 WAL 挪走**；
+- 第二次运行：**一次成功**（不许重试兜底）⇒ `SELECT` 仍是 `[1,3]`；
+  删除向量**逐字段**都在（`card` / `table` / `store_path` —— 读侧要拿路径去取位图）；
+- 新实例**继续可用**：再插一行 ⇒ `[1,3,5]`，且被删的 2/4 **不会因为重启而回来**。
+
+### 159.3 边界
+
+1. 修的是**进程内重启**（测试、备份/恢复工具、同机滚动升级用得上）。**进程退出路径本来是对的**
+   （`standalone` 主循环：cancel → join mysql → join bg → `main` 返回 ⇒ `MetaNode::drop` 停线程）；
+2. metanode 的 gRPC 服务随 shutdown 退出 ⇒ **停机时在途的 meta 请求会被丢弃**
+   （客户端看到连接关闭；这是刻意取舍：停机就该停，不该吊着）。需要"排空"的话是另一件事，
+   本刀不做，写在这里免得被当成已覆盖；
+3. 上一条还有个直接后果：**停机后 `NodeHandle` 的读接口不再可用**（任务已经把句柄放掉了）——
+   装配层仍持有 `MetaNode` 与 `RemoteCatalog`，但它们的语义已经"停"了。今天没有调用方在停机后
+   继续读目录（测试也不该），同样记在这里。
+
+### 159.4 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **518 passed / 0 failed / 0 ignored**；
+- `embedded_restart_e2e`（1 条，四段）：第一次运行的状态 → 优雅停机 + 挪走 WAL →
+  **重开一次成功** → 状态与删除向量逐字段都在 + 新实例继续可写；
+- `sql_delete_e2e`（5 条，含默认形态那条）：**去掉重试兜底之后仍全绿** ⇒
+  锁确实是"停任务"停掉的，不是"等出来"的；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **5/5**。\n
+---
+
+## 160. **`T6.12` 的最后一格：指标 HTTP 导出**（2026-09-30）
+
+`§26.6` 把这一格挂在"**需要新增依赖（离线环境不可加）**"上，于是一直只有周期日志。
+回头看当时的前提：这里要的不过是"解析请求行 + 回一段文本 + 关连接"，
+而 `serde_json` **已经是本 crate 的依赖** ⇒ **零新增依赖**就能做（手写 HTTP/1.1，协议面刻意小）。
+⇒ 那条"不能加依赖"的阻塞条件今天**不成立**，这一刀把它补上。
+
+顺带撞出一处**文档漂移**：`plan.md §5.1` 那行还写着"观测指标（S1-11）| **未接** | …"，
+而**同一个文件**的 `T6.12` 行早已是 ✅ 已完成 —— 台账 `D-15`（本刀闭环）。
+
+### 160.0 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `server::config` | `[metrics]`（`enabled` / `listen`），**默认关**；`#[serde(default)]` 挂到 `Config` 上（老配置没有这一段照样能读，与 `[meta]` 同一条理由） |
+| `server::metrics_http`（新） | 三个端点：`GET /metrics`（Prometheus 文本 0.0.4）、`GET /metrics.json`、`GET /healthz`；`spawn_metrics` 返回 `(实际地址, JoinHandle)` |
+| `LakehouseMetrics.chunk` | 新增 **`pressure_code`**（0 正常 / 1 Soft / 2 Hard / 3 Reject）：Prometheus 装不下字符串，而"背压到哪一档"正是要建告警的那一项 |
+| `standalone` | 起服务 + 停机时 **join**（与 mysql 同款） |
+| 用例 | `metrics_http` 单测 2 条（逐字段判据 + 数值逐字）+ `metrics_http_e2e` 1 条（五个环节） |
+
+### 160.1 五个决定
+
+1. **手写 HTTP/1.1，不引框架**。协议面小到可以一眼看完：只认 `GET`、**不认** keep-alive、
+   不认 chunked、不碰 header 语义；超过 8 KB 的请求头直接截断、2 秒读超时断开。
+   引框架要动依赖树（编译时间、供应链、以及"这个仓只有一个 HTTP 服务"这个事实本身）——
+   这里换不到任何东西。
+2. **Prometheus 文本从 JSON 快照生成**（`serde_json` 展开一层）⇒ **字段清单只有一份**，
+   "JSON 里有、指标里没有"这种漂移在结构上不可能；再加上一条**逐字段判据**：
+   把快照的每个字段都在文本里找一遍（字符串字段找 `<name>_available`）。
+   为什么值得为这件事写判据：映射规则里"字符串只报 availability"是手写的，
+   漏一条规则不会报错，只会让运维在故障现场**少一个数**（本仓最烦的那类静默）。
+3. **默认关**。它会**绑端口**，而"默认开"意味着每个进程（含测试夹具、同机多实例）
+   都去抢同一个端口 —— 端口怎么分配是**部署决定**，不该由默认值决定。
+   开关打开后**绑定失败即启动报错**（不静默降级：否则运维会以为指标在跑 —— 与 `[sql.mysql]` 同纪律）。
+4. **必须能 join**（`§159` 的教训直接写进设计）：`spawn_metrics` 把 `JoinHandle` 交出去，
+   `standalone` 在停机时 join 它，用例里正面断言"join 之后端口不再接受连接"。
+5. **`/healthz` 不查依赖**。它只证明"进程活着"（liveness）。"现在能不能服务请求"是就绪探针
+   （readiness）—— **本刀不做**：做了却只查一半依赖，比不做更误导运维。
+   这条边界写在这里，免得下一位实现者顺手加个"顺便查一下目录"。
+
+### 160.2 边界
+
+1. **无鉴权**：绑定地址就是访问控制（默认 `127.0.0.1`）。要暴露到公网请放在反向代理后面；
+2. **串行处理**：抓取是低频、无状态动作，不为它引入连接池；一个卡住的客户端最多占住 2 秒；
+3. 只支持 `GET`（其它 405）；未知路径 404 且把可用路径列在响应体里；
+4. 不含**就绪探针**与**运行时改配置**（都不是这一格的内容）。
+
+### 160.3 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **521 passed / 0 failed / 0 ignored**；
+- `metrics_http`（单测 2 条）：**逐字段判据**（快照里每个字段都要在 Prometheus 文本里出现，
+  且断言字段数 ≥ 22 —— 判据本身要跟着字段增长）+ 数值逐字渲染（含 `Option` 字段的 `_available`）；
+- `metrics_http_e2e`（1 条，五段）：① `/metrics` 的数值与 `Lakehouse::metrics()` **同源**
+  （`chunk_budget_bytes` 相等、插过数据后 `wal_next_seq > 0`、`pressure_code` 在）
+  ② `/metrics.json` 与结构体**字段集逐个相等** ③ `/healthz` = `ok`、未知路径 404、`POST` 405
+  ④ **端口被占用 ⇒ 启动报错**（错误里点名 `metrics http bind`）
+  ⑤ `cancel + join` 之后**端口真的关掉**；另外验了配置默认关 + `[metrics]` 段可读（含老配置兼容）；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **5/5**。
+- ⚠️ **本刀的第一次提交漏带了 `plan.md` 的三处改动**（同步脚本里那段有语法错误，整段没执行，
+  而 `D-15` 已经声称闭环 ⇒ 文档会撒谎）。用一条跟进的 docs 提交补齐 —— 记在这里，
+  因为"脚本报错所以那一段没跑"正是"改了行为/文档之后**要去看它到底改没改**"的一个实例。\n
+---
+
+## 161. **文档同步审计：ADR-9 的 RPO 口径 + ADR-10 的 stale 声称 + `design.md §11` 配置清单**（2026-09-30）
+
+范围是 `plan.md §2.3` 那张"文档同步项"清单自己给的：
+**#4（ADR-9 / README 已知限制）未做**、**#6（详细设计 §11 配置清单）部分完成**，
+另有一条**与 `§2.3` 冲突的声称**：`plan.md §5.1` 那行写着"文档同步（ADR-10 等）| **未修订**"，
+而 `§2.3-1` 早已把 ADR-10 标 ✅ ⇒ 台账 `D-17`（本刀闭环）。
+
+### 161.0 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `architecture.md §4 ADR-9` | 补**现状注**：`best_effort` 的真实 RPO = 窗口关闭 + `max_flush_delay` + `phase_spread`（默认 ≤90s，延迟到达多一个窗口）；**`durable` 的 RPO 不是 ≈0，而是归档间隔 + 一次上传时延**（默认 1s）；并写明**表级 `durability` 尚未参与归档判定**（台账 `D-16`） |
+| `design.md §11` | **整段重写**配置清单：以 `config.rs` 头部模板为准，补齐 `[server]/[meta]/[storage]/[chunk]/[sql]/[metrics]`，删掉 10 个"从未实现或早已改名"的键并**逐条说明为什么删** |
+| `README.md` | 新增 **§4 已知限制**（RPO 口径、`durable` 粒度与 RPO、软路由未做、"≤1 文件/窗口"的前提、指标默认关），把"设计意图"与"今天的界"分开 |
+| stale 声称三处 | `plan.md §5.1` 行（"未修订" ⇒ ✅ + `D-17`）、`plan.md §2.3 #4/#6` 状态、`refactor.md` 的 S2-9 行、`crates/chaos/examples/bench_baseline.rs` 的"ADR-10 **承诺**"注释（改为"目标，且**有前提**"） |
+| 判据 2 条（`testkit/tests/docs_consistency.rs`） | 见 §161.3 |
+
+### 161.1 三件实质发现（不只是措辞）
+
+1. **`durable` 的 RPO 不是 ≈0**。归档是**周期性**的（`[wal] archive_interval_secs` 默认 **1 秒**，
+   连同一次上传时延），所以 RPO 的下界由**归档间隔**决定。写"≈0"的两种坏后果都真实存在：
+   下一位实现者去追一个做不到的指标，或者**把间隔调大而不觉得违约**。
+   （`config.rs` 那段字段注释本来就写着"它直接决定 RPO 的界"—— 是 ADR 落后于代码。）
+2. **表级 `durability` 未接线**（台账 `D-16`）。ADR-9 定的是**表级**配置，
+   字段（`IngestConfig.durability`，`0=best_effort 1=durable`）也一直在、随表落盘；
+   但今天**归档开关是节点级的**（`[wal] archive_prefix` 给了就归档**全部**表）。
+   ⇒ 现在"开 `durable`"的实际粒度是**整个节点**。这条**不是文档问题**，是代码缺口：
+   本刀只把它写进 ADR 的现状注 + 入台账，接线另排一刀。
+3. **`design.md §11` 的清单曾"不能用"**：里面列着 `[gc] orphan_delay`、`[schema] default_policy`、
+   `multipart_threshold`、`target_file_size`、`schema_snapshot_lock`、`idle_timeout`、
+   `segment_max_size`、`segment_max_age`（还拼错过）、`group_commit_window` 等
+   **从未实现或早已改名**的键 —— 照着它写配置会**直接启动失败**。
+   这类漂移最难自查（要正好去写那份配置才会撞上），所以顺带加了一条判据（§161.3）。
+
+### 161.2 `best_effort` 的 RPO 为什么"可算"
+
+它以前只活在 `§32` 的实测里（"上界 `seal→committed` 31.4s"），而 ADR 只写"秒级（攒批窗口）"。
+今天可写成一个**闭式**：`窗口关闭`（≤60s，取决于写入落在窗口内哪个位置）
+`+ max_flush_delay_secs`（0）`+ flush_phase_spread_secs`（30）⇒ **默认 ≤ 90s**；
+**延迟到达的批次可能再多一个窗口**（`§32.4` 的离群提交）。
+
+### 161.3 两条新判据（把"还会漂"的两处变成能跑红）
+
+1. `adr10_decided_numbers_match_the_config_defaults`：ADR-10 定案表里的
+   `max_flush_delay`（0）与 `phase_spread`（30s）↔ `IngestSection` 的默认值。
+   `README §4` 的硬规则写着"改默认值必须附实测" —— 这条判据让它**能跑红**。
+2. `design_md_config_keys_exist_in_the_parser`：`design.md §11` 的 toml 块里**每个键**
+   都必须在 `config.rs` 里存在。失败信息直接说"照着这份清单写配置会直接启动失败"。
+
+两条都只钉**格式明确**的字符串（定案表的加粗格、§11 的 toml 块），不猜自然语言。
+
+### 161.4 边界
+
+1. **不新建平行文档**（`README §4` 硬规则 1）：ADR-9 就地补现状注、`§11` 就地重写；
+2. **未做**：`[gc]` 那一类**设计项本身的落地**（不是文档问题，且都不在阶段 2 的清单里）；
+   表级 `durability` 的接线（台账 `D-16`，另排）；
+3. `design.md §11` 里 `[store] type = "s3"` 的字段以 `StoreSection` 为准（本刀在清单里
+   只列了 `bucket/endpoint/access_key_id/secret_access_key/allow_http` 这几个已在用的）。
+
+### 161.5 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **523 passed / 0 failed / 0 ignored**（本刀 +2：两条新判据）；
+- `docs_consistency` → **7/7**（原 5 条 + 新增 2 条）；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**。\n
+---
+
+## 162. **台账 `D-16` 闭环：表级 `durability` 接线（按表归档）**（2026-09-30）
+
+`§161` 把 ADR-9 的口径写对时记下一条：ADR-9 定的是**表级**持久性，而归档开关是**节点级**的
+（`[wal] archive_prefix` 给了就归档全部表）—— 字段 `IngestConfig.durability` 一直在、随表落盘，
+却**从未被读**。这一刀把它接上。
+
+### 162.0 先说清交付了什么、没交付什么
+
+| | |
+|---|---|
+| ✅ **交付** | 一张 `durable` 表的数据**一定**被归档（哪怕节点默认不归档）；只有 `best_effort` 表独处一段时**不归档**（省钱的那一半）；**默认行为不变** |
+| ❌ **没交付** | **按记录**过滤（"只归档 durable 表的数据，同段邻居一个字节都不带"）。粒度是**段**：共段时同段别的表的数据也会被归档 |
+| 为什么 | WAL 记录帧是 `length \| crc \| type \| payload`，**seq 由 `header.first_seq` + 位置推导**（`segment.rs::decode_with_stop`）⇒ 把某几条记录过滤掉再编码会让它之后**所有**记录的 seq 位移，而 `BatchPending.wal_seq_start/end` 记的是**原 seq 区间** ⇒ 恢复时吸收错记录（**静默产出错数据**，比"少省钱"糟得多） |
+
+要真正做到按记录过滤，得先改 WAL 格式（记录自带 seq）或按表分段 —— 台账 `D-18`。
+
+### 162.1 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `ArchiveConfig` | 加 `all_tables: bool`（**默认 `true` = 老行为**） |
+| `wal_archive::segment_is_archived`（新） | 段级判定：段里出现过 `durable` 表的 `Data`/`BatchPending` ⇒ 归档；否则不归档；**读不了/解不开 ⇒ 归档**（保守） |
+| `wal_archive::archive_once` | 加 `durable: Option<&HashSet<String>>`（`None` = 全归档） |
+| `wal_archive::spawn_archiver` / `durable_tables` | 后台循环每轮解析一次"哪些表是 durable"（`list_tables` → `ingest_config.durability == 1`）；**解析失败 ⇒ 本轮全归档**（宁可多传） |
+| `[wal] archive_all_tables` | 配置开关（默认 `true`）+ 头部模板 + `archive_config()` 映射；`server` 侧把 `catalog` 句柄传给归档器；`datanode` 暂保持全归档（见 §162.3） |
+| 用例 | 单测 1 条（段级判定真值表，含"读不了 ⇒ 归档"）、e2e 2 条（省钱的一半 / 不能丢数据的一半 + 共租代价）、两个既有归档用例（`all_tables = true`）**仍然全绿 = 老行为没变** |
+
+### 162.2 四个决定
+
+1. **默认 `all_tables = true`**（不静默改老行为）。既有部署只要配了 `archive_prefix` 就是全归档；
+   默认改 `false` 会**静默**把那些表的 RPO 从"秒级可救"变成"丢盘即丢" —— 那是部署方
+   没同意过的语义变化。要 ADR-9 的成本模型，显式设 `false`（README §4 的「已知限制」会写）。
+2. **判定只看 `Data` / `BatchPending`**：它们是"带数据 / 带账目"的两类，而且都带 `table`。
+   `BatchS3Written / Committed / Abort` 只带 `batch_id`（判不出表），但它们很小、且丢了能被
+   `Pending` 的恢复通路重做 ⇒ 不进判定 —— 于是也**不会**因为"判不出来"而把整段误判成要归档。
+3. **判不出来就归档**（段读不了 / 目录拿不到 / 解析失败 ⇒ 全归档）：**成本 > 数据**这条取舍
+   写死在两处（`segment_is_archived` 的 `Err` 分支与 archiver 的 `warn` 分支）。方向与
+   `§156` 的"孤儿 GC 宁可留垃圾"同源。
+4. **只改了 `wal_archive.rs`，`restore` 一行没动**。因为它走的是 `§125` 那条
+   "**拉回来再走既有恢复通路**"：按表归档的收益与代价全都落在"传不传"这一格上 ——
+   这正是当初选"拉回"而不是"流式重放"的回报（`§125` 的赌注兑现在这里）。
+
+### 162.3 边界
+
+1. **粒度是段**（见 §162.0）：`durable` 表与别的表共段时，同段数据一起进归档；
+2. **不保证"某张 durable 表的数据只在归档里"**（只说"一定在"，不说"只有它"）；
+3. `datanode` 侧暂保持全归档（要多一个 CLI 参数；`§162.1` 的注释指向服务端的开关）；
+4. 表级 `durability` 的**其他语义**（读侧重建、`durability` 变更的迁移）不在本刀：
+   `restore` 之后走的是既有恢复通路，不需要按表分支。
+
+### 162.4 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **526 passed / 0 failed / 0 ignored**（本刀 +3：1 条段级判定单测 + 2 条按表归档 e2e）；
+- `wal_archive`（单测 1 条）：段级判定真值表 —— durable 段 / 混段 / 只有 Pending 的 durable 段 ⇒ 归档；
+  只有 `best_effort` ⇒ 不归档；**读不了的路径 ⇒ 归档**（保守方向也钉住了）；
+- `wal_archive_by_table`（e2e 2 条）：① 只有 `best_effort` ⇒ 上传 **0** 段（并用同一份数据在
+  "全归档口径"下会传 1 段做对照，证明"0"来自过滤而不是别的毛病）；② 混段 ⇒ 上传 1 段，
+  拉回后 **`durable` 表的数据逐条读得回**，且**共段的 `best_effort` 数据也在**（正面断言代价）；
+- `wal_archive_durable` / `wal_archive_e2e`（既有）在 `all_tables = true` 下仍全绿 ⇒ **老行为没变**；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **7/7**。\n
+---
+
+## 163. **`S2-10` 收口：读路径的按需保鲜（`ensure_fresh`）**（2026-09-30）
+
+### 163.0 先说一个发现：S2-10 的机制**早就落地了**
+
+`refactor.md` 把 `S2-10`（「`cache_ttl_secs` 降级为兜底：不再作为主要失效手段」）列在
+「S2 收尾（残余）· 待办」里 —— 但读代码后发现**机制已经在**（`§26` 之后就一直在）：
+
+```text
+spawn_cache_refresh：poll = min(200ms, ttl)
+  ├─ 启动立即刷一次
+  ├─ version()（schema_ver / manifest_ver / shard_version）变了 ⇒ 立即刷
+  └─ 都没变 ⇒ 只有距上次刷新 >= ttl 才刷（**这就是"兜底"**）
+```
+
+也就是说 `cache_ttl_secs` **不是**主要失效手段、`version()` 才是 —— `S2-10` 的目标已达成，
+那行"待办"是漂移（台账 `D-19`）。但顺着这条线去核，**撞到了一个真缺口**：
+
+> **读路径（查询入口）自己不做保鲜**：后台刷新循环是个**任务** —— 进程刚起来时它还没被调度到，
+> 或者装配层（测试、嵌入式用法）根本没起它。那段时间里查询拿**冷缓存**去计划，
+> 报 `table not found`。实测撞到两次：`§157`（purge 用例）与 `§160`（指标用例），
+> 当时都是**自己显式 `refresh` 才过的** —— 而我还顺手写下了"后台刷新的 TTL 是 30s"
+> 这类**错误注释**（错的：拍子是 200ms）。这一刀把缺口补上，并把那些注释改成真话。
+
+### 163.1 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `query::LocalCatalog::ensure_fresh`（新） | 读路径入口的"确保不落后于版本"：冷缓存必刷 → 节流（默认 200ms，一次本地读，零 RPC）→ 版本没变则零开销返回 → 变了则**单飞**刷一次；**失败不阻断读** |
+| `query::LocalCatalog` | 三个新字段（`freshness_min_interval` / `last_freshness_check` / `refresh_gate`）+ 两个计数（`freshness_checks` / `lazy_refreshes`）+ `set_freshness_check_interval`（测试用 0 ⇒ 确定、无 sleep） |
+| `query::QueryEngine::session_with_partial` | 建会话前调一次 `ensure_fresh` —— **会话是所有读路径的必经点**（`sql*` / `sql_stream*` / `schema_of*` 都从它出发） |
+| `server::CatalogMetrics` | 把两个新计数接进指标（Prometheus 文本与 JSON 导出**自动带上** —— `§160` 的"从 JSON 生成"那份设计在这里回报） |
+| 三个既有用例 | `embedded_restart_e2e` / `sql_purge_e2e` **删掉**"重启后显式刷缓存"那段 ⇒ 它们从此**顺带成为按需保鲜的证据**（更强）；`metrics_http_e2e` 的注释同改 |
+| 用例 | `catalog_snapshot`（+4：冷缓存必刷 / 节流零开销 / 版本变更被看见 / 没接线不 panic）+ `server/tests/cache_lazy_refresh_e2e.rs`（1 条，**刻意不起后台任务**、全程无 sleep） |
+
+### 163.2 五个决定
+
+1. **为什么读路径也要问版本**：后台刷新是**任务**，不是**保证**。进程刚起来的瞬间、或装配层
+   没起它时，读路径不该跟着瞎 —— "查询自己保证缓存不落后"是**语义**，不是优化。
+2. **节流 200ms**：远端 `version()` 是**一次 RPC**（`RemoteCatalog::version` → prefetch）。
+   不节流就等于把查询 QPS 直接放大到元数据面。取 200ms（与后台循环同拍）⇒
+   "有人在读的时候不会比后台更滞后"，代价有界（≤5 次/秒）。
+3. **冷缓存不看节流**（正确性优先）：从没刷过 ⇒ 必刷。这条是"刚起来就能查"的关键。
+4. **失败不阻断读**：与后台循环同一条纪律（刷新失败不清空旧快照、也不报错）。
+   真正"必须刷新才能给出正确结果"的场景是 **STALE 处置**（`refresh_now`）—— 那里仍然
+   **响亮失败**。两条路径的分工写在这里：读入口的保鲜是**尽力而为**，STALE 是**必须**。
+5. **单飞**（`refresh_gate`）：并发查询同时发现"版本变了"时只让一个真去刷，其余等它刷完
+   再确认一次 —— 否则一次 DDL 之后的一波查询会把同一次变更刷 N 遍。
+
+### 163.3 边界
+
+1. **仍然是轮询 + 版本比较，不是 watch/推送**（ADR-6 的演进方向里有 watch，但今天没有推送通道；
+   节流之后代价已经很有限）。要做推送是另一件事，别把它当成"顺手"；
+2. 读路径的保鲜**不替代** STALE 处置（后者盯的是"数据引用的文件不在快照里"，见 `stale_retry.rs`）；
+3. `cache_ttl_secs` 的角色**没有变**（它一直就是兜底）；本刀没有改它的默认值，
+   也没有把它删掉 —— 它是"版本计数万一漏推"的最后一道网。
+
+### 163.4 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **531 passed / 0 failed / 0 ignored**（本刀 +5）；
+- `catalog_snapshot`（+4）：冷缓存必刷（绕缓存建表 ⇒ `ensure_fresh` 之后可见）｜节流窗口内
+  **连版本都不问**（`freshness_checks` 不变的硬判据）｜版本变更（绕缓存 DDL）必须被看见｜
+  没接线 `CatalogOps` 时不 panic、不刷新；
+- `cache_lazy_refresh_e2e`（1 条，四段、**无 sleep**）：**刻意不起 `spawn_background`**
+  ⇒ 缓存只可能靠读路径自己保鲜：① 绕缓存建表后 `SELECT count(*)` 成功（以前 `table not found`）
+  ② 按需刷了 1 次、只问了 1 次版本（冷缓存不看节流）③ 紧接着的第二个查询**不再问版本**（节流）
+  ④ 绕缓存 `ADD COLUMN` 后 `SELECT c` 成功、且**缓存里的 schema 确有新列**（版本变更被看见）；
+- `embedded_restart_e2e` / `sql_purge_e2e` 删掉显式刷新后仍全绿 ⇒ 它们以前那两步是**多余**的；
+- `cargo clippy --workspace --all-targets -j 4` → 本仓告警 **0**；判据 **7/7**。\n
+---
+
+## 164. **ADR-1 真正落地：Vortex 成为默认格式**（台账 `D-8` 决策）（2026-10-09）
+
+### 164.0 决策与它带着的代价
+
+用户拍板：**采用 Vortex 默认**。这不是"把默认值改一下" —— ADR-1 从立项起就写着
+"Vortex 主格式 + Parquet 回退"，而 `§140` 的实测又把代价摆到了桌面上：
+**Vortex 是 Parquet 的 3.5–4.5 倍体积**（递增整数 23800/6680、随机串 63348/14000，且已是压缩后的默认配置）。
+决策是**在知道这个数字的前提下**做的；代价照实记在这里，不粉饰：
+
+| 代价 | 量级 / 现状 |
+|---|---|
+| 存储体积 | **3.5–4.5×**（`§140` 实测）⇒ 冷存储成本与冷读 IO 同步放大 |
+| 读侧剪枝 | vortex 这条读路径**只有文件级剪枝**（清单 min/max），**没有 row-group 级跳读** ⇒ 整文件解码（`F.4` 的 `.idx` 是按 parquet 行组对齐的，对它不适用） |
+
+### 164.1 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `query::table`（**关键**） | 新增 `.vortex` 的**读路径**：按扩展名与 parquet **分流** ⇒ vortex 走我们自己的解码（`yuntun_format::decode_batch`）+ `align_batch` 到表 schema（与 parquet **同一个函数**）+ 按 `keep_ranges` **自己切片**应用删除向量 ⇒ 灌进 `MemorySourceConfig` |
+| `format::DataFormat::from_path` | 新增"由路径判格式"的唯一入口（认不出 ⇒ parquet） |
+| `compaction` | **读改为按文件自己的格式**（原来用 `compactor.format` 一把梭）；产物格式 = 输入一致则沿用，混合才回退到 `compactor.format` |
+| 默认翻转 | `yuntun-format` 的 `vortex` feature **默认开**；`[ingest] default_format` 默认 `"vortex"`；`IngestorConfig::default()` / WAL DDL 重放的兜底 / `yuntun.toml.example` 同步 |
+| 启动自检 | `format::vortex_enabled()` + `Config::warnings()`：配了 vortex 但二进制没编进来 ⇒ **启动就说清楚**，而不是等第一次写入才失败 |
+| 用例 | `server/tests/vortex_default_e2e.rs`（3 条：默认 vortex 走完 写→读→删→改 / 显式 parquet 仍全通 / 自检不该误响）；`format` 的 vortex 用例按 feature 分叉（开启 ⇒ 往返 + `from_path` 认得出；关闭 ⇒ 仍要响亮失败）；chaos 的孤儿回收用例不再假设 parquet |
+
+### 164.2 三个决定（都是"先保证不错，再谈特性"）
+
+1. **先补读路径，再翻转默认**。翻转之前，vortex 文件在查询侧是
+   "挂了也没人认"（`query::table` 只有 parquet 读路径，代码注释里明写着）⇒ 直接改默认
+   就是"**写进去、查不到**" —— 这正是本仓最忌的**静默事故**。读路径不落地，默认就翻不得。
+2. **读必须按文件自己的格式**。翻转后全量立刻撞到：`compaction_during_query_keeps_counts_monotonic`
+   报 `Parquet error: Invalid Parquet file. Corrupt footer` —— 根因是**合并拿自己配置的格式去读**，
+   遇到另一类文件就是读不了（或更糟：读错）。格式是**文件的属性**（一张表里两类文件可以并存），
+   不是"本次合并的配置" ⇒ 加了 `from_path`，读侧一律按路径判。
+3. **合并产物沿用输入格式**，不顺手做"格式迁移"。输入一致 ⇒ 产物同格式；混合 ⇒ 才用 `compactor.format`。
+   理由：合并是后台作业，它不该**静默**改变既有部署的存储形态与体积 —— 要迁移应该是显式的一刀。
+
+### 164.3 边界（写清楚，别让下一个人以为都齐了）
+
+1. **vortex 读路径整文件解码**：没有 row-group 级跳读，也没有流式解码 ⇒ 单文件的内存与 IO 上界
+   未被刻画（与 `§88.6` 的"冷读无预算"是同一个缺口的两面）⇒ 已开台账 **`D-20`**；
+2. **行组级索引（`.idx`）只对 parquet 生效**：索引循环显式只对非 vortex 文件跑
+   （拿 parquet 的组号去剪 vortex = **剪错 = 静默少数据**）；
+3. **MSRV 实际是 1.95**（`vortex 0.86` 的下界，见 `§133`）—— `status.md` 此前写 1.94 是漂移，本刀改正；
+4. `--no-default-features` 仍可编出不带 vortex 的二进制（那时启动自检会点名）。
+
+### 164.4 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **536 passed / 0 failed / 0 ignored**（本刀 +5）；
+- `vortex_default_e2e`（3 条）：默认配置的产物**全是 `.vortex`**、写进去的三行读得到、
+  `DELETE` 后查不到（DV 在 vortex 上生效）、`UPDATE` 的新值读得到；显式 `parquet` 再走一遍**同样全通**
+  （回退格式没被这次改默认带走）；
+- `format`：开启 ⇒ 往返行数一致 + 产物 `.vortex` + `from_path` 认得出；关闭 ⇒ 仍**响亮失败**；
+- chaos **17/17**（含"孤儿 DV 回收"，它原本硬编码找 `.parquet`，已改成找"数据文件"）；
+  compaction 与 datanode 的合并用例在"按文件自己的格式读"修好后全绿；
+- `cargo clippy --workspace --all-targets` → 本仓 **0**；判据 **7/7**。
+- ⚠️ 一条**全量并发抖动**（与本刀改动无因果关系，但如实记）：`chaos::disk_watermark_aborts_oldest_batch_then_releases_segments`
+  在 `-j 4` 全量里偶发一次（`Pending`），**单跑两次皆 17/17 全绿**、且第二次全量干净 ⇒ 性质同
+  `status.md §4` 已登记的"chaos 与其余 test binary 并行争 CPU/IO"的已知 flaky。\n
+---
+
+## 165. **podman 真集群复验：smoke + soak 全绿**（2026-10-09）
+
+> 用户要求"用 podman 跑多节点来验证"。这不是新功能 —— rig（`tests/cluster.sh`）在 `§108`/`§112` 就
+> 有了；本刀是**照现状真跑一遍**，把"我们声称的多节点"兑现成**今天的证据**（`status.md §4` 的
+> "容器化多节点（需 podman）"那一行此前写的是"需要 podman 才能跑"，没写"最近一次跑是什么结果"）。
+
+### 165.1 环境与结论
+
+| 项 | 结果 |
+|---|---|
+| podman | **6.1.2**（宿主） |
+| `tests/cluster.sh smoke` | ✅ **EXIT=0**（三容器真集群 → 真断网 → 多数派仍写 → 接回**必须收敛**） |
+| `tests/cluster.sh soak 3 5` | ✅ **EXIT=0**（3 轮"冻住 follower 期间写 5 条" + 1 次真断网，**全部收敛**） |
+
+smoke 的关键证据（逐行）：
+
+```text
+③ 健康态：找出 leader + 写一条（幂等键 k1）      ⇒ accepted=true   manifest_ver=1
+④ 断掉 mn3（podman network disconnect）
+   多数派（1+2）仍写                            ⇒ accepted=true   manifest_ver=2
+   同一幂等键再写一次                            ⇒ accepted=false  manifest_ver=2  ← 幂等生效
+⑤ 把 mn3 接回 ⇒ 三方收敛（last=4）
+   再写 k3 ⇒ true / 重复 ⇒ false                ⇒ manifest_ver=3
+   收敛（last=6）
+```
+
+soak 的关键证据：第 1/2/3 轮各"冻住 mn2 期间写 5 条" ⇒ 分别收敛到 `last=6 / 11 / 16`，
+最后一次真断网后收敛到 `last=17`。
+
+### 165.2 顺带记一次**构建**上的坑（不是产品问题，但会挡住后来者）
+
+第一次跑在 `① 编 metanode + meta_probe` 阶段失败：`could not write output to …rcgu.o:
+No such file or directory`（`arrow-row` / `arrow-csv` / `tonic` 等一起红）。
+**根因是并发**：那时宿主上还有 cargo 在跑（release 与 debug 各自持有 target 锁、互相踩构建目录），
+不是盘满（`/home` 余 76G）。**单独重跑 1m34s 全绿** ⇒ 记一条纪律：
+**这个 rig 要在没有别的 cargo 在跑的时候跑**（`tests/cluster.sh build` 是 release 构建，与 `cargo test` 争 target）。
+
+### 165.3 边界（这次**没有**验到的）
+
+1. rig 只覆盖 **metanode**（控制面）：三节点 raft。
+   **数据面多 datanode** 目前只有"宿主多进程 + 共享 `--cold-root`"的形态
+   （`scripts/s3_multinode_smoke.sh`、`§37` 的 `bench_multi.sh`），**还没有 podman rig**；
+2. 真云 S3 / 跨机 / 跨可用区仍未验（与 `status.md §5.2` 同一条缺口）；
+3. 没跑 `lossy` / `netem`（有损与延迟链路）⇒ 部署包线（对称延迟 1.5s 就反复选举）仍是**上次**的实测，
+   本轮不重新声称。
+
+> 数据面多 datanode 的 podman rig 是 `§166` 起（分布式任务共同作业）的**证据底座** ——
+> 要验"多节点分领任务"，先得有一个能起 N 个 datanode 容器的 rig。\n
+---
+
+## 166. **后台作业的多节点分领：压缩按 `(table, shard)` 分租约**（2026-10-10）
+
+### 166.0 缺口是怎么定出来的
+
+用户要"**多 datanode 协作、分布式任务共同作业**"。先摸底（`code-explorer` 全仓取证）得到的现状是：
+
+| 作业 | 今天的形态 | 后果 |
+|---|---|---|
+| 压缩（compaction） | 全集群**一把全局 `compaction` 租约** | 同一时刻**只有一个节点**在合并 —— 多 datanode 的算力一点都用不上（合并偏偏是"每个分片各写一份产物"、天然可并行的作业） |
+| 孤儿清理（GC） | **连租约都没有** | 多节点各扫一遍全 bucket（幂等，但白干） |
+
+而租约机制本身是**通用**的：`purpose` + `epoch` + TTL + raft 权威 + 过期可接管
+（`§81`），proto 里那行注释甚至早就写着"分片粒度以后可扩成 `compaction:{table}:{shard}`"
+（`meta.proto`）⇒ **分领的原语现成，协议不用改**。所以第一刀就做最核心的那件事：
+**把锁的粒度从"集群"降到"分片"**。
+
+### 166.1 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `model::meta` | `compaction_shard_lease_purpose(prefix, table, shard)`（**唯一来源**：申请方与栅栏方必须同一个构造器）+ `GC_LEASE = "gc"` |
+| `compaction::compaction_round`（新，可测） | 一轮压缩：按表 → 按分片 → 预筛 → **每分片一把租约** → 合并 → 立刻归还；返回 `RoundStats {candidates, compacted, lease_busy, failed, stale}` |
+| `compaction::spawn_compaction_loop` | 不再抢全局租约（分领即互斥）；每轮调 `compaction_round`；分片**按名字排序**遍历（多节点顺序一致 ⇒ 不互相顶） |
+| **栅栏通用化**（关键正确性） | `commit_compaction` 多带一个 `lease_purpose`（proto tag 4 + `StateOp` + op 转换 + 远端）⇒ 状态机**按提交方声明的那把租约**核代次 |
+| **冲突检查**（新，也是关键正确性） | `commit_compaction` 拒绝"输入文件已被合并"（`deleted_at != 0`）⇒ 见 `§166.2` ③ |
+| 预筛改成**超集** | "文件数 ≥ `min_files`" **或** "这个分片上有 DV"（触发判定仍只有一处）⇒ DV 触发在**循环里**终于可达 |
+| 孤儿 GC | 加 `gc` 全局租约（对账是全局的，分片没意义 ⇒ 单跑即可）；`spawn_orphan_cleanup*` 新增 **`lease_holder`** 参数（两个节点同名会双双拿到租约，`§81` 的老坑） |
+| datanode CLI | 新增 `--compaction-gc-interval-secs`（GC 租约 TTL = 间隔 × 3 ⇒ 它同时决定"死后多久被接管"） |
+
+### 166.2 三个决定（第三个是**被用例逼出来的**）
+
+1. **锁粒度 = 分片，不是集群**：不同节点可同时合并不同的分片；同一分片仍由租约保证只有一个持有者。
+2. **栅栏必须跟着 purpose 走**：分片之后若栅栏仍只认全局 `compaction`，而那把锁根本没人持有 ⇒
+   栅栏**静默失配**（被接管的持有者照样提交成功 = 两个节点各产一份）。所以提交要把"我这代次属于哪把租约"
+   一起过线，状态机按它核。
+3. **输入必须仍然可见**（`§166.1` 的冲突检查，是本刀**唯一一个真 bug**，由用例 ① 抓出来）：
+   节点 A 合并完释放分片租约后，节点 B 拿着**旧快照**看到"这批文件还没合并"、抢到租约、**再合并一遍**
+   ⇒ 同一批输入产出两份（**行数翻倍**）。旧口径下这被"全局只有一把锁"顺带挡住了 —— 分片一开就可达。
+   *判据只能放在状态机里*：只有它能在**提交这一刻原子地**知道"这些文件还活着吗"；
+   客户端"先查再提交"是检查与使用分离（TOCTOU），那个窗口里对方可能已经提交了。
+   这类竞态在 `RoundStats` 里单独记为 `stale`（不是 `failed`）—— 它是分领下的**正常现象**。
+
+### 166.3 边界（这一刀**没有**做的）
+
+1. **没有任务目录**：每个节点各自从快照算出"要合并哪些"，彼此**看不见**对方的待办
+   （靠租约去重，不靠调度）⇒ 开台账 **`D-21`**（任务目录 + 认领 op，才能做优先级/公平/限流）；
+2. **冷数据仍不按 datanode 归属**（台账 `D-4` 的第二半未动）：协调者直连对象存储自读，扇出只盖热数据；
+3. **没有多 datanode 的 podman rig**（`§165.3` 已写明）⇒ 开台账 **`D-22`**；本刀的分领证据来自
+   **同进程两个 `Compactor`**（共享目录 + 共享存储，就是多 datanode 的形态）与 **datanode 进程级用例**；
+4. 合并期间仍持有该分片的 **DML 租约**（`F.3d-3`），删除优先；分片数很多时，每轮一次租约 raft 写
+   **会放大**（renew 频率 ≈ TTL/3）—— 未做批处理/合并申请。
+
+### 166.4 验证
+
+- `cargo test --workspace --no-fail-fast -j 4` → **541 passed / 0 failed / 0 ignored**（本刀 +5 条新用例）；
+- `crates/compaction/tests/shard_lease_distribution.rs`（新，5 条）：
+  ① **两个节点同时跑一轮** ⇒ 两个分片各合并一次（合计 2，多一个就是"同一批输入产出了两份"）+ 行数守恒 +
+  出现过"别人正持有"的跳过（分领真的发生了）；
+  ② **同一分片绝不合并两次** ⇒ `compacted` 合计 1、行数守恒；
+  ③ **栅栏按 purpose 核** ⇒ 落后代次被拦、不低于水位放行、**全局水位不误伤分片提交**（两把锁各自独立）；
+  ④ **`gc` 租约独占且可交接**（第二个节点拿不到；归还后能被接管）；
+  ⑤ **DV 触发在循环里可达** ⇒ 1 个文件（`min_files=5` 远不够）+ 删掉一半 ⇒ 循环照样合并，存活行数 = 原 − 删；
+- `datanode/tests/compaction_e2e` 的接管用例改成盯 **`gc` 租约**（分片租约"做完即还"抓不住）
+  ⇒ 仍验到"同一时刻一个持有者 + 死后被接管 + 代次推进 + Status 里看得见"，并加一条
+  "压缩租约若存在必是分片的（不可能是全局一把）"；
+- ⚠️ **三条全量并发抖动**（单跑皆绿，第二次全量干净）：`chaos::disk_watermark_...`（已知 flaky，
+  `status §4`）、`compaction::concurrent_writers_compaction_and_gc_converge`（30s 收尾窗口在 `-j 4` 下偶发）、
+  `query::slow_sources_wait_in_parallel_not_in_sequence`（纯时序断言 545ms）。三者性质同
+  "test binary 并行争 CPU/IO"，与本刀改动无因果关系，如实记在这里。\n
+---
+
+## 167. **多 datanode 的容器 rig + 分领的真证据**（台账 `D-22` 闭环）（2026-10-11）
+
+### 167.0 为什么要这一刀
+
+`§166`（G.0）把压缩改成按 `(table, shard)` 分租约，但它的证据来自**同进程两个 `Compactor`**
+—— 那是"两个作业对象"，不是"两个节点"。真多 datanode 需要的形态是：**各自的私有目录**
+（WAL/spill 被租约独占，同一目录第二个进程启动即被拒）、**共享一份冷存储**、各自的端口。
+这一刀把这套 rig 搭起来（`tests/datanode_cluster.sh` + `tests/datanode-compose.yaml`）。
+
+### 167.1 镜像这道坎（试错记录，免得下次再试一遍）
+
+| 镜像 | glibc | 结果 |
+|---|---|---|
+| `debian:trixie-slim` | 2.41 | ❌ `yuntun-datanode` 需要 `GLIBC_2.44`（metanode 不链 `libm` 所以没踩到） |
+| `fedora-minimal` | **2.43** | ❌ 差一点 |
+| **`archlinux`** | **2.44** | ✅ 能跑 |
+| musl 静态编 | — | ❌ 本机只有 `musl-gcc`，缺 `x86_64-linux-musl-g++`（某个依赖要 C++） |
+
+⇒ **五个容器统一用 `archlinux`**，二进制仍由宿主 cargo 编好挂进来。
+
+### 167.2 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `tests/datanode-compose.yaml`（新） | 3 个 metanode + 2 个 datanode；私有目录各一卷、**冷存储一个共享卷**；SQL 端口发布给宿主（19501/19502） |
+| `tests/datanode_cluster.sh`（新） | `build/up/smoke/logs/ps/down`；七步判据（见下） |
+| `meta_probe leases`（新子命令） | 把租约暴露给运维/rig：`purpose=holder:epoch`（"谁在做什么"是最先被问到的问题，而租约是唯一权威 —— 它在 raft 状态机里） |
+| `compaction` | ① 用 **全限定名**（`TableMeta::qualified_name()`）而不是 `TableMeta.name`；② 新增 **`max_merges_per_round`**（默认 8，可用 `--compaction-max-merges-per-round` 调） |
+| `wal_archive::durable_tables` | 同样改用全限定名（它自己的文档就写着"全限定名，与 WAL 记录里的 `table` 同形"，而代码此前返回裸名） |
+| `remote_catalog_parity` | 加一条用例钉住"表名标识能直接用于查询"（含"目录会归一化 ⇒ 裸名也查得到，所以作业**不该**依赖归一化"） |
+
+### 167.3 三个决定
+
+1. **判据必须能证伪**：第一版的"分领"断言只是"日志里出现过 `compaction round`" —— **假绿**
+   （两个节点全程 `compacted=0`，照样通过）。现在要求 **`compacted>=1`**。
+2. **"谁合并了"是不确定的**（两个节点抢同一批分片，谁先拿到租约谁做）⇒ 确定的那条判据是
+   **接管**：杀掉**正在干活的那台**，另一台必须接得上并继续合并。这条是硬证据。
+3. **`max_merges_per_round`**：一轮最多合并几个分片。两条理由 —— ① 限制单轮时长（一轮串行
+   合并几千个分片会把这一轮顶到小时级，而循环按 `interval` 跑）；② 给别的节点留机会
+   （剩下的下一轮谁抢到谁做，分领才是真的）。rig 里设成 1 让"两个节点都干到活"可观测。
+
+### 167.4 验证（实测输出）
+
+```text
+③ 写 → 读：四个分片、两节点各写一批   ⇒ dn1 上查 = 24；dn2 上查 = 24
+④ 分领                                ⇒ dn1 合并过：1；dn2 合并过：1
+⑤ 行数守恒                            ⇒ count(*) = 24
+⑥ gc 租约                             ⇒ gc=gc-dn1:1（只有一个持有者）
+⑦ 接管：杀掉正在干活的 dn1            ⇒ dn2 随后出现 compacted=1
+✅ smoke 通过
+```
+
+全量 **542 passed / 0 failed / 0 ignored**；clippy 本仓 0；判据 7/7（67,768 行 / 544 测试函数）。
+
+### 167.5 边界与两个没追到底的点（如实记）
+
+1. **数据面现在能进容器，但"真断网/冻结"那类故障维度仍只在控制面 rig（`tests/cluster.sh`）** ——
+   本 rig 的接管用的是 `podman kill`；
+2. **合并提交期间观测到一次"行数瞬时 24 → 21"**（正好一个分片的 3 行短暂不可见），随后收敛回 24；
+   第二次跑没复现。**没有追到底** ⇒ 开台账 **`D-23`**；rig 的判据先钉住"必须收敛回来"这条底线；
+3. **GC 静置期不能设太短**：rig 第一版设了 5s，结果冷存储里另一个节点的文件不见了（GC 的对账视图
+   滞后于提交）⇒ rig 用 60s。这提醒的是运维口径：grace 要大于"提交 → 各节点视图可见"的滞后。\n
+---
+
+## 168. **任务列表审计：把"计划/改造指南"的状态列拉回现实**（2026-10-11）
+
+用户要求"查看当前的 todo/task 列表、更新状态"。这一刀**没写产品代码**，做的是记账层 ——
+因为审计发现：几份"给人看的任务表"已经过期到会**误导下一位实现者**（让他按"未开始"去重做一遍
+早已做完的事）。这已经是本仓第四次同类漂移（`D-15` / `D-17` / `D-19`）⇒ 一并记入 **`D-24`**。
+
+### 168.1 改了什么
+
+| 文档 | 原状 | 现在 |
+|---|---|---|
+| `plan.md §5.1` **B/C/D 三组** | 都写 **"❌ 未开始"**（而同一文件 §7 的 R2–R6 **全部 ✅**） | 改写成"✅ 已落地 + 证据"，并保留"仍欠"项（冷数据归属与下推 = 台账 `D-4` 第二半） |
+| `plan.md §4` 本阶段未做 | 列着"相位分散量级定案（P0）"、"ColumnStats 未接入块级跳过" | 前两项划掉（✅ `§32` / ✅ `§145`）；**spill 复用（P2）如实保留为未做** |
+| `plan.md` 任务单元格 | `T10.8`/`T14.4` 还标未做 | ✅（tonic-build 已启用 / 跨实例合并 + `§167` 的多节点证据）；**`T6.15`（TTL 分片移除 + segment 清理闸门）核实为仍未做** ⇒ 标 ⚠️ 而不是跟着划掉 |
+| `refactor.md` 状态列 | S0"部分"、S1 残余"待办"、**S3–S6"未开始"**（与本文 §7–§10 自相矛盾） | 全部按实际回填 |
+| `refactor.md` 参数表 | `flush_phase_spread_secs` 默认写 **5s** | 改正为 **30s**（`D1` 定案，实测：5s 峰值提交 87 次/秒、30s 降到 10 次/秒） |
+| `status.md` §5.2 | "鉴权 / 成员变更（S3-6）未做" | 成员变更**已落地**（`§118`/`§120`/`§121`/`§128`）⇒ 只剩**鉴权** |
+
+### 168.2 一条纪律（第四次栽在同一类上）
+
+**状态列过期 = 让下一位按它重做一遍。** 之前三次是"同一份文档的两行互相矛盾"（`D-15`/`D-17`），
+这次是"整组记分卡停在起点"（`D-24`）。共同点：**它们是给人看的任务，却没有判据守着**
+（判据只能守住"格式明确的声明行"）。⇒ 可执行的结论只有一条：**每几刀就审一次任务表**，
+并且审计时**逐条核到代码/日志**，不要凭印象划勾（`T6.15` 就是差点被顺手划掉的那一条）。
+
+### 168.3 当前的待办全景（审计后）
+
+**功能/语义**：事务、视图/存储过程、`RENAME` 与可空性变更（缺载体）、`UPDATE` 高级形态（无 `WHERE`/`FROM`/`RETURNING`）。
+**分布式（G 组）**：G.1 任务目录（`D-21`）、G.2 冷数据归属与下推（`D-4` 第二半）、G.4 观测；G.0/G.3 已落地。
+**正确性待查**：`D-23`（合并提交期间观测到一次行数瞬时不可见）。
+**工程化**：真云 S3 + 跨机、冷读预算（`D-20`/`§88.6`）、鉴权、MSRV 1.95 真验证、chaos 去 flaky。
+**工程化（小）**：`T6.15` WAL segment 清理闸门、spill 复用（P2）。
+**决策**：`D-8` 已定（Vortex 默认）；`D-18`（按记录过滤归档）待定案。

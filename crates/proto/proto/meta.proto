@@ -1,6 +1,6 @@
 // yuntun metanode 的 gRPC 面（S3-0）。
 //
-// 设计依据：docs/metanode-design.md §5（接口契约）、§6（S3-0 验收）。
+// 设计依据：docs/archive/metanode-design.md §5（接口契约）、§6（S3-0 验收）。
 //
 // 三条**不能破坏**的约定（改之前先读设计）：
 //

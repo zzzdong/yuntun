@@ -1,6 +1,6 @@
 //! `yuntun-proto` —— metanode 的 gRPC 面（S3-0）。
 //!
-//! 契约见 `crates/proto/proto/meta.proto` 与 `docs/metanode-design.md §5`。
+//! 契约见 `crates/proto/proto/meta.proto` 与 `docs/archive/metanode-design.md §5`。
 //!
 //! # 本 crate 的定位
 //!

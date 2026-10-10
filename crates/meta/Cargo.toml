@@ -27,7 +27,7 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
-# S3-1 PoC（选型闸门）：raft-rs 是**候选实现**，选型结论见 docs/metanode-design.md §4.2
+# S3-1 PoC（选型闸门）：raft-rs 是**候选实现**，选型结论见 docs/archive/metanode-design.md §4.2
 # 与 docs/operation-log.md §40。若最终选 openraft，换的是本 crate 的内部实现，
 # 对 `CatalogState`（状态机）与上层接口无影响 —— 这正是先做 S3-2 的原因。
 raft = "0.7"

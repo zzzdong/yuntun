@@ -1,69 +1,67 @@
-# docs 索引与文档规则
+# docs 索引与文档规则（v2，2026-10-11 重建）
 
 > **先读这一页**：它回答"想了解 X 该读哪份、两份冲突听谁的、改了代码要同步哪些文档"。
+>
+> 本目录在 2026-10-11 做过一次**重建**：旧文档（12 份，含 §1…168 的操作日志）整体移入
+> [`archive/`](archive/)，现状/架构/计划三份按今天的事实重写 —— 原因与取舍见
+> [`operation-log.md`](operation-log.md) `§170`。
 
 ## 1. 按目的选文档
 
 | 我想…… | 读 |
 |---|---|
-| 知道**今天实际能做到什么 / 还缺什么 / 下一步做什么** | [`status.md`](status.md) ← **现状唯一入口** |
-| 知道**某个结论的证据**、某个实现与原设计的**偏差及原因** | [`operation-log.md`](operation-log.md)（§1–§168，按时间） |
-| 知道**任务怎么排、里程碑与准出门槛** | [`plan.md`](plan.md)（阶段 WBS / M1–M6 / 风险登记） |
-| 知道**架构为什么这样设计**、有哪些 ADR | [`architecture.md`](architecture.md)（12 个 ADR + 域设计） |
-| 知道**模块边界、接口契约、数据结构、状态机、配置项** | [`design.md`](design.md) |
-| 知道**从现状到分布式目标态该怎么改、按什么顺序** | [`refactor.md`](refactor.md)（S0–S6 / R0–R6） |
-| 想知道 **R3（metanode + raft）怎么设计、怎么排期、验收与风险** | [`metanode-design.md`](metanode-design.md)（R3 设计与计划；**R3 已完成** —— 现状看 `status.md`） |
-| 知道 **chunk 层（数据平面）的目标态** | [`architecture-with-chunk.md`](architecture-with-chunk.md) |
-| 知道**多协议 SQL 接入**怎么设计 | [`sql-access-design.md`](sql-access-design.md) |
-| 知道 **DELETE/UPDATE（未实现）**怎么设计 | [`delta-dml-design.md`](delta-dml-design.md) |
-| 知道**还存在哪些"实现 vs 文档"的未闭环偏差、各自打算怎么办** | [`closeout.md`](closeout.md)（偏差台账；**可机核的部分由 `crates/testkit/tests/docs_consistency.rs` 守着**） |
-| 想**跑起来用起来** | 仓库根 [`README.md`](../README.md) |
+| 知道 **yuntun 是什么、今天能做什么、怎么跑起来** | [`OVERVIEW.md`](OVERVIEW.md) ← **项目说明（现状唯一入口）** |
+| 知道 **架构怎么分层、crate 怎么切、关键决策与不变量** | [`ARCHITECTURE.md`](ARCHITECTURE.md) |
+| 知道 **任务怎么排、下一阶段做什么、还欠哪些账** | [`ROADMAP.md`](ROADMAP.md)（含**台账**：未闭环偏差 + 验收） |
+| **接手开发**：先读什么、别踩哪些坑、提示词 | [`HANDOVER.md`](HANDOVER.md) |
+| 知道 **某个结论的证据 / 某次改造的过程与偏差** | [`operation-log.md`](operation-log.md)（**§169 起**；§1…168 在 [`archive/operation-log.md`](archive/operation-log.md)） |
+| 知道 **历史设计全文**（12 个 ADR、逐模块详细设计、改造指南、SQL 接入设计） | [`archive/`](archive/) —— **是历史，不是现状** |
+| 想跑起来用起来 | 仓库根 [`../README.md`](../README.md) |
 
-**新读者建议顺序**：根 `README.md`（5 分钟）→ `docs/status.md`（10 分钟）→
-`docs/plan.md §2.1/§8`（路线与里程碑）→ 需要细节时再进 `architecture.md` / `design.md`。
+**新读者建议顺序**：根 `README.md`（5 分钟）→ `OVERVIEW.md`（10 分钟）→
+`ARCHITECTURE.md`（20 分钟）→ `ROADMAP.md §下一阶段`。
 
 ## 2. 权威性与冲突裁决
 
 ```
-status.md（现状） + operation-log.md（证据）        ← 最高
-      > plan.md（任务与门槛）
-      > architecture.md / design.md（设计）
-      > refactor.md（改造指南）
+OVERVIEW.md（今天是什么样）               ← 最高
+   > ARCHITECTURE.md（结构为什么这样） / ROADMAP.md（任务与门槛）
+   > operation-log.md（证据与过程）        ← 证据可以推翻前两者，但必须回改它们
+   > archive/**（历史，只备查；与上面冲突时一律以上面为准）
 ```
 
 - **同一事实出现矛盾时，以上序为准**，并且**必须回改低优先级文档**。
-  "实现已改、设计文档照旧"是本项目最大的返工来源（`operation-log §25/§27` 各有一例）。
-- 文档写"已实现/已具备"时，必须能指向 `operation-log` 的证据段或一个能跑的用例；
+  "实现已改、文档照旧"是本项目最大的返工来源（归档日志 `§25`/`§27` 各有一例，
+  `§168` 记的是"整组任务记分卡停在起点"这类更糟的形态）。
+- 文档写"已实现/已具备"时，必须能指向 `operation-log` 的证据段或一个**能跑的用例**；
   否则一律视为**意图**而非**现状**。
+
+### 2.1 归档与 §号映射（重要）
+
+- 归档日志保留原节号 **§1…168**；新日志从 **§169** 起续号，**不重号**。
+- 因此代码注释与本文档里的 `§166` / `§164` / `§88.6` 这类引用，
+  **§1…168 的指向 `docs/archive/operation-log.md`，§169 起的指向 `docs/operation-log.md`**。
+- 台账编号（`D-4` / `D-20` / `D-21` / `D-23` / `D-24` …）**沿用不变**（代码注释里引用着它们）；
+  旧台账 `archive/closeout.md` 里的已闭环条目作为历史保留，**未闭环项全部搬进** [`ROADMAP.md §4`](ROADMAP.md)。
 
 ## 3. 改代码时要同步什么（清单）
 
 | 你改了什么 | 必须同步 |
 |---|---|
-| 默认值 / 配置项 | `operation-log`（附**实测**）+ `status.md §3` + `plan.md §2.2` + 示例配置 `yuntun.toml.example` + 对应设计文档 |
-| 新增/改变语义契约 | `operation-log` + `status.md §3`（决策表）+ `design.md` 对应章节 + 一条**断言其反面后果**的用例 |
-| 完成某个任务 / 里程碑 | `plan.md`（状态列）+ `status.md §6` + `refactor.md`（若属 S/R 步骤） |
-| 发现与设计不符（无论改哪边） | `operation-log`（偏差与理由）+ 回改设计文档对应段落 |
-| 架构级决策（ADR） | 新增或**正式修订** ADR（版本演进写明"谁被谁取代、为什么"），并在 `status.md §7` 标注 |
+| 默认值 / 配置项 | `operation-log`（附**实测**）+ `ARCHITECTURE.md`（配置清单 + ADR 定案表）+ `yuntun.toml.example` |
+| 新增/改变语义契约 | `operation-log` + `ARCHITECTURE.md`（不变量/决策表）+ 一条**断言其反面后果**的用例 |
+| 完成某个任务 / 里程碑 | `ROADMAP.md`（任务状态 + 台账销账）+ `OVERVIEW.md`（能力矩阵若变了） |
+| 发现与文档不符（无论改哪边） | `operation-log`（偏差与理由）+ 回改上游文档对应段落 |
+| 架构级决策 | `ARCHITECTURE.md` 里**就地修订**并写明"谁被谁取代、为什么"，不新建平行文档 |
 
-## 4. 已知限制（当前口径，别按设计意图读）
+## 4. 文档维护的硬规则
 
-> 这一节只放**与设计意图不同**的现状。设计与 ADR 写的是目标，这里是**今天真实的界**。
-
-| 项 | 现状 | 依据 |
-|---|---|---|
-| `best_effort`（默认）的 **RPO** | **窗口关闭 + `max_flush_delay_secs` + `flush_phase_spread_secs`**，默认 **≤ 90s**；延迟到达的批次可能再多一个窗口 | `architecture.md §4 ADR-9` 的现状注；量级见 `operation-log §32` |
-| `durable` 的 **RPO** | 不是 ≈0，而是**归档间隔 + 一次上传时延**（默认 `archive_interval_secs = 1` ⇒ 秒级） | `architecture.md §4 ADR-9`；`operation-log §125` |
-| `durable` 的**粒度** | `[wal] archive_all_tables`：`true`（**默认**）= 全归档（老行为）｜`false` = 按表（只有出现过 `durable` 表数据的**段**才归档）。⚠️ 粒度是**段**：共段时邻居的数据一起进归档 | `architecture.md §4 ADR-9` 现状注；`operation-log §162` |
-| 客户端**软路由** | 未实现、当前不计划：落点由部署显式给定（contact point 模型） | `architecture.md §4 ADR-10`；`operation-log §100` |
-| "每窗口每 shard ≤1 文件" | **不是硬不变量**：仅当"窗口内数据量 ≤ `bytes_threshold`"时成立 | `architecture.md §4 ADR-10`；`operation-log §35` |
-| 指标 | 已有 HTTP 导出（`[metrics]`：`/metrics`、`/metrics.json`、`/healthz`），**默认关** | `operation-log §160` |
-
-## 5. 文档维护的硬规则
-
-1. **就地升版本，不新建平行文档**。只有"新维度"才新开文件（`status.md` 就是新增的现状维度）。
-2. **版本号三处一致**：头部声明 / 正文版本演进 / 文末落款（`architecture.md` 曾出现头部 v10、正文 v12、文末 v11）。
-3. **决策不许顺手改**：`status.md §3` 的已定案项，改必附实测数据（`plan.md §2.2`）。
-4. **先证据后结论**：结论写进 `status.md` / `plan.md` 之前，证据必须已在 `operation-log` 里。
-5. **行文留"为什么"**：写清"不这样做会怎样"（本项目大量坑是"不报错、只产出错数据"，
-   只写"怎么做"无法防止被下一个实现者改回去）。
+1. **就地升版本，不新建平行文档**。归档是"整体换代"这种大动作，不是日常手段（本目录只做过一次）。
+2. **决策不许顺手改**：`ARCHITECTURE.md §5` 的已定案项，改必附**实测数据**。
+3. **先证据后结论**：结论写进 `OVERVIEW.md` / `ROADMAP.md` 之前，证据必须已在 `operation-log` 里。
+4. **可机核的写成判据**，不要写"请记得同步"：判据在
+   `crates/testkit/tests/docs_consistency.rs`（跑 `cargo test -p yuntun-testkit` 即验）。
+   ⚠️ 写判据的教训：判据只能依赖**格式明确的声明行 / 表格行**，不能依赖"文件里出现过某字符串"
+   （归档日志 `§123`：三条判据分别被它们自己文档里提到的 `oneof kind` / `⏳` / `EvolveSchema` 误伤过）。
+5. **状态列是给人看的任务**：过期就等于让下一位按它重做一遍（`D-15`/`D-17`/`D-19`/`D-24` 四次同类）。
+   ⇒ 每几刀就审一次 `ROADMAP.md` 的状态列，审计时**逐条核到代码/日志**，不要凭印象划勾。

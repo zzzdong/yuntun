@@ -4,11 +4,12 @@
 对外暴露 **Arrow Flight SQL（gRPC）** 与 **MySQL wire（:3306）** 两个 SQL 协议端口，
 两者共用同一套 SQL 语义实现（`crates/sql`）。
 
-> **现状与下一步**见 [`docs/status.md`](docs/status.md)（唯一现状入口）；
+> **项目说明与现状**见 [`docs/OVERVIEW.md`](docs/OVERVIEW.md)（唯一现状入口）；
+> 结构见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)，任务与台账见 [`docs/ROADMAP.md`](docs/ROADMAP.md)，
+> 交接与提示词见 [`docs/HANDOVER.md`](docs/HANDOVER.md)，
 > 文档索引与冲突裁决顺序见 [`docs/README.md`](docs/README.md)。
-> 设计文档：[`plan.md`](docs/plan.md)（任务书 v2.3 / 阶段划分）、`architecture.md`（架构 + ADR）、
-> `design.md`（详细设计）、`refactor.md`（分布式改造指南）、`sql-access-design.md`（多协议接入）、
-> `operation-log.md`（实施日志与证据）。
+> 实施日志：[`docs/operation-log.md`](docs/operation-log.md)（§169 起）；
+> **旧文档（含 §1…168 的操作日志、ADR 全文、逐模块详细设计）已归档在 [`docs/archive/`](docs/archive/)** —— 是历史，不是现状。
 
 ---
 
@@ -98,7 +99,7 @@ $CLI schema cpu
 | DBeaver / JDBC | 见 §2.2 |
 | mysql CLI | `mysql -h 127.0.0.1 -P 3306 -u yuntun public`（trust 鉴权：任意用户名、空密码） |
 
-SQL 支持面（详见 `docs/sql-access-design.md` §4）：
+SQL 支持面（详见 `docs/OVERVIEW.md` §4；多协议接入设计在 `docs/archive/sql-access-design.md`）：
 
 | 类别 | 支持 |
 |---|---|
@@ -139,7 +140,7 @@ java -cp "$JAR:scripts" dbeaver_jdbc_probe
 |---|---|---|
 | **T1** | mysql CLI / 文本协议：SELECT、SHOW TABLES、INSERT | ✅（`scripts/pymysql_smoke.py`） |
 | **T2** | 驱动预编译（COM_STMT_PREPARE/EXECUTE）：写入 + **prepared SELECT 取回真实行** | ✅（mysql-connector C 扩展 / libmysqlclient 二进制协议栈；`scripts/pymysql_smoke.py` T2） |
-| **T3** | DBeaver 连接 / 表·列浏览 / 数据预览 | ✅（`scripts/dbeaver_jdbc_probe.java` + 手工清单，见 `docs/operation-log.md` §15） |
+| **T3** | DBeaver 连接 / 表·列浏览 / 数据预览 | ✅（`scripts/dbeaver_jdbc_probe.java` + 手工清单，见 `docs/archive/operation-log.md` §15） |
 | **T4**（非目标） | 事务、权限、视图、存储过程、PG wire | ❌ 明确报错或 no-op |
 
 ---
@@ -150,8 +151,8 @@ java -cp "$JAR:scripts" dbeaver_jdbc_probe
 - **trust 鉴权**：`[sql.mysql].users` 非空仅告警，当前不做口令校验——请按网络隔离部署；
 - **写后可查（读己之写）**：`INSERT` 成功即落 WAL；攒批线程在一个扫描周期（`[ingest].scan_interval_ms`，
   默认 100ms）内把该批数据发布到 store 层的**内存分片**，查询立即可见 —— **不再受 flush 相位分散（默认 ≤30s）
-  与查询缓存 TTL（默认 30s）影响**（`docs/plan.md` §4.5 / `docs/design.md` §7.4）；
-  数据落对象存储（Parquet + Manifest）仍按攒批窗口进行，落盘后进入快照隔离 / Compaction 语义；
+  与查询缓存 TTL（默认 30s）影响**（`docs/ARCHITECTURE.md` §3）；
+  数据落对象存储（vortex（默认）/ Parquet + Manifest）仍按攒批窗口进行，落盘后进入快照隔离 / Compaction 语义；
   回执的 `expected_visible_in_secs` = 该扫描周期上界；
 - **服务端预编译（prepared）**：已可用（写入 + prepared SELECT 二进制结果集，见 T2）。
   历史故障根因是 opensrv-mysql **0.7.0** 的 `PacketReader::next_async` 释放后使用
@@ -232,8 +233,8 @@ scripts/.venv/bin/pip install -r scripts/requirements.txt -i https://mirrors.ali
 | `scripts/pymysql_smoke.py <mysql地址>` | MySQL wire：T1 文本协议（DDL/INSERT/SELECT/SHOW/错误码 1146）+ T2 预编译 |
 | `scripts/flight_stream_smoke.py <flight地址> <表> [批数 行数]` | Flight `do_get` 流式（S1.10）：灌数 + ADBC 流式读取 + 服务端 RSS 采样（`0 0` = 只读模式） |
 | `scripts/dbeaver_jdbc_probe.java` | DBeaver / JDBC：T3 元数据与预览（需 `javac` + Connector/J） |
-| `scripts/s3_smoke.sh` | 真实 S3（SeaweedFS / MinIO）**网络读写**：flush → HTTP PUT 可见于桶；**删 WAL** 重启后冷读 → HTTP GET。`S3_ENDPOINT` / `S3_BUCKET` 可配（见 `docs/operation-log.md` §101） |
-| `tests/cluster.sh` | **容器化三节点真集群**（podman-compose + `debian:trixie-slim`）：真网络命名空间 / 真断网（`podman network disconnect`）/ 接回后**收敛硬断言**；配套极小 Meta 客户端 `cargo run -p yuntun-meta --example meta_probe`（见 `docs/operation-log.md` §108） |
+| `scripts/s3_smoke.sh` | 真实 S3（SeaweedFS / MinIO）**网络读写**：flush → HTTP PUT 可见于桶；**删 WAL** 重启后冷读 → HTTP GET。`S3_ENDPOINT` / `S3_BUCKET` 可配（见 `docs/archive/operation-log.md` §101） |
+| `tests/cluster.sh` | **容器化三节点真集群**（podman-compose + `debian:trixie-slim`）：真网络命名空间 / 真断网（`podman network disconnect`）/ 接回后**收敛硬断言**；配套极小 Meta 客户端 `cargo run -p yuntun-meta --example meta_probe`（见 `docs/archive/operation-log.md` §108） |
 | `scripts/s3_multinode_smoke.sh` | **多节点 + 真实 S3**：起 metanode + 两个可写数据进程（各私有 `--dir`、**同一个桶**），并发真写各自的 SQL 面 ⇒ 两边查询对拍都 `[1..6]`；再删 WAL 重启验冷读（见 §102） |
 
 ---
@@ -242,14 +243,22 @@ scripts/.venv/bin/pip install -r scripts/requirements.txt -i https://mirrors.ali
 
 ```
 crates/
-  model proto wal store format catalog ingest query compaction
+  model proto wal store format catalog          # 数据模型 / 消息 / WAL / 对象存储 / 格式
+  chunk      # 热数据缓冲（内存账本 / 背压 / spill / 确定性 flush）
+  ingest     # 写入管线（幂等预筛 → WAL → chunk → flush → Manifest）
+  query      # DataFusion 桥接 + 扇出合并 + DML 定位
+  compaction # 合并 / 孤儿 GC / 按分片分租约的后台作业
+  meta       # 控制平面（raft + fjall，bin: metanode）
   sql        # SQL 语义唯一实现（分流 / 参数绑定 / 方言 shim / 元数据 API）
   sqlwire    # 协议适配层：MySQL wire（opensrv-mysql）+ Arrow→wire 编码
+  shardrpc   # 数据面分片 RPC（热数据定向拉取）
   server     # 节点层：协议端口 + 装配（Lakehouse）
+  datanode   # 数据平面进程（bin: yuntun-datanode）
   client     # Rust SDK + CLI（bin: yuntun-cli）
   standalone # bin: yuntun（全组件参考装配）
   chaos      # 故障注入工具
-docs/        # 计划 / 架构 / 详细设计 / SQL 访问设计 / 操作日志
+  testkit    # 测试基建（tmpfs/disk 测试目录 + 文档一致性判据）
+docs/        # 项目说明 / 架构 / 任务计划 / 交接 + 操作日志（旧文档归档在 docs/archive/）
 scripts/     # 独立客户端冒烟脚本
 ```
 
@@ -281,4 +290,6 @@ let dir = yuntun_testkit::TestDir::tmpfs("wal-e2e");   // 自动创建 + Drop �
 let wal_dir = dir.string();                            // 直接塞进 TOML 配置
 ```
 
-文档与阶段进度：`docs/operation-log.md`（最新进展在文末章节）。
+文档：现状 [`docs/OVERVIEW.md`](docs/OVERVIEW.md) ｜ 架构 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) ｜
+任务与台账 [`docs/ROADMAP.md`](docs/ROADMAP.md) ｜ 交接与提示词 [`docs/HANDOVER.md`](docs/HANDOVER.md) ｜
+实施日志 [`docs/operation-log.md`](docs/operation-log.md)（§169 起）。

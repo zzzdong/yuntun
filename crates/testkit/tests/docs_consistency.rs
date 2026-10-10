@@ -1,40 +1,53 @@
-//! **文档一致性判据**（`§123`）：把"文档漂移"从"靠自觉"变成"能跑红"。
+//! **文档一致性判据**（归档 `§123` 立，`§170` 重建时按新文档结构重写）。
 //!
 //! # 为什么需要它
 //!
-//! `docs/README.md §2/§3` 定了纪律（改代码必须同步文档），但它**不是自执行的**。实测漂移过：
-//! `operation-log.md` 的头部索引停在 `§32` 而正文已到 `§122`、`docs/README.md` 还写着
-//! `（§1–§32）`、`plan.md` 头部是 `v2.2` 而落款是 `v2.1`、`meta.proto` 的"迁移进度"表把
-//! **已经迁移**的 op 标成 ⏳。这几处**都不是"读一遍能发现"的** —— 要正好读到那一行才会看见。
+//! `docs/README.md` 定了纪律（改代码必须同步文档），但它**不是自执行的**。实测漂移过：
+//! 归档日志的头部索引停在 §32 而正文已到 §122、`plan.md` 头部 v2.2 落款 v2.1、
+//! `meta.proto` 的迁移进度表把已迁移的 op 标成 ⏳、`status.md` 的规模行落后于代码、
+//! 以及**整组任务记分卡停在起点**（归档 `D-24`）。这些**都不是"读一遍能发现"的**。
 //!
-//! 这里只钉**可机械核对**的那几项。判据失败时的输出必须**直接告诉你改哪里**（和判据本身同样
-//! 重要 —— 否则它会变成噪声，最后被忽略）。
+//! 2026-10-11 文档整体归档重建（`§170`）之后：
+//! - 顶层只有 6 份（`README` / `OVERVIEW` / `ARCHITECTURE` / `ROADMAP` / `HANDOVER` / `operation-log`）；
+//! - 旧文档（含 §1…168 的日志）在 `docs/archive/`，**冻结不再维护**；
+//! - 本文件只钉**可机械核对**的那几项，且每条失败时的输出必须**直接告诉你改哪里**。
 //!
 //! # 有一条判据**故意**会在每次改代码之后变红
 //!
-//! [`status_md_scale_line_matches_the_code`] 依赖"代码行数 / crate 数 / 测试函数数"。你只要动
-//! 代码，它就会红 —— 直到你把 `docs/status.md` 的规模行更新成它报出来的数字。这是**有意**的：
-//! 那三个数字以前靠人记得改，而"记得改"正是会漂移的东西。
+//! [`overview_scale_line_matches_the_code`] 依赖"代码行数 / crate 数 / 测试函数数"。你只要动代码，
+//! 它就会红 —— 直到你把 `docs/OVERVIEW.md` 的规模行更新成它报出来的数字。这是**有意**的。
 //!
 //! # 只放"确定不会误报"的判断
 //!
-//! 宁可少放几条，也不放会偶发红的：每条判据都只依赖**格式明确**的字符串（见各函数的注释），
-//! 不去猜自然语言。
+//! 宁可少放几条，也不放会偶发红的。**写判据的教训**（归档 `§123`，三次栽在同一处）：
+//! 判据只能依赖**格式明确的声明行 / 表格行**，**不能**依赖"文件里出现过某字符串" ——
+//! 否则文档里解释"这条判据曾经误报过"的散文会把自己弄红。
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+
+/// 顶层文档集合（`§170` 之后就是这个集合；多一份 = 又开了一份会漂移的平行文档）。
+const TOP_LEVEL_DOCS: [&str; 6] = [
+    "README.md",
+    "OVERVIEW.md",
+    "ARCHITECTURE.md",
+    "ROADMAP.md",
+    "HANDOVER.md",
+    "operation-log.md",
+];
 
 // ---------------------------------------------------------------- 基础设施
 
-/// 仓库根 = 含 `docs/operation-log.md` 的那一级（从 `CARGO_MANIFEST_DIR` 向上找）。
+/// 仓库根 = 同时含 `docs/OVERVIEW.md` 与 `crates/` 的那一级。
 fn repo_root() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     loop {
-        if p.join("docs/operation-log.md").is_file() {
+        if p.join("docs/OVERVIEW.md").is_file() && p.join("crates").is_dir() {
             return p;
         }
         assert!(
             p.pop(),
-            "从 {} 向上没找到含 docs/operation-log.md 的仓库根",
+            "从 {} 向上没找到含 docs/OVERVIEW.md 与 crates/ 的仓库根",
             env!("CARGO_MANIFEST_DIR")
         );
     }
@@ -48,21 +61,21 @@ fn docs_file(root: &Path, name: &str) -> String {
     read(&root.join("docs").join(name))
 }
 
-/// `docs/*.md` + 根 `README.md`（"范围串"这类判据要跨文档扫）。
+/// 顶层 `docs/*.md` + 根 `README.md`（"范围串"这类判据要跨文档扫）。
+///
+/// ⚠️ **不含 `docs/archive/`**：归档是历史，里面的旧串"当时是对的"，不是导航。
 fn all_docs(root: &Path) -> Vec<(PathBuf, String)> {
     let mut out: Vec<(PathBuf, String)> = Vec::new();
     let dir = root.join("docs");
     for e in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("读 {} 失败：{e}", dir.display())) {
         let p = e.expect("目录项").path();
         if p.extension().is_some_and(|x| x == "md") {
-            let s = read(&p);
-            out.push((p, s));
+            out.push((p.clone(), read(&p)));
         }
     }
     let readme = root.join("README.md");
     if readme.is_file() {
-        let s = read(&readme);
-        out.push((readme, s));
+        out.push((readme.clone(), read(&readme)));
     }
     out
 }
@@ -109,25 +122,22 @@ fn backticked(line: &str) -> Vec<String> {
     out
 }
 
-// ---------------------------------------------------------------- 判据
-
-/// `operation-log.md` 的**头部索引**必须等于正文最后一节（号和日期都算）。
+/// 某份日志的"头部索引 vs 正文最后一节"核对（新日志与归档日志共用）。
 ///
-/// 这条是实测漂移最严重的：头部写 `最新：§32`，正文已到 `§122`（差 90 节）。
-#[test]
-fn operation_log_header_index_matches_last_section() {
-    let root = repo_root();
-    let log = docs_file(&root, "operation-log.md");
+/// 归档日志的判定逻辑**保持不变** —— 它冻结了，但它当年漂过 90 节，这条判据仍要守着，
+/// 免得后来者"顺手改归档"把历史改成自洽的样子。
+fn check_log_index(root: &Path, name: &str) {
+    let log = docs_file(root, name);
     let max = max_section_no(&log);
 
     let head = log
         .lines()
-        .take(8)
+        .take(12)
         .find(|l| l.contains("最新：**§"))
         .unwrap_or_else(|| {
             panic!(
-                "`docs/operation-log.md` 头部没有 `最新：**§N，YYYY-MM-DD**` 这一行 —— \
-                 没有它索引就无法核对，请补回（格式照 `§1–§32` 那版）"
+                "`docs/{name}` 头部没有 `最新：**§N，YYYY-MM-DD**` 这一行 —— \
+                 没有它索引就无法核对，请补回"
             )
         })
         .to_string();
@@ -147,7 +157,7 @@ fn operation_log_header_index_matches_last_section() {
 
     if n != max {
         panic!(
-            "`docs/operation-log.md` 的头部索引停在 §{n}，而正文已到 §{max}\n\
+            "`docs/{name}` 的头部索引停在 §{n}，而正文已到 §{max}\n\
              → 把头部那行改成：最新：**§{max}，{}**",
             date.clone().unwrap_or_else(|| "<最后一节的日期>".into())
         );
@@ -155,95 +165,7 @@ fn operation_log_header_index_matches_last_section() {
     if let Some(d) = date
         && !head.contains(&d)
     {
-        panic!(
-            "`docs/operation-log.md` 头部索引的日期不是最后一节的日期\n\
-             → 头部应写 `…§{max}，{d}…`，实际是：{head}"
-        );
-    }
-}
-
-/// 任何文档里的 `§1–§N` 范围串，`N` 必须等于正文最后一节。
-///
-/// 实测漂移：`docs/README.md` 写着 `（§1–§32，按时间）`。
-#[test]
-fn section_ranges_in_docs_match_the_last_section() {
-    let root = repo_root();
-    let max = max_section_no(&docs_file(&root, "operation-log.md"));
-    let mut bad: Vec<String> = Vec::new();
-
-    for (path, text) in all_docs(&root) {
-        // ⚠️ **跳过 `operation-log.md` 本身**：它是**只追加的历史**（本仓纪律不许改旧节），
-        // 里面的旧范围串是"当时确实如此"的**记录**，不是导航。导航类文档（`status.md`、
-        // `docs/README.md`、根 `README.md`、`closeout.md`…）才必须跟着最新走 ——
-        // 而 `operation-log` 的头部索引另有一条判据守着。
-        // （这条也是被自己弄红之后才想清楚的：`§123` 那节在讲"把 §1–§32 改成 §1–§122"，于是被判据拦住。）
-        if path.file_name().is_some_and(|n| n == "operation-log.md") {
-            continue;
-        }
-        for (i, line) in text.lines().enumerate() {
-            let mut rest = line;
-            while let Some(pos) = rest.find("§1–§") {
-                let after = &rest[pos + "§1–§".len()..];
-                let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
-                if let Ok(n) = digits.parse::<u64>()
-                    && n != max
-                {
-                    bad.push(format!(
-                        "{}:{} 写的是 §1–§{n}",
-                        path.display(),
-                        i + 1
-                    ));
-                }
-                rest = &after[digits.len()..];
-            }
-        }
-    }
-    assert!(
-        bad.is_empty(),
-        "这些地方的范围串落后于正文（最新是 §{max}）：\n  {}\n\
-         → 统一改成 `§1–§{max}`（这类串是给人看的索引，过期就等于误导）",
-        bad.join("\n  ")
-    );
-}
-
-/// `status.md` 的规模行必须与代码实况一致：行数 / crate 数 / 测试函数数。
-///
-/// 量法与文档里写的命令一致（`find crates -name '*.rs' | xargs wc -l`；`grep -rh` 计数
-/// `#[test]` / `#[tokio::test`）—— 刻意用**子串**计数，与 `grep` 的行为对齐。
-/// ⚠️ 改代码后这条**会红**，那是设计：请照着它报出来的数字更新 `docs/status.md`。
-#[test]
-fn status_md_scale_line_matches_the_code() {
-    let root = repo_root();
-    let status = docs_file(&root, "status.md");
-
-    let (lines, crates, tests) = measure(&root);
-    let line = status
-        .lines()
-        .find(|l| l.starts_with("规模：**"))
-        .unwrap_or_else(|| panic!("`docs/status.md` 里找不到以 `规模：**` 开头的那行"));
-    let reported: Vec<String> = line
-        .split(|c: char| !c.is_ascii_digit() && c != ',')
-        .filter(|s| !s.is_empty())
-        .map(|s| s.replace(',', ""))
-        .collect();
-    assert!(
-        reported.len() >= 3,
-        "规模行的格式变了（期望 `规模：**N 行 Rust / M 个 crate / K 个测试函数 …`）：{line}"
-    );
-    let want = [
-        (lines.to_string(), "行 Rust"),
-        (crates.to_string(), "个 crate"),
-        (tests.to_string(), "个测试函数"),
-    ];
-    for (i, (w, what)) in want.iter().enumerate() {
-        if reported[i] != *w {
-            panic!(
-                "`docs/status.md` 的规模行与代码不符：它写 `{what}` = {}，实测 {w}\n\
-                 → 把那一行改成：规模：**{lines} 行 Rust / {crates} 个 crate / {tests} 个测试函数 / …**\n\
-                 （用例数与 clippy 警告数不在本条判据里：它们要跑一次全量才知道）",
-                reported[i]
-            );
-        }
+        panic!("`docs/{name}` 头部索引的日期不是最后一节的日期\n→ 头部应写 `…§{max}，{d}…`，实际是：{head}");
     }
 }
 
@@ -284,21 +206,172 @@ fn measure(root: &Path) -> (u64, usize, usize) {
     (lines, crates, tests)
 }
 
+/// 收集文本里所有 `D-<digits>` 的编号（代码注释与台账都用这个形式互相引用）。
+fn ledger_ids(text: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while let Some(pos) = text[i..].find("D-") {
+        let start = i + pos + 2;
+        let digits: String = bytes[start..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .map(|b| *b as char)
+            .collect();
+        if !digits.is_empty() {
+            out.insert(format!("D-{digits}"));
+        }
+        i = start + digits.len().max(1);
+        if i >= text.len() {
+            break;
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------- 判据
+
+/// **新日志**（`docs/operation-log.md`）的头部索引必须等于正文最后一节（号与日期都算）。
+#[test]
+fn new_operation_log_header_index_matches_last_section() {
+    check_log_index(&repo_root(), "operation-log.md");
+}
+
+/// **归档日志**（`docs/archive/operation-log.md`）的头部索引必须等于它自己正文的最后一节。
+///
+/// 归档冻结之后这条判据的作用是"防止有人顺手改归档"：真改了正文而不改头部，它会红。
+#[test]
+fn archive_operation_log_header_index_matches_its_last_section() {
+    let root = repo_root();
+    check_log_index(&root, "archive/operation-log.md");
+}
+
+/// 顶层文档里的 `§1–§N` 范围串，`N` 必须等于**归档日志**的最后一节（§1…168 是归档的区间）。
+///
+/// 新文档一律用 `§1…168` 这种写法（区间串只属于归档）；本判据拦的是"有人又写回 `§1–§N` 且数字过期"。
+#[test]
+fn section_ranges_in_docs_match_the_archive() {
+    let root = repo_root();
+    let max = max_section_no(&docs_file(&root, "archive/operation-log.md"));
+    let mut bad: Vec<String> = Vec::new();
+
+    for (path, text) in all_docs(&root) {
+        if path.file_name().is_some_and(|n| n == "operation-log.md") {
+            // 新日志自身会引用归档节号，情形与其它文档一致，但它的"最新"由上面那条判据守；
+            // 这里跳过是为了不与 `§169 起`这类续号说法打架。
+            continue;
+        }
+        for (i, line) in text.lines().enumerate() {
+            let mut rest = line;
+            while let Some(pos) = rest.find("§1–§") {
+                let after = &rest[pos + "§1–§".len()..];
+                let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+                if let Ok(n) = digits.parse::<u64>()
+                    && n != max
+                {
+                    bad.push(format!("{}:{} 写的是 §1–§{n}", path.display(), i + 1));
+                }
+                rest = &after[digits.len()..];
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "这些地方的范围串与归档日志不符（归档最后一节是 §{max}）：\n  {}\n\
+         → 要么改成 `§1…{max}`（区间串只属于归档），要么删掉区间只留节号",
+        bad.join("\n  ")
+    );
+}
+
+/// `docs/OVERVIEW.md` 的规模行必须与代码实况一致：行数 / crate 数 / 测试函数数。
+///
+/// 量法与文档里写的命令一致（`find crates -name '*.rs' | xargs wc -l`；数 `#[test]` / `#[tokio::test`）。
+/// ⚠️ 改代码后这条**会红**，那是设计：照着它报出来的数字更新 `docs/OVERVIEW.md`。
+#[test]
+fn overview_scale_line_matches_the_code() {
+    let root = repo_root();
+    let overview = docs_file(&root, "OVERVIEW.md");
+
+    let (lines, crates, tests) = measure(&root);
+    let line = overview
+        .lines()
+        .find(|l| l.starts_with("规模：**"))
+        .unwrap_or_else(|| panic!("`docs/OVERVIEW.md` 里找不到以 `规模：**` 开头的那行"));
+    let reported: Vec<String> = line
+        .split(|c: char| !c.is_ascii_digit() && c != ',')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.replace(',', ""))
+        .collect();
+    assert!(
+        reported.len() >= 3,
+        "规模行的格式变了（期望 `规模：**N 行 Rust / M 个 crate / K 个测试函数 …`）：{line}"
+    );
+    let want = [
+        (lines.to_string(), "行 Rust"),
+        (crates.to_string(), "个 crate"),
+        (tests.to_string(), "个测试函数"),
+    ];
+    for (i, (w, what)) in want.iter().enumerate() {
+        if reported[i] != *w {
+            panic!(
+                "`docs/OVERVIEW.md` 的规模行与代码不符：它写 `{what}` = {}，实测 {w}\n\
+                 → 把那一行改成：规模：**{lines} 行 Rust / {crates} 个 crate / {tests} 个测试函数 / …**\n\
+                 （用例数与 clippy 警告数不在本条判据里：它们要跑一次全量才知道）",
+                reported[i]
+            );
+        }
+    }
+}
+
+/// 顶层文档集合必须**正好**是 `docs/README.md §1` 与 `§170` 约定的那 6 份。
+///
+/// 这条守的是本仓的硬规则："就地升版本，不新建平行文档"。多出来的每一份都是将来会漂移的地方；
+/// 真需要新维度时，改 [`TOP_LEVEL_DOCS`] 并在 `docs/README.md §1` 的表里登记它。
+#[test]
+fn docs_top_level_set_is_the_documented_one() {
+    let root = repo_root();
+    let dir = root.join("docs");
+    let mut found: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("读 {} 失败：{e}", dir.display()))
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            (p.is_file() && p.extension().is_some_and(|x| x == "md"))
+                .then(|| p.file_name().unwrap().to_string_lossy().into_owned())
+        })
+        .collect();
+    found.sort();
+    let mut want: Vec<String> = TOP_LEVEL_DOCS.iter().map(|s| s.to_string()).collect();
+    want.sort();
+    assert_eq!(
+        found, want,
+        "`docs/` 顶层文档集合与约定不符\n\
+         → 期望 {:?}\n→ 实际 {:?}\n\
+         （新维度要么并进这四份，要么就先改本判据与 `docs/README.md §1`；\
+         历史文档放 `docs/archive/`，那里不受本判据约束）",
+        want, found
+    );
+
+    // 归档必须还在（新文档里的 §号与台账靠它解释）。
+    for need in ["operation-log.md", "closeout.md", "architecture.md", "design.md"] {
+        let p = root.join("docs/archive").join(need);
+        assert!(
+            p.is_file(),
+            "归档缺了 `docs/archive/{need}` —— 它被新文档引用（§号映射 / 台账索引），不许删"
+        );
+    }
+}
+
 /// `meta.proto` 的"迁移进度"表必须诚实：
 /// ① 每个已在 `oneof op` 里的 op，都要在表里被点名；
-/// ② 表里标成 ⏳ 的 op，**不得**已经存在于 `oneof kind`（实测漂移：`EvolveSchema` 等已迁移却仍标 ⏳）。
+/// ② 表里标成 ⏳ 的 op，**不得**已经存在于 `oneof kind`。
 ///
-/// 本条只依据**表格行**与**声明行**，不看散文 —— 这条判据被自己的文案弄红过三次，见各处的注释。
+/// 本条只依据**表格行**与**声明行**，不看散文 —— 它被自己的文案弄红过三次（归档 `§123`）。
 #[test]
 fn proto_migration_table_is_honest() {
     let root = repo_root();
     let proto = read(&root.join("crates/proto/proto/meta.proto"));
 
-    // ⚠️ 两处**判据自己的教训**（都实测踩过，所以写法这么啰嗦）：
-    // 1. 不写死 oneof 的名字（它叫 `kind`，不是 `op`）；
-    // 2. 只认**非注释的声明行** —— 一开始用"文件里第一个 `oneof ` 之后的文本"，
-    //    结果被**本文件自己**加的一段注释（提到了 `oneof kind`）抢先命中，解析出 0 个 op。
-    //    判据依赖"字符串出现过"就必然会被自己/别人顺手写的散文带偏。
     let start = proto
         .lines()
         .position(|l| {
@@ -319,7 +392,6 @@ fn proto_migration_table_is_honest() {
         if t.is_empty() || t.starts_with("//") {
             continue;
         }
-        // 形如 `EvolveSchemaOp evolve_schema = 5;`
         let Some(ty) = t.split_whitespace().next() else {
             continue;
         };
@@ -329,7 +401,6 @@ fn proto_migration_table_is_honest() {
     }
     assert!(!ops.is_empty(), "没从 `oneof op` 里解析出任何 op —— 格式变了？");
 
-    // ① 表里必须点名每个 op（表是**注释**，所以只能按反引号里的名字找）
     let missing: Vec<&String> = ops
         .iter()
         .filter(|o| !proto.contains(&format!("`{o}`")))
@@ -340,10 +411,7 @@ fn proto_migration_table_is_honest() {
          → 加一行 `// | `X` | ✅ |`（新 op 必须同时进表）"
     );
 
-    // ② ⏳ 那行点名的 op 不得已经存在
     let mut lied: Vec<String> = Vec::new();
-    // ⚠️ 只扫**表格行**（`// | … |`），不扫散文 —— 第三处同类教训：注释里解释"这条曾经漂移过"
-    // 时写了 `⏳` 和 `EvolveSchema`，于是被这条判据自己误报。判据依赖的不该是"文件里出现过"。
     for line in proto
         .lines()
         .filter(|l| l.trim_start().starts_with("// |") && l.contains("⏳"))
@@ -361,76 +429,34 @@ fn proto_migration_table_is_honest() {
     );
 }
 
-/// `plan.md` 的版本号：**头部**与**落款**必须一致（实测漂移：头 v2.2 / 落款 v2.1）。
-#[test]
-fn plan_md_version_is_consistent() {
-    let root = repo_root();
-    let plan = docs_file(&root, "plan.md");
-
-    let ver = |s: &str| -> Option<String> {
-        let i = s.find("任务书 v")? + "任务书 v".len();
-        let v: String = s[i..]
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || *c == '.')
-            .collect();
-        (!v.is_empty()).then_some(v)
-    };
-
-    let head = plan.lines().next().unwrap_or_default();
-    let tail = plan
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or_default();
-    let (Some(h), Some(t)) = (ver(head), ver(tail)) else {
-        panic!("`docs/plan.md` 的头部或落款里找不到 `任务书 vX.Y`（头部：{head:?}；落款：{tail:?}）");
-    };
-    assert_eq!(
-        h, t,
-        "`docs/plan.md` 版本号不一致：头部 v{h} / 落款 v{t}\n→ 统一成同一个版本（改哪一处都行，别让它两说）"
-    );
-}
-
-// ---------------------------------------------------------------- ADR 类（§161）
-
-/// **ADR-10 的定案数值必须与配置默认值一致**（`operation-log §161`）。
+/// **ADR-10 的定案数值必须与配置默认值一致**（归档 `§161`；文档现在是 `ARCHITECTURE.md`）。
 ///
-/// 为什么值得钉：ADR-10 的两个量（`max_flush_delay` / `phase_spread`）是**实测定案**的
-/// （T8 基线，`§32`），而它们在代码里就是两个默认值。`README §4` 的硬规则写着
-/// "改默认值必须附实测" —— 这条判据让它变成**能跑红**的：谁改了默认值而没动 ADR，
-/// 就会在这里被拦住（反过来也一样）。
-///
-/// 只核对格式明确的两处：ADR-10 定案表里的 `| `max_flush_delay` | **0**（原 30） |`
-/// 与 `| `phase_spread` | **30s**（原 5） |`，以及 `config.rs` 里那两个字段的字面默认值。
+/// 为什么值得钉：ADR-10 的两个量（`max_flush_delay` / `phase_spread`）是**实测定案**的（T8 基线），
+/// 而它们在代码里就是两个默认值。"改默认值必须附实测"这条纪律靠它变成**能跑红**的。
 #[test]
 fn adr10_decided_numbers_match_the_config_defaults() {
     let root = repo_root();
-    let arch = docs_file(&root, "architecture.md");
+    let arch = docs_file(&root, "ARCHITECTURE.md");
     let cfg = read(&root.join("crates/server/src/config.rs"));
 
-    // ADR-10 的定案表（`§161` 之后这两行的格式是稳定的）
     let adr_md = arch
         .lines()
         .find(|l| l.contains("| `max_flush_delay` |"))
         .unwrap_or_else(|| {
             panic!(
-                "architecture.md 里找不到 ADR-10 的 `max_flush_delay` 定案行 —— \
+                "ARCHITECTURE.md 里找不到 ADR-10 的 `max_flush_delay` 定案行 —— \
                  若改了表格格式，请同步这条判据"
             )
         });
     let adr_spread = arch
         .lines()
         .find(|l| l.contains("| `phase_spread` |"))
-        .unwrap_or_else(|| {
-            panic!("architecture.md 里找不到 ADR-10 的 `phase_spread` 定案行")
-        });
+        .unwrap_or_else(|| panic!("ARCHITECTURE.md 里找不到 ADR-10 的 `phase_spread` 定案行"));
 
-    // `config.rs` 的默认值：字段名 → 默认值那一行
     let pick = |field: &str| -> String {
         let mut out = None;
         for (i, l) in cfg.lines().enumerate() {
             if l.trim_start().starts_with(&format!("pub {field}:")) {
-                // 往后找第一行 `xxx: 数字,`（Default 实现里）
                 for l2 in cfg.lines().skip(i) {
                     let t = l2.trim();
                     if let Some(rest) = t.strip_prefix(&format!("{field}:")) {
@@ -444,76 +470,55 @@ fn adr10_decided_numbers_match_the_config_defaults() {
         out.unwrap_or_else(|| panic!("config.rs 里找不到字段 {field} 的默认值"))
     };
 
-    // ADR 表里 `**0**` / `**30s**` ⇒ 数字
-    let num = |line: &str| -> u64 {
-        let mut best: Option<u64> = None;
-        for cell in line.split('|') {
-            let c = cell.trim().trim_matches('*');
-            let digits: String = c.chars().take_while(|ch| ch.is_ascii_digit()).collect();
-            if !digits.is_empty() {
-                let v: u64 = digits.parse().unwrap();
-                best = Some(match best {
-                    Some(b) if b >= v => b,
-                    _ => v,
-                });
-            }
-        }
-        best.unwrap_or_else(|| panic!("这一行里没有数字：{line}"))
-    };
-
-    let md = pick("max_flush_delay_secs").parse::<u64>().unwrap();
-    let spread = pick("flush_phase_spread_secs").parse::<u64>().unwrap();
-    // 定案表里的值是"定案值"（加粗那个），行里还有"（原 30）"这种历史值 ⇒
-    // 取**加粗**那一格：`**0**` / `**30s**`
     let bold = |line: &str| -> u64 {
         let cell = line
             .split('|')
             .find(|c| c.contains("**"))
             .unwrap_or_else(|| panic!("找不到加粗的定案格：{line}"));
-        // 落在 `**数字` 上
         let after = cell.split("**").nth(1).unwrap_or_default();
         let digits: String = after.chars().take_while(|ch| ch.is_ascii_digit()).collect();
         digits
             .parse()
             .unwrap_or_else(|_| panic!("加粗格里不是数字：{cell}"))
     };
+
+    let md = pick("max_flush_delay_secs").parse::<u64>().unwrap();
+    let spread = pick("flush_phase_spread_secs").parse::<u64>().unwrap();
     assert_eq!(
         bold(adr_md),
         md,
-        "ADR-10 的 `max_flush_delay` 定案值与 `IngestSection.max_flush_delay_secs` 的默认值不一致：\n  ADR: {}  ({})", bold(adr_md), adr_md
+        "ADR-10 的 `max_flush_delay` 定案值与配置默认值不一致：\n  ADR: {}  ({adr_md})",
+        bold(adr_md)
     );
     assert_eq!(
         bold(adr_spread),
         spread,
-        "ADR-10 的 `phase_spread` 定案值与 `IngestSection.flush_phase_spread_secs` 的默认值不一致：\n  ADR: {}  ({})", bold(adr_spread), adr_spread
+        "ADR-10 的 `phase_spread` 定案值与配置默认值不一致：\n  ADR: {}  ({adr_spread})",
+        bold(adr_spread)
     );
-    let _ = num; // 保留给日后更复杂的表格解析
 }
 
-/// **`design.md §11` 的配置清单里的每个键，都必须在解析器里真的存在**（`operation-log §161`）。
+/// **`ARCHITECTURE.md §8` 的配置清单里的每个键，都必须在解析器里真的存在**（归档 `§161`）。
 ///
-/// 为什么值得钉：`§11` 曾经列着 `[gc]` / `multipart_threshold` / `idle_timeout` 这类
-/// **从未实现**的键 —— 照着设计文档写配置会**启动失败**，而"文档里的配置清单不能用"
-/// 是自查最难发现的一类漂移（要正好去写那份配置才会撞上）。
+/// 为什么值得钉：配置清单曾经列着 `[gc]` / `multipart_threshold` / `idle_timeout` 这类**从未实现**
+/// 的键 —— 照着设计文档写配置会**启动失败**，而"文档里的配置清单不能用"是自查最难发现的一类漂移。
 #[test]
-fn design_md_config_keys_exist_in_the_parser() {
+fn architecture_config_keys_exist_in_the_parser() {
     let root = repo_root();
-    let design = docs_file(&root, "design.md");
+    let arch = docs_file(&root, "ARCHITECTURE.md");
     let cfg = read(&root.join("crates/server/src/config.rs"));
 
-    // 取 `## 十一、配置项清单` 之后第一个 ```toml 块
-    let start = design
-        .find("## 十一、配置项清单")
-        .expect("design.md 里找不到 `## 十一、配置项清单`");
-    let rest = &design[start..];
-    let block_start = rest.find("```toml").expect("§11 里应有 toml 代码块") + "```toml".len();
+    let start = arch
+        .find("配置项清单")
+        .expect("`ARCHITECTURE.md` 里找不到 `配置项清单` 这一节");
+    let rest = &arch[start..];
+    let block_start = rest.find("```toml").expect("配置清单里应有 toml 代码块") + "```toml".len();
     let block_end = rest[block_start..]
         .find("```")
-        .expect("§11 的 toml 代码块没有结束")
+        .expect("配置清单的 toml 代码块没有结束")
         + block_start;
     let block = &rest[block_start..block_end];
 
-    // 收集键名：`key = value`（跳过注释与段名）
     let mut checked = 0usize;
     for (i, line) in block.lines().enumerate() {
         let t = line.trim();
@@ -529,14 +534,59 @@ fn design_md_config_keys_exist_in_the_parser() {
         }
         assert!(
             cfg.contains(key),
-            "design.md §11（第 {i} 行起）写了配置键 `{key}`，但 `crates/server/src/config.rs` \
-             里根本没有它 —— 照着这份清单写配置会直接启动失败。\n\
+            "ARCHITECTURE.md §8 的配置清单（第 {i} 行起）写了配置键 `{key}`，但 \
+             `crates/server/src/config.rs` 里根本没有它 —— 照着这份清单写配置会直接启动失败。\n\
              要么删掉这一行，要么先在 `config.rs` 里加字段。"
         );
         checked += 1;
     }
     assert!(
         checked >= 20,
-        "§11 的配置清单里只解析出 {checked} 个键 —— 清单或被删空、或格式变了，请同步这条判据"
+        "配置清单里只解析出 {checked} 个键 —— 清单或被删空、或格式变了，请同步这条判据"
+    );
+}
+
+/// **代码注释里引用的台账编号（`D-*`）必须能在 `ROADMAP.md` 里找到**。
+///
+/// 为什么值得钉：`docs/ROADMAP.md §4` 的台账是"实现与文档不符"的唯一登记处，而代码注释里
+/// 直接引用着 `D-13` / `D-18` 这类编号。归档重建时最容易出的事故就是"新台账没抄全"
+/// ⇒ 代码里那句注释变成**悬空引用**（下一位看不懂，只能去翻 10k 行的归档）。
+#[test]
+fn ledger_ids_referenced_from_code_exist_in_the_roadmap() {
+    let root = repo_root();
+    let roadmap = docs_file(&root, "ROADMAP.md");
+    let known = ledger_ids(&roadmap);
+
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("读 {} 失败：{e}", dir.display()))
+            .flatten()
+        {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(&root.join("crates"), &mut files);
+
+    let mut dangling: Vec<String> = Vec::new();
+    for f in &files {
+        for id in ledger_ids(&read(f)) {
+            if !known.contains(&id) {
+                dangling.push(format!("{}: {id}", f.display()));
+            }
+        }
+    }
+    dangling.sort();
+    dangling.dedup();
+    assert!(
+        dangling.is_empty(),
+        "这些代码注释引用了 `ROADMAP.md` 里**不存在**的台账编号（悬空引用）：\n  {}\n\
+         → 在 `docs/ROADMAP.md §4` 里补上（未闭环的进 §4 表，已闭环的进 §4.1 索引）",
+        dangling.join("\n  ")
     );
 }

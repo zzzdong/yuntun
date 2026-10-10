@@ -1,4 +1,4 @@
-//! Chunk 层：数据平面核心（架构 `docs/architecture-with-chunk.md` §2）。
+//! Chunk 层：数据平面核心（架构 `docs/archive/architecture-with-chunk.md` §2）。
 //!
 //! **chunk ≡ 尚未成型的 RowGroup**：内存中是一组 `RecordBatch`，落对象存储后成为
 //! Parquet 中的一个 RowGroup。本 crate 负责回答"数据在哪活着"这条边界，不负责

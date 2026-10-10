@@ -1,4 +1,4 @@
-//! Catalog 状态机快照的**帧格式**（`docs/metanode-design.md` §4.4）。
+//! Catalog 状态机快照的**帧格式**（`docs/archive/metanode-design.md` §4.4）。
 //!
 //! # 为什么不是一个裸 blob
 //!
