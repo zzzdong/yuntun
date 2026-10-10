@@ -37,6 +37,9 @@ services:
       - --peer=2@mn2:9311,3@mn3:9311
       - --snapshot-log-entries=100000
       - --init
+    environment:
+      # `§169`：任务目录的派生是可观测的（`refresh_task` 的 debug 日志）
+      - RUST_LOG=${RUST_LOG:-yuntun_catalog=debug}
     volumes:
       - ../target/release/metanode:/usr/local/bin/metanode:ro
       - mn1-data:/data

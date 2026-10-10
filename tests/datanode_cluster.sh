@@ -53,9 +53,11 @@ trap on_fail EXIT
 
 build() {
   say "⓪ 编 metanode / datanode / cli / probe（宿主 cargo，release）"
-  (cd "$ROOT" && cargo build --release \
-      -p yuntun-meta --bin metanode --example meta_probe \
-      -p yuntun-datanode -p yuntun-client)
+  # ⚠️ **必须分两条**：`--bin`/`--example` 是**全局目标筛选**，写在同一条命令里会把
+  # 后面 `-p yuntun-datanode -p yuntun-client` 的二进制**排除掉**（实测：datanode 一直是旧的，
+  # 日志里还在打 `tables=` 而不是 `tasks_seen=`）。
+  (cd "$ROOT" && cargo build --release -p yuntun-meta --bin metanode --example meta_probe)
+  (cd "$ROOT" && cargo build --release -p yuntun-datanode -p yuntun-client)
 }
 
 # 容器日志（去 ANSI 后再 grep：日志里的字段带颜色转义，直接 grep 会漏）
@@ -126,7 +128,23 @@ smoke() {
   printf '  dn1 上查 = %s；dn2 上查 = %s（期望都是 24）\n' "$got1" "$got2"
   [[ "$got1" == "24" && "$got2" == "24" ]] || die "行数不对（dn1=$got1 / dn2=$got2，期望 24/24）"
 
-  say "④ 分领：两个节点都要**真的合并过**（`compacted>=1`）"
+  say "④ 任务目录：待办是**全集群同一份**，且被真的消费了（`§169`）"
+  # 探针的 `tasks` 读的是 metanode 的 Status（任务在 raft 状态机里 ⇒ 每个节点同一份）
+  printf '%s\n' "$("$PROBE" tasks "${META_HOSTS[@]}")" | sed 's/^/  /'
+  # 待办是**派生的**：要等两个节点各自 flush 完、清单里同分片攒到 ≥2 个文件才出现
+  # ⇒ 这里**等**而不是立刻断言（断言的对象是"两个节点最终都能从目录里拿到待办"）。
+  local deadline4=$((SECONDS + 180)) t1=0 t2=0
+  while ((SECONDS < deadline4)); do
+    clog yuntun-dn1 | grep -q 'tasks_seen=[1-9]' && t1=1
+    clog yuntun-dn2 | grep -q 'tasks_seen=[1-9]' && t2=1
+    ((t1 == 1 && t2 == 1)) && break
+    sleep 3
+  done
+  ((t1 == 1)) || die "dn1 一直没从任务目录里拿到待办（`tasks_seen` 始终 0）"
+  ((t2 == 1)) || die "dn2 一直没从任务目录里拿到待办 ⇒ 目录没有下发到所有节点"
+  printf '  两个节点都拿到过待办\n'
+
+  say "⑤ 分领：两个节点都要**真的合并过**（`compacted>=1`）"
   deadline=$((SECONDS + 180)) a=0 b=0
   while ((SECONDS < deadline)); do
     clog yuntun-dn1 | grep -q 'compacted=[1-9]' && a=1
@@ -141,7 +159,7 @@ smoke() {
   # 不确定的；**确定**要证的是 ⑦ —— 杀掉正在干活的那个，另一个必须接得上（分领 + 接管）。
   printf '  dn1 合并过：%s；dn2 合并过：%s（谁抢到不确定，接管见 ⑦）\n' "$a" "$b"
 
-  say "⑤ 行数守恒：合并之后用户看到的行数必须**收敛回** 24"
+  say "⑥ 行数守恒：合并之后用户看到的行数必须**收敛回** 24"
   # ⚠️ 为什么是"收敛"而不是"立刻等于 24"：实测在合并提交的那一刻观测到过一次
   # **瞬时掉到 21**（正好是一个分片的 3 行短暂不可见），随后回到 24。
   # 本刀**没有**把它追到底（台账 `D-23`）—— 这里先钉住"必须收敛回来"这条底线：
@@ -156,14 +174,14 @@ smoke() {
   printf '  count(*) = %s（期间观测到 %s 次瞬时 21）\n' "$got" "$dips"
   [[ "$got" == "24" ]] || die "合并后行数没有收敛回 24（实际 $got）—— 合并改变了用户看到的数据"
 
-  say "⑥ gc 租约：同一时刻只有一个持有者（孤儿对账是全局作业）"
+  say "⑦ gc 租约：同一时刻只有一个持有者（孤儿对账是全局作业）"
   local leases holders
   leases="$("$PROBE" leases "${META_HOSTS[@]}")"
   printf '%s\n' "$leases" | sed 's/^/  /'
   holders="$(printf '%s\n' "$leases" | grep -c '^gc=' || true)"
   ((holders <= 1)) || die "gc 租约出现了 $holders 个持有者（应当全局一把）"
 
-  say "⑦ 接管：**杀掉正在干活的那个**，另一个必须接得上（分领的硬证据）"
+  say "⑧ 接管：**杀掉正在干活的那个**，另一个必须接得上（分领的硬证据）"
   # 干活的那个 = `$a == 1` 时的 dn1，否则 dn2；被杀的必须让**另一个**出现新的合并。
   local worker idle
   if ((a == 1)); then worker="yuntun-dn1"; idle="yuntun-dn2"; else worker="yuntun-dn2"; idle="yuntun-dn1"; fi

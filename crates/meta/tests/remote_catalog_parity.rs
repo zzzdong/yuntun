@@ -34,6 +34,10 @@ struct Observed {
     deletions_now: Vec<(String, String, u32)>,
     /// 旧快照下生效的删除向量（撤销/生效的**窗口两端**都必须在两种形态下一致）
     deletions_old: Vec<(String, String, u32)>,
+    /// `§169`：**任务目录**（`(表:分片, 文件数, 删除行数, 原因)`）。
+    /// 它是**派生**的 ⇒ 同一串 op 之后两种形态必须算出**同一张表**（否则"分领"不成立：
+    /// 各节点会照自己那份待办干活）。
+    tasks: Vec<(String, u64, u64, u32)>,
 }
 
 async fn observed(c: &Arc<dyn CatalogOps>, old_snapshot: u64) -> Observed {
@@ -67,6 +71,17 @@ async fn observed(c: &Arc<dyn CatalogOps>, old_snapshot: u64) -> Observed {
         visible_old: ids(c.list_visible_files("public.cpu", old_snapshot, None).await.unwrap()),
         deletions_now: dvs(c, u64::MAX).await,
         deletions_old: dvs(c, old_snapshot).await,
+        tasks: {
+            let mut t: Vec<(String, u64, u64, u32)> = c
+                .list_tasks()
+                .await
+                .expect("list_tasks")
+                .iter()
+                .map(|t| (t.key().id(), t.files, t.deleted_rows, t.reason))
+                .collect();
+            t.sort();
+            t
+        },
     }
 }
 
@@ -481,6 +496,60 @@ async fn list_tables_identity_is_directly_usable_for_file_queries() {
         "文件上记的表名必须是全限定名（跨层唯一标识）：{:?}",
         by_bare[0].table
     );
+
+    server.abort();
+}
+
+/// `§169`：**任务目录必须在 raft 路径上也被派生出来**（不只是进程内直连形态）。
+///
+/// 这条把"任务表是状态机派生的事实"钉死：同一串 op 走一遍 raft ⇒ 远端与本地算出
+/// **同一条待办**（否则多节点各照自己那份干活，"分领"就不成立）。
+#[tokio::test]
+async fn task_directory_is_derived_on_both_catalog_forms() {
+    let cluster = Cluster::start();
+    let leader = cluster.wait_leader(T).expect("三节点应选出 leader");
+    let node = cluster.handle(leader).expect("取 leader 句柄");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { yuntun_meta::serve(node, listener).await });
+
+    let remote: Arc<dyn CatalogOps> =
+        Arc::new(RemoteCatalog::connect(vec![addr.to_string()]).expect("连接 metanode"));
+    let memory: Arc<dyn CatalogOps> = Arc::new(MemoryCatalog::new());
+    for c in [&remote, &memory] {
+        c.create_schema("public").await.ok();
+        c.create_table(CreateTableRequest {
+            name: "cpu".into(),
+            namespace: "public".into(),
+            schema: schema(&["ts", "v"]),
+            partition_cols: vec![],
+            default_format: "parquet".into(),
+            ingest_config: yuntun_model::meta::IngestConfig::standard(),
+        })
+        .await
+        .expect("建表");
+        // 同分片两个文件 ⇒ 达到"能合并"的必要条件（`threshold::FILES = 2`）
+        for b in ["b1", "b2"] {
+            c.commit_files(commit("public.cpu", b, &format!("k-{b}"), "s0"))
+                .await
+                .expect("提交文件");
+        }
+    }
+
+    let rt = remote.list_tasks().await.expect("远端任务目录");
+    let mt = memory.list_tasks().await.expect("本地任务目录");
+    let fmt = |v: &[yuntun_model::task::CompactionTask]| -> Vec<String> {
+        v.iter()
+            .map(|t| format!("{}:{} files={} reason={}", t.table, t.shard, t.files, t.reason))
+            .collect()
+    };
+    assert_eq!(
+        fmt(&rt),
+        vec!["public.cpu:s0 files=2 reason=0".to_string()],
+        "远端（走 raft）应当派生出这条待办：{:?}",
+        fmt(&rt)
+    );
+    assert_eq!(fmt(&rt), fmt(&mt), "两种形态的任务目录必须一致");
 
     server.abort();
 }

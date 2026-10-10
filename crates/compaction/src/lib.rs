@@ -793,8 +793,8 @@ pub fn spawn_orphan_cleanup_with_interval(
 /// 一轮压缩的账（`§166`：可观测"分领"到底分到了多少）。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RoundStats {
-    /// 本轮看到的表数（**诊断用**：`candidates=0` 时首先要分清是"没有表"还是"表里有但不够"）
-    pub tables: usize,
+    /// 本轮从**任务目录**拿到的待办数（`§169`；诊断用：`candidates=0` 时要分清"没有待办"还是"抢不到"）
+    pub tasks_seen: usize,
     /// 预筛后"值得看一看"的分片数
     pub candidates: usize,
     /// 真合并了的分片数
@@ -819,82 +819,49 @@ pub struct RoundStats {
 /// `D-10` 那类"删除成本永不收敛"的形状。
 pub async fn compaction_round(compactor: &Compactor) -> Result<RoundStats, LakeError> {
     let mut stats = RoundStats::default();
-    let tables = compactor.catalog.list_tables().await?;
-    stats.tables = tables.len();
+    // `§169`：待办从**任务目录**来 —— 它是状态机派生的、随元数据下发 ⇒ **每个节点看到同一份**。
+    // 此前是各节点自己 `list_tables` + 拉全量文件清单来"算"候选：既重复读元数据，
+    // 彼此也看不见对方的待办（无法调度）。现在这一轮连"扫清单"都省了。
+    let tasks = compactor.catalog.list_tasks().await?;
+    stats.tasks_seen = tasks.len();
     let snapshot = compactor.catalog.current_snapshot().await;
-    for t in &tables {
-        // ⚠️ 必须用**全限定名**：`TableMeta.name` 是**裸名**（`dist`），而清单/对象路径/WAL
-        // 一律按 `public.dist` 记。用裸名去列文件在 `MemoryCatalog` 里"碰巧能用"（它内部会
-        // 归一化），**远端目录不会** ⇒ 合并永远看不到任何文件（`§167` 在真多节点 rig 上撞到：
-        // `candidates=0` 而磁盘上明明有 4 个文件）。
-        let ident = t.qualified_name();
-        let files = compactor
-            .catalog
-            .list_visible_files(&ident, snapshot, None)
-            .await?;
-        if files.is_empty() {
+    // 任务已按 key 排序（`CatalogState::list_tasks`）⇒ 多节点遍历顺序一致，不会互相顶。
+    for t in &tasks {
+        if stats.compacted >= compactor.cfg.max_merges_per_round {
+            break; // 一轮的上限 ⇒ 剩下的下一轮（也留机会给别的节点，`§167`）
+        }
+        stats.candidates += 1;
+        let key = t.key();
+        // 认领 = 租约（`§169`：复用 `§166` 的分领原语，不另造认领协议）。
+        // 用途键带 `task:` 前缀，与压缩/GC 的键互不干扰。
+        let purpose = key.lease_purpose();
+        let mut gate = LeaseGate::for_purpose(
+            purpose.clone(),
+            compactor.lease_holder.clone(),
+            compactor.cfg.lease_ttl,
+        );
+        if !gate.acquire_or_renew(&compactor.catalog).await {
+            stats.lease_busy += 1; // 别的节点正领着这个分片 —— 分领的常态，不是错误
             continue;
         }
-        // 这个分片上有没有 DV（**只问目录，不读对象**）—— 供预筛用，判定仍在 `compact_shard` 里
-        let dv_files: std::collections::HashSet<String> = compactor
-            .catalog
-            .list_deletions(&t.name, snapshot)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|d| d.file_path)
-            .collect();
-        let mut by_shard: std::collections::HashMap<&str, Vec<&FileManifest>> =
-            std::collections::HashMap::new();
-        for f in &files {
-            by_shard.entry(f.shard.as_str()).or_default().push(f);
-        }
-        // ⚠️ 分片**按名字排序**遍历：多节点同时跑时大家的顺序一致 ⇒ 抢同一批分片时
-        // 不会出现"两个节点各拿一半又互相等"的抖动（确定性纪律，`§38`）。
-        let mut shards: Vec<&str> = by_shard.keys().copied().collect();
-        shards.sort_unstable();
-        for shard in shards {
-            // 一轮的上限到了 ⇒ 剩下的下一轮（也留机会给别的节点，`§167`）
-            if stats.compacted >= compactor.cfg.max_merges_per_round {
-                break;
-            }
-            let group = &by_shard[shard];
-            let has_dv = group.iter().any(|f| dv_files.contains(&f.file_path));
-            if group.len() < compactor.cfg.min_files && !has_dv {
-                continue;
-            }
-            stats.candidates += 1;
-            let purpose = yuntun_model::meta::compaction_shard_lease_purpose(
-                &compactor.cfg.lease_purpose,
-                &ident,
-                shard,
-            );
-            let mut gate =
-                LeaseGate::for_purpose(purpose.clone(), compactor.lease_holder.clone(), compactor.cfg.lease_ttl);
-            if !gate.acquire_or_renew(&compactor.catalog).await {
-                stats.lease_busy += 1;
-                continue;
-            }
-            match compact_shard(compactor, &ident, shard, snapshot, gate.epoch).await {
-                Ok(Some(_)) => stats.compacted += 1,
-                Ok(None) => {}
-                Err(e) => {
-                    // "输入已被别人合并"是分领下的**正常竞态**（本轮快照是旧的），不是故障
-                    if e.to_string().contains("compaction conflict") {
-                        stats.stale += 1;
-                        tracing::info!(table = %ident, shard, "本轮输入已被合并（跳过）");
-                    } else {
-                        stats.failed += 1;
-                        tracing::error!(error = %e, table = %ident, shard, "compaction failed");
-                    }
+        match compact_shard(compactor, &t.table, &t.shard, snapshot, gate.epoch).await {
+            Ok(Some(_)) => stats.compacted += 1,
+            // 任务只是"候选"：`compact_shard` 按本节点的 `[compaction]` 判定后可能不做（阈值不同）
+            Ok(None) => {}
+            Err(e) => {
+                if e.to_string().contains("compaction conflict") {
+                    stats.stale += 1;
+                    tracing::info!(task = %key.id(), "本轮输入已被合并（跳过）");
+                } else {
+                    stats.failed += 1;
+                    tracing::error!(error = %e, task = %key.id(), "compaction failed");
                 }
             }
-            // 做完立刻归还：接手方不必干等 TTL（`§81` 的优雅退出同一条理由）
-            let _ = compactor
-                .catalog
-                .release_lease(&purpose, &compactor.lease_holder, gate.epoch)
-                .await;
         }
+        let _ = compactor
+            .catalog
+            .release_lease(&purpose, &compactor.lease_holder, gate.epoch)
+            .await;
     }
     Ok(stats)
 }
@@ -915,7 +882,7 @@ pub fn spawn_compaction_loop(
             // 每一轮的租约都在分片做完时归还（`release_lease`），所以退出时没有"全局锁"要还。
             match compaction_round(&compactor).await {
                 Ok(st) => tracing::info!(
-                    tables = st.tables,
+                    tasks_seen = st.tasks_seen,
                     candidates = st.candidates,
                     compacted = st.compacted,
                     lease_busy = st.lease_busy,

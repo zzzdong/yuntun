@@ -74,6 +74,8 @@ struct Cache {
     /// 与 `files` 同一个道理：**已撤销的也要留在里面**（`revoked_at` 是"这份 DV 何时失效"的
     /// 另一半 —— 删掉它就回答不了"某个旧快照当时看得见什么"）。
     deletions: BTreeMap<(String, String), yuntun_model::dv::DeletionEntry>,
+    /// `§169`：后台作业的任务目录（**整体替换**：任务可能已消失 ⇒ 不留旧条目）
+    tasks: BTreeMap<String, yuntun_model::task::CompactionTask>,
     /// 做过一次全量刷新（在此之前缓存是不可信的，读必须等）
     primed: bool,
     /// 墓碑回收的下界：**早于它的快照不可查**（见 `RemoteCatalog::file_retention`）
@@ -233,6 +235,21 @@ impl RemoteCatalog {
     /// 两步（这条路径就是设计 §3.2 的「无变化零开销」）：
     /// 1. **纯版本探测**：`tables` 空 + `full=false` → 载荷为空，只回版本号/快照号；
     /// 2. 版本**变了**（或首次）才真的拉载荷：变了哪些表用 `Delta` 问，文件用 `since_snapshot` 拿增量。
+    /// **强制全量刷新**（`§169`：任务目录只在全量载荷里下发 ⇒ 看任务必须走它）。
+    async fn refresh_full(&self) -> Result<(), LakeError> {
+        let resp = self
+            .prefetch(pb::PrefetchRequest {
+                since_schema_ver: 0,
+                since_manifest_ver: 0,
+                full: true,
+                tables: Vec::new(),
+                since_snapshot: 0,
+            })
+            .await?;
+        self.apply(resp, &[], true);
+        Ok(())
+    }
+
     async fn refresh(&self) -> Result<(), LakeError> {
         let (c_schema, c_manifest, c_snapshot, primed) = {
             let c = self.cache.read().unwrap();
@@ -418,6 +435,20 @@ impl RemoteCatalog {
             c.deletions
                 .insert((d.dv_id.clone(), d.file_path.clone()), d);
         }
+
+        // `§169`：任务目录 —— **每次都整体替换**（不只在全量刷新时）。
+        //
+        // 为什么不能只在全量时换：任务会**消失**（合并完就不满足了），而增量刷新是常态 ⇒
+        // 只在全量时更新会让客户端永远抱着第一次看到的那张表（待办消失不了 = 每轮空转去抢
+        // 已经不存在的活）。任务表很小（每条一个分片），每次随下发搬一遍的代价可接受。
+        c.tasks = payload
+            .tasks
+            .iter()
+            .map(|m| {
+                let t = op::task_from_proto(m);
+                (t.key().id(), t)
+            })
+            .collect();
 
         // schema 名：**整体替换**（删掉的必须消失）
         c.namespaces = payload.namespaces.iter().cloned().collect();
@@ -957,6 +988,19 @@ impl CatalogOps for RemoteCatalog {
     /// ⚠️ 缓存是**上一次 prefetch** 的快照 ⇒ 可能有"刚 apply、还没下发"的 DV 不在集合里。
     /// 这由**静置期**兜住：一个对象要先被观察成孤儿**超过 `grace`**（默认 1 小时）才会删，
     /// 下一次 prefetch 早就把它带下来了。反方向（集合里多出已撤销的）是**保守方向**（少删）✓。
+    async fn list_tasks(&self) -> Result<Vec<yuntun_model::task::CompactionTask>, LakeError> {
+        // ⚠️ **必须走全量刷新**，不能用 `refresh()`：后者有"**什么都没变 ⇒ 直接返回**"的
+        // 零开销路径，而任务表只在**载荷**里下发 ⇒ 走增量刷新时它会永远停在第一次全量时
+        // 看到的那张表（待办消失了也看不见）。代价：一轮压缩多一次全量预取
+        // （默认 60s 一轮，任务表很小）⇒ 换来的是"待办一定是当前这份"。
+        self.refresh_full().await?;
+        let mut out: Vec<yuntun_model::task::CompactionTask> =
+            self.cached(|c| c.tasks.values().cloned().collect());
+        // 与状态机同序（按键排序）⇒ 多节点的遍历顺序一致
+        out.sort_by(|a, b| a.key().cmp(&b.key()));
+        Ok(out)
+    }
+
     async fn dv_object_paths(&self) -> Result<Vec<String>, LakeError> {
         self.refresh().await?;
         Ok(self.cached(|c| c.deletions.values().map(|d| d.store_path.clone()).collect()))
@@ -1217,6 +1261,7 @@ mod tests {
                     namespaces: vec!["public".into()],
                     deletions: Vec::new(),
                     idempotency_keys: Vec::new(),
+                    tasks: Vec::new(),
                 }),
             }
         };

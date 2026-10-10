@@ -177,6 +177,13 @@ pub trait CatalogOps: Send + Sync {
         lease_purpose: &str,
     ) -> Result<u64, LakeError>;
 
+    /// **后台作业的任务目录**（`§169`，G.1）："要合并哪些分片"由**状态机派生**并随元数据下发
+    /// ⇒ 多节点读到的是**同一份**待办（此前是各节点自己算，彼此看不见、也无法调度）。
+    ///
+    /// 它是"候选"而不是"命令"：派生的阈值是**超集**，执行者仍按自己的 `[compaction]` 判定。
+    /// **认领复用租约**（`TaskKey::lease_purpose()`），不另造认领协议。
+    async fn list_tasks(&self) -> Result<Vec<yuntun_model::task::CompactionTask>, LakeError>;
+
     /// **此刻仍需保护**的 batch_id（孤儿清理对账基准，§12.2.1 / T14.5）——同上，不得绑具体实现。
     ///
     /// = 保护期内的文件（活着，或墓碑期未过）∪ 在途批次。**过期的墓碑不在其中** ——
@@ -586,6 +593,10 @@ impl CatalogOps for MemoryCatalog {
 
     async fn known_batch_ids(&self) -> Result<Vec<String>, LakeError> {
         Ok(self.state.read().unwrap().known_batch_ids())
+    }
+
+    async fn list_tasks(&self) -> Result<Vec<yuntun_model::task::CompactionTask>, LakeError> {
+        Ok(self.state.read().unwrap().list_tasks())
     }
 }
 

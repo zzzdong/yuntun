@@ -370,6 +370,10 @@ message PrefetchPayload {
   // → 每个"别人写过的键"的重复请求都会白写一次 WAL 再去 SM 去重。
   // 为什么只在全量给：增量刷新没有"键的版本号"，逐次全发会让每次刷新都搬一遍大集合。
   repeated string idempotency_keys = 4;
+  // **后台作业的任务目录**（`§169`，G.1）：与 files/deletions **同一次响应**下发 ——
+  // 它是从"文件清单 + 删除向量"派生的，分两个接口读就会读到"派生态"与"输入态"不一致的窗口。
+  // 全量刷新时整体替换（任务可能已消失 ⇒ 客户端不该留着旧条目）。
+  repeated CompactionTaskMsg tasks = 7;
 }
 
 message FileEntry {
@@ -428,6 +432,9 @@ message StatusResponse {
   // 没有它就是**不可观测**的，运维只能靠猜。
   repeated uint64 voter_ids   = 12;
   repeated uint64 learner_ids = 13;
+  // `§169`：**后台作业的任务目录**（现在有哪些活）。与 leases（谁在做什么）拼起来
+  // 就是运维要的那张表；它随 raft 复制 ⇒ 每个节点读到同一份。
+  repeated CompactionTaskMsg tasks = 14;
 }
 
 // 租约的运维视图（只读快照，不含任何调度语义）。
@@ -566,6 +573,21 @@ message DeletionEntryMsg {
   uint64 revoked_at = 6;
   uint32 card       = 7;
   string store_path = 8;
+}
+
+// 后台作业的一条待办（`§169`）：**由状态机派生**，不是某个节点"报上来"的。
+message CompactionTaskMsg {
+  // 全限定表名（`schema.table`）
+  string table        = 1;
+  string shard        = 2;
+  // 该分片当前的可见文件数
+  uint64 files        = 3;
+  // 该分片当前生效的删除行数
+  uint64 deleted_rows = 4;
+  // 触发原因：0 = 文件数达到阈值，1 = 删除占比（DV 需要被消费）
+  uint32 reason       = 5;
+  // 首次登记的时刻（Unix 毫秒）
+  uint64 since_ms     = 6;
 }
 
 // 登记一批删除向量（`F.3c-3`）。

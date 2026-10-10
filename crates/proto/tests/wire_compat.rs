@@ -427,6 +427,15 @@ fn status_response_exposes_all_operational_fields() {
                 leases: Vec::new(),
         voter_ids: vec![1, 2, 3],
         learner_ids: vec![4],
+        // `§169`：任务目录也要逐字段无损（它决定了"有哪些活"）
+        tasks: vec![CompactionTaskMsg {
+            table: "public.t".into(),
+            shard: "s0".into(),
+            files: 7,
+            deleted_rows: 1500,
+            reason: 1,
+            since_ms: 1700000000000,
+        }],
         };
     let back = roundtrip(&s);
     assert_eq!(back, s);

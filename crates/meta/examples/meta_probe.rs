@@ -146,11 +146,18 @@ async fn propose_with_retry(clients: &[Client], op: pb::Op, secs: u64) -> pb::Pr
     }
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some((cmd, rest)) = args.split_first() else {
-        eprintln!("用法：meta_probe <status|leader|leases|write|verify> [key] <addr>...");
+        eprintln!("用法：meta_probe <status|leader|leases|tasks|write|verify> [key] <addr>...");
         std::process::exit(64);
     };
 
@@ -234,6 +241,32 @@ async fn main() {
             }
             for (purpose, (holder, epoch)) in seen {
                 println!("{purpose}={holder}:{epoch}");
+            }
+        }
+        // `§169`：任务目录 —— "现在有哪些活"是运维最先问的问题，而它在 raft 状态机里
+        // ⇒ 每个节点读到同一份。输出形如 `public.dist:s0 files=5 deleted=0 reason=files age_ms=1200`。
+        "tasks" => {
+            let mut out = Vec::new();
+            for c in clients.iter() {
+                let Some(st) = status(c).await else { continue };
+                for t in st.tasks {
+                    out.push(format!(
+                        "{}:{} files={} deleted={} reason={} age_ms={}",
+                        t.table,
+                        t.shard,
+                        t.files,
+                        t.deleted_rows,
+                        if t.reason == 1 { "dv" } else { "files" },
+                        now_ms().saturating_sub(t.since_ms)
+                    ));
+                }
+                break; // 任务表各副本一致 ⇒ 问到一个就够
+            }
+            if out.is_empty() {
+                println!("(无待办)");
+            }
+            for l in out {
+                println!("{l}");
             }
         }
         other => {

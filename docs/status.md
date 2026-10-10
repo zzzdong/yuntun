@@ -52,7 +52,7 @@
 
 ## 2. 能力矩阵（standalone 今天能做到什么）
 
-规模：**67,768 行 Rust / 20 个 crate / 544 个测试函数 / 542 个用例通过（0 ignored） / clippy 0 警告**
+规模：**68,336 行 Rust / 20 个 crate / 548 个测试函数 / 全量用例通过（0 ignored） / clippy 0 警告**
 工具链：**rustc 1.98.1 + edition 2024**（20 个 crate 全走 `edition.workspace = true`；见 `operation-log §59`）；
 **MSRV 声明 `1.95`**（`§164` 改正：此前写 1.94 是漂移 —— 下界实为 `vortex 0.86`（现默认依赖）要求的 1.95，见 `§133`；**尚未经真·1.95 编译验证**，见 `§60`）。
 全仓仅余 1 条**外部依赖**告警（`proc-macro-error2 v2.0.1`，来自 `opensrv-mysql`，非本仓代码）。
@@ -190,6 +190,10 @@ SQL DDL 的 `TIMESTAMP(p)` 精度不入 schema。
 
 **已知 flaky**：`yuntun-chaos` 与其余 test binary 并行争 CPU/IO → 恢复上限不足（单跑 1.3s）。
 已放宽到 60s 并写明理由；根治（chaos 独立跑 / 去 flaky）属 `plan.md` T6.1。
+**2026-10-11 复跑新增观测**：另有两条**计时断言**型用例在并行争抢下失败、单独重跑都 ok ——
+`yuntun-compaction::tests::concurrent_writers_compaction_and_gc_converge`（收尾收敛 30s 墙钟上限）
+与 `yuntun-query::partial_fanout::slow_sources_wait_in_parallel_not_in_sequence`（400ms 墙钟）。
+⇒ "并行全绿"这条口径目前**不成立**：要么把计时断言改成事件驱动，要么按 T6.1 隔离 chaos。
 
 ---
 

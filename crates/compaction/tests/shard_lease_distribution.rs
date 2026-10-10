@@ -333,3 +333,87 @@ async fn deletion_vector_trigger_is_reachable_from_the_loop() {
     );
     let _ = Duration::ZERO;
 }
+
+// ---------------------------------------------------------------- 任务目录（`§169`，G.1）
+
+/// ① **任务目录驱动工作**：清单满足条件 ⇒ 目录里出现待办；合并完 ⇒ 待办消失。
+///
+/// 这条同时钉住两件事：任务是**派生的**（不需要谁"报上来"），以及
+/// **合并真的会让待办消失**（否则每轮都会重复合并同一批文件）。
+#[tokio::test]
+async fn task_directory_appears_and_disappears_with_the_work() {
+    let fx = Fx::new().await;
+    fx.commit("s0", 5, 3).await; // 5 个文件 ≥ 阈值
+    let tasks = fx.catalog.list_tasks().await.unwrap();
+    assert_eq!(tasks.len(), 1, "应当有一条待办：{tasks:?}");
+    assert_eq!(tasks[0].table, "public.dist");
+    assert_eq!(tasks[0].shard, "s0");
+    assert_eq!(tasks[0].files, 5, "待办要带上「有多少个文件」（运维据此判断轻重）");
+    assert_eq!(
+        tasks[0].reason(),
+        yuntun_model::task::TaskReason::Files,
+        "触发原因应当是「文件数」"
+    );
+
+    let node = fx.node("a", 5);
+    let st = compaction_round(&node).await.unwrap();
+    assert_eq!(st.tasks_seen, 1, "本轮应当从目录里看到这条待办：{st:?}");
+    assert_eq!(st.compacted, 1, "应当合并掉：{st:?}");
+
+    let after = fx.catalog.list_tasks().await.unwrap();
+    assert!(after.is_empty(), "合并完待办必须消失：{after:?}");
+}
+
+/// ② **没有待办就不干活**：分片只有 1 个文件（也不带 DV）⇒ 目录里没有它 ⇒
+/// `compaction_round` 不该自己去"算"出活来（单一来源：待办只来自目录）。
+#[tokio::test]
+async fn no_task_means_no_work() {
+    let fx = Fx::new().await;
+    fx.commit("s0", 1, 3).await;
+    assert!(
+        fx.catalog.list_tasks().await.unwrap().is_empty(),
+        "1 个文件不该进待办"
+    );
+    let node = fx.node("a", 1); // 就算本节点的 min_files 低到 1，也只认目录
+    let st = compaction_round(&node).await.unwrap();
+    assert_eq!(st.tasks_seen, 0, "{st:?}");
+    assert_eq!(st.candidates, 0, "目录里没有 ⇒ 不干活：{st:?}");
+    assert_eq!(fx.visible_files("s0").await, 1, "文件应当原封不动");
+}
+
+/// ③ **DV 也会产生待办**（单个文件里删掉足够多的行 ⇒ 该分片值得被消费，`F.3d-2`）。
+#[tokio::test]
+async fn deletions_create_a_task_even_for_a_single_file() {
+    let fx = Fx::new().await;
+    fx.commit("s0", 1, 2_000).await;
+    let snap = fx.catalog.current_snapshot().await;
+    let file = fx
+        .catalog
+        .list_visible_files("public.dist", snap, Some("s0"))
+        .await
+        .unwrap()
+        .first()
+        .cloned()
+        .expect("一个已提交的文件");
+
+    let dv = yuntun_model::dv::DvBitmap::from_positions((0..1_000u32).collect::<Vec<u32>>());
+    let entry = yuntun_model::dv::DeletionEntry {
+        dv_id: "dv-task".into(),
+        table: "public.dist".into(),
+        file_path: file.file_path.clone(),
+        batch_id: file.batch_id.clone(),
+        applied_at: 0,
+        revoked_at: 0,
+        card: dv.card() as u32,
+        store_path: yuntun_model::dv::dv_object_path(&file.file_path, "dv-task"),
+    };
+    yuntun_store::put_bytes(&*fx.store, &entry.store_path, dv.to_bytes())
+        .await
+        .unwrap();
+    fx.catalog.apply_deletions(vec![entry]).await.unwrap();
+
+    let tasks = fx.catalog.list_tasks().await.unwrap();
+    assert_eq!(tasks.len(), 1, "DV 够大 ⇒ 单个文件也要进待办：{tasks:?}");
+    assert_eq!(tasks[0].reason(), yuntun_model::task::TaskReason::Deletions);
+    assert_eq!(tasks[0].deleted_rows, 1_000, "待办要报出被删的行数");
+}

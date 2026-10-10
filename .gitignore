@@ -14,3 +14,6 @@ tmp_dl/
 /data
 __pycache__/
 /vendor/
+
+# 误重定向产物（`cmd =1 file` 会把 `=1` 当文件名；已被误提交过一次）
+/=1

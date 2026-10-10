@@ -83,6 +83,17 @@ pub struct CatalogState {
     /// 它存在的唯一理由是让**孤儿 GC 看得见** ——"已上传未提交"的文件不是垃圾，
     /// 删了就是**真丢数据**（`R-9`）。此前这条判断只能靠 grace（时间假设）兜底。
     in_flight: BTreeMap<String, u64>,
+    /// **后台作业的任务目录**（`§169`，G.1）：`§166` 起多节点能分领了，但"要合并哪些分片"
+    /// 此前是**每个节点各自从清单算出来的** ⇒ 彼此看不见、也无法调度（优先级/公平/限流）。
+    ///
+    /// 存在这里（而不是某个节点的内存里）的理由：它是**状态机里的事实** ⇒ 随 raft 复制、
+    /// 随快照下发、每个副本算出**同一张表**（确定性纪律，`§38`）。
+    ///
+    /// ⚠️ 它是**派生**的（`refresh_task`）：`commit_files` / `apply_deletions` /
+    /// `commit_compaction` / `revoke` 之后重算**受影响的那一个分片**；
+    /// 不进 `encode_canonical`（对拍）：它完全由"文件 + DV"决定，进了会把
+    /// "派生逻辑变了"误报成"状态分叉"。
+    pub tasks: BTreeMap<String, yuntun_model::task::CompactionTask>,
     /// **删除向量事件**（`F.3`）：`dv_id` → 事件。
     ///
     /// 为什么是独立事件表而不是 `FileManifest` 上的可变字段（`delta-dml-design §3.2`）：
@@ -285,6 +296,101 @@ impl CatalogState {
     }
 
     /// 原子推进快照号并返回新值（快照号**必须严格单调**：文件可见性依赖 `valid_from <= snapshot`）。
+    // ------------------------------------------------------------ 任务目录（`§169`）
+
+    /// **重算一个分片的任务**（派生的唯一入口）。
+    ///
+    /// 输入只有"文件清单 + 删除向量"，两者都是状态机里的确定性事实 ⇒ **每个副本算出同一条任务**。
+    /// 幂等：满足就登记（保留首次 `since_ms`），不满足就删除 —— 因此**不需要**"谁来扫描产生
+    /// 任务"的仲裁（那会是又一个单点，且要再选一次主）。
+    pub fn refresh_task(&mut self, table: &str, shard: &str, now_ms: u64) {
+        let key = yuntun_model::task::TaskKey::new(table, shard).id();
+        let snap = self.snapshot_version;
+
+        let files: Vec<&FileManifest> = self
+            .files
+            .values()
+            .filter(|f| f.table == table && f.shard == shard && f.protects_at(snap))
+            .collect();
+        let n = files.len() as u64;
+
+        // 这个分片当前生效的删除行数（DV 是"锚定在某个文件"上的 ⇒ 按文件取）
+        let mut deleted_rows: u64 = 0;
+        let mut dv_hit = false;
+        for f in &files {
+            let mut card: u64 = 0;
+            for d in self.deletions.values() {
+                if d.file_path == f.file_path && d.active_at(snap) {
+                    card = card.saturating_add(d.card as u64);
+                }
+            }
+            deleted_rows = deleted_rows.saturating_add(card);
+            if f.row_count > 0
+                && card >= yuntun_model::task::threshold::DV_MIN_CARD
+                && (card as f64) / (f.row_count as f64) >= yuntun_model::task::threshold::DV_RATIO
+            {
+                dv_hit = true;
+            }
+        }
+
+        // 判定是**超集**：任务 = "这个分片值得看一看"，真正的合并判定仍在执行者的 `[compaction]` 里
+        // （漏登记 = 没人做；多登记 = 有人白看一眼 —— 前者才是事故）。
+        let reason = if n >= yuntun_model::task::threshold::FILES {
+            Some(yuntun_model::task::TaskReason::Files)
+        } else if dv_hit {
+            Some(yuntun_model::task::TaskReason::Deletions)
+        } else {
+            None
+        };
+
+        tracing::debug!(
+            table = %table,
+            shard = %shard,
+            files = n,
+            deleted_rows,
+            has_task = reason.is_some(),
+            "refresh_task（`§169`：任务目录派生）"
+        );
+        match reason {
+            Some(r) => {
+                let since = self.tasks.get(&key).map(|t| t.since_ms).unwrap_or(now_ms);
+                self.tasks.insert(
+                    key,
+                    yuntun_model::task::CompactionTask {
+                        table: table.to_string(),
+                        shard: shard.to_string(),
+                        files: n,
+                        deleted_rows,
+                        reason: r as u32,
+                        since_ms: since,
+                    },
+                );
+            }
+            None => {
+                self.tasks.remove(&key);
+            }
+        }
+    }
+
+    /// 按**某个文件**所在的分片重算任务（DV 的登记/撤销只知道文件路径时用）。
+    fn refresh_task_for_file(&mut self, file_path: &str, now_ms: u64) {
+        if let Some((t, sh)) = self
+            .files
+            .values()
+            .find(|f| f.file_path == file_path)
+            .map(|f| (f.table.clone(), f.shard.clone()))
+        {
+            self.refresh_task(&t, &sh, now_ms);
+        }
+    }
+
+    /// 当前的任务目录（按键排序 ⇒ 多节点的遍历顺序一致）。
+    pub fn list_tasks(&self) -> Vec<yuntun_model::task::CompactionTask> {
+        let mut out: Vec<yuntun_model::task::CompactionTask> = self.tasks.values().cloned().collect();
+        out.sort_by(|a, b| a.key().cmp(&b.key()));
+        out
+    }
+
     fn next_snapshot(&mut self) -> u64 {
         self.snapshot_version += 1;
         self.snapshot_version
@@ -533,6 +639,12 @@ impl CatalogState {
                 .unwrap_or_default();
             self.files.insert(req.batch_id.clone(), f);
         }
+        // `§169`：任务目录是**派生**的 ⇒ 清单变了就重算这个分片
+        {
+            let t = normalize_table(&req.table);
+            let sh = req.shard.clone();
+            self.refresh_task(&t, &sh, now_secs.saturating_mul(1000));
+        }
         self.bump_manifest_ver(&req.table);
         self.last_applied += 1;
 
@@ -741,6 +853,7 @@ impl CatalogState {
             return Ok(self.snapshot_version);
         }
         let next = self.next_snapshot();
+        let task_paths: Vec<String> = fresh.iter().map(|e| e.file_path.clone()).collect();
         for mut e in fresh {
             e.table = normalize_table(&e.table);
             e.applied_at = next;
@@ -752,6 +865,10 @@ impl CatalogState {
             }
             self.deletions
                 .insert((e.dv_id.clone(), e.file_path.clone()), e);
+        }
+        // `§169`：DV 变了 ⇒ 重算受影响分片的任务（DV 那条路可能让单个文件也进任务表）
+        for p in task_paths {
+            self.refresh_task_for_file(&p, 0);
         }
         self.schema_ver += 1;
         Ok(next)
@@ -917,6 +1034,8 @@ impl CatalogState {
         }
         if n > 0 {
             self.schema_ver += 1;
+            // `§169`：DV 被撤销 ⇒ 重算（这个分片可能不再需要合并）
+            self.refresh_task_for_file(file_path, 0);
         }
         n
     }
@@ -1090,6 +1209,9 @@ impl CatalogState {
                 touched.insert(normalize_table(&f.table));
             }
         }
+        let task_key: Option<(String, String)> = new_files
+            .first()
+            .map(|nf| (normalize_table(&nf.table), nf.shard.clone()));
         for mut nf in new_files {
             nf.valid_from = next;
             nf.status = FileStatus::Active as u32;
@@ -1102,6 +1224,10 @@ impl CatalogState {
         self.last_applied += 1;
         for t in &touched {
             self.bump_manifest_ver(t);
+        }
+        // `§169`：合并改了清单 ⇒ 重算这个分片的任务（合并完通常不再满足 ⇒ 任务消失）
+        if let Some((t, sh)) = task_key {
+            self.refresh_task(&t, &sh, 0);
         }
         Ok(next)
     }
@@ -1413,6 +1539,69 @@ impl CatalogState {
                 )));
             }
         }
+        // `§169`：任务目录**不进快照** —— 它由"文件 + 删除向量"**派生**（`refresh_task`），
+        // 存一份就会多出一个"派生结果与存储值不一致"的可能。这里按还原出来的清单重算一遍：
+        // 快照还原本来就是 O(文件数)，多一次派生不量级。
+        let mut keys: std::collections::BTreeSet<(String, String)> =
+            std::collections::BTreeSet::new();
+        for f in files.values() {
+            keys.insert((f.table.clone(), f.shard.clone()));
+        }
+        // 已被合并/删除的分片不该留着任务：这里只按**当前还在清单里**的分片重算 ⇒
+        // 任务表与"文件清单"天然同生同灭。
+        let mut tasks_after_restore: BTreeMap<String, yuntun_model::task::CompactionTask> =
+            BTreeMap::new();
+        {
+            let snapshot_version = msg.revision;
+            for (table, shard) in &keys {
+                let vis: Vec<&FileManifest> = files
+                    .values()
+                    .filter(|f| {
+                        f.table == *table && f.shard == *shard && f.protects_at(snapshot_version)
+                    })
+                    .collect();
+                let n = vis.len() as u64;
+                let mut deleted_rows = 0u64;
+                let mut dv_hit = false;
+                for f in &vis {
+                    let mut card = 0u64;
+                    for d in deletions.values() {
+                        if d.file_path == f.file_path && d.active_at(snapshot_version) {
+                            card = card.saturating_add(d.card as u64);
+                        }
+                    }
+                    deleted_rows = deleted_rows.saturating_add(card);
+                    if f.row_count > 0
+                        && card >= yuntun_model::task::threshold::DV_MIN_CARD
+                        && (card as f64) / (f.row_count as f64)
+                            >= yuntun_model::task::threshold::DV_RATIO
+                    {
+                        dv_hit = true;
+                    }
+                }
+                let reason = if n >= yuntun_model::task::threshold::FILES {
+                    Some(yuntun_model::task::TaskReason::Files)
+                } else if dv_hit {
+                    Some(yuntun_model::task::TaskReason::Deletions)
+                } else {
+                    None
+                };
+                if let Some(r) = reason {
+                    let key = yuntun_model::task::TaskKey::new(table.clone(), shard.clone()).id();
+                    tasks_after_restore.insert(
+                        key,
+                        yuntun_model::task::CompactionTask {
+                            table: table.clone(),
+                            shard: shard.clone(),
+                            files: n,
+                            deleted_rows,
+                            reason: r as u32,
+                            since_ms: 0,
+                        },
+                    );
+                }
+            }
+        }
         Ok(Self {
             tables,
             namespaces,
@@ -1424,6 +1613,7 @@ impl CatalogState {
             in_flight,
             deletions,
             purged,
+            tasks: tasks_after_restore,
             snapshot_version: msg.revision,
             last_applied: msg.last_applied,
             schema_ver: msg.schema_ver,

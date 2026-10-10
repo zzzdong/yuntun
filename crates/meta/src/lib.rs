@@ -266,6 +266,15 @@ impl NodeHandle {
     pub fn status(&self) -> yuntun_proto::meta::StatusResponse {
         // 先读**状态机**（另一个锁），再读 status 锁：锁序固定为 sm → status。
         // 在持有 status 时去取 sm，会和别处相反的取法撞成死锁。
+        // `§169`：任务目录（与 leases 同一把状态机锁、同一次读取 ⇒ 两者是同一时刻的世界）
+        let tasks = self
+            .sm
+            .lock()
+            .unwrap()
+            .list_tasks()
+            .iter()
+            .map(crate::op::task_to_proto)
+            .collect();
         let leases = self
             .sm
             .lock()
@@ -296,6 +305,8 @@ impl NodeHandle {
             // Status 是高频只读路径（心跳/排障/客户端落点都在用），不该顺带加锁去读 raft。
             voter_ids: s.voters.clone(),
             learner_ids: s.learners.clone(),
+            // `§169`：任务目录（现在有哪些活）—— 与 leases（谁在做）拼起来就是运维要的那张表
+            tasks,
         }
     }
 
@@ -502,6 +513,8 @@ impl NodeHandle {
                     .map(crate::op::deletion_to_proto)
                     .collect(),
                 idempotency_keys: keys,
+                // `§169`：任务目录 —— 与 files/deletions **同一次响应**下发（它是这两者派生的）
+                tasks: st.list_tasks().iter().map(crate::op::task_to_proto).collect(),
             }),
             full_reload: full,
         }

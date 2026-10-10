@@ -268,6 +268,9 @@ impl CatalogOps for BrokenCatalog {
     async fn dv_object_paths(&self) -> Result<Vec<String>, yuntun_model::LakeError> {
         self.inner.dv_object_paths().await
     }
+    async fn list_tasks(&self) -> Result<Vec<yuntun_model::task::CompactionTask>, yuntun_model::LakeError> {
+        self.inner.list_tasks().await
+    }
     async fn purge_table_files(
         &self,
         table: &str,

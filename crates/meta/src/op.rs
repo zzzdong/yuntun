@@ -558,6 +558,30 @@ pub fn deletion_to_proto(d: &yuntun_model::dv::DeletionEntry) -> pb::DeletionEnt
 }
 
 /// proto → `DeletionEntry`（与上面**成对**：只写一半就是"过线后字段悄悄丢"）。
+/// `§169`：任务目录 → proto（prefetch 下发用）。
+pub fn task_to_proto(t: &yuntun_model::task::CompactionTask) -> pb::CompactionTaskMsg {
+    pb::CompactionTaskMsg {
+        table: t.table.clone(),
+        shard: t.shard.clone(),
+        files: t.files,
+        deleted_rows: t.deleted_rows,
+        reason: t.reason,
+        since_ms: t.since_ms,
+    }
+}
+
+/// `§169`：proto → 任务目录（客户端缓存用）。
+pub fn task_from_proto(m: &pb::CompactionTaskMsg) -> yuntun_model::task::CompactionTask {
+    yuntun_model::task::CompactionTask {
+        table: m.table.clone(),
+        shard: m.shard.clone(),
+        files: m.files,
+        deleted_rows: m.deleted_rows,
+        reason: m.reason,
+        since_ms: m.since_ms,
+    }
+}
+
 pub fn deletion_from_proto(m: &pb::DeletionEntryMsg) -> yuntun_model::dv::DeletionEntry {
     yuntun_model::dv::DeletionEntry {
         dv_id: m.dv_id.clone(),
