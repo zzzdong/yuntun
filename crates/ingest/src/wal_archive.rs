@@ -254,7 +254,9 @@ pub async fn durable_tables(
                 .as_ref()
                 .is_some_and(|c| c.durability == 1)
         })
-        .map(|t| t.name)
+        // 与文档一致：**全限定名**（WAL 记录里的 `table` 就是它）；`TableMeta.name` 是裸名 ⇒
+        // 拿它去比对会永远不命中（`§167` 与合并那处同一个坑）。
+        .map(|t| t.qualified_name())
         .collect())
 }
 

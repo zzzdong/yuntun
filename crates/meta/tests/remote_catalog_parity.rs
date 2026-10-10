@@ -421,3 +421,66 @@ async fn remote_and_memory_catalogs_agree_on_the_same_ops() {
 
     server.abort();
 }
+
+/// **`list_tables()` 出来的标识必须能直接喂给 `list_visible_files`**（`§167`）。
+///
+/// 抓的是一个真 bug：`TableMeta.name` 是**裸名**（`cpu`），而全仓的标识是**全限定名**
+/// （`public.cpu`：清单键 / 对象路径 / WAL 记录）。`compaction` 与 `wal_archive::durable_tables`
+/// 曾拿裸名去查 ⇒ 在 `MemoryCatalog` 里"碰巧能用"（它内部归一化），**远端目录一律查不到**
+/// ⇒ 真多节点部署下**合并永远不触发**（`candidates=0` 而磁盘上明明有文件）。
+#[tokio::test]
+async fn list_tables_identity_is_directly_usable_for_file_queries() {
+    let cluster = Cluster::start();
+    let leader = cluster.wait_leader(T).expect("三节点应选出 leader");
+    let node = cluster.handle(leader).expect("取 leader 句柄");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { yuntun_meta::serve(node, listener).await });
+
+    let remote: Arc<dyn CatalogOps> =
+        Arc::new(RemoteCatalog::connect(vec![addr.to_string()]).expect("连接 metanode"));
+    remote.create_table(CreateTableRequest {
+        name: "cpu".into(),
+        namespace: "public".into(),
+        schema: schema(&["ts", "v"]),
+        partition_cols: vec![],
+        default_format: "parquet".into(),
+        ingest_config: yuntun_model::meta::IngestConfig::standard(),
+    })
+    .await
+    .expect("建表");
+    remote
+        .commit_files(commit("public.cpu", "b1", "k-b1", "s0"))
+        .await
+        .expect("提交文件");
+
+    let metas = remote.list_tables().await.expect("list_tables");
+    let cpu = metas.iter().find(|t| t.name == "cpu").expect("应当有 cpu");
+    // ① 裸名 ≠ 全限定名（这条定义性断言让"名字是什么"一目了然）
+    assert_eq!(cpu.name, "cpu");
+    assert_eq!(cpu.qualified_name(), "public.cpu");
+
+    // ② 用 `qualified_name()` 查询 ⇒ 必须查得到（后台作业就是这么用的）
+    let snap = remote.current_snapshot().await;
+    let files = remote
+        .list_visible_files(&cpu.qualified_name(), snap, None)
+        .await
+        .expect("全限定名必须能列出文件");
+    assert_eq!(files.len(), 1, "应当看到刚提交的那个文件：{files:?}");
+
+    // ③ 裸名也查得到（目录两侧都会归一化）—— 所以这坑**不会**表现为报错，而是"碰巧能用"；
+    //    真正的纪律是：**作业一律用 `qualified_name()`**（`FileManifest.table` 也是全限定名，
+    //    见下面这条），别依赖"某个实现会帮你归一化"。
+    let by_bare = remote
+        .list_visible_files(&cpu.name, snap, None)
+        .await
+        .expect("裸名查询不该报错");
+    assert_eq!(by_bare.len(), 1, "目录会归一化 ⇒ 裸名也查得到：{by_bare:?}");
+    assert_eq!(
+        by_bare[0].table, "public.cpu",
+        "文件上记的表名必须是全限定名（跨层唯一标识）：{:?}",
+        by_bare[0].table
+    );
+
+    server.abort();
+}

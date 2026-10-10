@@ -1,6 +1,6 @@
 # yuntun 实现操作日志（阶段 0 → 阶段 3）
 
-> 起记时间：2026-09-08（最新：**§166，2026-10-10**）。对应分支：main。
+> 起记时间：2026-09-08（最新：**§167，2026-10-11**）。对应分支：main。
 > 本日志记录实际操作顺序、**临时调整**、**与原计划（docs/design.md / architecture.md / plan.md）的偏差点**，
 > 以及**每个结论的证据**（缺陷根因、实测数据、反证过程）。
 >
@@ -10695,4 +10695,68 @@ No such file or directory`（`arrow-row` / `arrow-csv` / `tonic` 等一起红）
 - ⚠️ **三条全量并发抖动**（单跑皆绿，第二次全量干净）：`chaos::disk_watermark_...`（已知 flaky，
   `status §4`）、`compaction::concurrent_writers_compaction_and_gc_converge`（30s 收尾窗口在 `-j 4` 下偶发）、
   `query::slow_sources_wait_in_parallel_not_in_sequence`（纯时序断言 545ms）。三者性质同
-  "test binary 并行争 CPU/IO"，与本刀改动无因果关系，如实记在这里。
+  "test binary 并行争 CPU/IO"，与本刀改动无因果关系，如实记在这里。\n
+---
+
+## 167. **多 datanode 的容器 rig + 分领的真证据**（台账 `D-22` 闭环）（2026-10-11）
+
+### 167.0 为什么要这一刀
+
+`§166`（G.0）把压缩改成按 `(table, shard)` 分租约，但它的证据来自**同进程两个 `Compactor`**
+—— 那是"两个作业对象"，不是"两个节点"。真多 datanode 需要的形态是：**各自的私有目录**
+（WAL/spill 被租约独占，同一目录第二个进程启动即被拒）、**共享一份冷存储**、各自的端口。
+这一刀把这套 rig 搭起来（`tests/datanode_cluster.sh` + `tests/datanode-compose.yaml`）。
+
+### 167.1 镜像这道坎（试错记录，免得下次再试一遍）
+
+| 镜像 | glibc | 结果 |
+|---|---|---|
+| `debian:trixie-slim` | 2.41 | ❌ `yuntun-datanode` 需要 `GLIBC_2.44`（metanode 不链 `libm` 所以没踩到） |
+| `fedora-minimal` | **2.43** | ❌ 差一点 |
+| **`archlinux`** | **2.44** | ✅ 能跑 |
+| musl 静态编 | — | ❌ 本机只有 `musl-gcc`，缺 `x86_64-linux-musl-g++`（某个依赖要 C++） |
+
+⇒ **五个容器统一用 `archlinux`**，二进制仍由宿主 cargo 编好挂进来。
+
+### 167.2 做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `tests/datanode-compose.yaml`（新） | 3 个 metanode + 2 个 datanode；私有目录各一卷、**冷存储一个共享卷**；SQL 端口发布给宿主（19501/19502） |
+| `tests/datanode_cluster.sh`（新） | `build/up/smoke/logs/ps/down`；七步判据（见下） |
+| `meta_probe leases`（新子命令） | 把租约暴露给运维/rig：`purpose=holder:epoch`（"谁在做什么"是最先被问到的问题，而租约是唯一权威 —— 它在 raft 状态机里） |
+| `compaction` | ① 用 **全限定名**（`TableMeta::qualified_name()`）而不是 `TableMeta.name`；② 新增 **`max_merges_per_round`**（默认 8，可用 `--compaction-max-merges-per-round` 调） |
+| `wal_archive::durable_tables` | 同样改用全限定名（它自己的文档就写着"全限定名，与 WAL 记录里的 `table` 同形"，而代码此前返回裸名） |
+| `remote_catalog_parity` | 加一条用例钉住"表名标识能直接用于查询"（含"目录会归一化 ⇒ 裸名也查得到，所以作业**不该**依赖归一化"） |
+
+### 167.3 三个决定
+
+1. **判据必须能证伪**：第一版的"分领"断言只是"日志里出现过 `compaction round`" —— **假绿**
+   （两个节点全程 `compacted=0`，照样通过）。现在要求 **`compacted>=1`**。
+2. **"谁合并了"是不确定的**（两个节点抢同一批分片，谁先拿到租约谁做）⇒ 确定的那条判据是
+   **接管**：杀掉**正在干活的那台**，另一台必须接得上并继续合并。这条是硬证据。
+3. **`max_merges_per_round`**：一轮最多合并几个分片。两条理由 —— ① 限制单轮时长（一轮串行
+   合并几千个分片会把这一轮顶到小时级，而循环按 `interval` 跑）；② 给别的节点留机会
+   （剩下的下一轮谁抢到谁做，分领才是真的）。rig 里设成 1 让"两个节点都干到活"可观测。
+
+### 167.4 验证（实测输出）
+
+```text
+③ 写 → 读：四个分片、两节点各写一批   ⇒ dn1 上查 = 24；dn2 上查 = 24
+④ 分领                                ⇒ dn1 合并过：1；dn2 合并过：1
+⑤ 行数守恒                            ⇒ count(*) = 24
+⑥ gc 租约                             ⇒ gc=gc-dn1:1（只有一个持有者）
+⑦ 接管：杀掉正在干活的 dn1            ⇒ dn2 随后出现 compacted=1
+✅ smoke 通过
+```
+
+全量 **542 passed / 0 failed / 0 ignored**；clippy 本仓 0；判据 7/7（67,768 行 / 544 测试函数）。
+
+### 167.5 边界与两个没追到底的点（如实记）
+
+1. **数据面现在能进容器，但"真断网/冻结"那类故障维度仍只在控制面 rig（`tests/cluster.sh`）** ——
+   本 rig 的接管用的是 `podman kill`；
+2. **合并提交期间观测到一次"行数瞬时 24 → 21"**（正好一个分片的 3 行短暂不可见），随后收敛回 24；
+   第二次跑没复现。**没有追到底** ⇒ 开台账 **`D-23`**；rig 的判据先钉住"必须收敛回来"这条底线；
+3. **GC 静置期不能设太短**：rig 第一版设了 5s，结果冷存储里另一个节点的文件不见了（GC 的对账视图
+   滞后于提交）⇒ rig 用 60s。这提醒的是运维口径：grace 要大于"提交 → 各节点视图可见"的滞后。

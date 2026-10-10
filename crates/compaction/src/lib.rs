@@ -36,6 +36,12 @@ pub struct CompactionConfig {
     pub dv_min_card: u64,
     /// 合并产物最大行数（超过则拆分；MVP 单文件全量）
     pub max_rows_per_output: u64,
+    /// **一轮最多合并几个分片**（`§167`）。
+    ///
+    /// 两条理由：① **限制单轮时长** —— 一轮串行合并几千个分片会把这一轮顶到小时级，
+    /// 而循环是按 `interval` 跑的（期间租约还得续）；② **给别的节点留机会** —— 剩下的分片
+    /// 下一轮谁抢到谁做，多节点**分领**才是真的（而不是"一个节点一轮全包"）。
+    pub max_merges_per_round: usize,
     /// 作业循环间隔（默认 60s）
     pub interval: Duration,
     /// 孤儿文件静置期（默认 1h）
@@ -60,6 +66,7 @@ impl Default for CompactionConfig {
             dv_ratio_threshold: 0.1,
             dv_min_card: 1_000,
             max_rows_per_output: 5_000_000,
+            max_merges_per_round: 8,
             interval: Duration::from_secs(60),
             orphan_grace: Duration::from_secs(3600),
             lease_purpose: yuntun_model::meta::COMPACTION_LEASE.to_string(),
@@ -786,6 +793,8 @@ pub fn spawn_orphan_cleanup_with_interval(
 /// 一轮压缩的账（`§166`：可观测"分领"到底分到了多少）。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RoundStats {
+    /// 本轮看到的表数（**诊断用**：`candidates=0` 时首先要分清是"没有表"还是"表里有但不够"）
+    pub tables: usize,
     /// 预筛后"值得看一看"的分片数
     pub candidates: usize,
     /// 真合并了的分片数
@@ -811,11 +820,17 @@ pub struct RoundStats {
 pub async fn compaction_round(compactor: &Compactor) -> Result<RoundStats, LakeError> {
     let mut stats = RoundStats::default();
     let tables = compactor.catalog.list_tables().await?;
+    stats.tables = tables.len();
     let snapshot = compactor.catalog.current_snapshot().await;
     for t in &tables {
+        // ⚠️ 必须用**全限定名**：`TableMeta.name` 是**裸名**（`dist`），而清单/对象路径/WAL
+        // 一律按 `public.dist` 记。用裸名去列文件在 `MemoryCatalog` 里"碰巧能用"（它内部会
+        // 归一化），**远端目录不会** ⇒ 合并永远看不到任何文件（`§167` 在真多节点 rig 上撞到：
+        // `candidates=0` 而磁盘上明明有 4 个文件）。
+        let ident = t.qualified_name();
         let files = compactor
             .catalog
-            .list_visible_files(&t.name, snapshot, None)
+            .list_visible_files(&ident, snapshot, None)
             .await?;
         if files.is_empty() {
             continue;
@@ -839,6 +854,10 @@ pub async fn compaction_round(compactor: &Compactor) -> Result<RoundStats, LakeE
         let mut shards: Vec<&str> = by_shard.keys().copied().collect();
         shards.sort_unstable();
         for shard in shards {
+            // 一轮的上限到了 ⇒ 剩下的下一轮（也留机会给别的节点，`§167`）
+            if stats.compacted >= compactor.cfg.max_merges_per_round {
+                break;
+            }
             let group = &by_shard[shard];
             let has_dv = group.iter().any(|f| dv_files.contains(&f.file_path));
             if group.len() < compactor.cfg.min_files && !has_dv {
@@ -847,7 +866,7 @@ pub async fn compaction_round(compactor: &Compactor) -> Result<RoundStats, LakeE
             stats.candidates += 1;
             let purpose = yuntun_model::meta::compaction_shard_lease_purpose(
                 &compactor.cfg.lease_purpose,
-                &t.name,
+                &ident,
                 shard,
             );
             let mut gate =
@@ -856,17 +875,17 @@ pub async fn compaction_round(compactor: &Compactor) -> Result<RoundStats, LakeE
                 stats.lease_busy += 1;
                 continue;
             }
-            match compact_shard(compactor, &t.name, shard, snapshot, gate.epoch).await {
+            match compact_shard(compactor, &ident, shard, snapshot, gate.epoch).await {
                 Ok(Some(_)) => stats.compacted += 1,
                 Ok(None) => {}
                 Err(e) => {
                     // "输入已被别人合并"是分领下的**正常竞态**（本轮快照是旧的），不是故障
                     if e.to_string().contains("compaction conflict") {
                         stats.stale += 1;
-                        tracing::info!(table = %t.name, shard, "本轮输入已被合并（跳过）");
+                        tracing::info!(table = %ident, shard, "本轮输入已被合并（跳过）");
                     } else {
                         stats.failed += 1;
-                        tracing::error!(error = %e, table = %t.name, shard, "compaction failed");
+                        tracing::error!(error = %e, table = %ident, shard, "compaction failed");
                     }
                 }
             }
@@ -896,6 +915,7 @@ pub fn spawn_compaction_loop(
             // 每一轮的租约都在分片做完时归还（`release_lease`），所以退出时没有"全局锁"要还。
             match compaction_round(&compactor).await {
                 Ok(st) => tracing::info!(
+                    tables = st.tables,
                     candidates = st.candidates,
                     compacted = st.compacted,
                     lease_busy = st.lease_busy,

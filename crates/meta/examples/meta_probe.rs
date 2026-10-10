@@ -150,7 +150,7 @@ async fn propose_with_retry(clients: &[Client], op: pb::Op, secs: u64) -> pb::Pr
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some((cmd, rest)) = args.split_first() else {
-        eprintln!("用法：meta_probe <status|leader|write|verify> [key] <addr>...");
+        eprintln!("用法：meta_probe <status|leader|leases|write|verify> [key] <addr>...");
         std::process::exit(64);
     };
 
@@ -212,6 +212,28 @@ async fn main() {
             if r.accepted {
                 eprintln!("❌ 重放同一个幂等键竟然被接受了（{key}）—— 幂等记录不在状态机里");
                 std::process::exit(1);
+            }
+        }
+        // `§167`：把**租约**暴露给运维/rig 看 —— "谁在做什么"是最先被问到的问题，
+        // 而租约是唯一权威（它在 raft 状态机里）。输出形如 `gc=gc-dn1:3` / `compaction:public.t:s0=node-dn2:1`。
+        "leases" => {
+            let mut seen = std::collections::BTreeMap::<String, (String, u64)>::new();
+            for (i, c) in clients.iter().enumerate() {
+                let Some(st) = status(c).await else { continue };
+                for l in st.leases {
+                    if l.holder.is_empty() {
+                        continue;
+                    }
+                    seen.entry(l.purpose.clone())
+                        .or_insert((l.holder.clone(), l.epoch));
+                }
+                let _ = &addrs[i];
+            }
+            if seen.is_empty() {
+                println!("(无租约)");
+            }
+            for (purpose, (holder, epoch)) in seen {
+                println!("{purpose}={holder}:{epoch}");
             }
         }
         other => {

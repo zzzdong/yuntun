@@ -1,0 +1,138 @@
+# **多 datanode（数据面）+ 三节点 metanode（控制面）**的真容器集群（`§167`，台账 `D-22`）。
+#
+# # 为什么要它
+#
+# `tests/compose.yaml` 只起 **metanode**（控制面）。数据面多节点此前只有"宿主多进程 + 共享
+# `--cold-root`"的形态 ⇒ "多 datanode 各领各的分片去合并"这件事（`§166` 的 G.0）**没有真容器
+# 证据**。这个编排把那一半补上：3 个 metanode + 2 个 datanode，**各自独立的网络命名空间**，
+# 冷存储是**一个共享卷**。
+#
+# # 为什么镜像是 `archlinux`（而不是 `debian:trixie-slim`）
+#
+# 二进制由宿主 cargo 编好挂进来（同 `tests/compose.yaml` 的做法），所以**容器的 glibc 必须够新**：
+# `yuntun-datanode` 需要 **GLIBC_2.44**，而 `debian:trixie-slim` 是 **2.41**（metanode 不链
+# `libm` 所以没踩到）、`fedora-minimal` 是 **2.43**（差一点）。`archlinux` 是 **2.44** ⇒ 能跑。
+# （musl 静态编这条路走不通：本机只有 `musl-gcc`，缺 `x86_64-linux-musl-g++`。）
+#
+# # 形态要点
+#
+# * **私有目录各归各的**（`dn1-data` / `dn2-data`）：WAL/spill 被租约独占，同一目录第二个进程
+#   启动即被拒 —— 这正是"两个真进程/真容器"而不是"一个进程里的两个 Compactor"的意义；
+# * **冷存储一处**（`cold` 卷挂到同一个路径）：两个写者产出的文件在同一个桶里 ⇒ 对方的文件谁都可见；
+# * 两个 datanode **都开 `--compaction`**：`§166` 之前这是被禁止的（全局一把锁 ⇒ 多开只会互相挡）；
+#   现在它们应当**分领不同的分片**（判据见 `datanode_cluster.sh`）。
+
+services:
+  # ---------------- 控制面：三个 metanode ----------------
+  mn1:
+    image: quay.io/archlinux/archlinux:latest
+    container_name: yuntun-mn1
+    ports: ["19311:9311"]
+    command:
+      - /usr/local/bin/metanode
+      - --id=1
+      - --dir=/data
+      - --listen=0.0.0.0:9311
+      - --voters=1,2,3
+      - --peer=2@mn2:9311,3@mn3:9311
+      - --snapshot-log-entries=100000
+      - --init
+    volumes:
+      - ../target/release/metanode:/usr/local/bin/metanode:ro
+      - mn1-data:/data
+
+  mn2:
+    image: quay.io/archlinux/archlinux:latest
+    container_name: yuntun-mn2
+    ports: ["19312:9311"]
+    command:
+      - /usr/local/bin/metanode
+      - --id=2
+      - --dir=/data
+      - --listen=0.0.0.0:9311
+      - --voters=1,2,3
+      - --peer=1@mn1:9311,3@mn3:9311
+      - --snapshot-log-entries=100000
+      - --init
+    volumes:
+      - ../target/release/metanode:/usr/local/bin/metanode:ro
+      - mn2-data:/data
+
+  mn3:
+    image: quay.io/archlinux/archlinux:latest
+    container_name: yuntun-mn3
+    ports: ["19313:9311"]
+    command:
+      - /usr/local/bin/metanode
+      - --id=3
+      - --dir=/data
+      - --listen=0.0.0.0:9311
+      - --voters=1,2,3
+      - --peer=1@mn1:9311,2@mn2:9311
+      - --snapshot-log-entries=100000
+      - --init
+    volumes:
+      - ../target/release/metanode:/usr/local/bin/metanode:ro
+      - mn3-data:/data
+
+  # ---------------- 数据面：两个 datanode ----------------
+  dn1:
+    image: quay.io/archlinux/archlinux:latest
+    container_name: yuntun-dn1
+    depends_on: [mn1, mn2, mn3]
+    # SQL 端口发布给**宿主**上的 `yuntun-cli`（容器内仍是 50051）
+    ports: ["19501:50051"]
+    command:
+      - /usr/local/bin/yuntun-datanode
+      - --instance-id=dn1
+      - --dir=/data
+      - --cold-root=/cold
+      - --meta=mn1:9311
+      - --listen=0.0.0.0:9312
+      - --sql-listen=0.0.0.0:50051
+      - --compaction
+      - --compaction-min-files=2
+      - --compaction-max-merges-per-round=1
+      - --compaction-interval-secs=2
+      - --compaction-gc-interval-secs=2
+      - --compaction-gc-grace-secs=60
+      - --heartbeat-secs=2
+      - --reconcile-secs=2
+    volumes:
+      - ../target/release/yuntun-datanode:/usr/local/bin/yuntun-datanode:ro
+      - dn1-data:/data
+      - cold:/cold
+
+  dn2:
+    image: quay.io/archlinux/archlinux:latest
+    container_name: yuntun-dn2
+    depends_on: [mn1, mn2, mn3]
+    ports: ["19502:50051"]
+    command:
+      - /usr/local/bin/yuntun-datanode
+      - --instance-id=dn2
+      - --dir=/data
+      - --cold-root=/cold
+      - --meta=mn1:9311
+      - --listen=0.0.0.0:9312
+      - --sql-listen=0.0.0.0:50051
+      - --compaction
+      - --compaction-min-files=2
+      - --compaction-max-merges-per-round=1
+      - --compaction-interval-secs=2
+      - --compaction-gc-interval-secs=2
+      - --compaction-gc-grace-secs=60
+      - --heartbeat-secs=2
+      - --reconcile-secs=2
+    volumes:
+      - ../target/release/yuntun-datanode:/usr/local/bin/yuntun-datanode:ro
+      - dn2-data:/data
+      - cold:/cold
+
+volumes:
+  mn1-data:
+  mn2-data:
+  mn3-data:
+  dn1-data:
+  dn2-data:
+  cold:

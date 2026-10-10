@@ -161,6 +161,9 @@ struct Args {
     /// 压缩触发阈值：同一 shard 的可见文件数 ≥ 它才合并
     #[arg(long, default_value_t = 5)]
     compaction_min_files: usize,
+    /// 一轮最多合并几个分片（`§167`）：限制单轮时长，也让**别的节点**有机会分到剩下的
+    #[arg(long, default_value_t = 8)]
+    compaction_max_merges_per_round: usize,
     /// 压缩作业间隔（秒）
     #[arg(long, default_value_t = 60)]
     compaction_interval_secs: u64,
@@ -490,6 +493,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 cfg: yuntun_compaction::CompactionConfig {
                     min_files: args.compaction_min_files,
                     interval: Duration::from_secs(args.compaction_interval_secs),
+                    max_merges_per_round: args.compaction_max_merges_per_round,
                     orphan_grace: Duration::from_secs(args.compaction_gc_grace_secs),
                     // 租约期限：拿不到/续不上就停手（`§81`）
                     lease_ttl: Duration::from_secs(args.compaction_ttl_secs),
