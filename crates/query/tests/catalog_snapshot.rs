@@ -271,6 +271,11 @@ impl CatalogOps for BrokenCatalog {
     async fn list_tasks(&self) -> Result<Vec<yuntun_model::task::CompactionTask>, yuntun_model::LakeError> {
         self.inner.list_tasks().await
     }
+    async fn list_leases(
+        &self,
+    ) -> Result<Vec<yuntun_model::meta::LeaseEntry>, yuntun_model::LakeError> {
+        self.inner.list_leases().await
+    }
     async fn purge_table_files(
         &self,
         table: &str,

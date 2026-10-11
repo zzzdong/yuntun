@@ -125,6 +125,51 @@ pub struct CatalogMetrics {
     pub lazy_refreshes: u64,
 }
 
+/// 一条待办（任务目录；`§172`，G.4）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskMetric {
+    pub table: String,
+    pub shard: String,
+    pub files: u64,
+    pub deleted_rows: u64,
+    /// `"files"` = 文件数达阈值；`"dv"` = 删除占比达阈值
+    pub reason: String,
+    /// 挂了多久（秒；`null` = **未知**：从快照还原后还没被携带时钟的 op 触碰过）
+    pub age_secs: Option<u64>,
+}
+
+/// 一把租约（`§172`，G.4）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LeaseMetric {
+    pub purpose: String,
+    /// 空 = 空闲（已释放；条目仍在，因为代次水位要留着）
+    pub holder: String,
+    pub epoch: u64,
+    /// 已被持有多久（秒）
+    pub held_secs: u64,
+    /// 距到期还有多久（秒；`0` = 已到期，尚未被清扫/接管）
+    pub expires_in_secs: u64,
+}
+
+/// 后台作业的可见面（`§172`，G.4）：**有哪些活**（任务目录）+ **谁在做**（租约）。
+///
+/// 为什么两者放一起报：运维最先问的就是这两句；分开报会让"活很多但没人做"看起来像
+/// 两个无关的数字。**注意"0 条待办"与"读不到"要能分清** ⇒ 各带一个 `*_error`。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct JobMetrics {
+    pub tasks_total: usize,
+    /// 年龄未知的条数（快照还原之后还没被携带时钟的 op 触碰过）
+    pub tasks_unknown_age: usize,
+    pub tasks: Vec<TaskMetric>,
+    pub leases_total: usize,
+    /// 有持有者的租约数（`leases_total` 里还包含已释放、只留代次水位的那几条）
+    pub leases_held: usize,
+    pub leases: Vec<LeaseMetric>,
+    /// 读任务表失败（远端不可用等）：**报出来** —— 否则"0 条待办"会被读成"没活"
+    pub tasks_error: Option<String>,
+    pub leases_error: Option<String>,
+}
+
 /// query 执行区指标。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct QueryMetrics {
@@ -142,6 +187,8 @@ pub struct LakehouseMetrics {
     pub wal: WalMetrics,
     pub catalog: CatalogMetrics,
     pub query: QueryMetrics,
+    /// 后台作业：有哪些活、谁在做（`§172`）
+    pub jobs: JobMetrics,
 }
 
 impl Lakehouse {
@@ -211,6 +258,66 @@ pub async fn collect_metrics(
             reserved_bytes: query.query_memory_reserved(),
             limit_bytes: query.query_memory_limit(),
         },
+        jobs: collect_jobs(catalog).await,
+    }
+}
+
+/// 后台作业的指标（`§172`，G.4）：任务目录 + 租约。
+///
+/// **best-effort**：两块各自失败只记在 `*_error` 里，不影响整份快照 ——
+/// 但也**绝不静默**："读不到"与"没有"必须能分清（否则运维会把元数据面故障读成"今天没活"）。
+async fn collect_jobs(catalog: &Arc<dyn CatalogOps>) -> JobMetrics {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let (tasks, tasks_error) = match catalog.list_tasks().await {
+        Ok(t) => (t, None),
+        Err(e) => (Vec::new(), Some(e.to_string())),
+    };
+    let (leases, leases_error) = match catalog.list_leases().await {
+        Ok(l) => (l, None),
+        Err(e) => (Vec::new(), Some(e.to_string())),
+    };
+
+    let tasks: Vec<TaskMetric> = tasks
+        .iter()
+        .map(|t| TaskMetric {
+            table: t.table.clone(),
+            shard: t.shard.clone(),
+            files: t.files,
+            deleted_rows: t.deleted_rows,
+            reason: match t.reason() {
+                yuntun_model::task::TaskReason::Files => "files".to_string(),
+                yuntun_model::task::TaskReason::Deletions => "dv".to_string(),
+            },
+            // `since_ms == 0` ⇒ **未知**（快照还原后没被携带时钟的 op 触碰过）：
+            // 报 `None`，绝不去算 `now - 0`（那会是 54 年，观测就成了谎）
+            age_secs: (t.since_ms != 0).then(|| now_ms.saturating_sub(t.since_ms) / 1000),
+        })
+        .collect();
+
+    let leases: Vec<LeaseMetric> = leases
+        .iter()
+        .map(|l| LeaseMetric {
+            purpose: l.purpose.clone(),
+            holder: l.holder.clone(),
+            epoch: l.epoch,
+            held_secs: now_ms.saturating_sub(l.granted_at_ms) / 1000,
+            expires_in_secs: l.expires_at_ms.saturating_sub(now_ms) / 1000,
+        })
+        .collect();
+
+    JobMetrics {
+        tasks_total: tasks.len(),
+        tasks_unknown_age: tasks.iter().filter(|t| t.age_secs.is_none()).count(),
+        leases_total: leases.len(),
+        leases_held: leases.iter().filter(|l| !l.holder.is_empty()).count(),
+        tasks,
+        leases,
+        tasks_error,
+        leases_error,
     }
 }
 

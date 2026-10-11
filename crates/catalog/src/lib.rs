@@ -184,6 +184,14 @@ pub trait CatalogOps: Send + Sync {
     /// **认领复用租约**（`TaskKey::lease_purpose()`），不另造认领协议。
     async fn list_tasks(&self) -> Result<Vec<yuntun_model::task::CompactionTask>, LakeError>;
 
+    /// **租约快照**（`§172`，G.4）：与[任务目录][Self::list_tasks]拼起来就是运维要的那张表
+    /// ——「有哪些活」+「谁在做」。
+    ///
+    /// 语义：**此刻**持有的租约（含已释放但保留代次水位的条目，`holder` 为空）。
+    /// 它是**实时视图**（有 TTL、会被接管），因此**不是**从文件清单派生的 ——
+    /// 远端实现走 `Status` RPC 现取，而不是塞进预取载荷里缓存。
+    async fn list_leases(&self) -> Result<Vec<yuntun_model::meta::LeaseEntry>, LakeError>;
+
     /// **此刻仍需保护**的 batch_id（孤儿清理对账基准，§12.2.1 / T14.5）——同上，不得绑具体实现。
     ///
     /// = 保护期内的文件（活着，或墓碑期未过）∪ 在途批次。**过期的墓碑不在其中** ——
@@ -286,6 +294,18 @@ fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 宿主毫秒钟（`§172`）：`MemoryCatalog` 是**进程内直连**形态 —— 没有"op 携带的钟"可传
+/// （raft 形态的钟由 op 携带），所以由装配层取一次。
+///
+/// 它只喂给 `CatalogState` 的 `CompactionTask.since_ms`（**纯观测**字段，不参与任何判定），
+/// 且任务表的内容与排序都由"文件 + DV"决定 ⇒ 不会因钟而分叉。
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 
@@ -411,7 +431,8 @@ impl CatalogOps for MemoryCatalog {
     // ---------------------------------------------------------- 删除向量（F.3）
 
     async fn apply_deletions(&self, entries: Vec<DeletionEntry>) -> Result<u64, LakeError> {
-        self.state.write().unwrap().apply_deletions(entries)
+        // 时钟在宿主取（同 `apply_update`）：状态机不读钟（纪律 1）
+        self.state.write().unwrap().apply_deletions(entries, now_ms())
     }
 
     async fn list_deletions(
@@ -445,7 +466,7 @@ impl CatalogOps for MemoryCatalog {
             .state
             .write()
             .unwrap()
-            .revoke_deletions_for_file(file_path, at))
+            .revoke_deletions_for_file(file_path, at, now_ms()))
     }
 
     async fn dv_object_paths(&self) -> Result<Vec<String>, LakeError> {
@@ -464,11 +485,18 @@ impl CatalogOps for MemoryCatalog {
         table: &str,
         purge_id: &str,
     ) -> Result<PurgeOutcome, LakeError> {
-        self.state.write().unwrap().purge_table_files(table, purge_id)
+        self.state
+            .write()
+            .unwrap()
+            .purge_table_files(table, purge_id, now_ms())
     }
 
     async fn drop_shard(&self, table: &str, shard: &str) -> Result<u64, LakeError> {
-        Ok(self.state.write().unwrap().drop_shard(table, shard))
+        Ok(self
+            .state
+            .write()
+            .unwrap()
+            .drop_shard(table, shard, now_ms()))
     }
 
     async fn drop_table(&self, name: &str) -> Result<(), LakeError> {
@@ -597,6 +625,18 @@ impl CatalogOps for MemoryCatalog {
 
     async fn list_tasks(&self) -> Result<Vec<yuntun_model::task::CompactionTask>, LakeError> {
         Ok(self.state.read().unwrap().list_tasks())
+    }
+
+    async fn list_leases(&self) -> Result<Vec<yuntun_model::meta::LeaseEntry>, LakeError> {
+        // 状态机里的租约表是 `BTreeMap<purpose, _>` ⇒ 天然按用途键有序（确定性纪律 2）
+        Ok(self
+            .state
+            .read()
+            .unwrap()
+            .leases()
+            .values()
+            .cloned()
+            .collect())
     }
 }
 

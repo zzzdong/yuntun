@@ -90,7 +90,8 @@ services:
       - --instance-id=dn1
       - --dir=/data
       - --cold-root=/cold
-      - --meta=mn1:9311
+      # 种子列表给全（`§172`）：只给一台时，那一台不是 leader ⇒ 这个节点的**所有写都失败**
+      - --meta=mn1:9311,mn2:9311,mn3:9311
       - --listen=0.0.0.0:9312
       - --sql-listen=0.0.0.0:50051
       - --compaction
@@ -116,7 +117,7 @@ services:
       - --instance-id=dn2
       - --dir=/data
       - --cold-root=/cold
-      - --meta=mn1:9311
+      - --meta=mn1:9311,mn2:9311,mn3:9311
       - --listen=0.0.0.0:9312
       - --sql-listen=0.0.0.0:50051
       - --compaction

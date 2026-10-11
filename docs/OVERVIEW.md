@@ -75,8 +75,8 @@
 | 持久性 | WAL 权威（CRC + 组提交 + fsync）；崩溃恢复含 DDL 重放 + 非终态批次重提交；`durable` 档 = WAL 段归档到共享存储（**RPO = 归档间隔 + 一次上传时延**，默认秒级） |
 | 可见性 | 读己之写：fsync 后 ≤1 个 scan 周期（默认 100ms）可查，此时零已提交文件 |
 | 内存 | chunk 区 / query 区**硬分区互不抢占**；60/80/95 阶梯；spill（IPC+LZ4+CRC）；95% 明确拒写 |
-| 后台作业 | Compaction（**按 `(table, shard)` 分租约**，多节点可同时合并不同分片）+ 孤儿清理（全局 `gc` 租约）+ **任务目录**（待办是状态机派生的事实，多节点看到同一份） |
-| 运维 | 周期结构化打点；`[metrics]` 可选 HTTP 导出（`/metrics` Prometheus 文本、`/metrics.json`、`/healthz`）；`metanode` 成员变更 + 运维 CLI |
+| 后台作业 | Compaction（**按 `(table, shard)` 分租约**，多节点可同时合并不同分片）+ 孤儿清理（全局 `gc` 租约）+ **任务目录**（待办是状态机派生的事实，多节点看到同一份；任何改"文件或删除向量"的入口都会重算，见 `ARCHITECTURE.md §6`） |
+| 运维 | 周期结构化打点；`[metrics]` 可选 HTTP 导出（`/metrics` Prometheus 文本、`/metrics.json`、`/healthz`），其中 **`jobs` 段报"有哪些活 / 谁在做"**：每条待办（表·分片·文件数·删除行数·**年龄**）+ 每把租约（用途·持有者·代次·持有/剩余秒）+ 两个 `*_error`（"读不到"与"没有"能分清）；Prometheus 侧**每行带标签**；`metanode` 成员变更 + 运维 CLI；`meta_probe tasks/leases` |
 
 ### 4.2 明确不能（**都是明确报错，不是静默错**）
 
@@ -96,6 +96,7 @@
 | 多节点写同一分片 | ✅ | 设计即"各出各的文件 + 查询侧合并"；共享冷存储 + 按实例拉热数据 ⇒ **逐行精确相等**（`§91`/`§98`），"提交→标记"窗口不重复计数（读侧栅栏 `§99`） |
 | 多节点跑 compaction / 孤儿 GC | ✅ | `(table, shard)` 分租约 + `commit_compaction` epoch 栅栏 + 在途登记；开 GC 的多节点并发压测零误删（`§84`）；**任务目录**让待办全集群可见（`§169`） |
 | 客户端落点 | ✅ | **显式给定的 contact point**：连一个能接 SQL 的端点，扇出/合并由它负责；**客户端侧发现/软路由明确不做**（`§100`） |
+| **数据进程的元数据面** | ⚠️ **必须给多台** | `yuntun-datanode --meta` 支持逗号分隔的**种子列表**（`§172`）：只给一台时，那一台不是 leader ⇒ 这个节点的**所有写都失败**（重试只能在已知地址集合里换）。容器 rig 里给全三台 |
 | 真实对象存储（本机 S3/MinIO） | ✅ | 单机读写两向（`§101`）+ 多节点真写对拍与冷读（`§102`） |
 | **真云 S3（TLS/签名/限流）与跨机 / 跨可用区** | ⚠️ **未验** | 未测；且部署包线已有量过的数字，见 §7 |
 | **鉴权 / 多租户** | ❌ | 端口 trust 无鉴权（metanode 的成员变更已做，鉴权没做） |
@@ -104,7 +105,7 @@
 
 ## 6. 质量与证据网
 
-规模：**68,637 行 Rust / 20 个 crate / 551 个测试函数 / 用例全绿（⚠️ 并行跑时 2 条计时用例会 flaky，见 §6.1） / clippy 本仓 0 告警**
+规模：**69,247 行 Rust / 20 个 crate / 558 个测试函数 / 用例全绿（⚠️ 并行跑时 2 条计时用例会 flaky，见 §6.1） / clippy 本仓 0 告警**
 （工具链：本机 rustc 1.98.1 + edition 2024；**MSRV 声明 1.95**，由 `vortex 0.86` 顶出，
 **尚未经真·1.95 编译验证**）
 
@@ -119,11 +120,13 @@
 
 ### 6.1 测试稳定性（`§171` 已收口）
 
-- **曾经**有三条**计时断言**型用例在并行跑全量时失败、单独重跑都 ok：
+- **曾经**有**四条**"拿墙钟当判据"的用例在并行跑全量时失败、单独重跑都 ok：
   `yuntun-compaction::tests::concurrent_writers_compaction_and_gc_converge`（30s 墙钟收尾上限）、
   `yuntun-query::partial_fanout::slow_sources_wait_in_parallel_not_in_sequence`（400ms 墙钟）、
   `chaos::compaction_during_query_keeps_counts_monotonic`（30s 内要采到 3 份样本 ⇒ 实测只采到 1 份），
-  以及 server 的 `cache_lazy_refresh_e2e`（"节流窗口内不问版本"实际在赌"两次查询间隔 < 200ms"）。
+  server 的 `cache_lazy_refresh_e2e`（"节流窗口内不问版本"实际在赌"两次查询间隔 < 200ms"），
+  以及 datanode 的 `compaction_e2e::only_one_compactor_..._when_it_dies`（等"过 TTL 后接管"，
+  而 GC 租约 TTL **下限就是 30s** ⇒ 上界写 30s 等于必然抖，见 `§172`）。
 - **归因（实测，`§171.0`）**：**不是** chaos 跨 binary 饿死 —— cargo **逐个 test binary 串行**跑
   （热态一轮：总墙钟 90s vs 各段用时之和 86.6s）；真因是**同一个 binary 内多条重负载用例并行**。
   ⇒ 原计划"隔离 chaos"那条子项**撤回**（前提不成立）。
@@ -158,7 +161,8 @@
 **语义**：`UPDATE` 的 `FROM`/`RETURNING`/无 `WHERE` 形态、`ALTER` 的改类型/可空性/重命名（缺载体）、事务、视图。
 
 **分布式**：冷数据归属与下推（partial aggregate 下推 + 冷文件按节点分配，台账 `D-4` 第二半）、
-任务与持有者进 `/metrics`（G.4）、按记录过滤归档（`D-18`）。
+**任务与租约的"关联视图"**（`/metrics` 今天把"有哪些活"与"谁在做"分两张表报，靠 `task:<表>:<分片>`
+前缀人工对应；G.4 的下一格）、按记录过滤归档（`D-18`）。
 
 **工程化**：真云 S3 + 跨机、端口鉴权、冷读预算、WAL segment 清理闸门（`T6.15`）、spill 复用、MSRV 1.95 真编译。
 

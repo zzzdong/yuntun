@@ -553,3 +553,64 @@ async fn task_directory_is_derived_on_both_catalog_forms() {
 
     server.abort();
 }
+
+/// `§172`：**远端形态的任务目录必须跟着版本走** —— 便宜的路径（`refresh()` 版本探测）
+/// 也要能看到"待办消失"。
+///
+/// 这条钉的是 `§169` 当初那条判断（"必须走全量刷新，否则待办消失不了"）**不成立**：
+/// 任务表是"文件 + DV"的纯函数，而下线这批文件（`purge_table_files`）会推 `manifest_ver`
+/// ⇒ 探测就能看出变化、载荷随之把 `tasks` 整体替换掉。
+///
+/// 同时它也是台账 `D-25` 的远端证据：**整表清除之后待办必须消失**（否则每个节点每轮都会
+/// 去抢一个空分片的租约）。
+#[tokio::test]
+async fn remote_task_directory_follows_purge() {
+    let cluster = Cluster::start();
+    let leader = cluster.wait_leader(T).expect("三节点应选出 leader");
+    let node = cluster.handle(leader).expect("取 leader 句柄");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { yuntun_meta::serve(node, listener).await });
+
+    let remote: Arc<dyn CatalogOps> =
+        Arc::new(RemoteCatalog::connect(vec![addr.to_string()]).expect("连接 metanode"));
+    remote.create_schema("public").await.ok();
+    remote
+        .create_table(CreateTableRequest {
+            name: "cpu".into(),
+            namespace: "public".into(),
+            schema: schema(&["ts", "v"]),
+            partition_cols: vec![],
+            default_format: "parquet".into(),
+            ingest_config: yuntun_model::meta::IngestConfig::standard(),
+        })
+        .await
+        .expect("建表");
+    for b in ["b1", "b2"] {
+        remote
+            .commit_files(commit("public.cpu", b, &format!("k-{b}"), "s0"))
+            .await
+            .expect("提交文件");
+    }
+    let before = remote.list_tasks().await.expect("远端任务目录");
+    assert_eq!(
+        before.len(),
+        1,
+        "两个文件 ⇒ 应当有一条待办：{before:?}"
+    );
+
+    // 整表清除：此刻可见文件全部下线（**走 raft**：`PurgeFiles` op）
+    let out = remote
+        .purge_table_files("public.cpu", "purge-1")
+        .await
+        .expect("整表清除");
+    assert_eq!(out.files, 2, "两个可见文件都该下线");
+
+    let after = remote.list_tasks().await.expect("远端任务目录（清除后）");
+    assert!(
+        after.is_empty(),
+        "分片已经没有可见文件 ⇒ 待办必须消失（`D-25`）：{after:?}"
+    );
+
+    server.abort();
+}

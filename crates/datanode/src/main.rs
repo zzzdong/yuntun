@@ -129,8 +129,13 @@ struct Args {
     sql_listen: Option<String>,
     /// metanode 地址（如 `127.0.0.1:50051`）。给了就**入册**（注册走 raft）并起**心跳保活**；
     /// 只查询形态**必须**给（它没有本地数据，热数据全靠名录发现）。
-    #[arg(long)]
-    meta: Option<String>,
+    ///
+    /// ⚠️ **支持逗号分隔的种子列表**（`--meta=mn1:9311,mn2:9311,mn3:9311`），
+    /// 生产里**应当给全**（或至少两台）：写路径落在一个**非 leader** 的元数据面上会被拒
+    /// （`Unavailable` + leader hint），而重试只能在**已知的地址集合**里换 —— 只给一台，
+    /// 那一台不是 leader 时这个数据节点的**所有写都会失败**（`§172` 在容器 rig 上实测到）。
+    #[arg(long, value_delimiter = ',')]
+    meta: Vec<String>,
     /// 心跳间隔（秒）。**必须与 metanode 的巡检口径配套**：metanode 默认 15s 没见到就摘，
     /// 这里默认 5s（三次机会，抗一次网络抖动）。测试/调优时可改小。
     #[arg(long, default_value_t = 5)]
@@ -196,7 +201,7 @@ fn validate(args: &Args) -> Result<(), String> {
                 .into(),
         );
     }
-    if args.no_ingest && args.meta.is_none() {
+    if args.no_ingest && args.meta.is_empty() {
         return Err(
             "--no-ingest 的形态没有本地数据：必须给 --meta（热数据全靠名录发现）".into(),
         );
@@ -331,9 +336,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // ② 元数据面（两种形态都要）：给了 `--meta` 就接 metanode（注册经 raft、心跳只碰内存），
     //    否则只在本进程内登记（单机形态）。冷存根两种形态一致：先落本机目录。
-    let catalog: Arc<dyn CatalogOps> = match &args.meta {
-        Some(addr) => Arc::new(yuntun_meta::RemoteCatalog::connect(vec![addr.clone()])?),
-        None => Arc::new(MemoryCatalog::new()),
+    let catalog: Arc<dyn CatalogOps> = if args.meta.is_empty() {
+        Arc::new(MemoryCatalog::new())
+    } else {
+        // **种子列表**（逗号分隔，可给多台）：写路径落到非 leader 时要在**已知地址集合**里
+        // 换一台重试（`RemoteCatalog::propose` 在 `Unavailable` 上换地址）—— 只给一台就是
+        // "那一台不是 leader ⇒ 本节点所有写失败"（`§172` 实测）。
+        Arc::new(yuntun_meta::RemoteCatalog::connect(args.meta.clone())?)
     };
     // 冷存储：**一处创建、多处共享**（`Ingestor` / `Compactor` / 孤儿 GC / `QueryEngine` 都接它，
     // 见 ③/④）—— 所以形态只在这里判一次，下面各处都拿同一份。

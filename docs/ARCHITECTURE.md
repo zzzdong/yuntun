@@ -162,6 +162,27 @@ orphan_cleanup（全局 `gc` 租约单跑）：在途登记 + 静置期 + 两条
 **分领的安全底线**（不许因为"麻烦"绕过）：① 提交时的 **epoch 栅栏**；
 ② **输入已被合并即拒绝**（否则"旧快照 + 租约已还"会让同一批输入产出两份 = 行数翻倍）。
 
+### 6.1 任务目录的**入口清单**（改代码前对照；`§172`）
+
+任务目录是**派生量**（由"文件清单 + 删除向量"决定），所以**每一个会改变这两者的入口都必须重算
+对应分片**。漏一个的后果不是"少干活"：残留的待办指向一个**空分片**，多节点每轮都会去抢一次它的
+租约（"待办消失不了"），而运维看到的那张表是错的。今天这份清单（`CatalogState` 的方法）：
+
+| 入口 | 为什么会让待办变 | 时钟 |
+|---|---|---|
+| `commit_files` | 加文件（可能跨过 `FILES` 阈值） | op 携带的 `now_ms` |
+| `apply_deletions` | DV 变了（可能让**单文件**分片进任务表） | 同上 |
+| `revoke_deletions_for_file` | DV 被撤销（该分片可能不再需要合并） | 同上 |
+| `purge_table_files` | 整表文件下线 + 悬挂 DV 同步 revoke | 同上 |
+| `apply_update` | **既加新文件、又改 DV**（两侧都要看） | `now_secs × 1000` |
+| `drop_shard` | 整个分片下线 | op 携带的 `now_ms` |
+| `commit_compaction` | 合并改了清单（合并完通常就不再满足） | **没有**墙钟（靠租约 epoch 表达时序）⇒ 传 0 |
+| 快照还原 | 任务表**不进快照** ⇒ 按还原出来的清单重算一遍 | 0 = 年龄**未知** |
+
+**`since_ms` 的口径**：= **首次登记**的时刻（Unix 毫秒）；`0 = 未知`（还原之后、还没被携带时钟的
+入口触碰过）。刷新**只在原来未知时**补钟，**绝不重置**已有值 —— 否则 `age_ms` 永远是"刚登记"。
+观测侧把 0 渲染成 `unknown`（`meta_probe tasks` / `/metrics`），**不许**算 `now - 0`（那会是 54 年）。
+
 ---
 
 ## 7. 已定案决策（**禁止顺手改**；改必附实测）
@@ -303,7 +324,7 @@ listen = "127.0.0.1:9091"           # GET /metrics（Prometheus 文本）、/met
 | I5 | 幂等键独立于文件生命周期 + 入口预筛 | 合并后重试 = 静默重复 |
 | I6 | 提交带 `lease_purpose`；栅栏按它核 | 分片后栅栏失配 ⇒ 并发合并互相踩 |
 | I7 | 合并提交必须拒绝"输入已被合并" | 同一批输入产出两份 ⇒ 行数翻倍 |
-| I8 | 任务目录 = 状态机派生，且不进 `encode_canonical` | 谁扫谁写 ⇒ 单点 + 各节点待办不一致；进规范编码 ⇒ 对拍误报分叉 |
+| I8 | 任务目录 = 状态机派生，且不进 `encode_canonical`；**任何改"文件清单或删除向量"的入口都要重算对应分片**（入口清单见 §6.1） | 谁扫谁写 ⇒ 单点 + 各节点待办不一致；进规范编码 ⇒ 对拍误报分叉；漏一个入口 ⇒ 残留待办指向空分片（每轮白抢租约 + 运维表是错的，`D-25`/`D-29`） |
 | I9 | `Config.applied` 必须如实报 | raft 重放 ⇒ 静默分叉 |
 | I10 | 快照引用计数 / 每查询一次快照 | 同一次查询的 plan 与 scan 看到两个版本 |
 | I11 | **测试判据不许是墙钟**（用事件：并发峰值 / 按轮驱动收敛） | 阈值变成"机器调度得多快"⇒ 同 binary 内并行时假失败（`D-26`）；确需"必须有界"的兜底要写理由 + `§171` 豁免标记，判据 `wall_clock_assertions_need_a_reviewed_waiver` 守着 |
@@ -322,4 +343,13 @@ listen = "127.0.0.1:9091"           # GET /metrics（Prometheus 文本）、/met
   ⚠️ datanode 镜像必须是 **glibc ≥ 2.44**（实测用 `archlinux`；`debian:trixie-slim` 2.41 /
   `fedora-minimal` 2.43 都跑不起宿主编的二进制）；跑 rig 时**不要并发跑别的 cargo**。
 - **运维面**：`metanode` 的成员变更 CLI、`cargo run -p yuntun-meta --example meta_probe`
-  （`status` / `leader` / `leases` / **`tasks`** / `write` / `verify`）、`[metrics]` HTTP 导出。
+  （`status` / `leader` / `leases` / `tasks` / `write` / `verify`）、`[metrics]` HTTP 导出。
+  `/metrics` 的 **`jobs` 段**（`§172`，G.4）报"**有哪些活 / 谁在做**"：
+  `yuntun_jobs_tasks_total` / `tasks_unknown_age` / `leases_total` / `leases_held` 是标量，
+  另有**每行带标签**的 `yuntun_compaction_task_{files,deleted_rows,age_seconds,age_unknown}{table,shard}`
+  与 `yuntun_lease_{held_seconds,expires_in_seconds,epoch}{purpose,holder}`；
+  两个 `*_error`（`tasks_error` / `leases_error`）把"读不到"与"没有"分开 ——
+  否则元数据面故障会被读成"今天没活"。
+- **数据进程的元数据面**：`--meta` 是**种子列表**（逗号分隔，`§172`）。
+  生产**必须给多台**：只给一台时，那一台不是 leader ⇒ 该节点所有写失败（`D-30` 的真缺陷）。
+  跟随 leader hint 需要 id→地址映射，**未做**。

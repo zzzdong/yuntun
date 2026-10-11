@@ -81,7 +81,11 @@ pub struct CompactionTask {
     /// 触发原因（0 = 文件数，1 = 删除占比）
     #[prost(uint32, tag = "5")]
     pub reason: u32,
-    /// 首次登记的时刻（Unix 毫秒；观测"挂了多久"用）
+    /// 首次登记的时刻（Unix 毫秒；观测"挂了多久"用）。
+    ///
+    /// **`0 = 未知`**：任务目录**不进快照**（它是"文件 + DV"的派生量），所以从快照还原出来的
+    /// 任务在**下一次被携带时钟的 op 触碰之前**是不知道自己"挂了多久"的 —— 那时如实报 0，
+    /// 由 `meta_probe tasks` / `/metrics` 渲染成 `unknown`，而不是 `now - 0`（那会是 54 年）。
     #[prost(uint64, tag = "6")]
     pub since_ms: u64,
 }

@@ -1,6 +1,6 @@
 # yuntun 实施操作日志（§169 起）
 
-> 起记时间：2026-10-11（最新：**§171，2026-10-11**）。对应分支：main。
+> 起记时间：2026-10-11（最新：**§172，2026-10-11**）。对应分支：main。
 >
 > **这是什么**：从今天起，**每一刀**（一次成体系的改造）在这里留一节 —— 写清"做了什么、
 > 为什么这么做、边界在哪（**没做什么**）、怎么验的"。它是本项目的**证据出处**：
@@ -223,3 +223,101 @@
 - 时间收益：compaction 的 lib 测试段 **30.78s → 0.42s**（按轮驱动不再等墙钟）。
 - `cargo clippy --workspace --all-targets`：**0 告警**（此前 4 条，见 171.1-6）；
   `cargo test -p yuntun-testkit --test docs_consistency` 全绿（10 条判据）。
+
+---
+
+## 172. **N3 / G.1 收尾：任务目录的接线补全 + 运维面（`/metrics` 的任务与租约）**（2026-10-11）
+
+### 172.0 缺口（比计划里写的多两处 + rig 暴露一处）
+
+`ROADMAP.md §5` 的 N3 写了四件：① `/metrics` 暴露任务与租约（G.4）；② rig 实跑判据④；
+③ `D-25`（`purge` 之后重算任务）；④ `since_ms = 0` 的 `age_ms` 口径。动手前的审计又多出三处：
+
+- **接线不完整**：`§169` 的 `refresh_task` 只挂在 `commit_files` / `apply_deletions` / `revoke` /
+  `commit_compaction` 上，而**`apply_update`（UPDATE 既加新文件又改 DV）与 `drop_shard`（整个分片下线）**
+  也会让"待办该出现/该消失"⇒ 台账 **`D-29`**。
+- **时钟没贯通**：那几处刷新传的是 `0`（`since_ms` 永远是"未知"）——而 **op 上本来就带着 `now_ms`**
+  （`StateOp::now_ms()`），只是没往下传。
+- **rig 暴露的真缺陷**：`tests/datanode_cluster.sh smoke` 第一次跑**失败**在 ③
+  （`error: rpc: code: 'Internal error', message: "非 leader（可重试）：not leader (leader hint 2)"`）
+  —— 根因不是偶发：**datanode 的 `--meta` 只接一个 contact point**（`RemoteCatalog::connect(vec![addr])`），
+  那一台不是 leader 时这个数据节点的**所有写都失败**，而重试只能在**已知地址集合**里换。
+  `§167` 那次跑通只是因为当时**恰巧** leader 是 mn1 ⇒ 台账 **`D-30`**。
+
+### 172.1 做了什么
+
+| # | 改动 | 关键点 |
+|---|---|---|
+| 1 | **接线补全**（`catalog`） | `purge_table_files` 之后按**受影响的每个分片**重算（`D-25`）；`apply_update` 之后按"新文件的 (表,分片)"与"DV 锚定的文件"两路重算（`D-29`）；`drop_shard` 之后重算该分片（`D-29` 同族） |
+| 2 | **时钟贯通**（`state` ← `op`） | `apply_deletions` / `revoke_deletions_for_file` / `purge_table_files` / `drop_shard` 都收 `now_ms`，op 层传 `now`（op 携带的钟，纪律 1）；`commit_compaction` 那条**没有**墙钟（靠租约 epoch 表达时序）⇒ 如实传 0 并写明理由 |
+| 3 | **`since_ms` 口径**（`model`/`state`/`meta_probe`） | `0 = 未知`（快照不进任务目录 ⇒ 还原出来的任务不知道自己"挂了多久"）；`refresh_task` 只在"原来未知/不存在"时补钟、**已有值一律保留**；`meta_probe tasks` 把未知渲染成 `age_ms=unknown`，不再算 `now - 0`（那会是 54 年） |
+| 4 | **租约快照接缝**（`catalog` + `proto` + `meta`） | 新增 `CatalogOps::list_leases()`：内存形态读状态机（BTreeMap 天然有序）；远端形态走 `Status` 现取（**不缓存** —— 租约有 TTL，缓存只会给过期答案）。`LeaseView` 补 `granted_at_ms`（tag 5）：运维的下一个问题是"这件事做了多久" |
+| 5 | **`/metrics` 的作业面**（`server`） | `LakehouseMetrics.jobs`：`tasks_total` / `tasks_unknown_age` / 每条待办（表、分片、文件数、删除行数、原因、**年龄**）/ `leases_total` / `leases_held` / 每把租约（用途、持有者、代次、持有秒、剩余秒）+ **两个 `*_error`**（"读不到"与"没有"必须能分清）。Prometheus 侧**每行带标签**（`yuntun_compaction_task_*` / `yuntun_lease_*`），标签值转义、`# TYPE` 去重 |
+| 6 | **`datanode --meta` 改成种子列表**（`datanode` + compose） | 逗号分隔、可给多台（compose 里给全三台）⇒ 写落到非 leader 时能在已知集合里换；帮助文本写清"只给一台 ⇒ 那台不是 leader 时所有写失败" |
+| 7 | **rig 判据④的证据加强**（`tests/datanode_cluster.sh`） | 在等待循环里抓一份**非空任务快照**（抓不到就如实说明"两次轮询之间就被消费掉了"）+ 打印两个节点的**第一条 `tasks_seen=[1-9]` 轮次日志**；另修掉脚本里三处**反引号被 bash 当命令替换**（`command not found`，而 `say` 的输出本身就是判据 ⇒ 证据会被悄悄弄脏） |
+
+### 172.2 五个决定
+
+1. **把"任务目录的接线规则"写成一张入口清单**（`ARCHITECTURE.md §6`）。
+   `§169` 的教训是"派生量要靠人手挂到每个入口上"——所以必须**列出入口**并加一条不变量（I8 扩写）：
+   *任何改"文件清单或删除向量"的入口都必须重算对应分片*。今天这份清单是：
+   `commit_files` / `apply_deletions` / `revoke_deletions_for_file` / `purge_table_files` /
+   `apply_update` / `drop_shard` / `commit_compaction` / 快照还原。
+2. **`since_ms` 用"0 = 未知"，而不是"补一个当时的本地钟"**。
+   任务目录**不进快照**（它是派生态），所以还原之后确实**不知道**年龄；在还原路径读本地钟会让
+   **不同副本**给出不同的年龄（副本间状态分叉的观测版）。宁可如实报 unknown —— 而且它**只影响观测**，
+   不参与任何判定（所以"未知"是可接受的代价，而"编一个数字"不是）。
+3. **任务走版本驱动刷新、租约走 `Status` 现取**（两种数据的时效性不同）。
+   顺带**改正了 `§169` 的一条判断**：它写"`list_tasks` 必须走全量刷新，否则待办消失不了" ——
+   复读后确认**不成立**（任务表是"文件 + DV"的**纯函数**，而任何改动都会推版本 ⇒ 探测必能看出变化；
+   零开销路径只在"版本没变"时走，那时任务也不可能变）。代价差别很大：全量刷新 = 整个目录一次预取，
+   而 `/metrics`（Prometheus 默认 15s）与每轮压缩都会调它。⇒ 改成 `refresh()`，
+   并补一条**远端专属用例**钉住它（`remote_task_directory_follows_purge`）。删掉了因此变成死代码的 `refresh_full`。
+4. **rig 判据的"证据"要能自解释**。原判据只看日志里出现过 `tasks_seen>=1`；现在同时抓
+   任务表的**非空快照**（运维真正看的那张表）与两条轮次日志 —— 抓不到快照时**如实说明原因**
+   （待办在两次轮询之间被消费掉），而不是让"(无待办)"看起来像"没有活"。
+5. **`--meta` 单点不改协议、只改装配**（给种子列表），并把"跟随 leader hint"留在台账里。
+   理由：hint 是个 **id**，客户端要有 id→地址的映射才能用（那是成员表的事，`§118` 之后才有）；
+   而"给全三台"今天就能解决，且与 metanode 的 `--peer=a@b,c@d` 同一手感。
+
+### 172.3 边界（这一刀**没有**做的）
+
+- **任务与租约没有"关联视图"**：`/metrics` 里两张表各自独立，靠 `purpose` 前缀
+  （`task:<表>:<分片>`）人工对应。要做成"谁在做哪条待办"需要一次联接（`G.4` 的下一格）。
+- **没有跟随 leader hint**（见 172.2-5）：今天靠"给全地址"。故障形态是"所有已知地址都不是 leader"
+  （多数派丢失）——那种情况本来就写不进去。
+- **GC 租约的 TTL 下限 30s 没动**（生产决策："一轮扫得比间隔久也不至于被误接管"）⇒
+  `crates/datanode/tests/compaction_e2e.rs` 里"过 TTL 后接管"这条**天生要跑 ~30s**。
+- `/metrics.json` 的 `jobs.tasks` / `jobs.leases` 是数组，**未做截断/分页**：今天待办与租约的量级是
+  "每分片一条 / 每用途一把"，可控；上万条时要再加"只报前 N 条 + 总数"。
+
+### 172.4 验证
+
+- **单测/集成**：`yuntun-catalog` **60/60**（新增 5 条：purge/update/drop_shard 各让任务消失或出现、
+  `since_ms` 不许被刷新重置、还原后如实报未知）；`yuntun-meta::remote_catalog_parity` **4/4**
+  （新增 `remote_task_directory_follows_purge`）；`yuntun-server` 指标单测 **3/3**
+  （新增 `job_rows_carry_labels_and_never_invent_an_age`：带标签行 + 转义 + 未知年龄不许编数字 + TYPE 去重）；
+  `yuntun-proto::wire_compat` **8/8**（`LeaseView` 含 `granted_at_ms` 与 `tasks` 一起逐字段无损）。
+- **反证（用例有牙齿）**：临时把 `purge_table_files` 里的重算注掉 ⇒
+  `purge_drops_the_task_of_every_touched_shard` **红**（报出残留的
+  `CompactionTask { files: 2, since_ms: 1002000 }` 正是"空分片的待办永不消失"那个形状），恢复后绿。
+- **真集群 rig**（podman 6.1.2，`tests/datanode_cluster.sh smoke`）**EXIT=0**，判据④的实测输出：
+
+  ```
+  任务目录（抓到过的第一份非空快照）：
+    public.dist:s0 files=2 deleted=0 reason=files age_ms=0
+    public.dist:s1 files=2 deleted=0 reason=files age_ms=0
+    public.dist:s2 files=2 deleted=0 reason=files age_ms=0
+    public.dist:s3 files=2 deleted=0 reason=files age_ms=0
+  两个节点都拿到过待办 —— 各自的第一条轮次日志：
+    dn1: compaction round tasks_seen=4 candidates=1 compacted=1 lease_busy=0 failed=0
+    dn2: compaction round tasks_seen=3 candidates=1 compacted=1 lease_busy=0 failed=0
+  ```
+
+  （③ 两个节点各查 24 行；⑤ 两个节点都真的合并过；⑥ 行数守恒 24、**0 次瞬时 21**；
+  ⑦ `gc=gc-dn1:1` 单持有；⑧ 杀掉干活的那台 ⇒ 另一台接手。另：修 `D-30` **之前**同一脚本失败在 ③，
+  现场就是 `not leader (leader hint 2)` —— 这条失败的现场保留了，成了 `D-30` 的证据。）
+- **全量回归**：`cargo test --workspace` **exit=0**（0 failed；文档判据同步后全绿）。
+- **顺带审计了 `§171` 那一类的剩余风险**：扫了其它 `wait_for(30s)` 上界（`meta` 的进程用例等），
+  它们等的是"选举/进程就绪"（秒级）而不是"必须等满一个 TTL" ⇒ 不存在"上界 == 被等待量"的形状；
+  唯一一处正是本刀修的 `compaction_e2e`（GC 租约 TTL 下限 30s vs 30s 上界）。

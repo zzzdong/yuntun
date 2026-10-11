@@ -444,6 +444,9 @@ message LeaseView {
   string holder        = 2;
   uint64 epoch         = 3;
   uint64 expires_at_ms = 4;
+  // 授予时刻（`§172`，G.4）：运维要问的下一个问题是"**这件事做了多久**"。
+  // 与 `expires_at_ms` 一起才能算出"还剩多少 / 已经占了多久"。
+  uint64 granted_at_ms = 5;
 }
 
 // ---------------------------------------------------------------- 成员

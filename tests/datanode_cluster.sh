@@ -128,23 +128,38 @@ smoke() {
   printf '  dn1 上查 = %s；dn2 上查 = %s（期望都是 24）\n' "$got1" "$got2"
   [[ "$got1" == "24" && "$got2" == "24" ]] || die "行数不对（dn1=$got1 / dn2=$got2，期望 24/24）"
 
-  say "④ 任务目录：待办是**全集群同一份**，且被真的消费了（`§169`）"
-  # 探针的 `tasks` 读的是 metanode 的 Status（任务在 raft 状态机里 ⇒ 每个节点同一份）
-  printf '%s\n' "$("$PROBE" tasks "${META_HOSTS[@]}")" | sed 's/^/  /'
-  # 待办是**派生的**：要等两个节点各自 flush 完、清单里同分片攒到 ≥2 个文件才出现
-  # ⇒ 这里**等**而不是立刻断言（断言的对象是"两个节点最终都能从目录里拿到待办"）。
-  local deadline4=$((SECONDS + 180)) t1=0 t2=0
+  # ⚠️ 消息用**单引号**：双引号里的反引号会被 bash 当命令替换（实测打出 `command not found`，
+  # 而 say 的输出是**判据的一部分** ⇒ 证据会被悄悄弄脏）
+  say '④ 任务目录：待办是**全集群同一份**，且被真的消费了（§169）'
+  # 待办是**派生的**：要等两个节点各自 flush 完、清单里同分片攒到 ≥2 个文件才出现；
+  # 而它又会被压缩**很快消费掉**（这里 min_files=2、interval=2s）⇒ 抓一份**非空快照**
+  # 作为证据（抓不到就如实说明：轮询间隔比"出现→被消费"的窗口还长）。
+  local deadline4=$((SECONDS + 180)) t1=0 t2=0 snapshot=''
   while ((SECONDS < deadline4)); do
     clog yuntun-dn1 | grep -q 'tasks_seen=[1-9]' && t1=1
     clog yuntun-dn2 | grep -q 'tasks_seen=[1-9]' && t2=1
+    if [[ -z "$snapshot" ]]; then
+      # 探针的 `tasks` 读的是 metanode 的 Status（任务在 raft 状态机里 ⇒ 每个节点同一份）
+      local out
+      out="$("$PROBE" tasks "${META_HOSTS[@]}")"
+      [[ "$out" != "(无待办)" ]] && snapshot="$out"
+    fi
     ((t1 == 1 && t2 == 1)) && break
-    sleep 3
+    sleep 1
   done
-  ((t1 == 1)) || die "dn1 一直没从任务目录里拿到待办（`tasks_seen` 始终 0）"
+  printf '  任务目录（抓到过的第一份非空快照）：\n'
+  if [[ -n "$snapshot" ]]; then
+    printf '%s\n' "$snapshot" | sed 's/^/    /'
+  else
+    printf '    （没有抓到非空快照：待办在两次轮询之间就被消费掉了 —— 判定看下面的等待与轮次日志）\n'
+  fi
+  ((t1 == 1)) || die 'dn1 一直没从任务目录里拿到待办（tasks_seen 始终 0）'
   ((t2 == 1)) || die "dn2 一直没从任务目录里拿到待办 ⇒ 目录没有下发到所有节点"
-  printf '  两个节点都拿到过待办\n'
+  printf '  两个节点都拿到过待办 —— 各自的第一条轮次日志：\n'
+  clog yuntun-dn1 | grep 'tasks_seen=[1-9]' | head -1 | sed 's/^/    dn1: /'
+  clog yuntun-dn2 | grep 'tasks_seen=[1-9]' | head -1 | sed 's/^/    dn2: /'
 
-  say "⑤ 分领：两个节点都要**真的合并过**（`compacted>=1`）"
+  say '⑤ 分领：两个节点都要**真的合并过**（compacted>=1）'
   deadline=$((SECONDS + 180)) a=0 b=0
   while ((SECONDS < deadline)); do
     clog yuntun-dn1 | grep -q 'compacted=[1-9]' && a=1

@@ -352,7 +352,14 @@ impl CatalogState {
         );
         match reason {
             Some(r) => {
-                let since = self.tasks.get(&key).map(|t| t.since_ms).unwrap_or(now_ms);
+                // `since_ms` = **首次登记的时刻**；`0 = 未知`（任务是从快照还原出来的，
+                // 此后还没有任何**携带时钟**的 op 触碰过它）。
+                // 因此只在"原来未知/不存在"时补 `now_ms`；已有非零值一律保留 ——
+                // 否则每刷新一次就重置，`age_ms` 永远显示"刚登记"（观测就成了谎）。
+                let since = match self.tasks.get(&key).map(|t| t.since_ms) {
+                    Some(s) if s != 0 => s,
+                    _ => now_ms,
+                };
                 self.tasks.insert(
                     key,
                     yuntun_model::task::CompactionTask {
@@ -729,6 +736,7 @@ impl CatalogState {
         &mut self,
         table: &str,
         purge_id: &str,
+        now_ms: u64,
     ) -> Result<PurgeOutcome, LakeError> {
         if purge_id.is_empty() {
             return Err(LakeError::Other("整表清除缺 purge_id".into()));
@@ -784,6 +792,19 @@ impl CatalogState {
                 revoked += 1;
             }
         }
+        // `§172`（台账 `D-25`）：整表清除把**此刻可见文件**全部下线 ⇒ 这些分片的任务必须重算。
+        //
+        // 不重算的后果不是"少干活"：残留的待办指向一个**空分片**，多节点每轮都会去抢一次
+        // 它的租约（`§169` 明确要避免的形态——"待办消失不了"），运维看到的那张表也是错的。
+        let touched: std::collections::BTreeSet<String> = self
+            .files
+            .values()
+            .filter(|f| victims.contains(&f.batch_id))
+            .map(|f| f.shard.clone())
+            .collect();
+        for shard in touched {
+            self.refresh_task(&key, &shard, now_ms);
+        }
         self.purged.insert(purge_id.to_string(), next);
         self.bump_manifest_ver(&key);
         self.last_applied += 1;
@@ -811,7 +832,14 @@ impl CatalogState {
     ///    全部命中重复时**不推快照号**（没有真实变更就不该有版本前进）；
     /// 3. **触发全量缓存重建**（`schema_ver`）：DV 进的是读快照的**新字段**，
     ///    而增量通道只搬文件清单 ⇒ 必须走全量（`§5.2` 的"按表增量刷新"是后续项）。
-    pub fn apply_deletions(&mut self, entries: Vec<DeletionEntry>) -> Result<u64, LakeError> {
+    ///
+    /// `now_ms`：**op 携带的**墙钟（纪律 1：状态机不读钟）。它只用于 `CompactionTask.since_ms`
+    /// 这一个纯观测字段（`§172`）—— 因此传 0 也**不会**改变任何判定，只表示"这次不知道"。
+    pub fn apply_deletions(
+        &mut self,
+        entries: Vec<DeletionEntry>,
+        now_ms: u64,
+    ) -> Result<u64, LakeError> {
         let mut fresh: Vec<DeletionEntry> = Vec::with_capacity(entries.len());
         for e in entries {
             if e.dv_id.is_empty() || e.table.is_empty() || e.file_path.is_empty() {
@@ -868,7 +896,7 @@ impl CatalogState {
         }
         // `§169`：DV 变了 ⇒ 重算受影响分片的任务（DV 那条路可能让单个文件也进任务表）
         for p in task_paths {
-            self.refresh_task_for_file(&p, 0);
+            self.refresh_task_for_file(&p, now_ms);
         }
         self.schema_ver += 1;
         Ok(next)
@@ -971,6 +999,14 @@ impl CatalogState {
         // ③ **一个快照号服务两个事实** —— 这一行就是"原子"的全部
         let next = self.next_snapshot();
 
+        // `§172`（台账 `D-29`）：UPDATE **既加新文件、又改 DV** ⇒ 两侧都可能让任务出现/消失，
+        // 所以两边都要重算。在"消费掉两个 Vec"之前先把受影响的分片收集出来。
+        let touched_shards: std::collections::BTreeSet<String> = fresh_files
+            .iter()
+            .map(|f| f.shard.clone())
+            .collect();
+        let touched_paths: Vec<String> = fresh_dvs.iter().map(|e| e.file_path.clone()).collect();
+
         for mut f in fresh_files {
             f.valid_from = next;
             f.status = FileStatus::Active as u32;
@@ -1004,6 +1040,13 @@ impl CatalogState {
         self.bump_manifest_ver(&table);
         self.bump_schema_ver();
         self.last_applied += 1;
+        // `§172`（台账 `D-29`）：UPDATE 的两半都可能改变"这个分片值不值得合并"
+        for shard in touched_shards {
+            self.refresh_task(&table, &shard, now_secs.saturating_mul(1000));
+        }
+        for p in touched_paths {
+            self.refresh_task_for_file(&p, now_secs.saturating_mul(1000));
+        }
         Ok(next)
     }
 
@@ -1024,7 +1067,7 @@ impl CatalogState {
     ///
     /// 置 `revoked_at` 而**不是删行**：删了就无法回答"某个历史快照当时看到什么"。
     /// 返回被撤销的条数（0 = 没有悬挂 DV）。
-    pub fn revoke_deletions_for_file(&mut self, file_path: &str, at: u64) -> usize {
+    pub fn revoke_deletions_for_file(&mut self, file_path: &str, at: u64, now_ms: u64) -> usize {
         let mut n = 0usize;
         for d in self.deletions.values_mut() {
             if d.file_path == file_path && d.revoked_at == 0 {
@@ -1035,7 +1078,7 @@ impl CatalogState {
         if n > 0 {
             self.schema_ver += 1;
             // `§169`：DV 被撤销 ⇒ 重算（这个分片可能不再需要合并）
-            self.refresh_task_for_file(file_path, 0);
+            self.refresh_task_for_file(file_path, now_ms);
         }
         n
     }
@@ -1046,7 +1089,7 @@ impl CatalogState {
     }
 
     /// L1 分片移除（§6.3）：整 shard 文件 `deleted_at = current_snapshot + 1`。
-    pub fn drop_shard(&mut self, table: &str, shard: &str) -> u64 {
+    pub fn drop_shard(&mut self, table: &str, shard: &str, now_ms: u64) -> u64 {
         let next = self.next_snapshot();
         let key = normalize_table(table);
         let mut n = 0u64;
@@ -1056,6 +1099,8 @@ impl CatalogState {
                 n += 1;
             }
         }
+        // `§172`（台账 `D-29`）：整个分片下线 ⇒ 这个分片的待办必然不成立了（不清就是空转）
+        self.refresh_task(&key, shard, now_ms);
         self.bump_manifest_ver(&key);
         self.last_applied += 1;
         n
@@ -1226,6 +1271,10 @@ impl CatalogState {
             self.bump_manifest_ver(t);
         }
         // `§169`：合并改了清单 ⇒ 重算这个分片的任务（合并完通常不再满足 ⇒ 任务消失）
+        //
+        // 时钟传 0：**合并这条路径没有携带墙钟**（它靠"租约 epoch"表达时序，`§81`）——
+        // 于是若这个任务此前"未知年龄"，它会继续未知（`refresh_task` 只在有非零钟时才补）。
+        // 这是刻意的：宁可报 unknown，也不在这里读本地钟（纪律 1）。
         if let Some((t, sh)) = task_key {
             self.refresh_task(&t, &sh, 0);
         }
@@ -1791,7 +1840,7 @@ mod tests {
                 .unwrap();
             st.commit_files(commit_req("public.mem", "b2", &["k2"]), 1_004)
                 .unwrap();
-            st.drop_shard("public.cpu", "s0");
+            st.drop_shard("public.cpu", "s0", 0);
             st.commit_compaction(&["b2".to_string()], vec![merged_file("public.mem", "m1", 1)], 0, "")
                 .unwrap();
             st.sweep_expired_idempotency(24 * 3600, 1_010);
@@ -2266,12 +2315,12 @@ mod snapshot_tests {
         cases.push(("in_flight", s));
 
         let mut s = rich_state();
-        s.apply_deletions(vec![dv_entry("dv-x", "public.cpu", "f1.parquet")])
+        s.apply_deletions(vec![dv_entry("dv-x", "public.cpu", "f1.parquet")], 0)
             .unwrap();
         cases.push(("deletions", s));
 
         let mut s = rich_state();
-        s.purge_table_files("public.cpu", "purge-x").unwrap();
+        s.purge_table_files("public.cpu", "purge-x", 0).unwrap();
         cases.push(("purged", s));
 
         let mut s = rich_state();
@@ -2319,9 +2368,9 @@ mod snapshot_tests {
         let mut s = rich_state();
         let file = s.list_visible_files("public.cpu", u64::MAX, None)[0].clone();
         // 让这个文件下线（整表清除是最直接的方式）
-        s.purge_table_files("public.cpu", "p1").unwrap();
+        s.purge_table_files("public.cpu", "p1", 0).unwrap();
         let e = s
-            .apply_deletions(vec![dv_entry("dv-1", "public.cpu", &file.file_path)])
+            .apply_deletions(vec![dv_entry("dv-1", "public.cpu", &file.file_path)], 0)
             .unwrap_err()
             .to_string();
         assert!(
@@ -2334,7 +2383,7 @@ mod snapshot_tests {
         let mut legacy = dv_entry("dv-2", "public.cpu", &file.file_path);
         legacy.batch_id = String::new();
         assert!(
-            s.apply_deletions(vec![legacy]).is_ok(),
+            s.apply_deletions(vec![legacy], 0).is_ok(),
             "找不到清单时不拦（这条宽容是刻意的，写在这里免得被当成漏洞）"
         );
     }
@@ -2353,7 +2402,7 @@ mod snapshot_tests {
         let total: u64 = files.iter().map(|f| f.row_count).sum();
         assert!(!files.is_empty(), "前提：rich_state 得有一个已提交文件");
 
-        let out = s.purge_table_files("public.cpu", "purge-1").unwrap();
+        let out = s.purge_table_files("public.cpu", "purge-1", 0).unwrap();
         assert_eq!(out.files, files.len(), "此刻可见的文件全部下线");
         assert_eq!(out.rows, total, "受影响行数 = 下线文件里的可见行数");
         assert_eq!(out.snapshot, before + 1, "**一次整表清除只推一个快照号**");
@@ -2385,9 +2434,9 @@ mod snapshot_tests {
         let rows = s.list_visible_files("public.cpu", u64::MAX, None)[0].row_count;
         let mut dv = dv_entry("dv-1", "public.cpu", &file);
         dv.card = 3;
-        s.apply_deletions(vec![dv]).unwrap();
+        s.apply_deletions(vec![dv], 0).unwrap();
 
-        let out = s.purge_table_files("public.cpu", "purge-1").unwrap();
+        let out = s.purge_table_files("public.cpu", "purge-1", 0).unwrap();
         assert_eq!(out.revoked, 1, "悬挂的 DV 在同一次操作里被撤销");
         assert_eq!(out.rows, rows - 3, "受影响行数扣掉被 DV 藏起来的行（口径与行级删一致）");
         assert!(
@@ -2410,7 +2459,7 @@ mod snapshot_tests {
     #[test]
     fn purge_is_idempotent_by_id_and_never_eats_later_data() {
         let mut s = rich_state();
-        let first = s.purge_table_files("public.cpu", "p1").unwrap();
+        let first = s.purge_table_files("public.cpu", "p1", 0).unwrap();
         assert!(first.files > 0);
 
         // 清除之后又写进来一个文件（新数据）
@@ -2420,7 +2469,7 @@ mod snapshot_tests {
         assert_eq!(s.list_visible_files("public.cpu", u64::MAX, None).len(), 1);
 
         // 重放同一个 id ⇒ 空操作（**这就是重放安全的那一半**）
-        let again = s.purge_table_files("public.cpu", "p1").unwrap();
+        let again = s.purge_table_files("public.cpu", "p1", 0).unwrap();
         assert_eq!(again.files, 0, "同一个 id 不该再下线任何文件");
         assert_eq!(s.snapshot_version, snap, "空操作不推快照号");
         assert_eq!(
@@ -2430,7 +2479,7 @@ mod snapshot_tests {
         );
 
         // 换一个 id ⇒ 是一次新的清除（用户再执行一次 `DELETE FROM t` 就该是这个语义）
-        let fresh = s.purge_table_files("public.cpu", "p2").unwrap();
+        let fresh = s.purge_table_files("public.cpu", "p2", 0).unwrap();
         assert_eq!(fresh.files, 1);
         assert!(s.list_visible_files("public.cpu", u64::MAX, None).is_empty());
         assert_eq!(s.purge_count(), 2);
@@ -2442,14 +2491,14 @@ mod snapshot_tests {
         let mut s = CatalogState::new();
         s.create_table(create_table_req("cpu"), 1_000).unwrap();
         let snap = s.snapshot_version;
-        let out = s.purge_table_files("public.cpu", "p1").unwrap();
+        let out = s.purge_table_files("public.cpu", "p1", 0).unwrap();
         assert_eq!(out.files, 0);
         assert_eq!(out.snapshot, snap, "没有可下线的文件就不该推快照号");
 
         // 之后数据来了：同一个 id **不许**生效（否则就是"延迟生效的删除"）
         s.commit_files(commit_req("public.cpu", "b1", &["k1"]), 2_000)
             .unwrap();
-        let again = s.purge_table_files("public.cpu", "p1").unwrap();
+        let again = s.purge_table_files("public.cpu", "p1", 0).unwrap();
         assert_eq!(again.files, 0, "同一个 id 只在**那一刻**生效");
         assert_eq!(s.list_visible_files("public.cpu", u64::MAX, None).len(), 1);
     }
@@ -2464,7 +2513,7 @@ mod snapshot_tests {
             .apply_deletions(vec![
                 dv_entry("dv-1", "public.cpu", "f1.parquet"),
                 dv_entry("dv-2", "public.cpu", "f2.parquet"),
-            ])
+            ], 0)
             .unwrap();
         assert!(committed > before, "apply 必须分配新的快照号");
         assert_eq!(
@@ -2492,21 +2541,21 @@ mod snapshot_tests {
         // 幂等：同一条记录重放两遍不写两份、**也不推快照号**
         let snap = s.snapshot_version;
         let again = s
-            .apply_deletions(vec![dv_entry("dv-1", "public.cpu", "f1.parquet")])
+            .apply_deletions(vec![dv_entry("dv-1", "public.cpu", "f1.parquet")], 0)
             .unwrap();
         assert_eq!(again, snap, "全部命中重复 ⇒ 不该有版本前进");
         assert_eq!(s.all_deletions().len(), 2);
 
         // 撤销（compaction 消费）：置 revoked_at，旧快照仍"当时看得见"
         let at = s.snapshot_version + 1;
-        assert_eq!(s.revoke_deletions_for_file("f1.parquet", at), 1);
+        assert_eq!(s.revoke_deletions_for_file("f1.parquet", at, 0), 1);
         assert!(s.list_deletions("public.cpu", at).len() == 1, "撤销后不再生效");
         assert!(
             s.list_deletions("public.cpu", at - 1).len() == 2,
             "撤销**之前**的快照仍应看到它（历史可回答）"
         );
         assert_eq!(
-            s.revoke_deletions_for_file("f1.parquet", at + 1),
+            s.revoke_deletions_for_file("f1.parquet", at + 1, 0),
             0,
             "已经是 revoked 的不再重复撤销"
         );
@@ -2606,7 +2655,7 @@ mod snapshot_tests {
             .apply_deletions(vec![
                 dv_entry("dv-batch", "public.cpu", "f1.parquet"),
                 dv_entry("dv-batch", "public.cpu", "f2.parquet"),
-            ])
+            ], 0)
             .unwrap();
         let live = s.list_deletions("public.cpu", snap);
         assert_eq!(live.len(), 2, "同一个 dv_id 下两个文件都要留（键是「删除 × 文件」）");
@@ -2619,7 +2668,7 @@ mod snapshot_tests {
             .apply_deletions(vec![
                 dv_entry("dv-batch", "public.cpu", "f1.parquet"),
                 dv_entry("dv-batch", "public.cpu", "f2.parquet"),
-            ])
+            ], 0)
             .unwrap();
         assert_eq!(again, s.snapshot_version, "完全重复 ⇒ 不推快照号");
         assert_eq!(s.all_deletions().len(), 2);
@@ -2631,23 +2680,23 @@ mod snapshot_tests {
         let mut s = rich_state();
         let mut empty_card = dv_entry("dv-0", "public.cpu", "f1.parquet");
         empty_card.card = 0;
-        assert!(s.apply_deletions(vec![empty_card]).is_err(), "card=0 不该进目录");
+        assert!(s.apply_deletions(vec![empty_card], 0).is_err(), "card=0 不该进目录");
         let mut no_id = dv_entry("", "public.cpu", "f1.parquet");
         no_id.dv_id = String::new();
-        assert!(s.apply_deletions(vec![no_id]).is_err(), "缺 dv_id");
+        assert!(s.apply_deletions(vec![no_id], 0).is_err(), "缺 dv_id");
         let mut no_file = dv_entry("dv-1", "public.cpu", "");
         no_file.file_path = String::new();
-        assert!(s.apply_deletions(vec![no_file]).is_err(), "缺 file_path");
+        assert!(s.apply_deletions(vec![no_file], 0).is_err(), "缺 file_path");
         // 空批次是 no-op（不推版本）
         let snap = s.snapshot_version;
-        assert_eq!(s.apply_deletions(vec![]).unwrap(), snap);
+        assert_eq!(s.apply_deletions(vec![], 0).unwrap(), snap);
     }
 
     /// 删表连带清掉它的 DV：留着只会在同名重建后张冠李戴（DV 锚定的是旧文件）。
     #[test]
     fn dropping_a_table_removes_its_deletion_vectors() {
         let mut s = rich_state();
-        s.apply_deletions(vec![dv_entry("dv-1", "public.cpu", "f1.parquet")])
+        s.apply_deletions(vec![dv_entry("dv-1", "public.cpu", "f1.parquet")], 0)
             .unwrap();
         assert_eq!(s.all_deletions().len(), 1);
         s.drop_table("public.cpu").unwrap();
@@ -2658,7 +2707,7 @@ mod snapshot_tests {
     #[test]
     fn deletion_vectors_survive_snapshot_round_trip() {
         let mut s = rich_state();
-        s.apply_deletions(vec![dv_entry("dv-1", "public.cpu", "f1.parquet")])
+        s.apply_deletions(vec![dv_entry("dv-1", "public.cpu", "f1.parquet")], 0)
             .unwrap();
         let msg = s.to_snapshot_msg();
         assert_eq!(msg.deletions.len(), 1);
@@ -2742,5 +2791,119 @@ mod snapshot_tests {
                 bytes.len()
             );
         }
+    }
+
+    // ------------------------------------------- 任务目录的接线与年龄口径（`§172`）
+
+    /// **整表清除之后待办必须消失**（台账 `D-25`）。
+    ///
+    /// 不清的后果不是"少干活"：残留的待办指向一个**空分片**，多节点每轮都会去抢一次它的
+    /// 租约（`§169` 明确要避免的"待办消失不了"），运维看到的那张表也是错的。
+    #[test]
+    fn purge_drops_the_task_of_every_touched_shard() {
+        let mut s = rich_state();
+        s.commit_files(commit_req("public.cpu", "b2", &["k2"]), 1_002)
+            .unwrap();
+        assert_eq!(s.list_tasks().len(), 1, "两个文件 ⇒ 一条待办");
+
+        let out = s.purge_table_files("public.cpu", "p1", 5_000).unwrap();
+        assert_eq!(out.files, 2, "此刻可见的两个文件都该下线");
+        assert!(
+            s.list_tasks().is_empty(),
+            "文件全下线 ⇒ 待办必须消失：{:?}",
+            s.list_tasks()
+        );
+    }
+
+    /// **`UPDATE` 也会改变待办**（台账 `D-29`）：它既加新文件、又改 DV。
+    #[test]
+    fn update_recomputes_the_task() {
+        let mut s = rich_state(); // 只有 1 个文件 ⇒ 还没有待办
+        assert!(s.list_tasks().is_empty(), "{:?}", s.list_tasks());
+
+        // `UPDATE` 的"新行"那半：（同一个分片的）第二个文件
+        s.apply_update(
+            vec![],
+            vec![FileManifest {
+                file_path: "p/u1.parquet".into(),
+                batch_id: "u1".into(),
+                table: "public.cpu".into(),
+                shard: "s0".into(),
+                time_window: "w1".into(),
+                row_count: 5,
+                ..Default::default()
+            }],
+            "u1",
+            2_000,
+        )
+        .unwrap();
+        let tasks = s.list_tasks();
+        assert_eq!(tasks.len(), 1, "两个文件 ⇒ 待办出现：{tasks:?}");
+        assert_eq!(
+            tasks[0].since_ms, 2_000_000,
+            "年龄用 op 携带的钟（秒 → 毫秒），不是本地钟"
+        );
+    }
+
+    /// **整个分片下线** ⇒ 这个分片的待办必然不成立（同 `D-29`）。
+    #[test]
+    fn drop_shard_drops_the_task() {
+        let mut s = rich_state();
+        s.commit_files(commit_req("public.cpu", "b2", &["k2"]), 1_002)
+            .unwrap();
+        assert_eq!(s.list_tasks().len(), 1);
+
+        assert_eq!(s.drop_shard("public.cpu", "s0", 3_000), 2, "两个文件都被下线");
+        assert!(s.list_tasks().is_empty(), "{:?}", s.list_tasks());
+    }
+
+    /// **`since_ms` 的口径**（`§172`）：= **首次登记**的时刻；已有值**不被刷新重置**；
+    /// `0` = 未知（快照还原后）由**下一次携带时钟**的刷新补上。
+    #[test]
+    fn task_age_is_first_seen_and_never_reset() {
+        let mut s = rich_state();
+        s.commit_files(commit_req("public.cpu", "b2", &["k2"]), 1_000)
+            .unwrap();
+        assert_eq!(
+            s.list_tasks()[0].since_ms,
+            1_000_000,
+            "首次登记 = op 携带的钟（毫秒）"
+        );
+
+        // 再刷新一次（第三个文件）⇒ 首次登记时刻**不许被重置**（否则 age 永远是"刚登记"）
+        s.commit_files(commit_req("public.cpu", "b3", &["k3"]), 9_999)
+            .unwrap();
+        assert_eq!(
+            s.list_tasks()[0].since_ms,
+            1_000_000,
+            "首次登记时刻不许被每次刷新重置"
+        );
+
+        // 模拟"从快照还原"（任务目录不进快照 ⇒ 年龄未知）
+        for t in s.tasks.values_mut() {
+            t.since_ms = 0;
+        }
+        s.commit_files(commit_req("public.cpu", "b4", &["k4"]), 7_777)
+            .unwrap();
+        assert_eq!(
+            s.list_tasks()[0].since_ms,
+            7_777_000,
+            "未知年龄由下一次携带时钟的刷新补上"
+        );
+    }
+
+    /// 快照**不进任务目录**（派生态）⇒ 还原出来的任务**如实报未知年龄**（0），
+    /// 而不是让调用方去算 `now - 0`（那会是 54 年 —— 观测成了谎）。
+    #[test]
+    fn restored_tasks_report_an_unknown_age() {
+        let mut a = rich_state();
+        a.commit_files(commit_req("public.cpu", "b2", &["k2"]), 1_002)
+            .unwrap();
+        assert_eq!(a.list_tasks().len(), 1, "前提：源状态里有一条待办");
+
+        let b = CatalogState::restore_snapshot(&a.snapshot_artifact()).expect("恢复应成功");
+        let tasks = b.list_tasks();
+        assert_eq!(tasks.len(), 1, "派生态要按还原出来的清单重算：{tasks:?}");
+        assert_eq!(tasks[0].since_ms, 0, "还原后的年龄必须是「未知」");
     }
 }

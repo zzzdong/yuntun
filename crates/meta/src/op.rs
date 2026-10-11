@@ -891,7 +891,8 @@ pub fn apply(state: &mut CatalogState, op: &StateOp) -> Result<ApplyOutcome, Met
         }
         StateOp::DropShard { table, shard, .. } => {
             // 幂等：没有任何文件被标记删除（`n == 0`）= 无事可做
-            let n = state.drop_shard(table, shard);
+            // `now` = op 携带的钟（`§172`：任务表 `since_ms` 的口径；状态机自己不读钟）
+            let n = state.drop_shard(table, shard, now);
             Ok(ApplyOutcome::with_count(n))
         }
 
@@ -900,7 +901,7 @@ pub fn apply(state: &mut CatalogState, op: &StateOp) -> Result<ApplyOutcome, Met
             // 重复重放 ⇒ 快照号不变 ⇒ `hit()`（accepted=false 的那类语义）。
             let before = state.current_snapshot();
             state
-                .apply_deletions(entries.clone())
+                .apply_deletions(entries.clone(), now)
                 .map_err(MetaError::from_lake)?;
             if state.current_snapshot() == before {
                 Ok(ApplyOutcome::hit())
@@ -932,7 +933,7 @@ pub fn apply(state: &mut CatalogState, op: &StateOp) -> Result<ApplyOutcome, Met
             // 这一条**必须**成立：语义是"下线此刻可见文件"，重放一条旧 purge 若再生效
             // 就会把 purge 之后新写入的数据一起清掉（静默丢数据）。
             let out = state
-                .purge_table_files(table, purge_id)
+                .purge_table_files(table, purge_id, now)
                 .map_err(MetaError::from_lake)?;
             if out.files == 0 && out.revoked == 0 {
                 // 无事可做（幂等命中 / 空表）：仍然 `accepted=true` 但要**报行数 0**，
@@ -958,7 +959,7 @@ pub fn apply(state: &mut CatalogState, op: &StateOp) -> Result<ApplyOutcome, Met
         }
         StateOp::RevokeDeletions { file_path, at, .. } => {
             // 撤销是"置 `revoked_at`"，不是删行（历史快照还要能回答"当时为什么少几行"）
-            let n = state.revoke_deletions_for_file(file_path, *at);
+            let n = state.revoke_deletions_for_file(file_path, *at, now);
             if n == 0 {
                 Ok(ApplyOutcome::hit())
             } else {

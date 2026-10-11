@@ -230,24 +230,6 @@ impl RemoteCatalog {
         Err(last.unwrap_or_else(|| LakeError::Other("没有可用的 metanode（Delta）".into())))
     }
 
-    /// **强制全量刷新**（`§169`：任务目录只在**全量载荷**里下发 ⇒ 拿任务表必须走它）。
-    ///
-    /// 与 [`refresh`][Self::refresh] 的差别：后者有"什么都没变 ⇒ 直接返回"的零开销路径，
-    /// 于是任务表会永远停在第一次全量时看到的那张（**待办消失不了**）。
-    async fn refresh_full(&self) -> Result<(), LakeError> {
-        let resp = self
-            .prefetch(pb::PrefetchRequest {
-                since_schema_ver: 0,
-                since_manifest_ver: 0,
-                full: true,
-                tables: Vec::new(),
-                since_snapshot: 0,
-            })
-            .await?;
-        self.apply(resp, &[], true);
-        Ok(())
-    }
-
     /// **刷新本地缓存**（版本驱动）。
     ///
     /// 两步（这条路径就是设计 §3.2 的「无变化零开销」）：
@@ -985,18 +967,24 @@ impl CatalogOps for RemoteCatalog {
         Ok(self.cached(|c| c.snapshot))
     }
 
-    /// GC 用的"被引用"集合：**从本地缓存读**（同 `list_deletions` 的理由 —— GC 每轮都问，
-    /// 不能每轮都过一次网络）。
+    /// **任务目录**（`§169`，G.1）：待办由状态机派生 ⇒ 每个节点看到同一份。
     ///
-    /// ⚠️ 缓存是**上一次 prefetch** 的快照 ⇒ 可能有"刚 apply、还没下发"的 DV 不在集合里。
-    /// 这由**静置期**兜住：一个对象要先被观察成孤儿**超过 `grace`**（默认 1 小时）才会删，
-    /// 下一次 prefetch 早就把它带下来了。反方向（集合里多出已撤销的）是**保守方向**（少删）✓。
+    /// 走**便宜的版本驱动刷新**（`refresh()`：一次版本探测，需要时才拉载荷）。
+    ///
+    /// ⚠️ 这里改正过一条判断（`§172`）：`§169` 当初写的是"**必须走全量刷新**，否则
+    /// `refresh()` 的『什么都没变 ⇒ 直接返回』会让任务表永远停在旧的那张（待办消失不了）"。
+    /// 复读实现后确认那条**不成立**：任务表是"**文件 + 删除向量**"的**纯函数**，
+    /// 而任何一次对两者的改动都会推版本（`commit_files` / `commit_compaction` / `purge` /
+    /// `drop_shard` 推 `manifest_ver`；`apply_deletions` / `revoke` / `apply_update` 推
+    /// `schema_ver`）⇒ "待办变化"必然伴随"版本变化"⇒ 探测会走到拉载荷那条路，而 `apply()`
+    /// 里 `c.tasks` 是**整体替换**的。零开销路径只在"版本没变"时走，那时任务**也不可能变**。
+    ///
+    /// 两条路的代价差别很大：全量刷新 = **整个目录**（表 + 文件 + DV + 幂等键）的一次预取，
+    /// 而 `/metrics` 抓取（Prometheus 默认 15s）与每轮压缩都会调它 —— 那是拿
+    /// "元数据面每 15s 搬一遍全量"去换一个**并不存在**的正确性收益。
+    /// 钉住这条便宜的路径：`remote_task_directory_follows_purge`（下线之后待办必须消失）。
     async fn list_tasks(&self) -> Result<Vec<yuntun_model::task::CompactionTask>, LakeError> {
-        // ⚠️ **必须走全量刷新**，不能用 `refresh()`：后者有"**什么都没变 ⇒ 直接返回**"的
-        // 零开销路径，而任务表只在**载荷**里下发 ⇒ 走增量刷新时它会永远停在第一次全量时
-        // 看到的那张表（待办消失了也看不见）。代价：一轮压缩多一次全量预取
-        // （默认 60s 一轮，任务表很小）⇒ 换来的是"待办一定是当前这份"。
-        self.refresh_full().await?;
+        self.refresh().await?;
         let mut out: Vec<yuntun_model::task::CompactionTask> =
             self.cached(|c| c.tasks.values().cloned().collect());
         // 与状态机同序（按键排序）⇒ 多节点的遍历顺序一致
@@ -1004,6 +992,36 @@ impl CatalogOps for RemoteCatalog {
         Ok(out)
     }
 
+    /// **租约快照**（`§172`，G.4）：走 `Status` 现取，**不缓存**。
+    ///
+    /// 为什么不像任务表那样塞进 `PrefetchPayload`：任务表是"文件 + DV"的**派生量**
+    /// （必须与清单**同一次**读出来才对得上），而租约是"**此刻谁握着**"的实时事实 ——
+    /// 缓存它只会给出过期答案（租约 TTL 一到就该消失）。`Status` 本来就是给运维看的只读视图。
+    /// 代价：一次指标抓取多一个 RPC（抓取间隔量级 15s，可接受）。
+    async fn list_leases(&self) -> Result<Vec<yuntun_model::meta::LeaseEntry>, LakeError> {
+        let st = self.status().await?;
+        let mut out: Vec<yuntun_model::meta::LeaseEntry> = st
+            .leases
+            .iter()
+            .map(|l| yuntun_model::meta::LeaseEntry {
+                purpose: l.purpose.clone(),
+                holder: l.holder.clone(),
+                epoch: l.epoch,
+                granted_at_ms: l.granted_at_ms,
+                expires_at_ms: l.expires_at_ms,
+            })
+            .collect();
+        // 与状态机同序（那边按 purpose 有序）⇒ 运维视图与 `meta_probe leases` 一致
+        out.sort_by(|a, b| a.purpose.cmp(&b.purpose));
+        Ok(out)
+    }
+
+    /// GC 用的"被引用"集合：**从本地缓存读**（同 `list_deletions` 的理由 —— GC 每轮都问，
+    /// 不能每轮都过一次网络）。
+    ///
+    /// ⚠️ 缓存是**上一次 prefetch** 的快照 ⇒ 可能有"刚 apply、还没下发"的 DV 不在集合里。
+    /// 这由**静置期**兜住：一个对象要先被观察成孤儿**超过 `grace`**（默认 1 小时）才会删，
+    /// 下一次 prefetch 早就把它带下来了。反方向（集合里多出已撤销的）是**保守方向**（少删）✓。
     async fn dv_object_paths(&self) -> Result<Vec<String>, LakeError> {
         self.refresh().await?;
         Ok(self.cached(|c| c.deletions.values().map(|d| d.store_path.clone()).collect()))

@@ -214,12 +214,87 @@ fn flat_gauges(m: &LakehouseMetrics) -> Vec<(String, f64)> {
     out
 }
 
+/// Prometheus 标签值的转义（`\` `"` 换行）。
+fn escape_label(v: &str) -> String {
+    v.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+/// **带标签的行**（`§172`，G.4）：任务是"哪些活"、租约是"谁在做"。
+///
+/// 为什么单独一张表、而不是并进 [`flat_gauges`]：那张表是**标量**（从 JSON 展开），
+/// 这里是**行**（每条待办/每把租约一行）并且需要标签 —— 两者的规则不同。
+/// 摊平成"总数"会把运维真正要问的东西丢掉（**哪个表哪个分片**、**谁**持着租约）。
+/// 一条带标签的指标行：`(指标名, [(标签名, 标签值)], 值)`。
+type JobRow = (String, Vec<(&'static str, String)>, f64);
+
+fn job_rows(m: &LakehouseMetrics) -> Vec<JobRow> {
+    let mut out = Vec::new();
+    for t in &m.jobs.tasks {
+        let labels = vec![("table", t.table.clone()), ("shard", t.shard.clone())];
+        out.push((
+            "yuntun_compaction_task_files".to_string(),
+            labels.clone(),
+            t.files as f64,
+        ));
+        out.push((
+            "yuntun_compaction_task_deleted_rows".to_string(),
+            labels.clone(),
+            t.deleted_rows as f64,
+        ));
+        // 年龄未知时**不输出一个假数字**，而是明确报一条"这条是未知的"
+        match t.age_secs {
+            Some(a) => out.push((
+                "yuntun_compaction_task_age_seconds".to_string(),
+                labels,
+                a as f64,
+            )),
+            None => out.push((
+                "yuntun_compaction_task_age_unknown".to_string(),
+                labels,
+                1.0,
+            )),
+        }
+    }
+    for l in &m.jobs.leases {
+        let labels = vec![("purpose", l.purpose.clone()), ("holder", l.holder.clone())];
+        out.push((
+            "yuntun_lease_held_seconds".to_string(),
+            labels.clone(),
+            l.held_secs as f64,
+        ));
+        out.push((
+            "yuntun_lease_expires_in_seconds".to_string(),
+            labels.clone(),
+            l.expires_in_secs as f64,
+        ));
+        out.push(("yuntun_lease_epoch".to_string(), labels, l.epoch as f64));
+    }
+    // 稳定顺序（抓取结果可比对；也免得 Prometheus 侧因为顺序抖动做无谓更新）
+    out.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    out
+}
+
 /// 渲染 Prometheus 文本（0.0.4）。
 pub fn prometheus_text(m: &LakehouseMetrics) -> String {
     let mut out = String::with_capacity(2048);
+    let mut typed: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (name, value) in flat_gauges(m) {
-        out.push_str(&format!("# TYPE {name} gauge\n"));
+        if typed.insert(name.clone()) {
+            out.push_str(&format!("# TYPE {name} gauge\n"));
+        }
         out.push_str(&format!("{name} {value}\n"));
+    }
+    for (name, labels, value) in job_rows(m) {
+        if typed.insert(name.clone()) {
+            out.push_str(&format!("# TYPE {name} gauge\n"));
+        }
+        let ls: Vec<String> = labels
+            .iter()
+            .map(|(k, v)| format!("{k}=\"{}\"", escape_label(v)))
+            .collect();
+        out.push_str(&format!("{name}{{{}}} {value}\n", ls.join(",")));
     }
     out
 }
@@ -227,7 +302,9 @@ pub fn prometheus_text(m: &LakehouseMetrics) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CatalogMetrics, ChunkMetrics, QueryMetrics, WalMetrics};
+    use crate::{
+        CatalogMetrics, ChunkMetrics, JobMetrics, LeaseMetric, QueryMetrics, TaskMetric, WalMetrics,
+    };
 
     /// 一个人造快照：**每个字段都给不同的值**，免得"忘了搬字段"看不出来。
     fn snapshot() -> LakehouseMetrics {
@@ -269,6 +346,50 @@ mod tests {
                 reserved_bytes: Some(22),
                 limit_bytes: None,
             },
+            jobs: JobMetrics {
+                tasks_total: 2,
+                tasks_unknown_age: 1,
+                tasks: vec![
+                    TaskMetric {
+                        table: "public.dist".into(),
+                        shard: "s0".into(),
+                        files: 25,
+                        deleted_rows: 26,
+                        reason: "files".into(),
+                        age_secs: Some(27),
+                    },
+                    // 故意带一个**引号**：标签值必须转义（否则 Prometheus 文本会被解析坏）
+                    TaskMetric {
+                        table: "pub\"lic".into(),
+                        shard: "s1".into(),
+                        files: 28,
+                        deleted_rows: 29,
+                        reason: "dv".into(),
+                        age_secs: None,
+                    },
+                ],
+                leases_total: 2,
+                leases_held: 1,
+                leases: vec![
+                    LeaseMetric {
+                        purpose: "gc".into(),
+                        holder: "dn-1".into(),
+                        epoch: 30,
+                        held_secs: 31,
+                        expires_in_secs: 32,
+                    },
+                    // 已释放（holder 为空）：条目留着是为了代次水位
+                    LeaseMetric {
+                        purpose: "task:public.dist:s0".into(),
+                        holder: String::new(),
+                        epoch: 33,
+                        held_secs: 34,
+                        expires_in_secs: 0,
+                    },
+                ],
+                tasks_error: None,
+                leases_error: Some("boom".into()),
+            },
         }
     }
 
@@ -303,7 +424,55 @@ mod tests {
                 checked += 1;
             }
         }
-        assert!(checked >= 24, "字段数不对（{checked}）—— 判据本身要跟着字段增长");
+        assert!(checked >= 37, "字段数不对（{checked}）—— 判据本身要跟着字段增长");
+    }
+
+    /// **带标签的任务/租约行**（`§172`，G.4）：这是"有哪些活、谁在做"在 Prometheus 侧的全部内容。
+    ///
+    /// 三条要求：① 每行都出得来（不是只有总数）；② 标签值转义；③ **年龄未知时不编数字**
+    /// —— 报一条 `age_unknown=1`，而不是 `now - 0`（那会是 54 年）。
+    #[test]
+    fn job_rows_carry_labels_and_never_invent_an_age() {
+        let text = prometheus_text(&snapshot());
+        assert!(
+            text.contains("yuntun_compaction_task_files{table=\"public.dist\",shard=\"s0\"} 25"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "yuntun_compaction_task_deleted_rows{table=\"public.dist\",shard=\"s0\"} 26"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("yuntun_compaction_task_age_seconds{table=\"public.dist\",shard=\"s0\"} 27"),
+            "{text}"
+        );
+        // 未知年龄：`*_unknown=1`，且**不许**出现该标签组合的 age_seconds
+        assert!(
+            text.contains("yuntun_compaction_task_age_unknown{table=\"pub\\\"lic\",shard=\"s1\"} 1"),
+            "标签值要转义、未知年龄要如实报：{text}"
+        );
+        assert!(
+            !text.contains("yuntun_compaction_task_age_seconds{table=\"pub\\\"lic\""),
+            "未知年龄不许编一个数字出来：{text}"
+        );
+        assert!(
+            text.contains("yuntun_lease_held_seconds{purpose=\"gc\",holder=\"dn-1\"} 31"),
+            "{text}"
+        );
+        assert!(
+            text.contains("yuntun_lease_epoch{purpose=\"task:public.dist:s0\",holder=\"\"} 33"),
+            "空闲租约（holder 空）也要在：代次水位是运维要看的东西：{text}"
+        );
+        // 每行都要有 `# TYPE`，但**同名只能一次**（Prometheus 对重复 TYPE 会报错）
+        for name in ["yuntun_lease_epoch", "yuntun_compaction_task_files"] {
+            let n = text
+                .lines()
+                .filter(|l| l.starts_with(&format!("# TYPE {name} ")))
+                .count();
+            assert_eq!(n, 1, "`{name}` 的 TYPE 行出现了 {n} 次：{text}");
+        }
     }
 
     /// 数值要**对得上**（不是"有没有这一行"就算过）。

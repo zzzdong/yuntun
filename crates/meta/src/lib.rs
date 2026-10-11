@@ -286,6 +286,7 @@ impl NodeHandle {
                 holder: l.holder.clone(),
                 epoch: l.epoch,
                 expires_at_ms: l.expires_at_ms,
+                granted_at_ms: l.granted_at_ms,
             })
             .collect();
         let s = self.status.lock().unwrap();

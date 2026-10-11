@@ -250,14 +250,21 @@ async fn main() {
             for c in clients.iter() {
                 let Some(st) = status(c).await else { continue };
                 for t in st.tasks {
+                    // `§172`：`since_ms == 0` ⇒ **未知**（任务是从快照还原出来的，
+                    // 此后还没有被携带时钟的 op 触碰过）。早先这里直接算 `now - 0`
+                    // ⇒ 打印"挂了 54 年"：观测不但没用，还在骗人。
+                    let age = if t.since_ms == 0 {
+                        "unknown".to_string()
+                    } else {
+                        now_ms().saturating_sub(t.since_ms).to_string()
+                    };
                     out.push(format!(
-                        "{}:{} files={} deleted={} reason={} age_ms={}",
+                        "{}:{} files={} deleted={} reason={} age_ms={age}",
                         t.table,
                         t.shard,
                         t.files,
                         t.deleted_rows,
                         if t.reason == 1 { "dv" } else { "files" },
-                        now_ms().saturating_sub(t.since_ms)
                     ));
                 }
                 break; // 任务表各副本一致 ⇒ 问到一个就够

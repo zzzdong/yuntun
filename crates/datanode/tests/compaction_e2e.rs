@@ -382,7 +382,9 @@ async fn only_one_compactor_holds_the_lease_and_it_is_taken_over_when_it_dies() 
             let h = hw.clone();
             async move { holder(&h).is_some() }
         },
-        Duration::from_secs(30),
+        // `§172` waiver：只是"防挂住"的上界（起两个子进程 + 一轮 GC）。给宽一点，
+        // 免得机器被占满时把"慢"报成"没拿到租约"。
+        Duration::from_secs(90),
         "有一个节点取得 gc 租约",
         &Arc::new(Mutex::new(String::new())),
     )
@@ -410,7 +412,13 @@ async fn only_one_compactor_holds_the_lease_and_it_is_taken_over_when_it_dies() 
             let want = survivor_owned.clone();
             async move { holder(&h).as_deref() == Some(want.as_str()) }
         },
-        Duration::from_secs(30),
+        // `§172` waiver：**这条等待天生就要等满 TTL** —— GC 租约的期限是
+        // `max(3 × 间隔, 30s)`（`spawn_orphan_cleanup_with_interval` 里的下限是刻意留的：
+        // "一轮扫得比间隔久也不至于被误接管"），所以接管**不可能**早于 ~30s 发生。
+        // 上界因此必须取 TTL 的**数倍**（原来写 30s = 恰好等于 TTL ⇒ 必然抖：
+        // 全量并行跑时报过 "等待「幸存者接管了租约（过 TTL 后）」超时"）。
+        // 它是"防挂住"的上界，不是延迟断言 —— 机器慢只影响耗时，不影响判定。
+        Duration::from_secs(150),
         "幸存者接管了租约（过 TTL 后）",
         &Arc::new(Mutex::new(String::new())),
     )

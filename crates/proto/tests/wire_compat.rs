@@ -424,7 +424,24 @@ fn status_response_exposes_all_operational_fields() {
         first_index: 21,
         last_index: 30,
         version: yuntun_proto::PROTO_VERSION.into(),
-                leases: Vec::new(),
+                leases: vec![
+            // `§172`：租约的运维视图（含 `granted_at_ms` —— 运维要回答"这件事做了多久"）
+            LeaseView {
+                purpose: "compaction:public.dist:s0".into(),
+                holder: "dn-1".into(),
+                epoch: 7,
+                expires_at_ms: 1_700_000_060_000,
+                granted_at_ms: 1_700_000_000_000,
+            },
+            // 已释放（holder 空、代次留着）也要无损
+            LeaseView {
+                purpose: "gc".into(),
+                holder: String::new(),
+                epoch: 3,
+                expires_at_ms: 0,
+                granted_at_ms: 1_699_999_000_000,
+            },
+        ],
         voter_ids: vec![1, 2, 3],
         learner_ids: vec![4],
         // `§169`：任务目录也要逐字段无损（它决定了"有哪些活"）
