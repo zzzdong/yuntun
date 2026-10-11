@@ -178,28 +178,65 @@ impl pb::shard_fetch_server::ShardFetch for ShardService {
             .map(predicate_from_msg)
             .transpose()?
             .flatten();
+        // `§177`：分组键也一起送下去 —— 分组是在**数据所在处**做的，
+        // 响应的形状（一个组 vs 每组一行）由"带不带 group_by"决定。
+        let query = yuntun_model::agg::AggQuery {
+            specs,
+            group_by: req.group_by.clone(),
+            predicate,
+        };
         let aggs = self
             .reader
             .read_table_aggs(
                 &req.table,
                 req.known_manifest_ver,
                 &req.known_batch_ids,
-                &specs,
-                predicate.as_ref(),
+                &query,
             )
             .await
             .map_err(internal)?;
-        if aggs.partials.len() != specs.len() {
-            // 长度不符 = 本地 reader 违反了契约。**响亮失败**：让调用方收到错，
-            // 而不是把"少了一个聚合"的响应当成正常答案（§173 的边界第 2 条）。
-            return Err(Status::internal(format!(
-                "聚合部分状态个数（{}）与请求（{}）不符",
-                aggs.partials.len(),
-                specs.len()
-            )));
-        }
+        // 形状必须与请求一致（**响亮失败**："少了一个组/少了一个聚合"看起来都像正常答案）
+        let (partials, groups) = match &aggs.states {
+            yuntun_model::agg::AggStates::Plain(p) => {
+                if !query.group_by.is_empty() {
+                    return Err(Status::internal(
+                        "聚合形状不符：请求带了 group_by，却算出不分组的结果".to_string(),
+                    ));
+                }
+                if p.len() != query.specs.len() {
+                    return Err(Status::internal(format!(
+                        "聚合部分状态个数（{}）与请求（{}）不符",
+                        p.len(),
+                        query.specs.len()
+                    )));
+                }
+                (p.iter().map(partial_to_msg).collect(), Vec::new())
+            }
+            yuntun_model::agg::AggStates::Grouped(gs) => {
+                if query.group_by.is_empty() {
+                    return Err(Status::internal(
+                        "聚合形状不符：请求没带 group_by，却算出分组结果".to_string(),
+                    ));
+                }
+                let mut out = Vec::with_capacity(gs.len());
+                for g in gs {
+                    if g.key.len() != query.group_by.len() || g.states.len() != query.specs.len() {
+                        return Err(Status::internal(format!(
+                            "分组状态的形状不符：键 {} 个（请求 {}）、状态 {} 个（请求 {}）",
+                            g.key.len(),
+                            query.group_by.len(),
+                            g.states.len(),
+                            query.specs.len()
+                        )));
+                    }
+                    out.push(group_to_msg(g));
+                }
+                (Vec::new(), out)
+            }
+        };
         Ok(Response::new(pb::FetchShardAggsResponse {
-            partials: aggs.partials.iter().map(partial_to_msg).collect(),
+            partials,
+            groups,
             flushed_watermark: aggs.flushed_watermark,
             stale: aggs.stale,
         }))
@@ -386,11 +423,12 @@ impl ShardFetch for GrpcShardFetch {
         table: &'a str,
         known_manifest_ver: u64,
         known_batch_ids: Vec<String>,
-        specs: Vec<yuntun_model::agg::AggSpec>,
-        predicate: Option<yuntun_model::predicate::Predicate>,
+        query: yuntun_model::agg::AggQuery,
     ) -> BoxFuture<'a, Result<ShardAggs, LakeError>> {
         Box::pin(async move {
             let mut c = self.client.clone();
+            let grouped = query.is_grouped();
+            let specs = query.specs.clone();
             let resp = self
                 .call(
                     "fetch_shard_aggs",
@@ -400,25 +438,36 @@ impl ShardFetch for GrpcShardFetch {
                         known_batch_ids,
                         aggs: specs.iter().map(agg_spec_to_msg).collect(),
                         // `§176`：谓词过网（`None` = 不过滤）
-                        predicate: predicate.as_ref().map(predicate_to_msg),
+                        predicate: query.predicate.as_ref().map(predicate_to_msg),
+                        // `§177`：分组键过网（空 = 不分组 ⇒ 响应走 `partials`）
+                        group_by: query.group_by.clone(),
                     }),
                 )
                 .await?;
             let resp = resp.into_inner();
-            // 长度是契约：**不许**"按短的来"（少一个聚合的结果是错的，而它看起来很正常）
-            if resp.partials.len() != specs.len() {
-                return Err(LakeError::Other(format!(
-                    "shard rpc: fetch_shard_aggs: 部分状态个数（{}）与请求（{}）不符",
-                    resp.partials.len(),
-                    specs.len()
-                )));
-            }
-            let mut partials = Vec::with_capacity(resp.partials.len());
-            for m in &resp.partials {
-                partials.push(partial_from_msg(m)?);
-            }
+            let states = if grouped {
+                let mut gs = Vec::with_capacity(resp.groups.len());
+                for m in &resp.groups {
+                    gs.push(group_from_msg(m, &query)?);
+                }
+                yuntun_model::agg::AggStates::Grouped(gs)
+            } else {
+                // 长度是契约：**不许**"按短的来"（少一个聚合的结果是错的，而它看起来很正常）
+                if resp.partials.len() != specs.len() {
+                    return Err(LakeError::Other(format!(
+                        "shard rpc: fetch_shard_aggs: 部分状态个数（{}）与请求（{}）不符",
+                        resp.partials.len(),
+                        specs.len()
+                    )));
+                }
+                let mut partials = Vec::with_capacity(resp.partials.len());
+                for m in &resp.partials {
+                    partials.push(partial_from_msg(m)?);
+                }
+                yuntun_model::agg::AggStates::Plain(partials)
+            };
             Ok(ShardAggs {
-                partials,
+                states,
                 flushed_watermark: resp.flushed_watermark,
                 stale: resp.stale,
             })
@@ -610,5 +659,73 @@ fn predicate_from_msg(
                 "不认识的谓词种类：{other}"
             )))
         }
+    }))
+}
+
+/// `§177`：一组（键 + 状态）→ 消息。
+fn group_to_msg(g: &yuntun_model::agg::GroupStates) -> pb::GroupStatesMsg {
+    pb::GroupStatesMsg {
+        key: g.key.iter().map(scalar_to_msg).collect(),
+        states: g.states.iter().map(partial_to_msg).collect(),
+    }
+}
+
+/// `§177`：消息 → 一组。**形状不符一律报错**（少一个键列 = 把不同的组并成一组）。
+fn group_from_msg(
+    m: &pb::GroupStatesMsg,
+    query: &yuntun_model::agg::AggQuery,
+) -> Result<yuntun_model::agg::GroupStates, LakeError> {
+    if m.key.len() != query.group_by.len() {
+        return Err(LakeError::Other(format!(
+            "shard rpc: fetch_shard_aggs: 分组键个数（{}）与请求（{}）不符",
+            m.key.len(),
+            query.group_by.len()
+        )));
+    }
+    if m.states.len() != query.specs.len() {
+        return Err(LakeError::Other(format!(
+            "shard rpc: fetch_shard_aggs: 组内状态个数（{}）与请求（{}）不符",
+            m.states.len(),
+            query.specs.len()
+        )));
+    }
+    let key: Result<Vec<yuntun_model::agg::KeyPart>, LakeError> =
+        m.key.iter().map(scalar_from_msg).collect();
+    let states: Result<Vec<yuntun_model::agg::PartialAgg>, LakeError> =
+        m.states.iter().map(partial_from_msg).collect();
+    Ok(yuntun_model::agg::GroupStates {
+        key: key?,
+        states: states?,
+    })
+}
+
+/// `has_value = false` ⇒ NULL（分组里 NULL 是**一个组**）。
+fn scalar_to_msg(v: &yuntun_model::agg::KeyPart) -> pb::ScalarMsg {
+    let mut m = pb::ScalarMsg::default();
+    match v {
+        None => m.has_value = false,
+        Some(yuntun_model::agg::AggScalar::Int(i)) => {
+            m.has_value = true;
+            m.int_val = *i;
+        }
+        Some(yuntun_model::agg::AggScalar::Text(t)) => {
+            m.has_value = true;
+            m.is_text = true;
+            m.text_val = t.clone();
+        }
+    }
+    m
+}
+
+fn scalar_from_msg(
+    m: &pb::ScalarMsg,
+) -> Result<yuntun_model::agg::KeyPart, LakeError> {
+    if !m.has_value {
+        return Ok(None);
+    }
+    Ok(Some(if m.is_text {
+        yuntun_model::agg::AggScalar::Text(m.text_val.clone())
+    } else {
+        yuntun_model::agg::AggScalar::Int(m.int_val)
     }))
 }

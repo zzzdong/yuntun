@@ -22,6 +22,8 @@
 //!
 //! 写在 [`yuntun_model::agg`] 的模块文档里（那一层是"可分解 + 精确"的判定处）。
 
+use std::collections::BTreeMap;
+
 use arrow::array::{Array, Int64Array, StringArray, UInt64Array};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
@@ -32,7 +34,7 @@ use sqlparser::ast::{
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-use yuntun_model::agg::{AggKind, AggScalar, AggSpec, PartialAgg};
+use yuntun_model::agg::{AggKind, AggScalar, AggSpec, KeyPart, PartialAgg};
 use yuntun_model::predicate::{CmpOp, Literal, Predicate};
 use yuntun_model::error::LakeError;
 
@@ -45,6 +47,11 @@ pub struct Pushdown {
     pub table: String,
     /// 与 `SELECT` 列表**同序**的聚合（合并时按这个下标对齐结果列）
     pub specs: Vec<AggSpec>,
+    /// **分组键列**（`§177`；顺序是契约的一部分）。空 = 不分组（结果是"一行"）。
+    ///
+    /// 非空时 `specs` 是"**每组的**聚合"，且投影必须是"分组键（同序）在前、聚合在后"
+    /// —— 否则结果列对不上，一律不下推。
+    pub group_by: Vec<String>,
     /// 可选的行过滤（`§176`）：**`None` = 没有 `WHERE`**。
     ///
     /// 有 `WHERE` 但**翻译不出来**（算术 / 函数 / `LIKE` / 浮点 / 跨类型…）时，
@@ -73,8 +80,40 @@ pub fn detect(sql: &str, default_schema: &str, snapshot: &CatalogSnapshot) -> Op
         )
     };
     let cached = snapshot.get(&ident)?;
-    let specs = select
-        .projection
+
+    // `§177`：**分组键**。只收"普通列"（`GROUP BY v+1` 这类表达式键不下推），
+    // 且类型必须在支持面内（整数 / 字符串）—— 别的类型（浮点、布尔…）一律不下推。
+    let group_by = match &select.group_by {
+        GroupByExpr::Expressions(exprs, _) => {
+            let mut keys = Vec::with_capacity(exprs.len());
+            for e in exprs {
+                let col = column_of(e)?;
+                if !matches!(
+                    cached.schema.field_with_name(&col).ok().map(|f| f.data_type()),
+                    Some(DataType::Int64 | DataType::Utf8)
+                ) {
+                    return None;
+                }
+                keys.push(col);
+            }
+            keys
+        }
+        _ => return None,
+    };
+
+    // 投影必须是"**分组键（同序）在前、聚合在后**"：这样结果的列才对得上，
+    // 也才能用 DataFusion 冷结果给的 schema/列名直接拼装（不必自己编一套列名）。
+    let (key_items, agg_items) = select.projection.split_at(group_by.len());
+    for (item, want) in key_items.iter().zip(group_by.iter()) {
+        let got = match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => column_of(e),
+            _ => None,
+        };
+        if got.as_deref() != Some(want.as_str()) {
+            return None;
+        }
+    }
+    let specs = agg_items
         .iter()
         .map(|item| spec_of_item(item, &cached.schema))
         .collect::<Option<Vec<_>>>()?;
@@ -89,6 +128,7 @@ pub fn detect(sql: &str, default_schema: &str, snapshot: &CatalogSnapshot) -> Op
     Some(Pushdown {
         table: ident,
         specs,
+        group_by,
         predicate,
     })
 }
@@ -285,9 +325,10 @@ fn single_simple_select(q: &Query) -> Option<&Select> {
     if select.prewhere.is_some() || select.having.is_some() {
         return None;
     }
-    // `GROUP BY` 有三种写法（`Expressions` / `All` / …）——**只有"空 Expressions"** 才算没有
+    // `GROUP BY` 有三种写法（`Expressions` / `All` / …）—— 只有"**列表达式列表**"这一族能下推，
+    // 而且**不许带修饰**（`ROLLUP` / `CUBE` / `GROUPING SETS` 会多出"小计行"，那是另一种结果形状）
     match &select.group_by {
-        GroupByExpr::Expressions(exprs, modifiers) if exprs.is_empty() && modifiers.is_empty() => {}
+        GroupByExpr::Expressions(_, modifiers) if modifiers.is_empty() => {}
         _ => return None,
     }
     // 下面这些每一个都会改变"聚合在什么之上做"：一律不碰
@@ -416,7 +457,7 @@ fn ident_parts(name: &ObjectName) -> Vec<String> {
 pub fn merge_into_cold(
     cold: &RecordBatch,
     specs: &[AggSpec],
-    hot: &[Vec<PartialAgg>],
+    hot: &[yuntun_model::agg::AggStates],
 ) -> Result<RecordBatch, LakeError> {
     if cold.num_rows() != 1 || cold.num_columns() != specs.len() {
         return Err(LakeError::Other(format!(
@@ -430,7 +471,13 @@ pub fn merge_into_cold(
     for (i, spec) in specs.iter().enumerate() {
         let mut acc = cold_value_of(cold.column(i), spec)?;
         for per_source in hot {
-            acc = yuntun_model::agg::merge(&acc, &per_source[i])?;
+            // 不分组 ⇒ 每个来源给的就是"一行"的状态；形状不符 ⇒ 响亮失败
+            let yuntun_model::agg::AggStates::Plain(part) = per_source else {
+                return Err(LakeError::Other(
+                    "聚合下推的前提不成立：不分组的查询却拿到了分组结果".into(),
+                ));
+            };
+            acc = yuntun_model::agg::merge(&acc, &part[i])?;
         }
         columns.push(array_of(acc, cold.column(i).data_type())?);
     }
@@ -438,15 +485,143 @@ pub fn merge_into_cold(
         .map_err(|e| LakeError::Other(format!("聚合下推结果拼装失败：{e}")))
 }
 
+/// **分组**结果的合并（`§177`）：冷结果已经是"每组一行"，热来源的部分状态按**键**并入。
+///
+/// 与 [`merge_into_cold`] 的差别是这里要做**键的并集**（只存在于热数据的组要**新增**一行），
+/// 而不是"在原行上改值"。顺序按**键升序** ⇒ 确定（可复现），而 `GROUP BY` 的行序本来
+/// 就不在契约里（原路也没保证）。
+pub fn merge_grouped_into_cold(
+    cold: &RecordBatch,
+    query: &yuntun_model::agg::AggQuery,
+    hot: &[yuntun_model::agg::AggStates],
+) -> Result<RecordBatch, LakeError> {
+    let nk = query.group_by.len();
+    if cold.num_columns() != nk + query.specs.len() {
+        return Err(LakeError::Other(format!(
+            "聚合下推的前提不成立：分组查询的冷结果应当是 {} 个键列 + {} 个聚合列，实际 {} 列",
+            nk,
+            query.specs.len(),
+            cold.num_columns()
+        )));
+    }
+    let mut acc: BTreeMap<Vec<KeyPart>, Vec<PartialAgg>> = BTreeMap::new();
+    for row in 0..cold.num_rows() {
+        let mut key = Vec::with_capacity(nk);
+        for i in 0..nk {
+            key.push(cold_key_at(cold.column(i), row)?);
+        }
+        let states = (0..query.specs.len())
+            .map(|j| cold_value_at(cold.column(nk + j), &query.specs[j], row))
+            .collect::<Result<Vec<_>, LakeError>>()?;
+        acc.insert(key, states);
+    }
+    for source in hot {
+        let yuntun_model::agg::AggStates::Grouped(groups) = source else {
+            return Err(LakeError::Other(
+                "聚合下推的前提不成立：热来源返回的不是分组结果".into(),
+            ));
+        };
+        for g in groups {
+            let states = acc.entry(g.key.clone()).or_insert_with(|| {
+                g.states
+                    .iter()
+                    .map(|p| yuntun_model::agg::PartialAgg::empty(p.kind()))
+                    .collect()
+            });
+            for (i, p) in g.states.iter().enumerate() {
+                let cur = states.get(i).ok_or_else(|| {
+                    LakeError::Other("热来源的状态个数与请求不符".into())
+                })?;
+                states[i] = yuntun_model::agg::merge(cur, p)?;
+            }
+        }
+    }
+
+    let mut columns: Vec<arrow::array::ArrayRef> = Vec::with_capacity(cold.num_columns());
+    for i in 0..nk {
+        let vals: Vec<KeyPart> = acc.keys().map(|k| k[i].clone()).collect();
+        columns.push(key_array_of(cold.column(i).data_type(), &vals)?);
+    }
+    for j in 0..query.specs.len() {
+        let vals: Vec<PartialAgg> = acc.values().map(|st| st[j].clone()).collect();
+        columns.push(array_of_many(&vals, cold.column(nk + j).data_type())?);
+    }
+    RecordBatch::try_new(cold.schema(), columns)
+        .map_err(|e| LakeError::Other(format!("聚合下推结果拼装失败：{e}")))
+}
+
+/// 冷结果里某个**分组键分量**的取值（NULL 要如实保留 —— 它是一组）。
+fn cold_key_at(col: &arrow::array::ArrayRef, row: usize) -> Result<KeyPart, LakeError> {
+    if col.is_null(row) {
+        return Ok(None);
+    }
+    if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+        return Ok(Some(AggScalar::Int(a.value(row))));
+    }
+    if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
+        return Ok(Some(AggScalar::Text(a.value(row).to_string())));
+    }
+    Err(LakeError::Other(format!(
+        "分组键的类型不认识：{:?}",
+        col.data_type()
+    )))
+}
+
+fn key_array_of(
+    want: &DataType,
+    vals: &[KeyPart],
+) -> Result<arrow::array::ArrayRef, LakeError> {
+    match want {
+        DataType::Int64 => {
+            let mut out = Vec::with_capacity(vals.len());
+            for v in vals {
+                out.push(match v {
+                    None => None,
+                    Some(AggScalar::Int(i)) => Some(*i),
+                    Some(AggScalar::Text(_)) => {
+                        return Err(LakeError::Other("分组键是字符串，但列是 Int64".into()))
+                    }
+                });
+            }
+            Ok(std::sync::Arc::new(Int64Array::from(out)))
+        }
+        DataType::Utf8 => {
+            let mut out: Vec<Option<String>> = Vec::with_capacity(vals.len());
+            for v in vals {
+                out.push(match v {
+                    None => None,
+                    Some(AggScalar::Text(t)) => Some(t.clone()),
+                    Some(AggScalar::Int(_)) => {
+                        return Err(LakeError::Other("分组键是整数，但列是 Utf8".into()))
+                    }
+                });
+            }
+            Ok(std::sync::Arc::new(StringArray::from(out)))
+        }
+        other => Err(LakeError::Other(format!(
+            "分组键列的类型不支持：{other:?}"
+        ))),
+    }
+}
+
 /// 从冷结果的**第一个值**读出部分状态（NULL 要如实保留：`count` 是 0，`sum/min/max` 是 NULL）。
 fn cold_value_of(col: &arrow::array::ArrayRef, spec: &AggSpec) -> Result<PartialAgg, LakeError> {
-    let null = col.is_null(0);
+    cold_value_at(col, spec, 0)
+}
+
+/// 从冷结果的**第 `row` 行**读出部分状态（分组时每行一组）。
+fn cold_value_at(
+    col: &arrow::array::ArrayRef,
+    spec: &AggSpec,
+    row: usize,
+) -> Result<PartialAgg, LakeError> {
+    let null = col.is_null(row);
     match spec.kind {
         AggKind::CountStar | AggKind::Count => {
             let v = if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
-                a.value(0) as u64
+                a.value(row) as u64
             } else if let Some(a) = col.as_any().downcast_ref::<UInt64Array>() {
-                a.value(0)
+                a.value(row)
             } else {
                 return Err(LakeError::Other(format!(
                     "count 的返回类型不认识：{:?}",
@@ -459,15 +634,15 @@ fn cold_value_of(col: &arrow::array::ArrayRef, spec: &AggSpec) -> Result<Partial
             let a = col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
                 LakeError::Other(format!("sum 的返回类型不是 Int64：{:?}", col.data_type()))
             })?;
-            Ok(PartialAgg::SumInt((!null).then(|| a.value(0))))
+            Ok(PartialAgg::SumInt((!null).then(|| a.value(row))))
         }
         AggKind::Min | AggKind::Max => {
             let s = if null {
                 None
             } else if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
-                Some(AggScalar::Int(a.value(0)))
+                Some(AggScalar::Int(a.value(row)))
             } else if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
-                Some(AggScalar::Text(a.value(0).to_string()))
+                Some(AggScalar::Text(a.value(row).to_string()))
             } else {
                 return Err(LakeError::Other(format!(
                     "min/max 的返回类型不认识：{:?}",
@@ -484,45 +659,71 @@ fn cold_value_of(col: &arrow::array::ArrayRef, spec: &AggSpec) -> Result<Partial
 }
 
 /// 合并后的部分状态 → 与冷结果**同类型**的单元素数组（schema 不动）。
+/// 一个聚合列的**一整列**值（分组时是多行）。
+///
+/// 类型由**冷结果那一列**决定（DataFusion 给的），我们只负责把合并后的状态写进去 ——
+/// 状态与列类型不符 ⇒ 响亮失败（那说明判定层放行了一个它不该放行的形状）。
+fn array_of_many(
+    values: &[PartialAgg],
+    want: &DataType,
+) -> Result<arrow::array::ArrayRef, LakeError> {
+    let mut ints: Vec<Option<i64>> = Vec::with_capacity(values.len());
+    let mut texts: Vec<Option<String>> = Vec::with_capacity(values.len());
+    let mut saw_text = false;
+    for merged in values {
+        let (iv, tv): (Option<i64>, Option<String>) = match (merged, want) {
+            (PartialAgg::Count(v), DataType::Int64) => (Some(*v as i64), None),
+            (PartialAgg::Count(v), DataType::UInt64) => (Some(*v as i64), None),
+            (PartialAgg::SumInt(v), DataType::Int64) => (*v, None),
+            (PartialAgg::Min(s) | PartialAgg::Max(s), DataType::Int64) => (
+                match s {
+                    Some(AggScalar::Int(i)) => Some(*i),
+                    None => None,
+                    Some(AggScalar::Text(_)) => {
+                        return Err(LakeError::Other("min/max 合并出了字符串，但列是 Int64".into()))
+                    }
+                },
+                None,
+            ),
+            (PartialAgg::Min(s) | PartialAgg::Max(s), DataType::Utf8) => (
+                None,
+                match s {
+                    Some(AggScalar::Text(t)) => Some(t.clone()),
+                    None => None,
+                    Some(AggScalar::Int(_)) => {
+                        return Err(LakeError::Other("min/max 合并出了整数，但列是 Utf8".into()))
+                    }
+                },
+            ),
+            (got, want) => {
+                return Err(LakeError::Other(format!(
+                    "聚合下推结果类型与冷结果不一致：合并出 {:?}，冷结果列是 {want:?}",
+                    got.kind()
+                )))
+            }
+        };
+        saw_text |= tv.is_some();
+        ints.push(iv);
+        texts.push(tv);
+    }
+    Ok(if saw_text {
+        std::sync::Arc::new(StringArray::from(texts))
+    } else if matches!(want, DataType::UInt64) {
+        // `count` 在 DataFusion 里是 UInt64 还是 Int64 由它决定，我们照着写
+        std::sync::Arc::new(UInt64Array::from(
+            ints.into_iter().map(|v| v.unwrap_or(0) as u64).collect::<Vec<_>>(),
+        ))
+    } else {
+        std::sync::Arc::new(Int64Array::from(ints))
+    })
+}
+
+/// 不分组时用：一个聚合列只有**一个**值。
 fn array_of(
     merged: PartialAgg,
     want: &DataType,
 ) -> Result<arrow::array::ArrayRef, LakeError> {
-    match (merged, want) {
-        (PartialAgg::Count(v), DataType::Int64) => {
-            Ok(std::sync::Arc::new(Int64Array::from(vec![v as i64])))
-        }
-        (PartialAgg::Count(v), DataType::UInt64) => {
-            Ok(std::sync::Arc::new(UInt64Array::from(vec![v])))
-        }
-        (PartialAgg::SumInt(v), DataType::Int64) => {
-            Ok(std::sync::Arc::new(Int64Array::from(vec![v])))
-        }
-        (PartialAgg::Min(s) | PartialAgg::Max(s), DataType::Int64) => {
-            let v = match s {
-                Some(AggScalar::Int(i)) => Some(i),
-                None => None,
-                Some(AggScalar::Text(_)) => {
-                    return Err(LakeError::Other("min/max 合并出了字符串，但列是 Int64".into()));
-                }
-            };
-            Ok(std::sync::Arc::new(Int64Array::from(vec![v])))
-        }
-        (PartialAgg::Min(s) | PartialAgg::Max(s), DataType::Utf8) => {
-            let v = match s {
-                Some(AggScalar::Text(t)) => Some(t),
-                None => None,
-                Some(AggScalar::Int(_)) => {
-                    return Err(LakeError::Other("min/max 合并出了整数，但列是 Utf8".into()));
-                }
-            };
-            Ok(std::sync::Arc::new(StringArray::from(vec![v])))
-        }
-        (got, want) => Err(LakeError::Other(format!(
-            "聚合下推结果类型与冷结果不一致：合并出 {:?}，冷结果列是 {want:?}",
-            got.kind()
-        ))),
-    }
+    array_of_many(std::slice::from_ref(&merged), want)
 }
 
 #[cfg(test)]
@@ -738,8 +939,8 @@ mod tests {
         let specs = vec![AggSpec::count_star(), AggSpec::new(AggKind::SumInt, "v")];
         let cold_batch = cold(vec![PartialAgg::Count(10), PartialAgg::SumInt(Some(100))]);
         let hot = vec![
-            vec![PartialAgg::Count(3), PartialAgg::SumInt(Some(7))],
-            vec![PartialAgg::Count(0), PartialAgg::SumInt(None)],
+            yuntun_model::agg::AggStates::Plain(vec![PartialAgg::Count(3), PartialAgg::SumInt(Some(7))]),
+            yuntun_model::agg::AggStates::Plain(vec![PartialAgg::Count(0), PartialAgg::SumInt(None)]),
         ];
         let got = merge_into_cold(&cold_batch, &specs, &hot).unwrap();
         assert_eq!(got.num_rows(), 1);
@@ -757,7 +958,7 @@ mod tests {
         let with_hot = merge_into_cold(
             &cold_null,
             &specs,
-            &[vec![PartialAgg::SumInt(Some(5))]],
+            &[yuntun_model::agg::AggStates::Plain(vec![PartialAgg::SumInt(Some(5))])],
         )
         .unwrap();
         assert_eq!(
@@ -770,7 +971,12 @@ mod tests {
             5
         );
         let all_null =
-            merge_into_cold(&cold_null, &specs, &[vec![PartialAgg::SumInt(None)]]).unwrap();
+            merge_into_cold(
+                &cold_null,
+                &specs,
+                &[yuntun_model::agg::AggStates::Plain(vec![PartialAgg::SumInt(None)])],
+            )
+                .unwrap();
         assert!(all_null.column(0).is_null(0), "全 NULL ⇒ 仍然是 NULL（不是 0）");
     }
 
@@ -781,5 +987,84 @@ mod tests {
         let only_one = cold(vec![PartialAgg::Count(1)]);
         let e = merge_into_cold(&only_one, &specs, &[]).unwrap_err();
         assert!(e.to_string().contains("前提不成立"), "{e}");
+    }
+
+    // ------------------------------------------------ 分组合并（`§177`）
+
+    /// 分组结果：`(键, 聚合值)` 表；键是 `Option<Int64>`（`None` = NULL 组）。
+    fn cold_grouped(rows: Vec<(Option<i64>, i64)>) -> RecordBatch {
+        let keys: Vec<Option<i64>> = rows.iter().map(|(k, _)| *k).collect();
+        let vals: Vec<i64> = rows.iter().map(|(_, v)| *v).collect();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Int64, true),
+            Field::new("c0", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(keys)),
+                Arc::new(Int64Array::from(vals)),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// 热来源按**键**并入；只存在于热数据的组要**新增一行**（不是"在冷行上改值"）。
+    #[test]
+    fn grouped_merge_adds_groups_that_only_hot_data_has() {
+        let q = yuntun_model::agg::AggQuery {
+            specs: vec![AggSpec::count_star()],
+            group_by: vec!["v".into()],
+            predicate: None,
+        };
+        // 冷：v=1 有 10 行、NULL 组有 2 行
+        let cold_batch = cold_grouped(vec![(Some(1), 10), (None, 2)]);
+        let hot = vec![yuntun_model::agg::AggStates::Grouped(vec![
+            yuntun_model::agg::GroupStates {
+                key: vec![Some(AggScalar::Int(1))],
+                states: vec![PartialAgg::Count(3)],
+            },
+            // 只存在于热数据的组
+            yuntun_model::agg::GroupStates {
+                key: vec![Some(AggScalar::Int(9))],
+                states: vec![PartialAgg::Count(4)],
+            },
+        ])];
+        let got = merge_grouped_into_cold(&cold_batch, &q, &hot).unwrap();
+        let k = got.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let c = got.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let mut rows: Vec<(Option<i64>, i64)> = (0..got.num_rows())
+            .map(|i| {
+                (
+                    if k.is_null(i) { None } else { Some(k.value(i)) },
+                    c.value(i),
+                )
+            })
+            .collect();
+        rows.sort(); // 键升序（NULL 在前）
+        assert_eq!(
+            rows,
+            vec![(None, 2), (Some(1), 13), (Some(9), 4)],
+            "NULL 组不受影响、v=1 累加、v=9 是新组"
+        );
+        assert_eq!(got.schema(), cold_batch.schema(), "schema 必须沿用 DataFusion 的");
+    }
+
+    /// 分组形状不符（一边分组一边不分组）⇒ **响亮失败**（少一个组看起来也像正常答案）。
+    #[test]
+    fn grouped_merge_refuses_a_mismatched_shape() {
+        let q = yuntun_model::agg::AggQuery {
+            specs: vec![AggSpec::count_star()],
+            group_by: vec!["v".into()],
+            predicate: None,
+        };
+        let cold_batch = cold_grouped(vec![(Some(1), 10)]);
+        let e = merge_grouped_into_cold(
+            &cold_batch,
+            &q,
+            &[yuntun_model::agg::AggStates::Plain(vec![PartialAgg::Count(1)])],
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("不是分组结果"), "{e}");
     }
 }

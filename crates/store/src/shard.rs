@@ -95,8 +95,8 @@ impl ShardRead {
 /// 一次**聚合拉取**的结果与边界信息（`§173`，G.2 / 归档 `S5-3`）。
 #[derive(Debug, Clone)]
 pub struct ShardAggs {
-    /// 与请求的 specs **同序同长**的部分状态（顺序是契约的一部分）
-    pub partials: Vec<yuntun_model::agg::PartialAgg>,
+    /// 聚合结果（`§177`）：**不分组**或与 **分组**（每种与请求同序同长 / 按键升序）
+    pub states: yuntun_model::agg::AggStates,
     /// 与 [`ShardRead::flushed_watermark`] 同一口径（**实例级**，不是分片级投影）
     pub flushed_watermark: u64,
     /// 与 [`ShardRead::stale`] 同一语义。**聚合比行更怕它**：少一个来源，
@@ -218,14 +218,13 @@ pub trait ShardReader: Send + Sync + std::fmt::Debug {
         table: &str,
         known_manifest_ver: u64,
         exclude: &[String],
-        specs: &[yuntun_model::agg::AggSpec],
-        predicate: Option<&yuntun_model::predicate::Predicate>,
+        query: &yuntun_model::agg::AggQuery,
     ) -> Result<ShardAggs, LakeError> {
         let read = self
             .read_table_excluding(table, known_manifest_ver, exclude)
             .await?;
         Ok(ShardAggs {
-            partials: yuntun_model::agg::fold_batches_with(specs, &read.batches, predicate)?,
+            states: yuntun_model::agg::fold_query(query, &read.batches)?,
             flushed_watermark: read.flushed_watermark,
             stale: read.stale,
         })
@@ -287,35 +286,31 @@ pub trait ShardFetch: Send + Sync {
         table: &'a str,
         known_manifest_ver: u64,
         known_batch_ids: Vec<String>,
-        specs: Vec<yuntun_model::agg::AggSpec>,
-        predicate: Option<yuntun_model::predicate::Predicate>,
+        query: yuntun_model::agg::AggQuery,
     ) -> futures::future::BoxFuture<'a, Result<ShardAggs, LakeError>> {
         Box::pin(async move {
-            let mut partials: Option<Vec<yuntun_model::agg::PartialAgg>> = None;
+            // 一个分片都没有 ⇒ 单位元 / 没有组（**不是空 Vec**：调用方按"同序同长"对齐）
+            let mut states = if query.is_grouped() {
+                yuntun_model::agg::AggStates::Grouped(Vec::new())
+            } else {
+                yuntun_model::agg::AggStates::Plain(
+                    query
+                        .specs
+                        .iter()
+                        .map(|s| yuntun_model::agg::PartialAgg::empty(s.kind))
+                        .collect(),
+                )
+            };
             for id in self.fetch_shards(table).await? {
                 let read = self
                     .fetch_shard(&id, known_manifest_ver, known_batch_ids.clone())
                     .await?;
-                let part =
-                    yuntun_model::agg::fold_batches_with(&specs, &read.batches, predicate.as_ref())?;
-                partials = Some(match partials {
-                    None => part,
-                    Some(acc) => acc
-                        .iter()
-                        .zip(part.iter())
-                        .map(|(a, b)| yuntun_model::agg::merge(a, b))
-                        .collect::<Result<Vec<_>, _>>()?,
-                });
+                let part = yuntun_model::agg::fold_query(&query, &read.batches)?;
+                states = yuntun_model::agg::merge_states(&states, &part)?;
             }
             let wm = self.fetch_watermark(known_manifest_ver).await?;
             Ok(ShardAggs {
-                // 一个分片都没有 ⇒ 返回单位元（**不是空 Vec**：调用方按"与 specs 同长"来对齐）
-                partials: partials.unwrap_or_else(|| {
-                    specs
-                        .iter()
-                        .map(|s| yuntun_model::agg::PartialAgg::empty(s.kind))
-                        .collect()
-                }),
+                states,
                 flushed_watermark: wm.flushed_watermark,
                 stale: wm.stale,
             })
@@ -396,17 +391,10 @@ impl ShardReader for RemoteShard {
         table: &str,
         known_manifest_ver: u64,
         exclude: &[String],
-        specs: &[yuntun_model::agg::AggSpec],
-        predicate: Option<&yuntun_model::predicate::Predicate>,
+        query: &yuntun_model::agg::AggQuery,
     ) -> Result<ShardAggs, LakeError> {
         self.fetch
-            .fetch_shard_aggs(
-                table,
-                known_manifest_ver,
-                exclude.to_vec(),
-                specs.to_vec(),
-                predicate.cloned(),
-            )
+            .fetch_shard_aggs(table, known_manifest_ver, exclude.to_vec(), query.clone())
             .await
     }
     // `read_table` 用默认实现（枚举 + 逐片 + 水位）；reclaim 用默认空实现（GC 归服务端）

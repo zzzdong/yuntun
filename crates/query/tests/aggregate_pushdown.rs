@@ -14,14 +14,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use arrow::array::Int64Array;
+use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use futures::future::BoxFuture;
 use yuntun_catalog::{CatalogOps, MemoryCatalog};
 use yuntun_chunk::{ChunkKey, ChunkStore, ChunkStoreConfig, MemoryLedger, SealPolicy};
-use yuntun_model::agg::{AggSpec, PartialAgg};
-use yuntun_model::predicate::Predicate;
+use yuntun_model::agg::{AggQuery, PartialAgg};
 use yuntun_model::error::LakeError;
 use yuntun_model::ops::CreateTableRequest;
 use yuntun_query::{LocalCatalog, QueryEngine};
@@ -37,12 +36,27 @@ const WINDOW: &str = "2026-10-11T10:00";
 // ---------------------------------------------------------------- 夹具
 
 fn schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]))
+    Arc::new(Schema::new(vec![
+        Field::new("v", DataType::Int64, true),
+        // `§177`：字符串列 —— 看板里最常见的分组键是"主机名 / 租户名"
+        Field::new("s", DataType::Utf8, true),
+    ]))
 }
 
 /// 带 NULL 的批次（NULL 语义是聚合最容易错的地方之一）。
+///
+/// `s` 由 `v` **派生**（`NULL ⇒ NULL`）：这样一条用例的数据同时覆盖整数分组键、
+/// 字符串分组键与"NULL 是一个组"这三条，而不必为每种都另起一套夹具。
 fn batch(vals: &[Option<i64>]) -> RecordBatch {
-    RecordBatch::try_new(schema(), vec![Arc::new(Int64Array::from(vals.to_vec()))]).unwrap()
+    let s: Vec<Option<String>> = vals.iter().map(|v| v.map(|x| format!("h{x}"))).collect();
+    RecordBatch::try_new(
+        schema(),
+        vec![
+            Arc::new(Int64Array::from(vals.to_vec())),
+            Arc::new(StringArray::from(s)),
+        ],
+    )
+    .unwrap()
 }
 
 /// 一个"实例"的热数据（数据留在 chunk 里：本用例测的是读侧）。
@@ -212,14 +226,25 @@ impl ShardReader for CountingReader {
         table: &str,
         known: u64,
         exclude: &[String],
-        specs: &[AggSpec],
-        predicate: Option<&Predicate>,
+        query: &AggQuery,
     ) -> Result<ShardAggs, LakeError> {
         self.agg_pulls.fetch_add(1, Ordering::SeqCst);
         self.inner
-            .read_table_aggs(table, known, exclude, specs, predicate)
+            .read_table_aggs(table, known, exclude, query)
             .await
     }
+}
+
+
+/// 部分状态在网上的**定长表示**有多大（真实实现是几十字节的 proto）。
+///
+/// 分组时是"每组的标量" ⇒ 组越多越大，但**仍然不是行**（这正是这一刀要测的那件事）。
+fn agg_bytes_of(states: &yuntun_model::agg::AggStates) -> usize {
+    let n = match states {
+        yuntun_model::agg::AggStates::Plain(_) => 1,
+        yuntun_model::agg::AggStates::Grouped(g) => g.len(),
+    };
+    n * std::mem::size_of::<PartialAgg>()
 }
 
 /// 一个**假的远端**：`fetch_shard` 按真实编码（arrow IPC）计"上网的字节"，
@@ -285,24 +310,22 @@ impl ShardFetch for WireFetch {
         table: &'a str,
         known_manifest_ver: u64,
         known_batch_ids: Vec<String>,
-        specs: Vec<AggSpec>,
-        predicate: Option<Predicate>,
+        query: AggQuery,
     ) -> BoxFuture<'a, Result<ShardAggs, LakeError>> {
         Box::pin(async move {
             let read = self
                 .inner
                 .read_table_excluding(table, known_manifest_ver, &known_batch_ids)
                 .await?;
-            // `§176`：谓词在**数据旁边**生效（与真实服务端同一条代码路径）
-            let partials =
-                yuntun_model::agg::fold_batches_with(&specs, &read.batches, predicate.as_ref())?;
+            // `§176`/`§177`：谓词与分组**都**在**数据旁边**生效（与真实服务端同一条代码路径）
+            let states = yuntun_model::agg::fold_query(&query, &read.batches)?;
             // 上网的字节 = 部分状态那点标量（真实实现是几十字节的 proto）
             self.agg_bytes.fetch_add(
-                partials.len() * std::mem::size_of::<PartialAgg>(),
+                agg_bytes_of(&states),
                 Ordering::SeqCst,
             );
             Ok(ShardAggs {
-                partials,
+                states,
                 flushed_watermark: read.flushed_watermark,
                 stale: read.stale,
             })
@@ -367,14 +390,21 @@ impl ShardReader for AlwaysStale {
         _table: &str,
         _known: u64,
         _exclude: &[String],
-        specs: &[AggSpec],
-        _predicate: Option<&Predicate>,
+        query: &AggQuery,
     ) -> Result<ShardAggs, LakeError> {
         Ok(ShardAggs {
-            partials: specs
-                .iter()
-                .map(|s| PartialAgg::empty(s.kind))
-                .collect(),
+            // 形状必须**跟着请求走**（不分组 ⇒ 单位元；分组 ⇒ 没有组）
+            states: if query.is_grouped() {
+                yuntun_model::agg::AggStates::Grouped(Vec::new())
+            } else {
+                yuntun_model::agg::AggStates::Plain(
+                    query
+                        .specs
+                        .iter()
+                        .map(|s| PartialAgg::empty(s.kind))
+                        .collect(),
+                )
+            },
             flushed_watermark: 99,
             stale: true,
         })
@@ -424,7 +454,7 @@ fn cell(col: &arrow::array::ArrayRef, r: usize) -> String {
 /// **下推路径与行路径逐位相同**（`ROADMAP` N4 的硬要求）。
 ///
 /// 覆盖：冷 + 热合并、`count(*)` / `count(col)` / `sum` / `min` / `max`、NULL 语义、空来源，
-/// 以及**必须退回原路**的形状（`WHERE` / `avg` / `GROUP BY` / 表达式）——
+/// 以及**必须退回原路**的形状（翻译不出来的谓词 / `avg` / 形状对不上的 `GROUP BY` / 表达式）——
 /// 退回的那些也必须逐位相同（退错了同样是错），而且**不许**偷偷打聚合拉取。
 #[tokio::test]
 async fn pushed_down_aggregates_match_the_row_path_bit_for_bit() {
@@ -466,7 +496,16 @@ async fn pushed_down_aggregates_match_the_row_path_bit_for_bit() {
         ("SELECT count(*) FROM agg WHERE v < -1 OR v > 5", true),
         // 字面量在左 ⇒ 比较符必须翻转（不翻就是静默错）
         ("SELECT count(*) FROM agg WHERE 3 <= v", true),
-        // 必须退回原路：翻译不出来的谓词、avg、GROUP BY、表达式
+        // `§177`：**分组**也能下推（每组的标量过网，不是行）
+        ("SELECT v, count(*) FROM agg GROUP BY v", true),
+        ("SELECT v, count(*), sum(v), min(v) FROM agg GROUP BY v", true),
+        // 字符串分组键（看板里最常见的"按主机/租户分组"）
+        ("SELECT s, count(*) FROM agg GROUP BY s", true),
+        // 多列键 + "键在前、聚合在后"
+        ("SELECT v, s, count(*) FROM agg GROUP BY v, s", true),
+        // 谓词与分组一起：先筛行、再分组
+        ("SELECT v, count(*) FROM agg WHERE v > 0 GROUP BY v", true),
+        // 必须退回原路：翻译不出来的谓词、avg，以及**形状对不上**的分组
         // 注：`v LIKE 'a%'` 是**非法的**（Int64 对字符串模式，DataFusion 直接报类型错）
         // ⇒ 换几个**合法但翻译不出来**的形状
         ("SELECT count(*) FROM agg WHERE v BETWEEN 1 AND 3", false),
@@ -474,8 +513,12 @@ async fn pushed_down_aggregates_match_the_row_path_bit_for_bit() {
         ("SELECT count(*) FROM agg WHERE v > 1.5", false),
         ("SELECT count(*) FROM agg WHERE abs(v) > 1", false),
         ("SELECT count(*) FROM agg WHERE NOT (v > 1)", false),
+        // 分组里"不能下推"的：投影顺序不符、表达式键、ORDER BY、HAVING
+        ("SELECT count(*), v FROM agg GROUP BY v", false),
+        ("SELECT v + 1, count(*) FROM agg GROUP BY v + 1", false),
+        ("SELECT v, count(*) FROM agg GROUP BY v ORDER BY v", false),
+        ("SELECT v, count(*) FROM agg GROUP BY v HAVING count(*) > 1", false),
         ("SELECT avg(v) FROM agg", false),
-        ("SELECT v, count(*) FROM agg GROUP BY v", false),
         ("SELECT count(*) + 1 FROM agg", false),
     ];
     for (sql, pushable) in cases {

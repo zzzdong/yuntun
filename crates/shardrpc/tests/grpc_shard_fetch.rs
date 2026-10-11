@@ -252,6 +252,23 @@ async fn known_batch_ids_fence_survives_the_wire() {
     assert_eq!(unrelated.rows(), 3, "不相干的 batch 不得误伤热数据");
 }
 
+/// 取不分组结果（形状不符 ⇒ 响亮失败：那说明协议两侧说的不是同一件事）。
+fn plain_of(states: &yuntun_model::agg::AggStates) -> Vec<yuntun_model::agg::PartialAgg> {
+    match states {
+        yuntun_model::agg::AggStates::Plain(p) => p.clone(),
+        other => panic!("期望不分组结果，实际：{other:?}"),
+    }
+}
+
+fn groups_of(
+    states: &yuntun_model::agg::AggStates,
+) -> Vec<yuntun_model::agg::GroupStates> {
+    match states {
+        yuntun_model::agg::AggStates::Grouped(g) => g.clone(),
+        other => panic!("期望分组结果，实际：{other:?}"),
+    }
+}
+
 /// `§173`：**聚合拉取过网络** —— 只回标量，且**顺序与长度是契约**。
 ///
 /// 三条都要钉住：
@@ -277,31 +294,27 @@ async fn aggregate_pull_survives_the_wire() {
         AggSpec::new(AggKind::Min, "a"),
         AggSpec::new(AggKind::Max, "a"),
     ];
+    let q = yuntun_model::agg::AggQuery::plain(specs.clone());
     let over_wire = remote
-        .read_table_aggs(TABLE, 0, &[], &specs, None)
+        .read_table_aggs(TABLE, 0, &[], &q)
         .await
         .expect("聚合拉取过网络");
     let in_process = local
-        .read_table_aggs(TABLE, 0, &[], &specs, None)
+        .read_table_aggs(TABLE, 0, &[], &q)
         .await
         .expect("进程内聚合拉取");
 
     assert_eq!(
-        over_wire.partials, in_process.partials,
+        over_wire.states, in_process.states,
         "过网与进程内必须逐位相同（契约是按序、按长、按值）"
     );
-    assert_eq!(over_wire.partials.len(), specs.len(), "长度是契约");
-    assert_eq!(over_wire.partials[0], PartialAgg::Count(3), "count(*)");
-    assert_eq!(over_wire.partials[1], PartialAgg::Count(3), "count(a)");
-    assert_eq!(over_wire.partials[2], PartialAgg::SumInt(Some(6)), "sum");
-    assert_eq!(
-        over_wire.partials[3],
-        PartialAgg::Min(Some(AggScalar::Int(1)))
-    );
-    assert_eq!(
-        over_wire.partials[4],
-        PartialAgg::Max(Some(AggScalar::Int(3)))
-    );
+    let wire = plain_of(&over_wire.states);
+    assert_eq!(wire.len(), specs.len(), "长度是契约");
+    assert_eq!(wire[0], PartialAgg::Count(3), "count(*)");
+    assert_eq!(wire[1], PartialAgg::Count(3), "count(a)");
+    assert_eq!(wire[2], PartialAgg::SumInt(Some(6)), "sum");
+    assert_eq!(wire[3], PartialAgg::Min(Some(AggScalar::Int(1))));
+    assert_eq!(wire[4], PartialAgg::Max(Some(AggScalar::Int(3))));
     assert_eq!(
         over_wire.flushed_watermark, in_process.flushed_watermark,
         "水位必须一起过网（与行级拉取同一口径）"
@@ -323,26 +336,26 @@ async fn aggregate_pull_survives_the_wire() {
             op: CmpOp::Gt,
             value: Literal::Int(1),
         };
+        let q = yuntun_model::agg::AggQuery {
+            specs: spec.clone(),
+            group_by: Vec::new(),
+            predicate: Some(p.clone()),
+        };
         let filtered = remote
-            .read_table_aggs(TABLE, 0, &[], &spec, Some(&p))
+            .read_table_aggs(TABLE, 0, &[], &q)
             .await
             .expect("带谓词的聚合拉取");
-        assert_eq!(filtered.partials[0], PartialAgg::Count(2), "只有 3 与 2 放行");
-        assert_eq!(filtered.partials[1], PartialAgg::SumInt(Some(5)));
-        assert_eq!(
-            filtered.partials[2],
-            PartialAgg::Min(Some(AggScalar::Int(2)))
-        );
-        assert_eq!(
-            filtered.partials[3],
-            PartialAgg::Max(Some(AggScalar::Int(3)))
-        );
+        let f = plain_of(&filtered.states);
+        assert_eq!(f[0], PartialAgg::Count(2), "只有 3 与 2 放行");
+        assert_eq!(f[1], PartialAgg::SumInt(Some(5)));
+        assert_eq!(f[2], PartialAgg::Min(Some(AggScalar::Int(2))));
+        assert_eq!(f[3], PartialAgg::Max(Some(AggScalar::Int(3))));
         // 与进程内同一条路径逐位相同（谓词两侧的转译不能有任何差别）
         let local = local
-            .read_table_aggs(TABLE, 0, &[], &spec, Some(&p))
+            .read_table_aggs(TABLE, 0, &[], &q)
             .await
             .expect("进程内带谓词的聚合拉取");
-        assert_eq!(filtered.partials, local.partials);
+        assert_eq!(filtered.states, local.states);
     }
 
     // 空集：`sum`/`min`/`max` 是 NULL（不是 0）—— 这条也会过网
@@ -351,10 +364,89 @@ async fn aggregate_pull_survives_the_wire() {
     let empty_addr = serve(empty_local).await;
     let empty_remote = remote_reader(&empty_addr).await;
     let got = empty_remote
-        .read_table_aggs(TABLE, 0, &[], &specs, None)
+        .read_table_aggs(TABLE, 0, &[], &yuntun_model::agg::AggQuery::plain(specs.clone()))
         .await
         .expect("空来源也要能答");
-    assert_eq!(got.partials[0], PartialAgg::Count(0));
-    assert_eq!(got.partials[2], PartialAgg::SumInt(None), "空集求和是 NULL");
-    assert_eq!(got.partials[3], PartialAgg::Min(None));
+    let g = plain_of(&got.states);
+    assert_eq!(g[0], PartialAgg::Count(0));
+    assert_eq!(g[2], PartialAgg::SumInt(None), "空集求和是 NULL");
+    assert_eq!(g[3], PartialAgg::Min(None));
+}
+
+/// `§177`：**分组**也要过网，而且网里仍然是**标量**（每组的标量），不是行。
+///
+/// 用具体数字钉住它（数据在 `[3, 1, 2]` 上按值分组 ⇒ 三个组，每组一行）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn grouped_aggregate_pull_survives_the_wire() {
+    use yuntun_model::agg::{AggKind, AggQuery, AggScalar, AggSpec, PartialAgg};
+    use yuntun_model::predicate::{CmpOp, Literal, Predicate};
+
+    let dir = yuntun_testkit::TestDir::tmpfs("wire-agg-grouped");
+    let chunk = instance(&dir, "inst-g");
+    write(&chunk, &[3, 1, 2, 1]);
+    let local: Arc<dyn ShardReader> = chunk;
+    let addr = serve(local.clone()).await;
+    let remote = remote_reader(&addr).await;
+
+    let q = AggQuery {
+        specs: vec![AggSpec::count_star(), AggSpec::new(AggKind::SumInt, "a")],
+        group_by: vec!["a".into()],
+        predicate: None,
+    };
+    let over_wire = remote
+        .read_table_aggs(TABLE, 0, &[], &q)
+        .await
+        .expect("分组聚合拉取过网络");
+    let in_process = local
+        .read_table_aggs(TABLE, 0, &[], &q)
+        .await
+        .expect("进程内分组聚合拉取");
+    assert_eq!(over_wire.states, in_process.states, "过网与进程内必须逐位相同");
+
+    let groups = groups_of(&over_wire.states);
+    let got: Vec<_> = groups
+        .iter()
+        .map(|g| (g.key.clone(), g.states.clone()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (
+                vec![Some(AggScalar::Int(1))],
+                vec![PartialAgg::Count(2), PartialAgg::SumInt(Some(2))]
+            ),
+            (
+                vec![Some(AggScalar::Int(2))],
+                vec![PartialAgg::Count(1), PartialAgg::SumInt(Some(2))]
+            ),
+            (
+                vec![Some(AggScalar::Int(3))],
+                vec![PartialAgg::Count(1), PartialAgg::SumInt(Some(3))]
+            ),
+        ],
+        "按键升序的三个组：{got:?}"
+    );
+
+    // 分组 + 谓词一起过网（`v > 1` ⇒ 只剩 2 与 3 两组）
+    let q2 = AggQuery {
+        specs: vec![AggSpec::count_star()],
+        group_by: vec!["a".into()],
+        predicate: Some(Predicate::Cmp {
+            column: "a".into(),
+            op: CmpOp::Gt,
+            value: Literal::Int(1),
+        }),
+    };
+    let filtered = remote
+        .read_table_aggs(TABLE, 0, &[], &q2)
+        .await
+        .expect("分组 + 谓词");
+    let fg = groups_of(&filtered.states);
+    assert_eq!(
+        fg.iter().map(|g| g.key.clone()).collect::<Vec<_>>(),
+        vec![
+            vec![Some(AggScalar::Int(2))],
+            vec![Some(AggScalar::Int(3))]
+        ]
+    );
 }

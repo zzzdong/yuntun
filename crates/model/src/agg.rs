@@ -19,6 +19,7 @@
 //!
 //! 这两条是**边界**而不是性能取舍：越过它们的后果是"结果悄悄错一点"。
 
+use std::collections::BTreeMap;
 use arrow::array::{Array, Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 
@@ -83,7 +84,10 @@ impl AggSpec {
 }
 
 /// `min`/`max` 的比较载体（今天只支持整数与字符串 —— 见模块文档第 2 条）。
-#[derive(Clone, Debug, PartialEq)]
+///
+/// `Ord` 只用于**分组键的排序**（确定性纪律：两个来源的同一组要能被合到一起），
+/// **不**用于 `min`/`max` 的语义 —— 那是 [`Self::cmp`]（类型不一致时**响亮失败**）。
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AggScalar {
     Int(i64),
     Text(String),
@@ -110,7 +114,7 @@ impl AggScalar {
 /// `None` 的语义与 SQL 一致：`sum`/`min`/`max` 在**空集**（或全 NULL 列）上是 NULL，
 /// 而 `count` 是 0。合并时必须保留这个差别（`None + Some(x) = Some(x)`，但
 /// `None + None = None`）—— 把 NULL 当 0 会让"空表求和"变成 0 而不是 NULL。
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PartialAgg {
     Count(u64),
     SumInt(Option<i64>),
@@ -269,6 +273,213 @@ pub fn merge_all(partials: &[PartialAgg]) -> Result<Option<PartialAgg>, LakeErro
         acc = merge(&acc, p)?;
     }
     Ok(Some(acc))
+}
+
+/// 一次**聚合拉取**的请求（`§177`）：算哪些聚合、按哪些列分组、先按什么谓词筛行。
+///
+/// 三个参数打包成一个结构体的理由：它们**一起**决定"要算什么"，而 trait 方法每加一个
+/// 参数就要改一遍所有实现（`read_table_aggs` 已经改过两轮了）。
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct AggQuery {
+    pub specs: Vec<AggSpec>,
+    /// 分组键列（**有序**）；空 = 不分组
+    pub group_by: Vec<String>,
+    pub predicate: Option<Predicate>,
+}
+
+impl AggQuery {
+    /// 不分组的查询（`§173` 的形状）
+    pub fn plain(specs: Vec<AggSpec>) -> Self {
+        Self {
+            specs,
+            group_by: Vec::new(),
+            predicate: None,
+        }
+    }
+
+    pub fn is_grouped(&self) -> bool {
+        !self.group_by.is_empty()
+    }
+}
+
+/// 分组键的一个分量。
+///
+/// `None` = 该列的键是 **NULL**：SQL 的 `GROUP BY` 把 NULL **当作一个组**
+/// （与 `=` 的语义不同 —— `NULL = NULL` 是 UNKNOWN，但分组时它们就是一组）
+/// ⇒ 必须用一个**独立分量**表示它，而不是"没有值"。
+pub type KeyPart = Option<AggScalar>;
+
+/// 一组的状态（`§177`）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupStates {
+    /// 与 [`AggQuery::group_by`] **同序同长**（顺序是契约的一部分）
+    pub key: Vec<KeyPart>,
+    /// 与 [`AggQuery::specs`] **同序同长**
+    pub states: Vec<PartialAgg>,
+}
+
+/// 聚合拉取的结果（`§177`）。
+///
+/// **两种形状之一**，由请求带不带 `group_by` 决定。刻意做成**和类型**而不是两个可选字段：
+/// "两个字段只有一个有意义"是**可以误用**的契约（而且哪个有意义要靠猜）⇒ 用类型表达。
+#[derive(Clone, Debug, PartialEq)]
+pub enum AggStates {
+    /// 不分组：与 specs 同序同长（**空输入也是单位元，不是空 Vec**）
+    Plain(Vec<PartialAgg>),
+    /// 分组：**按 key 升序**（确定性：多来源的同一组必须能合到一起）
+    Grouped(Vec<GroupStates>),
+}
+
+impl AggStates {
+    /// 组的个数（不分组时恒为 1）。
+    pub fn groups(&self) -> usize {
+        match self {
+            Self::Plain(_) => 1,
+            Self::Grouped(g) => g.len(),
+        }
+    }
+}
+
+/// 按 [`AggQuery`] 在**多批**上折叠（`§177`）。
+///
+/// 分组时**逐行**累积到该组的状态上（批与来源之间的顺序都不影响结果 —— 这几种聚合
+/// 都是可交换可结合的，而"哪个组"由**键**决定）。
+pub fn fold_query(query: &AggQuery, batches: &[RecordBatch]) -> Result<AggStates, LakeError> {
+    if !query.is_grouped() {
+        return Ok(AggStates::Plain(fold_batches_with(
+            &query.specs,
+            batches,
+            query.predicate.as_ref(),
+        )?));
+    }
+    let mut acc: BTreeMap<Vec<KeyPart>, Vec<PartialAgg>> = BTreeMap::new();
+    for batch in batches {
+        // 谓词**先**筛行（`§176`），再按行分组
+        let work = match query.predicate.as_ref() {
+            None => std::borrow::Cow::Borrowed(batch),
+            Some(p) => std::borrow::Cow::Owned(crate::predicate::filter_batch(batch, p)?),
+        };
+        for row in 0..work.num_rows() {
+            let key = key_of(&work, &query.group_by, row)?;
+            let states = acc
+                .entry(key)
+                .or_insert_with(|| query.specs.iter().map(|s| PartialAgg::empty(s.kind)).collect());
+            for (i, spec) in query.specs.iter().enumerate() {
+                states[i] = merge(&states[i], &fold_one(spec, &work, row)?)?;
+            }
+        }
+    }
+    Ok(AggStates::Grouped(
+        acc.into_iter()
+            .map(|(key, states)| GroupStates { key, states })
+            .collect(),
+    ))
+}
+
+/// 把两个来源的结果合到一起（`§177`）；形状不一致 ⇒ **响亮失败**（那是契约错，
+/// 静默取一边会让"少了一个分组"以正常答案的形式活下来）。
+pub fn merge_states(a: &AggStates, b: &AggStates) -> Result<AggStates, LakeError> {
+    match (a, b) {
+        (AggStates::Plain(x), AggStates::Plain(y)) => {
+            let mut out = Vec::with_capacity(x.len());
+            for i in 0..x.len().max(y.len()) {
+                let lhs = x.get(i).ok_or_else(|| mismatch("plain", x.len(), y.len()))?;
+                let rhs = y.get(i).ok_or_else(|| mismatch("plain", x.len(), y.len()))?;
+                out.push(merge(lhs, rhs)?);
+            }
+            Ok(AggStates::Plain(out))
+        }
+        (AggStates::Grouped(x), AggStates::Grouped(y)) => {
+            let mut acc: BTreeMap<Vec<KeyPart>, Vec<PartialAgg>> = BTreeMap::new();
+            for g in x.iter().chain(y.iter()) {
+                let states = acc.entry(g.key.clone()).or_insert_with(|| {
+                    g.states
+                        .iter()
+                        .map(|p| PartialAgg::empty(p.kind()))
+                        .collect()
+                });
+                for (i, p) in g.states.iter().enumerate() {
+                    let cur = states
+                        .get(i)
+                        .ok_or_else(|| mismatch("grouped", g.states.len(), i))?;
+                    states[i] = merge(cur, p)?;
+                }
+            }
+            Ok(AggStates::Grouped(
+                acc.into_iter()
+                    .map(|(key, states)| GroupStates { key, states })
+                    .collect(),
+            ))
+        }
+        _ => Err(LakeError::Other(
+            "聚合部分状态的形状不一致（一边分组、一边不分组）".into(),
+        )),
+    }
+}
+
+fn mismatch(what: &str, a: usize, b: usize) -> LakeError {
+    LakeError::Other(format!(
+        "聚合部分状态的长度不一致（{what}：{a} vs {b}）—— 两个来源说的不是同一件事"
+    ))
+}
+
+/// 一行在该分组键上的取值（**列缺失 = NULL**，与 `fold_batch` 同口径）。
+fn key_of(
+    batch: &RecordBatch,
+    group_by: &[String],
+    row: usize,
+) -> Result<Vec<KeyPart>, LakeError> {
+    let mut out = Vec::with_capacity(group_by.len());
+    for name in group_by {
+        let Ok(idx) = batch.schema().index_of(name) else {
+            out.push(None);
+            continue;
+        };
+        let col = batch.column(idx);
+        out.push(if col.is_null(row) {
+            None
+        } else {
+            Some(scalar_at(col, row)?)
+        });
+    }
+    Ok(out)
+}
+
+/// 一行的部分状态（单行版：分组时要逐行累积）。
+fn fold_one(spec: &AggSpec, batch: &RecordBatch, row: usize) -> Result<PartialAgg, LakeError> {
+    let Some(name) = spec.column.as_deref() else {
+        return Ok(PartialAgg::Count(1)); // `count(*)`：一行就是 1
+    };
+    let empty = || match spec.kind {
+        AggKind::Count | AggKind::CountStar => PartialAgg::Count(0),
+        AggKind::SumInt => PartialAgg::SumInt(None),
+        AggKind::Min => PartialAgg::Min(None),
+        AggKind::Max => PartialAgg::Max(None),
+    };
+    // 列缺失 或 该行是 NULL ⇒ 这一行**不贡献**（`count` 不加、`sum/min/max` 保持 NULL）
+    if batch.schema().index_of(name).is_err() || column(batch, spec)?.is_null(row) {
+        return Ok(empty());
+    }
+    Ok(match spec.kind {
+        AggKind::Count | AggKind::CountStar => PartialAgg::Count(1),
+        AggKind::SumInt => PartialAgg::SumInt(Some(int_column(batch, spec)?.value(row))),
+        AggKind::Min => PartialAgg::Min(Some(scalar_at(column(batch, spec)?, row)?)),
+        AggKind::Max => PartialAgg::Max(Some(scalar_at(column(batch, spec)?, row)?)),
+    })
+}
+
+/// 取一行上的标量（今天只有整数与字符串两种分组键 —— 判定层已经把别的类型挡在门外）。
+fn scalar_at(col: &dyn Array, row: usize) -> Result<AggScalar, LakeError> {
+    if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+        return Ok(AggScalar::Int(a.value(row)));
+    }
+    if let Some(a) = col.as_any().downcast_ref::<StringArray>() {
+        return Ok(AggScalar::Text(a.value(row).to_string()));
+    }
+    Err(LakeError::Other(format!(
+        "分组键/极值的类型不认识：{:?}",
+        col.data_type()
+    )))
 }
 
 fn min_of(
@@ -514,5 +725,175 @@ mod tests {
         .unwrap();
         assert_eq!(got, PartialAgg::Count(5));
         assert!(merge_all(&[]).unwrap().is_none());
+    }
+
+    // ------------------------------------------------------ 分组聚合（`§177`）
+
+    /// 两列：`v` 整数（分组键用）、`s` 字符串（分组键用）。
+    fn batch2(
+        vals: Vec<Option<i64>>,
+        names: Vec<Option<&str>>,
+    ) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Int64, true),
+            Field::new("s", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vals)),
+                Arc::new(StringArray::from(names)),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn grouped(query: AggQuery, batches: Vec<RecordBatch>) -> Vec<GroupStates> {
+        match fold_query(&query, &batches).unwrap() {
+            AggStates::Grouped(g) => g,
+            other => panic!("应当是分组结果：{other:?}"),
+        }
+    }
+
+    /// **NULL 是一个组**（SQL 的分组语义：`NULL = NULL` 虽然是 UNKNOWN，但分组时它们是一组）。
+    /// 写错这一条的形态是"NULL 行各成一组"或"NULL 行被丢掉" —— 两种都不报错。
+    #[test]
+    fn grouped_fold_puts_null_keys_in_one_group() {
+        let mut q = AggQuery::plain(vec![AggSpec::count_star()]);
+        q.group_by = vec!["v".into()];
+        let got = grouped(q, vec![batch(vec![Some(1), None, Some(1), None])]);
+        assert_eq!(got.len(), 2, "两组：1 与 NULL：{got:?}");
+        assert_eq!(got[0].key, vec![None], "NULL 排在整数之前（键序只求确定）");
+        assert_eq!(got[0].states[0], PartialAgg::Count(2));
+        assert_eq!(got[1].key, vec![Some(AggScalar::Int(1))]);
+        assert_eq!(got[1].states[0], PartialAgg::Count(2));
+    }
+
+    /// 两个来源**按键合并**（不是"按行对齐"），且 NULL 键在两边指的是同一个组。
+    #[test]
+    fn grouped_merge_is_key_wise_including_the_null_key() {
+        let specs = vec![AggSpec::count_star(), AggSpec::new(AggKind::SumInt, "v")];
+        let a = fold_query(
+            &AggQuery {
+                specs: specs.clone(),
+                group_by: vec!["v".into()],
+                predicate: None,
+            },
+            &[batch(vec![Some(1), None, Some(3)])],
+        )
+        .unwrap();
+        let b = fold_query(
+            &AggQuery {
+                specs: specs.clone(),
+                group_by: vec!["v".into()],
+                predicate: None,
+            },
+            &[batch(vec![Some(1), None, Some(7)])],
+        )
+        .unwrap();
+        let merged = merge_states(&a, &b).unwrap();
+        let AggStates::Grouped(g) = merged else {
+            panic!("应当是分组结果");
+        };
+        let got: Vec<_> = g
+            .iter()
+            .map(|x| (x.key.clone(), x.states.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    vec![None],
+                    vec![PartialAgg::Count(2), PartialAgg::SumInt(None)]
+                ),
+                (
+                    vec![Some(AggScalar::Int(1))],
+                    vec![PartialAgg::Count(2), PartialAgg::SumInt(Some(2))]
+                ),
+                (
+                    vec![Some(AggScalar::Int(3))],
+                    vec![PartialAgg::Count(1), PartialAgg::SumInt(Some(3))]
+                ),
+                (
+                    vec![Some(AggScalar::Int(7))],
+                    vec![PartialAgg::Count(1), PartialAgg::SumInt(Some(7))]
+                ),
+            ],
+            "按键合并 + 键升序：{got:?}"
+        );
+    }
+
+    /// **字符串键**与**多列键**（看板里最常见的就是"按主机/租户分组"）。
+    #[test]
+    fn grouped_fold_handles_text_and_multi_column_keys() {
+        let mut q = AggQuery::plain(vec![AggSpec::count_star()]);
+        q.group_by = vec!["s".into(), "v".into()];
+        let got = grouped(
+            q,
+            vec![batch2(
+                vec![Some(1), Some(1), Some(2)],
+                vec![Some("b"), Some("a"), Some("b")],
+            )],
+        );
+        let keys: Vec<_> = got.iter().map(|g| g.key.clone()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                vec![Some(AggScalar::Text("a".into())), Some(AggScalar::Int(1))],
+                vec![Some(AggScalar::Text("b".into())), Some(AggScalar::Int(1))],
+                vec![Some(AggScalar::Text("b".into())), Some(AggScalar::Int(2))],
+            ],
+            "多列键按**字典序**升序：{keys:?}"
+        );
+    }
+
+    /// 分组与谓词**同时**生效（谓词先筛行，再分组）。
+    #[test]
+    fn grouped_fold_applies_the_predicate_before_grouping() {
+        use crate::predicate::{CmpOp, Literal};
+        let mut q = AggQuery::plain(vec![AggSpec::count_star()]);
+        q.group_by = vec!["v".into()];
+        q.predicate = Some(Predicate::Cmp {
+            column: "v".into(),
+            op: CmpOp::Gt,
+            value: Literal::Int(1),
+        });
+        let got = grouped(q, vec![batch(vec![Some(1), Some(2), None, Some(2)])]);
+        assert_eq!(
+            got,
+            vec![GroupStates {
+                key: vec![Some(AggScalar::Int(2))],
+                states: vec![PartialAgg::Count(2)],
+            }],
+            "只有 v=2 的两行（NULL 不放行、v=1 不满足）：{got:?}"
+        );
+    }
+
+    /// 空输入的两种形状：**不分组 ⇒ 单位元**（不是空 Vec）；**分组 ⇒ 没有组**。
+    #[test]
+    fn empty_input_gives_identity_or_no_groups() {
+        let plain = fold_query(
+            &AggQuery::plain(vec![AggSpec::count_star(), AggSpec::new(AggKind::Min, "v")]),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            plain,
+            AggStates::Plain(vec![PartialAgg::Count(0), PartialAgg::Min(None)])
+        );
+        let mut q = AggQuery::plain(vec![AggSpec::count_star()]);
+        q.group_by = vec!["v".into()];
+        assert_eq!(fold_query(&q, &[]).unwrap(), AggStates::Grouped(vec![]));
+    }
+
+    /// 形状不一致 ⇒ **响亮失败**（"一边分组、一边不分组"是契约错，静默取一边会少算）。
+    #[test]
+    fn mismatched_states_are_loud() {
+        let mut q = AggQuery::plain(vec![AggSpec::count_star()]);
+        q.group_by = vec!["v".into()];
+        let grouped_states = fold_query(&q, &[batch(vec![Some(1)])]).unwrap();
+        let plain_states = fold_query(&AggQuery::plain(vec![AggSpec::count_star()]), &[]).unwrap();
+        let e = merge_states(&grouped_states, &plain_states).unwrap_err();
+        assert!(e.to_string().contains("形状不一致"), "{e}");
     }
 }

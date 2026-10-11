@@ -76,6 +76,29 @@ message FetchShardAggsRequest {
   // 可选的行过滤（`§176`）：**缺席 = 不过滤**。语义与 SQL 的 `WHERE` 一致
   // （只放行 TRUE；NULL 参与的比较是 UNKNOWN ⇒ 不放行）。
   PredicateMsg predicate = 5;
+  // **分组键列**（`§177`；顺序是契约的一部分）。
+  //
+  // 空 ⇒ 响应走 `partials`（"一整组"的部分状态）；非空 ⇒ 响应走 `groups`
+  // （每个键一组）。两者**互斥**，由这里决定 —— 协议里不放两个可选字段让对端去猜。
+  repeated string group_by = 6;
+}
+
+// 一个标量值（**分组键的分量**；也用于表达 `min`/`max` 的极值）。
+// `has_value = false` ⇒ **NULL**（分组时 NULL 是**一个组**，与 `=` 的语义不同）。
+message ScalarMsg {
+  bool has_value = 1;
+  // `true` ⇒ 读 `text_val`；`false` ⇒ 读 `int_val`
+  bool is_text   = 2;
+  int64 int_val  = 3;
+  string text_val = 4;
+}
+
+// 一个分组键对应的部分状态（`§177`）。
+message GroupStatesMsg {
+  // 与请求的 `group_by` **同序同长**
+  repeated ScalarMsg key = 1;
+  // 与请求的 `aggs` **同序同长**
+  repeated PartialAggMsg states = 2;
 }
 
 // 一个聚合的部分状态。
@@ -97,12 +120,16 @@ message PartialAggMsg {
 }
 
 message FetchShardAggsResponse {
-  // 与请求 `aggs` **同序同长**（长度不符 = 协议错，调用方应当报错而不是猜）
+  // 与请求 `aggs` **同序同长**（长度不符 = 协议错，调用方应当报错而不是猜）。
+  // **仅当**请求没带 `group_by` 时使用（带 `group_by` 时看 `groups`）。
   repeated PartialAggMsg partials = 1;
   uint64 flushed_watermark = 2;
   // 与行级拉取同一语义：`known_manifest_ver < flushed_watermark` ⇒ 本次可能不完整，
   // 而且**聚合比行更危险**（少一个来源 = 计数偏小却看起来像个正常数字）
   bool stale = 3;
+  // **分组结果**（`§177`；请求带 `group_by` 时才用）：按 key **升序** ⇒
+  // 两个来源的同一组能被确定性地合并。没有行 ⇒ 空列表（不是"一个空组"）。
+  repeated GroupStatesMsg groups = 4;
 }
 
 message ShardIdMsg {

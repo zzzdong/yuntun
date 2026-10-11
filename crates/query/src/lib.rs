@@ -113,7 +113,8 @@ impl QueryOutcome {
 /// 刻意复用同一套三态语义：`Read` = 拿到了；`Missing` = 拿不到（降级 + 点名）；
 /// `Stale` = 还没拿到（刷新重试，**不得当答案**）。两套语义只会在某个边界上漂。
 enum AggOutcome {
-    Read(Vec<yuntun_model::agg::PartialAgg>),
+    /// `§177`：可能是**分组**结果（每组的标量），不只是"一行"
+    Read(yuntun_model::agg::AggStates),
     Missing(String),
     Stale(HotReadStale),
 }
@@ -357,19 +358,37 @@ impl QueryEngine {
         // （网络白花），而且**同一批热数据会被算两遍**（一次在冷扫描里、一次在聚合 RPC 里）。
         let partial = std::sync::Arc::new(PartialSink::new(self.partial_policy));
         let ctx = self.session_cold_only(schema, partial.clone()).await?;
-        let cold = ctx.sql(query).await?.collect().await?;
-        // 形状判定是**保守**的（拿不准不下推），所以"判定通过但产物形状不对"不该发生；
-        // 真发生了就**原路重跑**，而不是猜一个（正确性优先于省下的那次扫描）。
-        let cold = match cold.as_slice() {
-            [b] if b.num_rows() == 1 && b.num_columns() == plan.specs.len() => b.clone(),
-            _ => {
+        let cold_batches = ctx.sql(query).await?.collect().await?;
+        // ⚠️ **先拼成一张**：DataFusion 按分区产出批次，分组时几乎必然是**多批**
+        // （不分组时也常是 1 批，但不能依赖这个 —— 依赖它就会"判定通过却退回原路"，
+        //  而那种失败**没有任何报错**，只是悄悄不优化）。
+        let cold = match cold_batches.first() {
+            Some(first) => arrow::compute::concat_batches(&first.schema(), &cold_batches)
+                .map_err(|e| DataFusionError::Execution(format!("聚合下推：冷结果拼接失败：{e}")))?,
+            None => {
                 tracing::debug!(
                     table = %plan.table,
-                    "聚合下推：冷结果的形状与判定不符，退回原路"
+                    "聚合下推：冷结果为空批次，退回原路"
                 );
                 return Ok(None);
             }
         };
+        // 形状判定是**保守**的（拿不准不下推），所以"判定通过但产物形状不对"不该发生；
+        // 真发生了就**原路重跑**，而不是猜一个（正确性优先于省下的那次扫描）。
+        // `§177`：分组时冷结果是"**每组一行**"（行数由数据决定），不分组时恒为 1 行
+        let want_cols = plan.group_by.len() + plan.specs.len();
+        if cold.num_columns() != want_cols
+            || (cold.num_rows() != 1 && plan.group_by.is_empty())
+        {
+            tracing::debug!(
+                table = %plan.table,
+                grouped = !plan.group_by.is_empty(),
+                rows = cold.num_rows(),
+                cols = cold.num_columns(),
+                "聚合下推：冷结果的形状与判定不符，退回原路"
+            );
+            return Ok(None);
+        }
 
         // ---- ② 热的一半：逐来源下发（只回标量）----
         let hot = self.catalog.hot_shards();
@@ -384,15 +403,19 @@ impl QueryEngine {
 
         let outcomes = futures::future::join_all(hot.iter().map(|(instance, reader)| {
             let ident = plan.table.clone();
-            let specs = plan.specs.clone();
+            let aq = yuntun_model::agg::AggQuery {
+                specs: plan.specs.clone(),
+                group_by: plan.group_by.clone(),
+                predicate: plan.predicate.clone(),
+            };
             let exclude = exclude.clone();
-            let predicate = plan.predicate.clone();
             let instance = instance.clone();
             async move {
                 let outcome = match tokio::time::timeout_at(
                     deadline,
-                    // `§176`：谓词一起送过去（在**数据所在处**生效，网络里仍只走标量）
-                    reader.read_table_aggs(&ident, snap_ver, &exclude, &specs, predicate.as_ref()),
+                    // `§176`/`§177`：谓词与分组键一起送过去（都在**数据所在处**生效，
+                    // 网络里仍只走标量 —— 分组只是"每组的标量"，不是行）
+                    reader.read_table_aggs(&ident, snap_ver, &exclude, &aq),
                 )
                 .await
                 {
@@ -402,7 +425,7 @@ impl QueryEngine {
                         known_manifest_ver: snap_ver,
                         flushed_watermark: a.flushed_watermark,
                     }),
-                    Ok(Ok(a)) => AggOutcome::Read(a.partials),
+                    Ok(Ok(a)) => AggOutcome::Read(a.states),
                     Ok(Err(e)) => AggOutcome::Missing(e.to_string()),
                     Err(_elapsed) => AggOutcome::Missing(format!(
                         "超出热读预算（{} ms 内未答复）",
@@ -414,10 +437,10 @@ impl QueryEngine {
         }))
         .await;
 
-        let mut per_source: Vec<Vec<yuntun_model::agg::PartialAgg>> = Vec::with_capacity(hot.len());
+        let mut per_source: Vec<yuntun_model::agg::AggStates> = Vec::with_capacity(hot.len());
         for (instance, outcome) in outcomes {
             match outcome {
-                AggOutcome::Read(partials) => per_source.push(partials),
+                AggOutcome::Read(states) => per_source.push(states),
                 AggOutcome::Missing(reason) => {
                     let source = MissingSource {
                         table: plan.table.clone(),
@@ -439,9 +462,18 @@ impl QueryEngine {
             }
         }
 
-        // ---- ③ 合并：热的部分状态并进冷结果的那一行 ----
-        let merged = agg_pushdown::merge_into_cold(&cold, &plan.specs, &per_source)
-            .map_err(|e| DataFusionError::Execution(format!("聚合下推合并失败：{e}")))?;
+        // ---- ③ 合并：热的部分状态并进冷结果（不分组 = 并进那一行；分组 = 按**键**并入每一组）----
+        let aq = yuntun_model::agg::AggQuery {
+            specs: plan.specs.clone(),
+            group_by: plan.group_by.clone(),
+            predicate: None, // 冷结果那一半由 DataFusion 自己算了，合并时不需要谓词
+        };
+        let merged = if aq.is_grouped() {
+            agg_pushdown::merge_grouped_into_cold(&cold, &aq, &per_source)
+        } else {
+            agg_pushdown::merge_into_cold(&cold, &plan.specs, &per_source)
+        }
+        .map_err(|e| DataFusionError::Execution(format!("聚合下推合并失败：{e}")))?;
         Ok(Some(QueryOutcome {
             batches: vec![merged],
             partial: partial.read(),
