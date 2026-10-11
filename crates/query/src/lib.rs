@@ -17,6 +17,7 @@ pub mod index;
 pub mod locate;
 pub mod partial;
 pub mod agg_pushdown;
+pub mod placement;
 mod stmt;
 pub mod prune;
 pub mod provider;
@@ -87,6 +88,8 @@ pub struct QueryEngine {
     index_pruning: bool,
     /// **聚合下推开关**（`§173`）：默认开；关掉只为**对拍**（见 [`Self::with_agg_pushdown`]）。
     agg_pushdown: bool,
+    /// **只读这几个冷文件**（`§178`）：默认 `None`（全读）；见 [`Self::with_only_files`]。
+    only_files: Option<Vec<String>>,
 }
 
 /// 一次查询的结果：批次 + **完整性标记**（`crate::partial`）。
@@ -133,6 +136,8 @@ impl QueryEngine {
             index_pruning: true,
             // `§173`：聚合下推默认开（关掉只为对拍）
             agg_pushdown: true,
+            // `§178`：默认读全部冷文件（分配是下一刀的事）
+            only_files: None,
         }
     }
 
@@ -158,6 +163,8 @@ impl QueryEngine {
             hot_read_budget: DEFAULT_HOT_READ_BUDGET,
             index_pruning: true,
             agg_pushdown: true,
+            // `§178`：默认读全部冷文件（分配是下一刀的事）
+            only_files: None,
         })
     }
 
@@ -209,6 +216,16 @@ impl QueryEngine {
     ///
     /// 唯一用途是**对拍**：同一批查询在"开"与"关"下必须**逐行一致** ——
     /// 剪错 = 静默少数据，而这条开关就是那个断言的载体（`query/tests/index_parity.rs`）。
+    /// **只读这几个冷文件**（`§178`，N4b 的接缝）：默认 `None`（全读）。
+    ///
+    /// 给它的场景是"这个引擎这一支只负责分配给它的那几个文件"。今天只有用例与下一刀的
+    /// 远端冷读会设它 —— 与 [`Self::with_index_pruning`] / [`Self::with_agg_pushdown`]
+    /// 同性质：**不是运维旋钮**，是对拍与下一刀的载体。
+    pub fn with_only_files(mut self, files: Option<Vec<String>>) -> Self {
+        self.only_files = files;
+        self
+    }
+
     /// **聚合下推开关**（`§173`）：默认开。
     ///
     /// 关掉只为一件事：**对拍**（同一查询在"下推"与"原路"两条路径上必须**逐位相同**）——
@@ -329,6 +346,7 @@ impl QueryEngine {
                     hot_read_budget: self.hot_read_budget,
                     index_pruning: self.index_pruning,
                     hot_enabled,
+                    only_files: self.only_files.clone(),
                 },
             )),
         );

@@ -101,6 +101,11 @@ pub struct ReadPath {
     ///
     /// 它不是给运维调的旋钮：只有聚合下推那条路径会关它，且**当次查询**用完即弃。
     pub hot_enabled: bool,
+    /// **只读这几个冷文件**（`§178`）：`None` = 全读。见 provider 里同名字段的说明。
+    ///
+    /// 与 `index_pruning` / `agg_pushdown` 同性质 —— 它是**下一刀（远端冷读）的接缝**与
+    /// 对拍的载体，不是给运维调的旋钮，也不放进 TOML。
+    pub only_files: Option<Vec<String>>,
 }
 
 /// 单个来源的热读结果 —— **够用就好**的三态。
@@ -145,6 +150,11 @@ pub struct YuntunTableProvider {
     index_pruning: bool,
     /// 热读开关（`§173`）：见 [`ReadPath::hot_enabled`]。
     hot_enabled: bool,
+    /// **只读这几个冷文件**（`§178`，N4b 的接缝）：`None` = 全读。
+    ///
+    /// 键是 [`FileManifest::file_path`]（全局唯一的路径，跨节点无歧义 —— **不要用下标**，
+    /// 下标在不同快照里会漂移）。给它的场景是"这一支只负责**分配给它**的那几个文件"。
+    only_files: Option<Vec<String>>,
     /// 索引文件的读取出口（`F.4`）
     store: Arc<dyn object_store::ObjectStore>,
 }
@@ -242,6 +252,7 @@ impl YuntunTableProvider {
             hot_read_budget: read.hot_read_budget,
             index_pruning: read.index_pruning,
             hot_enabled: read.hot_enabled,
+            only_files: read.only_files.clone(),
             store: read.store,
         }
     }
@@ -588,6 +599,26 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
                 "文件级剪枝：按清单 min/max 跳过文件（§129，plan T13.2）"
             );
         }
+        // `§178`：**只保留分配给这一支的文件**。放在这里（剪枝之后、取 DV / 分格式 /
+        // 建索引计划**之前**）是因为下面所有派生集合都从 `kept` 出发 ⇒ 一处过滤就够，
+        // 不必改三处；而且**热读栅栏那份清单不许过滤**（它必须是"本次快照全部可见批次"，
+        // 否则同一批数据会被算两遍）。
+        let kept: Vec<&FileManifest> = match &self.only_files {
+            None => kept,
+            Some(allow) => {
+                let kept: Vec<&FileManifest> = kept
+                    .into_iter()
+                    .filter(|f| allow.contains(&f.file_path))
+                    .collect();
+                tracing::debug!(
+                    table = %self.ident,
+                    kept = kept.len(),
+                    allowed = allow.len(),
+                    "冷文件分配：这一支只读分配给它的文件（§178）"
+                );
+                kept
+            }
+        };
         // ⚠️ **全被剪掉**时不能塞一个空的 `FileGroup`（扫描器会报错）⇒ 直接跳过这一支；
         // 下面第 ③ 支会给一个空的执行计划，语义正好（没有数据）。
         if !kept.is_empty() {
