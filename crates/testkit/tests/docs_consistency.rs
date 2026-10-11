@@ -546,6 +546,80 @@ fn architecture_config_keys_exist_in_the_parser() {
     );
 }
 
+/// **测试里的"墙钟断言"必须带豁免标记**（`§171`）。
+///
+/// 为什么值得钉：台账 `D-26` 的两条计时 flaky **是同一个形状** —— 用 `elapsed < 阈值` 去测
+/// "并发 / 收敛"，而那个阈值实际测的是**机器调度得多快**：同一个 test binary 里
+/// 多条重负载用例并行跑时必然翻车（那两条用例单独跑都 ok，并行跑就红）。
+/// 修法是把判据换成**事件**（并发峰值 / 按轮驱动到收敛）。
+///
+/// 仍需要墙钟的只剩一类：**"必须有界"的兜底**（防的是永不返回，而不是延迟度量）。
+/// 那类必须**显式写明理由** —— 做法是在该行或前 15 行内出现 `§171` 标记
+/// （当 waiver 用，与 `#[allow]` 同理：不是禁止，是要求说明"这条上界在防什么"）。
+///
+/// 扫描只认**代码行**（不认 `///` / `//` 开头的注释行），也**跳过本文件自己** ——
+/// 它的源码里必然出现那个模式（这正是文件头记的教训："判据不能依赖'文件里出现过某字符串'"；
+/// 跳过 `operation-log.md` 是同一条纪律的另一个例子）。
+#[test]
+fn wall_clock_assertions_need_a_reviewed_waiver() {
+    const WAIVER: &str = "§171";
+    const WINDOW: usize = 15;
+
+    let root = repo_root();
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("读 {} 失败：{e}", dir.display()))
+            .flatten()
+        {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(&root.join("crates"), &mut files);
+
+    // 被测对象：`elapsed <` / `elapsed >`（"用时必须小于/大于某个时长"= 拿墙钟当判据）
+    let is_clock_assertion = |line: &str| {
+        let t = line.trim_start();
+        !t.starts_with("//") && (line.contains("elapsed <") || line.contains("elapsed >"))
+    };
+
+    let me = std::fs::canonicalize(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/docs_consistency.rs"),
+    )
+    .ok();
+
+    let mut offenders: Vec<String> = Vec::new();
+    for f in &files {
+        if me.as_ref().is_some_and(|m| std::fs::canonicalize(f).ok().as_ref() == Some(m)) {
+            continue; // 本文件自己（见上面的说明）
+        }
+        let text = read(f);
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if !is_clock_assertion(line) {
+                continue;
+            }
+            let from = i.saturating_sub(WINDOW);
+            let waived = lines[from..=i].iter().any(|l| l.contains(WAIVER));
+            if !waived {
+                offenders.push(format!("{}:{} {}", f.display(), i + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "这些地方拿**墙钟**当判据（机器被占满时必然假失败，台账 `D-26`）：\n  {}\n\
+         → 首选换成**事件**判据（并发峰值 / 按轮驱动到收敛）；\n\
+         确实需要「必须有界」的兜底时，在断言前 15 行内写清理由并带 `§171` 标记。",
+        offenders.join("\n  ")
+    );
+}
+
 /// **代码注释里引用的台账编号（`D-*`）必须能在 `ROADMAP.md` 里找到**。
 ///
 /// 为什么值得钉：`docs/ROADMAP.md §4` 的台账是"实现与文档不符"的唯一登记处，而代码注释里

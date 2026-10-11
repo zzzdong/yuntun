@@ -1081,34 +1081,60 @@ async fn compaction_during_query_keeps_counts_monotonic() {
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         Arc::new(std::sync::Mutex::new(Vec::<u64>::new())),
     );
+    // 采样进度的广播通道（`§171`）：`usize` = 已采到几份样本
+    let (samples_tx, mut samples_rx) = tokio::sync::watch::channel(0usize);
     let query_task = {
         let (catalog, engine) = (setup.catalog.clone(), setup.engine.clone());
         let (stop, seen) = (stop.clone(), seen.clone());
+        // `§171`：采样任务把"已采到几份"广播出来，主循环据此**等到**样本再推进 ——
+        // "确实采到了"由**构造**保证，而不是赌 10ms 的采样任务插得进来。
+        // （原写法是事后断言"样本数 ≥ 3"，于是覆盖成了**机器快慢的函数**：
+        //  实测并行跑全量时 30s 只采到 1 份，而同一条用例单独跑只要 0.38s。）
+        let tx = samples_tx.clone();
         tokio::spawn(async move {
             loop {
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
                 let n = count_rows_parts(&catalog, &engine, "public.cq").await;
-                seen.lock().unwrap().push(n);
+                {
+                    let mut g = seen.lock().unwrap();
+                    g.push(n);
+                    let _ = tx.send(g.len()); // 广播"现在有几份"
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
     };
 
+    /// 等到采样任务至少出了 `n` 份样本（`§171`：覆盖由**构造**保证）。
+    ///
+    /// `§171` waiver：这里的时间上界只用来**防挂住**，不参与判定 ——
+    /// 判定看的是采样值本身（单调不减 / 不超过已 ack）。
+    async fn wait_for_samples(rx: &mut tokio::sync::watch::Receiver<usize>, n: usize) {
+        while *rx.borrow_and_update() < n {
+            tokio::time::timeout(Duration::from_secs(120), rx.changed())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("采样任务 120s 内没出第 {n} 份样本 —— 先查 count_rows_parts 是否被拖住")
+                })
+                .unwrap_or_else(|_| panic!("采样任务已退出（第 {n} 份样本等不到）"));
+        }
+    }
+
     let c = compactor(setup.catalog.clone(), &store_root, 3);
     let mut acked = 0u64;
-    // **等到采够样本**（把 `§66.5` 的观察落地）：
+    // **固定跑 3 轮**，每轮在"合并前 / 合并后"各等一份样本（`§171`）。
     //
-    // 门槛不能是"固定跑 3 轮" —— 满负载机器上 3 轮可能整个落在两次 10ms 采样**之间**，
-    // 于是样本数成了机器快慢的函数（本轮实测：负载 115 时只采到 1 个样本）。
-    // 改成"轮数下限 3 **且** 样本数下限 3"（带 30s 超时）后，机器慢只影响**耗时**，
-    // 不影响**判定** —— 而这两者的混淆正是 flaky 的来源。
-    let sample_deadline = std::time::Instant::now() + Duration::from_secs(30);
+    // 原写法是"轮数下限 3 **且** 样本数下限 3（带 30s 超时）" —— 门槛看着与耗时无关，
+    // 但"30s 内采不到 3 份"在满负载机器上真的发生过（实测并行跑全量：**1 份**，
+    // 而同一条用例单独跑 0.38s）⇒ 样本数仍是**机器快慢的函数**。
+    // 现在改成：等不到就不往下走（`wait_for_samples` 兜 120s 防挂住），
+    // 于是"确实采样到了"不再取决于调度。
     let mut round = 0usize;
-    while round < 3
-        || (seen.lock().unwrap().len() < 3 && std::time::Instant::now() < sample_deadline)
-    {
+    while round < 3 {
+        // 合并前：这份样本看到的是"本轮 flush 完、还没合并"的多文件状态
+        wait_for_samples(&mut samples_rx, round * 2 + 1).await;
         // 每轮 3 批 → 3 个文件（rows_threshold=1，每批一个 chunk）
         for i in 0..3 {
             acked += ingest_into(&setup, "cq", "s0", 1_000 + (round * 10 + i) as i64).await;
@@ -1163,17 +1189,19 @@ async fn compaction_during_query_keeps_counts_monotonic() {
             1,
             "round {round}: 新快照应只见合并产物"
         );
+        // 合并后：这份样本看到的是"新快照只剩合并产物"的状态
+        wait_for_samples(&mut samples_rx, round * 2 + 2).await;
         round += 1;
     }
 
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     query_task.await.unwrap();
     let observed = seen.lock().unwrap().clone();
-    // 门槛只保证"确实采样到了并发窗口"，不追求样本量：
-    // 满负载机器上 10ms 间隔的采样次数会明显变少，卡死数量会把机器快慢当成失败。
+    // 6 = 3 轮 ×（合并前 + 合并后）—— 由上面的 `wait_for_samples` **构造**保证。
+    // 留着这条是当"同步机制还在工作"的保险：它红了说明等待逻辑被改坏了，而不是机器慢。
     assert!(
-        observed.len() >= 3,
-        "查询样本太少（{}），无法支撑并发断言（已跑 {round} 轮、30s 采样超时兜底）",
+        observed.len() >= 6,
+        "样本数不足（{}）：3 轮 × 前后各一份 = 6 份 —— 同步机制坏了？（round={round}）",
         observed.len()
     );
 

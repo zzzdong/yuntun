@@ -49,20 +49,20 @@ cargo test -p yuntun-testkit --test docs_consistency   # 文档判据（改代�
 - 不要新建平行的设计/计划文档（就地升版本）；docs/archive/ 是冻结历史，不要改它。
 
 【这一刀要做的事（按 docs/ROADMAP.md §5，从最小的开始，做完再挑下一项）】
-默认从 N2 开始（测试可信）：
-  - 把两条计时断言型用例改成事件驱动（不要靠墙钟）：
-      crates/compaction/src/lib.rs 的 tests::concurrent_writers_compaction_and_gc_converge（30s 墙钟收尾上限）
-      crates/query/tests/partial_fanout.rs 的 slow_sources_wait_in_parallel_not_in_sequence（400ms 墙钟）
-  - 让 chaos 与其余 test binary 不再互相饿死（隔离或分批）。
-  - 验收：cargo test --workspace **并行**连续多轮全绿（当前"并行全绿"不成立，台账 D-26）。
-接着按顺序处理 N3（G.1 收尾：/metrics 暴露任务与持有者 + rig 实跑判据 + D-25）、
-N4（G.2 冷数据归属与下推，台账 D-4 第二半）、N5（D-23 行数瞬时不可见的复现与归因）。
+N1/N2 已完成（§170 文档重建；§171 测试可信 —— 计时断言已换成事件判据，并有判据禁止新增墙钟断言）。
+默认从 N3 开始（G.1 收尾：任务目录的运维面）：
+  - /metrics 暴露任务数与租约持有者（G.4）；
+  - tests/datanode_cluster.sh 实跑新判据（两个节点都从任务目录拿到过待办）并附输出；
+  - 台账 D-25：purge_table_files 之后重算任务（+1 条用例）；
+  - 快照还原后 since_ms = 0 导致的 age_ms 口径（§169.3）。
+接着按顺序处理 N4（G.2 冷数据归属与下推，台账 D-4 第二半）、N5（D-23 行数瞬时不可见的复现与归因）。
 先做哪一项由你说，但**一次只做一刀**，且必须留下证据与文档同步。
 
 【每一步的交付要求】
 - 说明"改了什么、为什么这么做、边界在哪（**没做什么**）"；边界一栏必须写。
 - 命令与结果照实报（跑了什么、绿了没有、哪条在什么条件下会红）；不许把"没跑"写成"应该没问题"。
-- 改完跑：cargo check --workspace --all-targets、相关测试、cargo test -p yuntun-testkit --test docs_consistency。
+- 改完跑：cargo check --workspace --all-targets、相关测试、cargo test -p yuntun-testkit --test docs_consistency、
+  cargo clippy --workspace --all-targets（口径类声称只有这条命令能守）。
 - 提交信息按本仓风格：`<type>(<crate 列表>): <一句话>（§N）`，正文写做了什么/决定/边界/验证。
 ```
 
@@ -74,7 +74,7 @@ N4（G.2 冷数据归属与下推，台账 D-4 第二半）、N5（D-23 行数�
 |---|---|---|
 | 1 | **§169 起在新日志，§1…168 在归档** | 代码注释里的 `§166`/`§88.6` 指归档；别以为日志"丢了" |
 | 2 | **台账编号 `D-*` 沿用不变**（`D-4`/`D-18`/`D-20`/`D-21`/`D-23`/`D-25`/`D-26`） | 代码注释里引用着它们；重号即漂移 |
-| 3 | **"并行全量测试全绿"今天不成立**（`D-26`） | 别拿它当准出条件；也别把并行下的计时节流当"真缺陷"（先单独重跑） |
+| 3 | **测试里不许拿墙钟当判据**（`D-26` 已闭环，`§171`） | 用**事件**（并发峰值 / 按轮驱动到收敛）；确需"必须有界"的兜底要写理由 + `§171` 豁免标记 —— 否则新判据会拦你。另：cargo 是**逐个 test binary 串行**跑的，并行发生在**同一个 binary 内**（别再把锅甩给 chaos） |
 | 4 | **任务目录 ≠ 任务队列**（`§169`） | 待办由状态机**派生**、"谁在做"由**租约**回答；proto 里**没有** Claim/Renew/Complete op（与归档计划的候选形态不同，是刻意决定） |
 | 5 | **vortex 是默认格式，且读路径是整文件解码** | 体积 3.5–4.5 倍、无组级剪枝、`.idx` 只对 parquet 有效（`D-20`）；写性能相关结论必须重新测，不能沿用 parquet 时代 |
 | 6 | **部署包线已量过**：对称延迟 1.5s 就反复选举 | 跨机/跨可用区前必须按 RTT 重定 `connect_timeout`/`RPC_TIMEOUT`/选举超时 |
@@ -90,3 +90,8 @@ N4（G.2 冷数据归属与下推，台账 D-4 第二半）、N5（D-23 行数�
 - **测试临时目录**：写盘类用例默认落 tmpfs（`testkit::TestDir::tmpfs`）；需要真 fsync/崩溃语义的用 `TestDir::disk`。
 - **改配置键**：先改 `crates/server/src/config.rs` 的模板，再回来改 `ARCHITECTURE.md §8` —— 有判据盯着（照着文档写配置必须能启动）。
 - **启动自检会告警的情况不要忽略**（如 `chunk_max_resident_secs ≤ max_flush_delay + spread` ⇒ 相位分散静默失效）。
+- **写测试**：判据要表达**性质**（"三个来源同时在飞"、"驱动 N 轮后收敛"），不要表达**机器多快**
+  （`elapsed < X`）—— 后者在 `cargo test --workspace` 下必然 flaky，且已加判据拦截
+  （`wall_clock_assertions_need_a_reviewed_waiver`，见 `ARCHITECTURE.md §9` 的 I11）。
+- **改完代码请跑全仓 clippy 而不只是定向测试**：口径类声称（如"本仓 0 告警"）只有那条命令能守；
+  `§169` 就是这么留下 4 条告警的（台账 `D-27`）。

@@ -295,7 +295,6 @@ impl CatalogState {
         v
     }
 
-    /// 原子推进快照号并返回新值（快照号**必须严格单调**：文件可见性依赖 `valid_from <= snapshot`）。
     // ------------------------------------------------------------ 任务目录（`§169`）
 
     /// **重算一个分片的任务**（派生的唯一入口）。
@@ -387,10 +386,11 @@ impl CatalogState {
     /// 当前的任务目录（按键排序 ⇒ 多节点的遍历顺序一致）。
     pub fn list_tasks(&self) -> Vec<yuntun_model::task::CompactionTask> {
         let mut out: Vec<yuntun_model::task::CompactionTask> = self.tasks.values().cloned().collect();
-        out.sort_by(|a, b| a.key().cmp(&b.key()));
+        out.sort_by_key(|a| a.key());
         out
     }
 
+    /// 原子推进快照号并返回新值（快照号**必须严格单调**：文件可见性依赖 `valid_from <= snapshot`）。
     fn next_snapshot(&mut self) -> u64 {
         self.snapshot_version += 1;
         self.snapshot_version

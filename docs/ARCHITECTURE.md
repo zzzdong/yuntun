@@ -306,6 +306,7 @@ listen = "127.0.0.1:9091"           # GET /metrics（Prometheus 文本）、/met
 | I8 | 任务目录 = 状态机派生，且不进 `encode_canonical` | 谁扫谁写 ⇒ 单点 + 各节点待办不一致；进规范编码 ⇒ 对拍误报分叉 |
 | I9 | `Config.applied` 必须如实报 | raft 重放 ⇒ 静默分叉 |
 | I10 | 快照引用计数 / 每查询一次快照 | 同一次查询的 plan 与 scan 看到两个版本 |
+| I11 | **测试判据不许是墙钟**（用事件：并发峰值 / 按轮驱动收敛） | 阈值变成"机器调度得多快"⇒ 同 binary 内并行时假失败（`D-26`）；确需"必须有界"的兜底要写理由 + `§171` 豁免标记，判据 `wall_clock_assertions_need_a_reviewed_waiver` 守着 |
 
 ---
 

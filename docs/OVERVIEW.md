@@ -104,26 +104,36 @@
 
 ## 6. 质量与证据网
 
-规模：**68,386 行 Rust / 20 个 crate / 550 个测试函数 / 用例全绿（⚠️ 并行跑时 2 条计时用例会 flaky，见 §6.1） / clippy 本仓 0 告警**
+规模：**68,637 行 Rust / 20 个 crate / 551 个测试函数 / 用例全绿（⚠️ 并行跑时 2 条计时用例会 flaky，见 §6.1） / clippy 本仓 0 告警**
 （工具链：本机 rustc 1.98.1 + edition 2024；**MSRV 声明 1.95**，由 `vortex 0.86` 顶出，
 **尚未经真·1.95 编译验证**）
 
 | 层 | 证据 | 位置 |
 |---|---|---|
-| 单元 / 集成 | `cargo test --workspace`（⚠️ 并行下的计时 flaky 见 §6.1）；0 ignored | 全仓 |
+| 单元 / 集成 | `cargo test --workspace`：**连续 3 轮全绿**（各 104 段）／0 ignored／"拿墙钟当判据"有判据拦（§6.1） | 全仓 |
 | chaos | **11/11** 场景（真实磁盘 + 跨重启 + 并发），进程中抓出**五个真缺陷**且全部已修 | `crates/chaos` + `§27…§31`/`§99` |
 | 容器化真集群 | `tests/cluster.sh smoke`/`soak`（3 metanode，真断网 + 接回收敛硬断言） | `§165` |
 | 多 datanode 容器 rig | `tests/datanode_cluster.sh smoke`（两节点都真的合并过 + 行数守恒 + `gc` 单持有 + 杀掉干活的那台另一台接手） | `§167` |
 | 分布式对拍 | 两写进程并发真写 ⇒ 两边查询逐行相等（含反证） | `§98` |
 | 文档判据 | 改代码会让规模行 / proto 迁移表 / ADR 定案数值 / 配置清单变红 | `crates/testkit/tests/docs_consistency.rs` |
 
-### 6.1 测试稳定性（**今天不成立的一条口径**）
+### 6.1 测试稳定性（`§171` 已收口）
 
-- `yuntun-chaos` 与其余 test binary **并行争 CPU/IO** ⇒ 恢复上限不足（单跑 1.3s，已放宽到 60s）；
-- **2026-10-11 复跑新增观测**：另有两条**计时断言**型用例在并行争抢下失败、单独重跑都 ok：
-  - `yuntun-compaction::tests::concurrent_writers_compaction_and_gc_converge`（收尾收敛 30s 墙钟上限）
-  - `yuntun-query::partial_fanout::slow_sources_wait_in_parallel_not_in_sequence`（400ms 墙钟）
-- ⇒ **"并行全绿"目前不成立**。要么把计时断言改成事件驱动，要么隔离 chaos（`ROADMAP.md` 的 N2）。
+- **曾经**有三条**计时断言**型用例在并行跑全量时失败、单独重跑都 ok：
+  `yuntun-compaction::tests::concurrent_writers_compaction_and_gc_converge`（30s 墙钟收尾上限）、
+  `yuntun-query::partial_fanout::slow_sources_wait_in_parallel_not_in_sequence`（400ms 墙钟）、
+  `chaos::compaction_during_query_keeps_counts_monotonic`（30s 内要采到 3 份样本 ⇒ 实测只采到 1 份），
+  以及 server 的 `cache_lazy_refresh_e2e`（"节流窗口内不问版本"实际在赌"两次查询间隔 < 200ms"）。
+- **归因（实测，`§171.0`）**：**不是** chaos 跨 binary 饿死 —— cargo **逐个 test binary 串行**跑
+  （热态一轮：总墙钟 90s vs 各段用时之和 86.6s）；真因是**同一个 binary 内多条重负载用例并行**。
+  ⇒ 原计划"隔离 chaos"那条子项**撤回**（前提不成立）。
+- **已修**：判据换成**事件 / 构造性同步**（扇出 = 同时在飞的来源数峰值；压缩与回收 = 按轮驱动到收敛；
+  采样覆盖 = watch 广播后"等到"样本；节流窗口 = 显式设定而不是依赖默认 200ms）。
+  compaction 段 **30.78s → 0.42s**，chaos 段 **30–73s → 3.15s**（17/17）。
+- **而且不会再回来**：新判据 `wall_clock_assertions_need_a_reviewed_waiver` 禁止"拿用时当判据"，
+  除非在该处写明理由并带 `§171` 豁免标记。
+- **验收**：收口后连续 **3 轮** `cargo test --workspace` 全绿（`exit=0`，每轮 104 段）。
+- 历史遗留仍在：`yuntun-chaos` 的恢复上限在 CPU 争抢下曾不足，已放宽到 60s 并写明理由（`§28`）。
 
 ---
 

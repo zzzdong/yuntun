@@ -200,8 +200,14 @@ async fn a_hung_source_degrades_the_query_and_names_the_timeout() {
         "原因要能区分『没响应』与『拒绝连接』——处置完全不同：{}",
         missing[0].reason
     );
+    // 上界是"**有界**"的反面（无限挂住），**不是延迟度量**（`§171` / 台账 `D-26`）。
+    //
+    // 所以这里取 `HUNG_TIMEOUT` 的 20 倍，而不是原来那个"3s 的紧界"：
+    // 串行三段（枚举分片 → 读分片 → 取水位，各 300ms 超时）正常约 1s，
+    // 机器被占满时 3s 的紧界会把"慢"误判成"没界"——那正是本轮要修的那类**假失败**。
+    // 宽出来的余量**不会**放过真缺陷：真缺陷是**永不返回**（用例会挂住，而不是刚好超一点）。
     assert!(
-        elapsed < Duration::from_secs(3),
+        elapsed < HUNG_TIMEOUT * 20,
         "查询必须**有界**（超时上限 {HUNG_TIMEOUT:?}，不是一直等）：{elapsed:?}"
     );
 }

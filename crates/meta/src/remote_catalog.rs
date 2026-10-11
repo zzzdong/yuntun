@@ -230,12 +230,10 @@ impl RemoteCatalog {
         Err(last.unwrap_or_else(|| LakeError::Other("没有可用的 metanode（Delta）".into())))
     }
 
-    /// **刷新本地缓存**（版本驱动）。
+    /// **强制全量刷新**（`§169`：任务目录只在**全量载荷**里下发 ⇒ 拿任务表必须走它）。
     ///
-    /// 两步（这条路径就是设计 §3.2 的「无变化零开销」）：
-    /// 1. **纯版本探测**：`tables` 空 + `full=false` → 载荷为空，只回版本号/快照号；
-    /// 2. 版本**变了**（或首次）才真的拉载荷：变了哪些表用 `Delta` 问，文件用 `since_snapshot` 拿增量。
-    /// **强制全量刷新**（`§169`：任务目录只在全量载荷里下发 ⇒ 看任务必须走它）。
+    /// 与 [`refresh`][Self::refresh] 的差别：后者有"什么都没变 ⇒ 直接返回"的零开销路径，
+    /// 于是任务表会永远停在第一次全量时看到的那张（**待办消失不了**）。
     async fn refresh_full(&self) -> Result<(), LakeError> {
         let resp = self
             .prefetch(pb::PrefetchRequest {
@@ -250,6 +248,11 @@ impl RemoteCatalog {
         Ok(())
     }
 
+    /// **刷新本地缓存**（版本驱动）。
+    ///
+    /// 两步（这条路径就是设计 §3.2 的「无变化零开销」）：
+    /// 1. **纯版本探测**：`tables` 空 + `full=false` → 载荷为空，只回版本号/快照号；
+    /// 2. 版本**变了**（或首次）才真的拉载荷：变了哪些表用 `Delta` 问，文件用 `since_snapshot` 拿增量。
     async fn refresh(&self) -> Result<(), LakeError> {
         let (c_schema, c_manifest, c_snapshot, primed) = {
             let c = self.cache.read().unwrap();
@@ -997,7 +1000,7 @@ impl CatalogOps for RemoteCatalog {
         let mut out: Vec<yuntun_model::task::CompactionTask> =
             self.cached(|c| c.tasks.values().cloned().collect());
         // 与状态机同序（按键排序）⇒ 多节点的遍历顺序一致
-        out.sort_by(|a, b| a.key().cmp(&b.key()));
+        out.sort_by_key(|a| a.key());
         Ok(out)
     }
 

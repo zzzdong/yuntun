@@ -65,6 +65,14 @@ async fn query_path_refreshes_its_own_cache_before_planning() {
     // ⚠️ 刻意**不**调 `spawn_background`：没有任何后台刷新任务 ⇒ 缓存只能靠读路径自己保鲜
     let mut session = SessionCtx::default();
 
+    // `§171`：把保鲜节流窗口拉到很远 —— ③ 要证的是"**窗口内**不问版本"这条**结构**，
+    // 而不是"两次查询的间隔小于 200ms"（后者是机器快慢的函数：并行跑全量时这里会假失败）。
+    // ④ 会再把它调回 ZERO，覆盖"窗口过了就问"的那一半。
+    lakehouse
+        .query
+        .catalog()
+        .set_freshness_check_interval(std::time::Duration::from_secs(3600));
+
     // ① 绕过缓存建表（走目录句柄，不经过 SQL 的写路径刷新）
     lakehouse
         .catalog

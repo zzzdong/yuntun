@@ -634,6 +634,86 @@ pub fn classify_orphans(
         .collect()
 }
 
+/// **一轮孤儿对账**（`spawn_orphan_cleanup_with_interval` 的循环体，于此提出）。
+///
+/// 语义与提取前**逐行一致**：列举 → 与 `known_batch_ids`（保护期 ∪ 在途）对账 →
+/// 未匹配的记"首次发现时刻" → 静置超过 `grace` 才删。任一基准拿不到就**整轮不删**（安全方向）。
+///
+/// 返回本轮真删掉的对象数；`None` = 本轮跳过（拿不到对账基准，什么都没删）。
+///
+/// **为什么提成函数**（`§171`）：它原先只存在于后台循环体里 ⇒ 用例只能"等墙钟看它跑了没有"，
+/// 于是机器被占满时会**误报"没收敛"**（台账 `D-26` 的两条计时 flaky 之一）。
+/// 提出来之后，用例可以**按轮驱动**到收敛 —— 断言的仍是同一批性质（不误删 / 真回收 / 保护集合），
+/// 但不再把"机器调度得多快"当成被测对象。
+async fn orphan_cleanup_round(
+    store: &Arc<dyn object_store::ObjectStore>,
+    catalog: &Arc<dyn CatalogOps>,
+    prefix: &str,
+    grace: Duration,
+    first_seen: &mut std::collections::HashMap<String, u64>,
+) -> Option<usize> {
+    let objects = match yuntun_format::list_objects(store, prefix).await {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::error!(error = %e, "orphan cleanup: list failed");
+            return None;
+        }
+    };
+    let known: HashSet<String> = match catalog.known_batch_ids().await {
+        Ok(ids) => ids.into_iter().collect(),
+        Err(e) => {
+            // 【安全】对账基准拿不到时**绝不删除任何对象**：宁可留垃圾文件
+            tracing::error!(error = %e, "orphan cleanup: known_batch_ids failed, skip this round");
+            return None;
+        }
+    };
+    // 删除向量还要"被事件引用"（`§156`）——同一把安全闸：拿不到就整轮不删。
+    // 拿不到时的后果与上面**方向相反**：不是误删而是"这一轮留着不回收"，安全。
+    let referenced_dv: HashSet<String> = match catalog.dv_object_paths().await {
+        Ok(paths) => paths.into_iter().collect(),
+        Err(e) => {
+            tracing::error!(error = %e, "orphan cleanup: dv_object_paths failed, skip this round");
+            return None;
+        }
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut removed = 0usize;
+    let mut current: HashSet<String> = HashSet::new();
+    for (path, _size) in &objects {
+        let Some(bid) = reconciliation_key(path) else {
+            continue;
+        };
+        current.insert(bid.clone());
+        if is_object_protected(path, &known, &referenced_dv) {
+            first_seen.remove(&bid);
+            continue;
+        }
+        let seen_at = *first_seen.entry(bid.clone()).or_insert(now_ms);
+        if now_ms.saturating_sub(seen_at) < grace.as_millis() as u64 {
+            continue; // 静置期内，不动
+        }
+        match yuntun_store::delete(store.as_ref(), path).await {
+            Ok(()) => {
+                removed += 1;
+                first_seen.remove(&bid);
+                tracing::info!(path = %path, batch_id = %bid, "orphan file removed");
+            }
+            Err(e) => {
+                tracing::warn!(path = %path, error = %e, "orphan delete failed")
+            }
+        }
+    }
+    // 清理已消失对象的观察记录
+    first_seen.retain(|bid, _| current.contains(bid));
+    if removed > 0 {
+        tracing::info!(removed, "orphan cleanup round done");
+    }
+    Some(removed)
+}
+
 /// 后台孤儿清理循环（§9.1 / §12.2.1）：
 /// 每 interval 列举 `prefix` 下全部 S3 对象 → 与 Meta 已知 batch_id 对账
 /// → 未匹配的文件记录"首次发现时间"，**静置超过 grace 才删除**。
@@ -726,65 +806,7 @@ pub fn spawn_orphan_cleanup_with_interval(
             if !gate.acquire_or_renew(&catalog).await {
                 continue; // 别的节点在清：本轮跳过（重复扫一遍没有收益）
             }
-            let objects = match yuntun_format::list_objects(&store, &prefix).await {
-                Ok(o) => o,
-                Err(e) => {
-                    tracing::error!(error = %e, "orphan cleanup: list failed");
-                    continue;
-                }
-            };
-            let known: HashSet<String> = match catalog.known_batch_ids().await {
-                Ok(ids) => ids.into_iter().collect(),
-                Err(e) => {
-                    // 【安全】对账基准拿不到时**绝不删除任何对象**：宁可留垃圾文件
-                    tracing::error!(error = %e, "orphan cleanup: known_batch_ids failed, skip this round");
-                    continue;
-                }
-            };
-            // 删除向量还要"被事件引用"（`§156`）——同一把安全闸：拿不到就整轮不删。
-            // 拿不到时的后果与上面**方向相反**：不是误删而是"这一轮留着不回收"，安全。
-            let referenced_dv: HashSet<String> = match catalog.dv_object_paths().await {
-                Ok(paths) => paths.into_iter().collect(),
-                Err(e) => {
-                    tracing::error!(error = %e, "orphan cleanup: dv_object_paths failed, skip this round");
-                    continue;
-                }
-            };
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            let mut removed = 0usize;
-            let mut current: HashSet<String> = HashSet::new();
-            for (path, _size) in &objects {
-                let Some(bid) = reconciliation_key(path) else {
-                    continue;
-                };
-                current.insert(bid.clone());
-                if is_object_protected(path, &known, &referenced_dv) {
-                    first_seen.remove(&bid);
-                    continue;
-                }
-                let seen_at = *first_seen.entry(bid.clone()).or_insert(now_ms);
-                if now_ms.saturating_sub(seen_at) < grace.as_millis() as u64 {
-                    continue; // 静置期内，不动
-                }
-                match yuntun_store::delete(store.as_ref(), path).await {
-                    Ok(()) => {
-                        removed += 1;
-                        first_seen.remove(&bid);
-                        tracing::info!(path = %path, batch_id = %bid, "orphan file removed");
-                    }
-                    Err(e) => {
-                        tracing::warn!(path = %path, error = %e, "orphan delete failed")
-                    }
-                }
-            }
-            // 清理已消失对象的观察记录
-            first_seen.retain(|bid, _| current.contains(bid));
-            if removed > 0 {
-                tracing::info!(removed, "orphan cleanup round done");
-            }
+            let _ = orphan_cleanup_round(&store, &catalog, &prefix, grace, &mut first_seen).await;
         }
     })
 }
@@ -974,6 +996,92 @@ mod tests {
     use yuntun_model::ops::CommitFilesRequest;
     use yuntun_model::ops::CreateTableRequest;
 
+    /// 按**轮**驱动压缩直到"可见文件数 ≤ `limit`"（`§171`）。
+    ///
+    /// 上限是**轮数**而不是墙钟 —— 机器慢只会多跑几轮，不会把"慢"报成"没收敛"
+    /// （台账 `D-26` 的两条计时 flaky 之一就是这么来的）。
+    /// 超上限才 panic：那时报的是**真的没收敛**，而不是"调度得慢"。
+    async fn drive_compaction_until_visible(
+        compactor: &Compactor,
+        table: &str,
+        limit: usize,
+    ) -> Vec<FileManifest> {
+        const MAX_ROUNDS: usize = 64;
+        for _ in 0..MAX_ROUNDS {
+            let files = visible_files_of(compactor, table).await;
+            if files.len() <= limit {
+                return files;
+            }
+            let st = compaction_round(compactor)
+                .await
+                .expect("compaction_round 不该整体失败");
+            assert_eq!(st.failed, 0, "驱动轮里不该有失败：{st:?}");
+        }
+        let files = visible_files_of(compactor, table).await;
+        panic!(
+            "驱动 {MAX_ROUNDS} 轮压缩后仍未收敛：可见 {} 个（上限 {limit}）",
+            files.len()
+        );
+    }
+
+    /// 当前快照下的可见文件（压缩驱动与断言共用同一口径）。
+    async fn visible_files_of(compactor: &Compactor, table: &str) -> Vec<FileManifest> {
+        compactor
+            .catalog
+            .list_visible_files(table, compactor.catalog.current_snapshot().await, None)
+            .await
+            .unwrap()
+    }
+
+    /// 按**轮**驱动孤儿对账，直到三件事同时成立（`§171`）：
+    /// 可见文件的对象都在 / 空间已回收 / 保护集合 == 可见文件。
+    ///
+    /// 与 [驱动压缩][drive_compaction_until_visible] 同理：上限是轮数；失败信息要能**自己解释**
+    /// （哪一条没成立、两侧的数字各是多少），而不是只说一句"超时"。
+    async fn drive_gc_until_settled(
+        store: &Arc<dyn object_store::ObjectStore>,
+        catalog: &Arc<dyn CatalogOps>,
+        prefix: &str,
+        visible: &[FileManifest],
+        written_batches: usize,
+    ) {
+        const MAX_ROUNDS: usize = 64;
+        let mut first_seen = std::collections::HashMap::new();
+        let mut last: Option<(Vec<String>, Vec<String>)> = None;
+        for _ in 0..MAX_ROUNDS {
+            let _ = orphan_cleanup_round(store, catalog, prefix, Duration::ZERO, &mut first_seen)
+                .await;
+            let objects: Vec<String> = list_s3_files(store, prefix)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(p, _)| p)
+                .collect();
+            let known: Vec<String> = catalog.known_batch_ids().await.unwrap();
+            let all_present = visible.iter().all(|f| objects.contains(&f.file_path));
+            // 空间确实回收：对象数远小于写过的批次数
+            let reclaimed = objects.len() * 2 < written_batches;
+            // 在途集合归零：保护集合 == 可见文件（没有残留登记，也没有过期墓碑赖着）
+            let settled = known.len() == visible.len();
+            if all_present && reclaimed && settled {
+                return;
+            }
+            last = Some((objects, known));
+        }
+        let (objects, known) = last.unwrap_or_default();
+        panic!(
+            "驱动 {MAX_ROUNDS} 轮对账后仍未收尾：\n  \
+             可见文件的对象都在? {}\n  \
+             空间已回收? （对象 {} vs 写入 {written_batches}）\n  \
+             保护集合 == 可见({})? {} （known {}）",
+            visible.iter().all(|f| objects.contains(&f.file_path)),
+            objects.len(),
+            visible.len(),
+            known.len() == visible.len(),
+            known.len()
+        );
+    }
+
     fn batch() -> arrow::record_batch::RecordBatch {
         arrow::record_batch::RecordBatch::try_new(
             SArc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)])),
@@ -1028,8 +1136,10 @@ mod tests {
         .await
         .unwrap();
 
+        // 后台 GC 与两个写者**同时在跑**（要挡的正是"文件已上传、目录还不知道"那一下）；
+        // 收尾时不再靠墙钟等它扫到，而是下面**按轮驱动**（`§171`）。
         let shutdown = CancellationToken::new();
-        let _gc = spawn_orphan_cleanup_with_interval(
+        let gc_handle = spawn_orphan_cleanup_with_interval(
             store.clone(),
             catalog.clone(),
             "yuntun/".to_string(),
@@ -1096,9 +1206,16 @@ mod tests {
         for t in tasks {
             t.await.unwrap();
         }
-        // 再让 GC 扫几轮：把"已提交"的文件也暴露在扫描之下（它们靠 files 保护）
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        // 再**按轮**驱动 GC：把"已提交"的文件也暴露在扫描之下（它们靠 files 保护）。
+        //
+        // `§171`：原写法是 `sleep(120ms)` 赌后台循环扫过 —— 机器被占满时它可能**一轮都没跑**，
+        // 于是下一条"埋下的真孤儿必须被回收"会**假失败**（台账 `D-26`）。
+        // 显式驱动之后那条判据与机器快慢无关；"写入期间 GC 与写者并发"的覆盖一段不少。
         shutdown.cancel();
+        let _ = gc_handle.await;
+        let mut first_seen = std::collections::HashMap::new();
+        let _ = orphan_cleanup_round(&store, &catalog, "yuntun/", Duration::ZERO, &mut first_seen)
+            .await;
 
         // ---- 判据 ①：每个可见文件的对象**真的存在** ----
         let snapshot = catalog.current_snapshot().await;
@@ -1223,23 +1340,19 @@ mod tests {
             "合并产物是活着的，必须仍在保护集合里"
         );
 
-        // GC 跑起来：grace = ZERO（不靠时间假设）
-        let shutdown = CancellationToken::new();
-        let _gc = spawn_orphan_cleanup_with_interval(
-            c.store.clone(),
-            catalog.clone(),
-            "yuntun/".to_string(),
-            Duration::ZERO,
-            Duration::from_millis(20),
-            "test-gc".to_string(),
-            shutdown.clone(),
-        );
-
-        // 旧对象**真的消失**（空间回来了），同时合并产物**还在**（别删过头）
+        // 旧对象**真的消失**（空间回来了），同时合并产物**还在**（别删过头）。
+        //
+        // `§171`：**按轮驱动**孤儿对账（轮数上限），不再 `spawn` 后台循环 + 等 30s 墙钟 ——
+        // 后者把"机器调度得多快"当成了被测对象（台账 `D-26`）。grace = ZERO：不靠时间假设。
         let store = c.store.clone();
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            let left: Vec<String> = list_s3_files(&store, "yuntun/")
+        let cat: Arc<dyn CatalogOps> = catalog.clone();
+        let mut first_seen = std::collections::HashMap::new();
+        let mut left: Vec<String> = Vec::new();
+        let mut settled = false;
+        for _ in 0..32 {
+            let _ =
+                orphan_cleanup_round(&store, &cat, "yuntun/", Duration::ZERO, &mut first_seen).await;
+            left = list_s3_files(&store, "yuntun/")
                 .await
                 .unwrap()
                 .into_iter()
@@ -1247,15 +1360,14 @@ mod tests {
                 .collect();
             let olds_gone = old_paths.iter().all(|p| !left.contains(p));
             if olds_gone && left.contains(&merged_path) {
+                settled = true;
                 break;
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "回收超时。旧文件应消失、产物应保留：left={left:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(30)).await;
         }
-        shutdown.cancel();
+        assert!(
+            settled,
+            "驱动 32 轮对账后仍未达成「旧文件消失 + 产物保留」：left={left:?}"
+        );
 
         // 元数据不受影响：可见文件仍是那一个产物，行数仍是输入之和
         let after = catalog
@@ -1390,24 +1502,21 @@ mod tests {
             t.await.unwrap();
         }
 
+        // ---- 写入已停 ⇒ **确定性地**推到位（`§171` / `D-26`）----
+        //
+        // 原写法是"让后台循环继续跑，用**墙钟**（30s × 2 段）等收敛"。它测的是
+        // **机器调度得多快**：同一二进制里多条重负载用例并行时会被误判成"没收敛"。
+        // 现在改成：停掉后台循环 ⇒ 手工**按轮驱动**压缩与对账到收敛（轮数上限；
+        // 超上限才 panic，报的是"真的没收敛"）。
+        //
+        // ⚠️ 并发**没有被削弱**：写入期间两个循环一直与写者在跑（要挡的竞态窗口都在那一段），
+        // 换掉的只是"最后那一段等待"。
+        shutdown.cancel();
+        let _ = loop_handle.await;
+        let _ = gc_handle.await;
+
         // ---- 等收敛：可见文件数落到 `min_files + 1` 以内 ----
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        let visible = loop {
-            let files = catalog
-                .list_visible_files(TABLE, catalog.current_snapshot().await, None)
-                .await
-                .unwrap();
-            if files.len() <= MIN_FILES + 1 {
-                break files;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "文件数没有收敛：可见 {} 个（写入批次数 {}）",
-                files.len(),
-                WRITERS * ROUNDS
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        };
+        let visible = drive_compaction_until_visible(&compactor, TABLE, MIN_FILES + 1).await;
 
         // ---- 判据 ①：行数一个不少 ----
         let total: u64 = visible.iter().map(|f| f.row_count).sum();
@@ -1432,41 +1541,8 @@ mod tests {
         );
 
         // ---- 判据 ③ + ④：对象真的在；空间回收；保护集合 == 可见文件 ----
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            let objects: Vec<String> = list_s3_files(&store, "yuntun/")
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|(p, _)| p)
-                .collect();
-            let known: Vec<String> = catalog.known_batch_ids().await.unwrap();
-            let all_present = visible.iter().all(|f| objects.contains(&f.file_path));
-            // 空间确实回收：对象数远小于写过的批次数
-            let reclaimed = objects.len() * 2 < WRITERS * ROUNDS;
-            // 在途集合归零：保护集合 == 可见文件（没有残留登记，也没有过期墓碑赖着）
-            let settled = known.len() == visible.len();
-            if all_present && reclaimed && settled {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "收尾未达成：
-  可见文件的对象都在? {all_present}
-  空间已回收? {reclaimed}（对象 {} vs 写入 {}）
-  保护集合==可见({})? {} （known {}）",
-                objects.len(),
-                WRITERS * ROUNDS,
-                visible.len(),
-                settled,
-                known.len()
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-
-        shutdown.cancel();
-        let _ = loop_handle.await;
-        let _ = gc_handle.await;
+        let cat: Arc<dyn CatalogOps> = catalog.clone();
+        drive_gc_until_settled(&store, &cat, "yuntun/", &visible, WRITERS * ROUNDS).await;
     }
 
     /// **压缩产物也必须"先登记、后上传"**（`R-9` 在压缩侧的形态）—— 确定性地观察这一步。
@@ -1620,18 +1696,18 @@ mod tests {
         .unwrap();
         catalog.record_in_flight("inflight-batch", now_ms()).await.unwrap();
 
-        let shutdown = CancellationToken::new();
-        let _gc = spawn_orphan_cleanup_with_interval(
-            store.clone(),
-            catalog.clone(),
-            "yuntun/".to_string(),
-            Duration::ZERO, // 静置期取 0：**不靠时间假设**，只靠"在途可见"
-            Duration::from_millis(20),
-            "test-gc".to_string(),
-            shutdown.clone(),
+        // `§171`：**按轮驱动**孤儿对账，不再 `spawn` 后台循环 + `sleep(300ms)` 赌它跑过 ——
+        // 那种写法在机器被占满时会**假通过**（GC 一轮都没扫到，于是"真孤儿应被回收"无从谈起）。
+        // 一轮就够：grace = ZERO ⇒ **不靠时间假设**，只靠"在途可见"。
+        let cat: Arc<dyn CatalogOps> = catalog.clone();
+        let mut first_seen = std::collections::HashMap::new();
+        let removed = orphan_cleanup_round(&store, &cat, "yuntun/", Duration::ZERO, &mut first_seen)
+            .await
+            .expect("一轮对账（对账基准拿得到）");
+        assert!(
+            removed >= 1,
+            "这一轮至少要回收那个纯孤儿（否则这条用例是空转）：removed={removed}"
         );
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        shutdown.cancel();
 
         let left: Vec<String> = list_s3_files(&store, "yuntun/")
             .await

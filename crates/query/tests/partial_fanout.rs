@@ -23,6 +23,7 @@
 //! （`ShardRead.stale` vs `Err`），本用例把这条边界钉住。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -105,6 +106,37 @@ impl ShardReader for AlwaysStale {
     }
 }
 
+/// **"同时在飞"的探针**（`§171`）：数"此刻有多少个来源正处在等待中"，并记住峰值。
+///
+/// 为什么需要它：验证"扇出是并发的"最直白的写法是**量墙钟**（`elapsed < 400ms`），
+/// 但那测的是**机器的调度速度** —— 同一二进制里多条重负载用例并行跑时，
+/// 3 × 200ms 的等待会超过 400ms，用例就被误判（台账 `D-26`）。
+/// 改成数"同时在飞"之后，断言的仍然是**并发性质本身**：串行实现（一个来源答完再问下一个）
+/// 的峰值恒为 1，无论机器多快多慢。
+#[derive(Debug, Default)]
+struct OverlapProbe {
+    active: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl OverlapProbe {
+    /// 进入等待；返回此刻在飞的数量。
+    fn enter(&self) -> usize {
+        let n = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(n, Ordering::SeqCst);
+        n
+    }
+
+    fn leave(&self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// 历史峰值（并发度）。
+    fn peak(&self) -> usize {
+        self.peak.load(Ordering::SeqCst)
+    }
+}
+
 /// **慢但会答**的来源：`delay` 之后返回 `rows` 行。
 ///
 /// 覆写 `read_table_excluding`（**查询路径走的正是它**；`read_table` 只是它 `exclude = []` 的
@@ -113,6 +145,20 @@ impl ShardReader for AlwaysStale {
 struct SlowButAnswers {
     delay: Duration,
     rows: Vec<i64>,
+    /// 等待期间的"在飞"计数（`§171`：并发的证据，不靠墙钟）
+    probe: Arc<OverlapProbe>,
+}
+
+impl SlowButAnswers {
+    /// 带探针的来源（要观察并发时用）。
+    fn probed(delay: Duration, rows: Vec<i64>, probe: Arc<OverlapProbe>) -> Self {
+        Self { delay, rows, probe }
+    }
+
+    /// 不关心并发的来源（自带一个没人读的探针）。
+    fn new(delay: Duration, rows: Vec<i64>) -> Self {
+        Self::probed(delay, rows, Arc::new(OverlapProbe::default()))
+    }
 }
 
 #[async_trait]
@@ -138,7 +184,10 @@ impl ShardReader for SlowButAnswers {
         known: u64,
         _exclude: &[String],
     ) -> Result<ShardRead, LakeError> {
+        // 进入/离开"等待中"各记一次（`§171`：并发的**事件**证据，不用墙钟）
+        self.probe.enter();
         tokio::time::sleep(self.delay).await;
+        self.probe.leave();
         Ok(ShardRead {
             batches: vec![batch(&self.rows)],
             flushed_watermark: known,
@@ -374,17 +423,20 @@ async fn stale_is_retried_then_fails_loudly_never_downgraded_to_partial() {
 /// **多个慢来源的等待必须取最大，而不是相加**（`§88`）。
 ///
 /// 串行 `for` 的时代，3 个各 200ms 的来源要让查询等 600ms —— 而它们之间**毫无依赖**。
-/// 这条用例直接把"扇出的形状"钉在时间上：串行版本必然失败（3×200ms > 400ms 阈值）。
 ///
-/// 阈值取得宽（200ms 的并行实现 vs 400ms 的界）：它要的是**区分相加与取最大**，
-/// 不是测某台机器的快。
+/// **判据是事件不是墙钟**（`§171` / 台账 `D-26`）：原写法量 `elapsed < 400ms`，那测的是
+/// **机器调度得多快**（同一二进制里多条重负载用例并行时会被误判）。现在数的是
+/// "同一时刻有几个来源在飞"（`OverlapProbe`）：串行实现的峰值恒为 1，
+/// 并行实现必为 3 —— **与机器快慢无关**，而这正是"相加 vs 取最大"的差别本身。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn slow_sources_wait_in_parallel_not_in_sequence() {
+    let probe = Arc::new(OverlapProbe::default());
     let slow = |rows: Vec<i64>| -> Arc<dyn ShardReader> {
-        Arc::new(SlowButAnswers {
-            delay: Duration::from_millis(200),
+        Arc::new(SlowButAnswers::probed(
+            Duration::from_millis(200),
             rows,
-        })
+            probe.clone(),
+        ))
     };
 
     let engine = engine_with_budget(
@@ -398,15 +450,17 @@ async fn slow_sources_wait_in_parallel_not_in_sequence() {
     )
     .await;
 
-    let t0 = std::time::Instant::now();
     let out = engine.sql_partial(QUERY).await.expect("三个来源最终都会答");
-    let elapsed = t0.elapsed();
 
     assert_eq!(values(&out.batches), vec![1, 2, 3], "并发不许改变结果");
     assert!(!out.is_partial(), "都答上来了，不该标 partial");
-    assert!(
-        elapsed < Duration::from_millis(400),
-        "等待应当是 max(各来源) 而不是相加：3 × 200ms 串行会到 600ms，实测 {elapsed:?}"
+    // 判据是**事件**而不是墙钟（`§171` / `D-26`）：三个来源必须**同时**处在等待中。
+    // 串行实现（一个答完再问下一个）峰值恒为 1 —— 与机器快慢无关，因此这条不再 flaky。
+    assert_eq!(
+        probe.peak(),
+        3,
+        "三个来源必须同时在飞（串行实现会得到 1）：峰值 {}",
+        probe.peak()
     );
 }
 
@@ -419,10 +473,9 @@ async fn slow_sources_wait_in_parallel_not_in_sequence() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn budget_above_which_sources_degrade_to_partial() {
     let slow = |rows: Vec<i64>| -> Arc<dyn ShardReader> {
-        Arc::new(SlowButAnswers {
-            delay: Duration::from_secs(2), // 远慢于预算
-            rows,
-        })
+        // 故意拉到 5s：下面断言的上界（2s）要比它**明显**小 —— 否则"预算真的截断了等待"
+        // 会退化成"机器够快"（`§171` / `D-26`）。
+        Arc::new(SlowButAnswers::new(Duration::from_secs(5), rows))
     };
 
     let engine = engine_with_budget(
@@ -442,9 +495,12 @@ async fn budget_above_which_sources_degrade_to_partial() {
         .expect("预算耗尽 ⇒ 降级（Allow），不是整体失败");
     let elapsed = t0.elapsed();
 
+    // `§171` waiver：一条墙钟断言必须**写明它是哪一种**。这一条防的是"预算根本没生效"，
+    // 也就是"**等满来源延迟**（5s）"这一半 —— 上界（2s）只是把那个量级钉住；
+    // 它不是延迟度量（没有哪条实现承诺"150ms 预算必须 1s 内返回"）。
     assert!(
-        elapsed < Duration::from_secs(1),
-        "预算必须真的截断等待（来源要 2s，预算 150ms）：实测 {elapsed:?}"
+        elapsed < Duration::from_secs(2),
+        "预算必须真的截断等待（来源要 5s，预算 150ms ⇒ 2s ≈ 13× 预算、又比来源延迟小得多）：实测 {elapsed:?}"
     );
     assert!(out.is_partial(), "超预算的来源是“拿不到” ⇒ 必须标记");
     let missing = out.partial.missing();

@@ -1,6 +1,6 @@
 # yuntun 实施操作日志（§169 起）
 
-> 起记时间：2026-10-11（最新：**§170，2026-10-11**）。对应分支：main。
+> 起记时间：2026-10-11（最新：**§171，2026-10-11**）。对应分支：main。
 >
 > **这是什么**：从今天起，**每一刀**（一次成体系的改造）在这里留一节 —— 写清"做了什么、
 > 为什么这么做、边界在哪（**没做什么**）、怎么验的"。它是本项目的**证据出处**：
@@ -151,3 +151,75 @@
 - 归档前后各跑一次全量测试，结果一致（本轮改动不含产品代码）。
 - 直接核对：`docs/` 顶层只剩 6 份（`README.md` / `OVERVIEW.md` / `ARCHITECTURE.md` /
   `ROADMAP.md` / `HANDOVER.md` / `operation-log.md`）+ `archive/` 12 份。
+
+---
+
+## 171. **N2 测试可信：两条计时 flaky 换成事件判据（并把这条纪律变成判据）**（2026-10-11）
+
+### 171.0 缺口与**归因的更正**
+
+台账 `D-26` 记的是"两条**计时断言**型用例在并行跑全量时失败、单独重跑都 ok"。本轮先复现再动手，
+结果推翻了原归因里的一句话：
+
+- **原归因**（`§170` 那版写的）："并行争抢 CPU/IO（chaos 与其余 test binary 互相饿死）"。
+- **实测更正**：cargo 是**逐个 test binary 串行**跑的 —— 热态一轮全量：总墙钟 **90s**、各段用时之和
+  **86.6s**（`round 1/2/3` 三次分别 93/89/87s vs 91.2/85.9/85.1s）。⇒ chaos 不可能在"饿死"别人。
+- **真实原因**：同一个 binary 内**多条重负载用例并行**（`partial_fanout` 里 7 条用例、
+  多条自带 `multi_thread worker_threads = 4`；`compaction` 的 lib 测试同理，还有后台循环在跑）。
+  ⇒ N2 原本那条"**让 chaos 与其余 binary 隔离**"**不成立，撤回**（不是做完，而是前提错了）；
+  真正要做的是把**断言本身**从墙钟改成事件。
+
+### 171.1 做了什么
+
+| # | 改动 | 关键点 |
+|---|---|---|
+| 1 | **`orphan_cleanup_round` 提成生产函数**（`crates/compaction/src/lib.rs`） | 原来它只存在于 `spawn_orphan_cleanup_with_interval` 的循环体里 ⇒ 用例只能"等墙钟看它跑了没有"。提出来（逐行同语义，三处"拿不到对账基准就整轮不删"由 `continue` 改成 `return None`）之后，用例可以**按轮驱动**到收敛 |
+| 2 | 三个 compaction 用例改**按轮驱动** | `concurrent_writers_compaction_and_gc_converge`（两段各 30s 墙钟 ⇒ 改成 `drive_compaction_until_visible` / `drive_gc_until_settled`，上限是**轮数** 64）、`expired_tombstones_are_reclaimed_by_gc`（30s 轮询 ⇒ 32 轮）、`multi_writer_plus_gc_never_deletes_a_committed_file` 与 `gc_never_deletes_an_in_flight_file_even_with_zero_grace`（`sleep(120ms)`/`sleep(300ms)` 赌后台循环扫过 ⇒ 显式驱动一轮）。**写入期间后台循环照跑**（竞态窗口都在那一段），换掉的只是"最后那段等待" |
+| 3 | `partial_fanout::slow_sources_wait_in_parallel_not_in_sequence` 改**事件判据** | 新增 `OverlapProbe`（数"此刻有几个来源在飞"并记峰值）：断言"峰值 == 3"。串行实现恒为 1 —— 与机器快慢无关。（原写法 `elapsed < 400ms` 测的是**机器调度速度**） |
+| 4 | 两处"必须有界"的兜底**放宽并写明理由** | `partial_fanout` 的预算用例（来源延迟 2s→**5s**，界 1s→**2s**）、`shardrpc::hung_source_degrades`（`< 3s` → `< HUNG_TIMEOUT * 20`）。它们防的是**永不返回**，不是延迟度量 |
+| 5 | **新判据** `wall_clock_assertions_need_a_reviewed_waiver` | 扫 `crates/**/*.rs` 的**代码行**（不认注释行、跳过判据文件自己）里出现 `elapsed <` / `elapsed >` 的地方：必须在本行或前 15 行内有 `§171` 标记（当 waiver 用，与 `#[allow]` 同理）。**没有它，下一位会再写一条** |
+| 6 | 顺带修 `§169` 的收尾遗留（台账 **`D-27`**） | 全仓 clippy 跑出 **4 条告警**（catalog 2 条：`unnecessary_sort_by` + `empty_line_after_doc_comments`；meta 2 条：同型），根因是 §169 的插入把 `next_snapshot` / `refresh` 的**文档注释与函数拆散**了（`refresh_full` 被插在 `refresh` 的 doc 与函数体之间）⇒ 一并修正，全仓回到 **0 告警** |
+| 7 | chaos 的 `compaction_during_query_keeps_counts_monotonic`：采样覆盖改成**构造性同步**（台账 **`D-28`**） | 它的门槛原是"3 轮 **且** 样本数 ≥3（带 30s 超时）"—— 看着与耗时无关，但**第 4 次全量真的失败了**：30s 只采到 **1** 份（单独跑同一条 0.38s）。改成：采样任务用 `tokio::sync::watch` 广播"已采到几份"，主循环在**每轮合并前/后各等一份** ⇒ 覆盖由构造保证（等待带 120s 防挂住）|
+| 8 | `cache_lazy_refresh_e2e::query_path_refreshes_its_own_cache_before_planning`：节流窗口**显式设成 3600s**（`D-28`） | 第 4 次全量里同样失败：③ 的断言是"窗口内不问版本"，而它默认窗口只有 **200ms** ⇒ 断言实际在赌"两次查询间隔 < 200ms"（机器快慢的函数）。用**已有的** `set_freshness_check_interval` 把窗口拉远，④ 再调回 `ZERO` 覆盖另一半 |
+
+### 171.2 三个决定
+
+1. **修的是判据，不是阈值**。"把 400ms 放宽到 2s"能让用例变绿，但判据仍然是墙钟 ——
+   下一位照样能写出下一条。所以：能表达成**事件**的（并发度、收敛轮数）一律换事件；
+   只有"必须有界"这一类保留时间上界，并且**必须写明它在防什么**（waiver 机制把"必须解释"变成硬要求）。
+2. **辅助函数提到生产代码里**，而不是在测试里复制一份清理逻辑。理由：复制一份就会漂移
+   （"测试里的对账"与"生产里的对账"是两套），而提出来之后它还是个**可确定性驱动的单元**
+   —— 本仓"删错文件是真丢数据"的那类不变量正需要这种颗粒度。
+3. **"隔离 chaos"这条撤回，并保留撤回记录**。原计划写的是"chaos 与其余 binary 不再互相饿死"，
+   而实测证明它们本来就串行跑 —— 把它做成一个脚本反而会**掩盖**真实原因（intra-binary 并行）。
+   ⇒ 状态列写"❌ 撤回（前提不成立，见 `§171.0`）"，而不是"✅ 已做"。
+
+### 171.3 边界（这一刀**没有**做的）
+
+- chaos 里其它 **60s 轮询上限**没动：它们是"防挂住"的兜底（失败信息也够用）。
+  ⚠️ **一条被证伪的判断要留档**：本刀第一次写这段时写的是"3 轮全量全绿 ⇒ 没有证据说要改"，
+  而**第 4 次**全量就冒出两条同类失败（171.1-7/8）⇒ 教训是 **"N 轮全绿"不是"没有证据"**，
+  它是"证据还不够"；对**同一类**断言，正确做法是**一次审完**（本轮最后就是把 compaction 测试模块
+  整个审了一遍，而不是只修报出来的那两条）。
+- `crates/meta/tests/*` 的 30s 轮询上限（多节点进程用例）同理未动（要起真进程，事件化成本高）。
+- **测量类**用例（`chaos/examples/bench*`）里的时间是**被测对象本身**，不适用这条规则
+  （`is_clock_assertion` 只认 `elapsed <`/`elapsed >` 这种"拿用时当判据"的形状）。
+- 判据的**扫描范围是"代码行"**：形如 `if start.elapsed() > idle { … }` 的**生产逻辑**也在范围内
+  （它同样会因机器慢而改变行为）—— 目前全仓只有两处豁免，都在测试里。
+
+### 171.4 验证
+
+- **N2 的验收**（`ROADMAP.md §3`）：热态 `cargo test --workspace` 全绿
+  —— **`exit=0` / `FAILED` 0 行 / 每轮 104 段 `test result: ok`**，连续 **4 组**：
+  改造前 3 轮墙钟 93/89/87s（各段之和 91.2/85.9/85.1s —— 这组数字本身就是 `§171.0` 的
+  "逐 binary 串行"证据），收口后再 **3 轮 95/92/89s**。
+- chaos 二进制：**17/17、3.15s**（此前并行跑 **30–73s**，且第 4 次跑出 1 失败）——
+  串行闸门本来就是全覆盖的（17/17 都 `CHAOS_GATE`），慢的不是"抢锁"，是**采样覆盖**那条断言
+  （171.1-7）。修完连跑 3 轮：3/4/3s，全绿。
+- **反证 ①（判据有区分力）**：把 `probe.peak()` 的期望从 3 改成 1 ⇒ 用例失败并报出
+  `峰值 3`（left: 3, right: 1）—— 说明"并发"是真的被观测到了，而不是恒真断言。
+- **反证 ②（新判据有牙齿）**：故意注入一条无豁免的 `let _sanity = elapsed < Duration::from_secs(9);`
+  ⇒ `wall_clock_assertions_need_a_reviewed_waiver` 红，并直接报出**文件:行号与那一行**；撤销后即绿。
+- 时间收益：compaction 的 lib 测试段 **30.78s → 0.42s**（按轮驱动不再等墙钟）。
+- `cargo clippy --workspace --all-targets`：**0 告警**（此前 4 条，见 171.1-6）；
+  `cargo test -p yuntun-testkit --test docs_consistency` 全绿（10 条判据）。
