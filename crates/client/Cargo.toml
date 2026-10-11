@@ -33,6 +33,10 @@ yuntun-meta = { path = "../meta" }
 yuntun-testkit = { path = "../testkit" }
 yuntun-server = { path = "../server" }
 yuntun-catalog = { path = "../catalog" }
+# `§174`：注入一个"读不到的来源"（假 `ShardReader`）来验 partial 标记的最后一跳
+yuntun-store = { path = "../store" }
+# 实现 `ShardReader` 要用同一个宏（假来源的注入点）
+async-trait = { workspace = true }
 yuntun-model = { path = "../model" }
 tokio-util = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

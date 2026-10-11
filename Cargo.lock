@@ -6882,6 +6882,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "arrow-flight",
+ "async-trait",
  "clap",
  "futures",
  "parquet",
@@ -6899,6 +6900,7 @@ dependencies = [
  "yuntun-model",
  "yuntun-proto",
  "yuntun-server",
+ "yuntun-store",
  "yuntun-testkit",
 ]
 

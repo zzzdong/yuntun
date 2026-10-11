@@ -276,3 +276,148 @@ async fn replayed_request_is_deduplicated_batch_by_batch() {
     shutdown.cancel();
     let _ = server.await;
 }
+
+// ---------------------------------------------------------------- `§174`：降级走到用户面前
+
+/// **读不到的来源**：连接被拒（不是超时 —— 两者在错误里要能分开）。
+#[derive(Debug)]
+struct Unreachable;
+
+#[async_trait::async_trait]
+impl yuntun_store::ShardReader for Unreachable {
+    fn tier(&self) -> yuntun_store::ShardTier {
+        yuntun_store::ShardTier::Memory
+    }
+    fn version(&self) -> u64 {
+        0
+    }
+    async fn shards_of(
+        &self,
+        _table: &str,
+    ) -> Result<Vec<yuntun_store::ShardId>, yuntun_model::error::LakeError> {
+        Err(yuntun_model::error::LakeError::Other("connection refused".into()))
+    }
+    async fn read_shard(
+        &self,
+        _id: &yuntun_store::ShardId,
+        _known_manifest_ver: u64,
+    ) -> Result<yuntun_store::ShardRead, yuntun_model::error::LakeError> {
+        Err(yuntun_model::error::LakeError::Other("connection refused".into()))
+    }
+    async fn watermark(
+        &self,
+        _known_manifest_ver: u64,
+    ) -> Result<yuntun_store::ShardRead, yuntun_model::error::LakeError> {
+        Err(yuntun_model::error::LakeError::Other("connection refused".into()))
+    }
+}
+
+/// `§174`：**降级必须走到用户面前** —— partial 标记从服务端到 SDK 的最后一跳。
+///
+/// 服务端在"有来源读不到"时照常返回可用结果并标记 partial（**故意的**降级，不是失败）。
+/// 但那个标记如果没人读，降级就等于**静默少数据**：`count(*)` 会小一点却看不出来。
+///
+/// 这不是假设：容器 rig 曾在压缩提交期间观测到"行数从 24 瞬时掉到 21"（台账 `D-23`），
+/// 当时**无法判断**那是"可见性缺口"还是"某个来源被降级"—— 因为这条链上没人读那个标记。
+///
+/// 两个方向都要钉（假警报同样是错：一个恒存在的标记会让调用方无视它）：
+/// - 有来源读不到 ⇒ `query_full` 报 partial 并**点名**，同时照常给出可用结果；
+/// - 全都读得到 ⇒ **不许**报。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_degraded_query_is_flagged_as_partial() {
+    let (client, lakehouse, shutdown, server) = start_server().await;
+    client
+        .execute("CREATE TABLE cpu (ts BIGINT, host TEXT, usage DOUBLE)")
+        .await
+        .unwrap();
+    client
+        .insert("cpu", vec![batch(1, "a", 0.5), batch(2, "b", 0.75)])
+        .await
+        .unwrap();
+    wait_count(&client, "SELECT count(*) AS c FROM yuntun.public.cpu", 2).await;
+
+    // ① 完整：唯一来源读得到 ⇒ **不许**标 partial
+    let ok = client
+        .query_full("SELECT count(*) AS c FROM yuntun.public.cpu")
+        .await
+        .unwrap();
+    assert!(
+        ok.partial.is_none(),
+        "完整结果被标成 partial = 假警报：{:?}",
+        ok.partial
+    );
+
+    // ② 注入一个**读不到的来源**（名录 + 热读器）⇒ 下一个快照里它就是热来源之一
+    lakehouse
+        .catalog
+        .register_datanode(yuntun_model::meta::DatanodeMember {
+            instance_id: "inst-ghost".into(),
+            address: "127.0.0.1:1".into(),
+            registered_at_ms: 0,
+        })
+        .await
+        .unwrap();
+    lakehouse
+        .query
+        .catalog()
+        .set_hot_shards("inst-ghost", Arc::new(Unreachable));
+    lakehouse
+        .query
+        .catalog()
+        .refresh(&lakehouse.catalog)
+        .await
+        .unwrap();
+
+    let degraded = client
+        .query_full("SELECT count(*) AS c FROM yuntun.public.cpu")
+        .await
+        .unwrap();
+    let p = degraded
+        .partial
+        .expect("有来源读不到却没标记 = 静默少数据（这正是 `D-23` 当时缺的那层信息）");
+    let text = p.to_string();
+    assert!(
+        text.contains("inst-ghost"),
+        "缺失来源必须**点名**（否则排障的人不知道该去看谁）：{p}"
+    );
+    assert!(
+        text.contains("connection refused"),
+        "原因要能区分\"连接被拒\"与\"没响应\"：{p}"
+    );
+    // 降级 ≠ 失败：可用那部分照常返回
+    assert_eq!(
+        degraded.batches[0].num_rows(),
+        1,
+        "降级后仍必须给出可用结果"
+    );
+
+    // ③ **CLI 这一跳**（容器 rig 的判据 ⑥ 就架在它上面）：脚本必须能把
+    //    "少行且是降级"与"少行且是缺口"分开 —— 所以警告要以**稳定标记**出现在 **stderr** 上，
+    //    且**不许污染 stdout**（CSV/JSON 是管道输出）。
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_yuntun-cli"))
+        .args([
+            "--addr",
+            client.addr(),
+            "query",
+            "--format",
+            "csv",
+            "SELECT count(*) AS c FROM yuntun.public.cpu",
+        ])
+        .output()
+        .expect("跑 yuntun-cli");
+    let err = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "降级不是失败：CLI 必须退 0；stderr={err}");
+    assert!(
+        err.contains("WARN: partial result"),
+        "脚本要能认出这件事（判据 ⑥ 靠它区分降级与缺口）：{err}"
+    );
+    assert!(err.contains("inst-ghost"), "点名同样要走到 stderr：{err}");
+    assert!(
+        !stdout.contains("WARN"),
+        "警告不许污染 stdout（CSV/JSON 是管道输出）：{stdout}"
+    );
+
+    shutdown.cancel();
+    let _ = server.await;
+}

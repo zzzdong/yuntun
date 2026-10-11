@@ -19,7 +19,8 @@
 #   ③ 写 → 读：两个节点各写一批，任意节点都查得到（共享冷存储 + 扇出）；
 #   ④ **两个节点都真的合并过**（`compacted>=1`，不是"日志里出现过 compaction round"——
 #      后者是假绿：第一版就是这么写的，而两个节点全程 `compacted=0`）；
-#   ⑤ **行数守恒**（合并不许改变用户看到的行数）；
+#   ⑤ **行数守恒**（合并不许改变用户看到的行数）。"瞬时少行"要能**区分**两种原因（`§174`）：
+#      **降级**（服务端标了 partial）与**可见性缺口**（没有标记却少行 ⇒ 当场失败）；
 #   ⑥ `gc` 租约**同一时刻只有一个持有者**（孤儿对账是全局作业）；
 #   ⑦ 杀掉一个 datanode ⇒ 另一个**继续干活**（接管）。
 
@@ -177,16 +178,33 @@ smoke() {
   say "⑥ 行数守恒：合并之后用户看到的行数必须**收敛回** 24"
   # ⚠️ 为什么是"收敛"而不是"立刻等于 24"：实测在合并提交的那一刻观测到过一次
   # **瞬时掉到 21**（正好是一个分片的 3 行短暂不可见），随后回到 24。
-  # 本刀**没有**把它追到底（台账 `D-23`）—— 这里先钉住"必须收敛回来"这条底线：
-  # 合并不许**永久**改变用户看到的行数。
-  local deadline5=$((SECONDS + 60)) got=0 dips=0
+  #
+  # `§174`：这条判据现在能**区分两种少行** —— 这正是 `D-23` 当时缺的那层信息：
+  #   * **降级**（服务端标了 partial：有来源读不到）⇒ 计数并打印，**不算失败**
+  #     （那是刻意的降级：`[query] partial = "allow"`）；
+  #   * **缺口**（没有 partial 标记却少行）⇒ **当场失败** —— 那才是可见性丢了数据。
+  # 判据架在 CLI 打到 stderr 的稳定标记 `WARN: partial result` 上（`§174` 起）。
+  local deadline5=$((SECONDS + 60)) got=0 dips_degraded=0 dips_gap=0 first_gap=''
   while ((SECONDS < deadline5)); do
-    got="$("$CLI" --addr "${DN_SQL[0]}" query --format csv "SELECT count(*) FROM dist" | tr -dc '0-9')"
+    local err
+    # 两条流必须**分开**：stderr 捕获、stdout 落文件（警告文本里也可能出现数字）
+    err="$("$CLI" --addr "${DN_SQL[0]}" query --format csv "SELECT count(*) FROM dist" \
+      2>&1 >/tmp/yuntun_rig_count.out)" || true
+    got="$(tr -dc '0-9' < /tmp/yuntun_rig_count.out)"
+    if [[ "$got" != "24" ]]; then
+      if [[ "$err" == *'WARN: partial result'* ]]; then
+        dips_degraded=$((dips_degraded + 1))
+      else
+        dips_gap=$((dips_gap + 1))
+        [[ -z "$first_gap" ]] && first_gap="got=$got；stderr=$err"
+      fi
+    fi
     [[ "$got" == "24" ]] && break
-    [[ "$got" == "21" ]] && dips=$((dips + 1))
     sleep 2
   done
-  printf '  count(*) = %s（期间观测到 %s 次瞬时 21）\n' "$got" "$dips"
+  printf '  count(*) = %s（期间瞬时少行：**降级** %s 次 / **缺口** %s 次）\n' \
+    "$got" "$dips_degraded" "$dips_gap"
+  ((dips_gap == 0)) || die "出现「**没有** partial 标记却少行」的观测 ⇒ 那是**可见性缺口**（不是降级）：$first_gap"
   [[ "$got" == "24" ]] || die "合并后行数没有收敛回 24（实际 $got）—— 合并改变了用户看到的数据"
 
   say "⑦ gc 租约：同一时刻只有一个持有者（孤儿对账是全局作业）"

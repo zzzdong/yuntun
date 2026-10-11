@@ -2906,4 +2906,69 @@ mod snapshot_tests {
         assert_eq!(tasks.len(), 1, "派生态要按还原出来的清单重算：{tasks:?}");
         assert_eq!(tasks[0].since_ms, 0, "还原后的年龄必须是「未知」");
     }
+
+    /// **压缩提交不许在任何快照号上"少行"或"双计"**（台账 `D-23` 的状态机那一半）。
+    ///
+    /// 为什么值得**穷举快照号**：可见性是 `valid_from <= snapshot < deleted_at` 这一条**不等式**，
+    /// 而提交时两半被赋成同一个 `next`。只要有一处写错（`<=` 与 `<` 弄反、`next` 写成 `next±1`、
+    /// 或者旧文件没打墓碑），症状就是**某一个快照号**上少几行 / 多几行 ——
+    /// 查询恰好落在那个号上时，用户看到的是一个**偏小却很正常**的数字。
+    ///
+    /// 容器 rig 曾经观测到"行数从 24 瞬时掉到 21"（`D-23`），当时没能归因。
+    /// 逐个快照号断言是唯一能把"只在一个号上错"的缺陷逼出来的形状 ——
+    /// 比在真实集群里等运气靠谱得多。
+    #[test]
+    fn compaction_never_dips_or_double_counts_any_snapshot() {
+        let mut s = rich_state(); // 已有 b1（7 行）
+        s.commit_files(commit_req("public.cpu", "b2", &["k2"]), 1_003)
+            .unwrap();
+        let before = s.snapshot_version;
+        let merged = FileManifest {
+            file_path: "p/merged.parquet".into(),
+            batch_id: "merged".into(),
+            table: "public.cpu".into(),
+            shard: "s0".into(),
+            time_window: "w1".into(),
+            row_count: 14, // = 两个输入之和（合并不许改变行数）
+            ..Default::default()
+        };
+        let after = s
+            .commit_compaction(&["b1".into(), "b2".into()], vec![merged], 0, "")
+            .expect("压缩提交（无租约 ⇒ 栅栏放行）");
+        assert!(after > before, "提交必须推进快照号");
+
+        let mut prev_rows = 0u64;
+        for snap in 0..=(after + 2) {
+            let vis = s.list_visible_files("public.cpu", snap, None);
+            let rows: u64 = vis.iter().map(|f| f.row_count).sum();
+            assert!(
+                rows >= prev_rows,
+                "快照 {snap} 的行数比上一个还少（{prev_rows} → {rows}）—— 可见性出现**缺口**"
+            );
+            assert!(
+                rows <= 14,
+                "快照 {snap} 看到 {rows} 行 > 总数 14 —— **双计**（输入与产物同时可见）"
+            );
+            if snap >= after {
+                assert_eq!(rows, 14, "快照 {snap} 必须看到合并后的全部 14 行");
+            }
+            // 更尖锐的一条：产物与它的输入**不许在同一个快照里同时可见**
+            let ids: Vec<&str> = vis.iter().map(|f| f.batch_id.as_str()).collect();
+            let has_merged = ids.contains(&"merged");
+            let has_input = ids.contains(&"b1") || ids.contains(&"b2");
+            assert!(
+                !(has_merged && has_input),
+                "快照 {snap} 同时看到产物与输入（{ids:?}）= 双计"
+            );
+            prev_rows = rows;
+        }
+        // 提交前一个快照必须**完整**（缺口最可能出现在这里：墓碑与产物用同一个号）
+        let pre = s.list_visible_files("public.cpu", after - 1, None);
+        assert_eq!(
+            pre.iter().map(|f| f.row_count).sum::<u64>(),
+            14,
+            "提交前一个快照也必须看到全部 14 行：{:?}",
+            pre.iter().map(|f| &f.batch_id).collect::<Vec<_>>()
+        );
+    }
 }

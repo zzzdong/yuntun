@@ -38,6 +38,80 @@ pub use input::InputFormat;
 /// 默认 shard（与 SqlEngine 的语句级写入一致）。
 pub const DEFAULT_SHARD: &str = "default";
 
+/// **结果不完整**（`§174`）：服务端在 `do_get` 流的第一条 `FlightData` 的 `app_metadata` 里
+/// 显式标记（格式见 `crates/server/src/flight.rs::partial_metadata`）。
+///
+/// # 为什么客户端必须把它读出来
+///
+/// 服务端在**有来源读不到**时会照常返回可用结果并标记 partial（`architecture §4.2` 第三条）——
+/// 那是刻意的降级，不是失败。但**"标记"如果没人读，降级就等于静默少数据**：
+/// `SELECT count(*)` 会给出一个**偏小却看起来很正常**的数字，而调用方无从分辨。
+///
+/// 这不是假设：容器 rig 曾经在压缩提交期间观测到"行数瞬时从 24 掉到 21"（台账 `D-23`），
+/// 当时**无法判断**那是"可见性缺口"还是"某个来源被降级" —— 因为这条链上没人读那个标记
+/// （这就是台账 `D-31`：服务端标了、客户端没人读）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialNotice {
+    /// 服务端给的一句人话（缺了哪些来源、为什么）
+    pub detail: String,
+    /// 缺失来源的点名（`instance @ table: reason`），便于排障
+    pub missing: Vec<String>,
+}
+
+impl std::fmt::Display for PartialNotice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.detail)?;
+        if !self.missing.is_empty() {
+            write!(f, "；缺失来源：{}", self.missing.join(", "))?;
+        }
+        Ok(())
+    }
+}
+
+/// 一次查询的**完整结果**：批次 + "完不完整"这件事。
+#[derive(Debug, Clone)]
+pub struct QueryOutcome {
+    pub batches: Vec<RecordBatch>,
+    /// `None` = 结果完整（服务端没标 partial）——**空 metadata 就是完整的证据**，
+    /// 不是"没读到"（服务端在完整时**不发**这个字段，见 `flight_partial_metadata.rs` 用例②）
+    pub partial: Option<PartialNotice>,
+}
+
+/// 从第一条 `FlightData` 的 `app_metadata` 里认出"结果不完整"。
+///
+/// 容错方向是刻意的：**解析不出来就当作不完整**（返回 `None` 表示"没有标记"，
+/// 而不是"完整"）。这里只在**读到 `"partial": true`** 时才认为有降级 ——
+/// 反过来（把解析失败当成 partial）会造成假警报，而假警报会让调用方无视这个字段。
+fn partial_from_app_metadata(meta: &[u8]) -> Option<PartialNotice> {
+    if meta.is_empty() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(meta).ok()?;
+    if v.get("partial").and_then(|b| b.as_bool()) != Some(true) {
+        return None;
+    }
+    let detail = v
+        .get("detail")
+        .and_then(|d| d.as_str())
+        .unwrap_or("服务端未给出原因")
+        .to_string();
+    let missing = v
+        .get("missing")
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|m| {
+                    let inst = m.get("instance").and_then(|x| x.as_str()).unwrap_or("?");
+                    let table = m.get("table").and_then(|x| x.as_str()).unwrap_or("?");
+                    let reason = m.get("reason").and_then(|x| x.as_str()).unwrap_or("?");
+                    format!("{inst} @ {table}: {reason}")
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(PartialNotice { detail, missing })
+}
+
 /// 客户端错误。
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -123,13 +197,31 @@ impl Client {
     }
 
     /// 一次性查询：返回全部批次（eager，大结果集请用 [`Client::query_stream`]）。
+    ///
+    /// ⚠️ 它**丢掉了"结果完不完整"这件事**（只剩批次）—— 想要它请用 [`Client::query_full`]。
+    /// 这里仍会 `tracing::warn!` 一条，至少不留"降级了却没人知道"的静默路径。
     pub async fn query(&self, sql: &str) -> Result<Vec<RecordBatch>> {
-        let mut stream = self.query_stream(sql).await?;
+        let out = self.query_full(sql).await?;
+        if let Some(p) = &out.partial {
+            tracing::warn!(detail = %p, "query returned a PARTIAL result（批次不完整）");
+        }
+        Ok(out.batches)
+    }
+
+    /// 一次性查询，**带回"完不完整"**（`§174`）。
+    ///
+    /// 判据是"服务端有没有标记"，不是"批次看起来对不对"：降级后的结果**可能完全正常**
+    /// （比如正好缺的那一片是空的），凭数据本身看不出来。
+    pub async fn query_full(&self, sql: &str) -> Result<QueryOutcome> {
+        let (partial, mut stream) = self.query_stream_full(sql).await?;
         let mut out = Vec::new();
         while let Some(item) = stream.next().await {
             out.push(item?);
         }
-        Ok(out)
+        Ok(QueryOutcome {
+            batches: out,
+            partial,
+        })
     }
 
     /// 流式查询：结果集边到边用（CLI / SDK 大结果集路径）。
@@ -137,6 +229,26 @@ impl Client {
         &self,
         sql: &str,
     ) -> Result<impl Stream<Item = Result<RecordBatch>> + Send + 'static> {
+        let (partial, stream) = self.query_stream_full(sql).await?;
+        if let Some(p) = &partial {
+            tracing::warn!(detail = %p, "query returned a PARTIAL result（批次不完整）");
+        }
+        Ok(stream)
+    }
+
+    /// 流式查询 + **先给出"完不完整"**（`§174`）。
+    ///
+    /// partial 标记挂在流的**第一条**消息上（服务端把它写在 schema 上，Flight 编码器落到
+    /// 第一条 `FlightData` 的 `app_metadata`）⇒ "先看一眼再往下流"是可行的，
+    /// **不必**等整个结果集到齐才知道这次结果不完整。
+    #[allow(clippy::type_complexity)]
+    pub async fn query_stream_full(
+        &self,
+        sql: &str,
+    ) -> Result<(
+        Option<PartialNotice>,
+        impl Stream<Item = Result<RecordBatch>> + Send + 'static,
+    )> {
         let mut client = self.inner.clone();
         let stream = client
             .do_get(Ticket {
@@ -144,9 +256,20 @@ impl Client {
             })
             .await?
             .into_inner();
+        // 只看第一条（schema），然后把它**放回流里** —— 解码器需要 schema 那条消息。
+        let mut stream = Box::pin(stream);
+        let first = stream.next().await;
+        let partial = first
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .and_then(|d| partial_from_app_metadata(&d.app_metadata));
+        let rest = futures::stream::iter(first).chain(stream);
         let decoded =
-            FlightRecordBatchStream::new_from_flight_data(stream.map(|r| r.map_err(to_flight_error)));
-        Ok(decoded.map(|r| r.map_err(|e| ClientError::Decode(e.to_string()))))
+            FlightRecordBatchStream::new_from_flight_data(rest.map(|r| r.map_err(to_flight_error)));
+        Ok((
+            partial,
+            decoded.map(|r| r.map_err(|e| ClientError::Decode(e.to_string()))),
+        ))
     }
 
     /// 结果集 schema（逻辑计划，不执行查询）。
@@ -288,6 +411,43 @@ mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+
+    /// `§174`：**partial 标记的解析边界**。
+    ///
+    /// 方向是刻意的：**读到 `"partial": true` 才算降级**。反过来（把解析失败、空 metadata
+    /// 或别的 JSON 当作 partial）会造出**假警报** —— 而假警报的代价是调用方学会无视这个字段，
+    /// 于是真降级又变回静默。所以"完整"必须由"没有那个字段"来表达（服务端确实如此：
+    /// 完整时 metadata 是**空的**）。
+    #[test]
+    fn partial_metadata_is_only_read_when_it_says_so() {
+        // ①②③ 的输入统一走 `.as_bytes()`：raw byte string 不许含非 ASCII，
+        // 而这里的 JSON 里就是要放中文（服务端的 `detail` 是人话）。
+        let none_cases = [
+            "",
+            r#"{"partial":false}"#,
+            "not json at all",
+            r#"{"something":"else"}"#,
+        ];
+        for case in none_cases {
+            assert_eq!(
+                partial_from_app_metadata(case.as_bytes()),
+                None,
+                "`{case}` 不该被当成降级（假警报会让调用方学会无视这个字段）"
+            );
+        }
+        // ④ 真降级：detail + 缺失来源都要能读懂并点名
+        let meta = r#"{"partial":true,"detail":"缺 1 个来源","missing":[
+                 {"instance":"inst-b","table":"public.t","reason":"connection refused"}]}"#;
+        let p = partial_from_app_metadata(meta.as_bytes())
+            .expect("标记了 partial 就必须认出来");
+        assert_eq!(p.detail, "缺 1 个来源");
+        assert_eq!(p.missing, vec!["inst-b @ public.t: connection refused"]);
+        assert!(p.to_string().contains("inst-b"), "{p}");
+        // ⑤ 只有 `partial: true`（服务端没给 detail）⇒ 仍然要报，给一句兜底的人话
+        let p = partial_from_app_metadata(r#"{"partial":true}"#.as_bytes()).expect("仍然要报");
+        assert!(!p.detail.is_empty(), "兜底文案不能是空串：{p:?}");
+        assert!(p.missing.is_empty());
+    }
 
     #[test]
     fn insert_receipt_parses_engine_json() {

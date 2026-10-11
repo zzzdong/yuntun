@@ -182,7 +182,18 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         Cmd::Query { sql, format } => {
             let client = Client::connect(&addr).await?;
-            let batches = client.query(&sql).await?;
+            // `§174`：**把"结果不完整"这件事走到用户面前**。
+            //
+            // 服务端在有来源读不到时会照常返回可用结果并标记 partial（故意的降级）——
+            // 但标记如果没人读，降级就等于**静默少数据**：`count(*)` 会小一点，却看不出来。
+            // 所以打印到 **stderr**（不污染 `--format csv/json` 的管道输出），
+            // 并带一个稳定的英文标记便于脚本/rig 判据认出它。
+            let out = client.query_full(&sql).await?;
+            let batches = out.batches;
+            if let Some(p) = &out.partial {
+                eprintln!("WARN: partial result —— 部分结果：{p}");
+                eprintln!("      （有来源读不到 ⇒ 行数与聚合值**可能偏小**；这是降级，不是失败）");
+            }
             if batches.is_empty() {
                 // DDL / INSERT 等无结果集语句（服务端回 Affected，简易轨无行）
                 println!("OK");
