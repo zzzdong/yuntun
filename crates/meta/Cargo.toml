@@ -45,5 +45,9 @@ arrow = { workspace = true }
 prost = { workspace = true }
 yuntun-model = { path = "../model" }
 yuntun-proto = { path = "../proto" }
+# `§175`：假 metaserver 的用例要断言 `CatalogOps` 的读接口（`list_visible_files` / `current_snapshot`），
+# 并用 `futures::stream::unfold` 把 accept 循环包成 Stream（与 `yuntun_shardrpc::serve` 同一手法）
+yuntun-catalog = { path = "../catalog" }
+futures = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }
