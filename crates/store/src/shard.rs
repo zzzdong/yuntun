@@ -92,6 +92,18 @@ impl ShardRead {
     }
 }
 
+/// 一次**聚合拉取**的结果与边界信息（`§173`，G.2 / 归档 `S5-3`）。
+#[derive(Debug, Clone)]
+pub struct ShardAggs {
+    /// 与请求的 specs **同序同长**的部分状态（顺序是契约的一部分）
+    pub partials: Vec<yuntun_model::agg::PartialAgg>,
+    /// 与 [`ShardRead::flushed_watermark`] 同一口径（**实例级**，不是分片级投影）
+    pub flushed_watermark: u64,
+    /// 与 [`ShardRead::stale`] 同一语义。**聚合比行更怕它**：少一个来源，
+    /// 计数会变成"偏小但看起来很正常"的数字（所以调用方拿到 `stale` 必须重试，不得当答案）。
+    pub stale: bool,
+}
+
 // ---------------------------------------------------------------- 读侧接缝
 
 /// **热数据读接口**：查询侧唯一依赖的热数据入口。
@@ -192,6 +204,32 @@ pub trait ShardReader: Send + Sync + std::fmt::Debug {
         })
     }
 
+    /// **整表的聚合拉取**（`§173`）：把这个来源上"对 `known_manifest_ver` 尚不可冷读"的那部分
+    /// 折成**部分状态**（标量），供协调者合并。
+    ///
+    /// 默认实现 = 读行（[`Self::read_table_excluding`]）+ 本地折叠 ⇒ **只对进程内来源成立**
+    /// （`ChunkStore`：本来就没有网络可省）。**远端来源必须覆写**（见 [`RemoteShard`]），
+    /// 否则"下推"会退化成"把行拉回来再折" —— 网络一点没省，而那正是这一刀要修的东西。
+    ///
+    /// 水位与 `stale` 的口径**与 [`Self::read_table_excluding`] 逐字相同**（取实例水位，
+    /// 不是分片级投影）。聚合对这个口径更敏感：少一个来源，计数看起来仍像个正常数字。
+    async fn read_table_aggs(
+        &self,
+        table: &str,
+        known_manifest_ver: u64,
+        exclude: &[String],
+        specs: &[yuntun_model::agg::AggSpec],
+    ) -> Result<ShardAggs, LakeError> {
+        let read = self
+            .read_table_excluding(table, known_manifest_ver, exclude)
+            .await?;
+        Ok(ShardAggs {
+            partials: yuntun_model::agg::fold_batches(specs, &read.batches)?,
+            flushed_watermark: read.flushed_watermark,
+            stale: read.stale,
+        })
+    }
+
     /// 回收**本地副本**中已被 `cached_snapshot` 覆盖（或已陈旧世代）的条目。
     ///
     /// 默认空实现：远端分片服务的 GC 由其自身负责，不由查询节点驱动。
@@ -234,6 +272,52 @@ pub trait ShardFetch: Send + Sync {
         &'a self,
         known_manifest_ver: u64,
     ) -> futures::future::BoxFuture<'a, Result<ShardRead, LakeError>>;
+
+    /// **聚合拉取**（`§173`）：在**数据所在处**算部分状态，只回标量。
+    ///
+    /// 默认实现 = 逐分片取行 + 本地折叠 —— 它**只为测试假实现与"没有聚合 RPC"的实现**准备：
+    /// 生产实现必须覆写成走服务端的聚合 RPC（见 `crates/shardrpc` 的 `GrpcShardFetch`），
+    /// 否则这条路径什么也没省。
+    ///
+    /// 水位口径与 [`Self::fetch_shard`] 一致：**先读分片、后取实例水位**（顺序是刻意的，
+    /// 见 [`ShardReader::read_table`] 的说明）。
+    fn fetch_shard_aggs<'a>(
+        &'a self,
+        table: &'a str,
+        known_manifest_ver: u64,
+        known_batch_ids: Vec<String>,
+        specs: Vec<yuntun_model::agg::AggSpec>,
+    ) -> futures::future::BoxFuture<'a, Result<ShardAggs, LakeError>> {
+        Box::pin(async move {
+            let mut partials: Option<Vec<yuntun_model::agg::PartialAgg>> = None;
+            for id in self.fetch_shards(table).await? {
+                let read = self
+                    .fetch_shard(&id, known_manifest_ver, known_batch_ids.clone())
+                    .await?;
+                let part = yuntun_model::agg::fold_batches(&specs, &read.batches)?;
+                partials = Some(match partials {
+                    None => part,
+                    Some(acc) => acc
+                        .iter()
+                        .zip(part.iter())
+                        .map(|(a, b)| yuntun_model::agg::merge(a, b))
+                        .collect::<Result<Vec<_>, _>>()?,
+                });
+            }
+            let wm = self.fetch_watermark(known_manifest_ver).await?;
+            Ok(ShardAggs {
+                // 一个分片都没有 ⇒ 返回单位元（**不是空 Vec**：调用方按"与 specs 同长"来对齐）
+                partials: partials.unwrap_or_else(|| {
+                    specs
+                        .iter()
+                        .map(|s| yuntun_model::agg::PartialAgg::empty(s.kind))
+                        .collect()
+                }),
+                flushed_watermark: wm.flushed_watermark,
+                stale: wm.stale,
+            })
+        })
+    }
 
     /// 服务端变更水位（拿不到返回 0：查询侧退化为 TTL 刷新）。
     fn fetch_version(&self) -> u64 {
@@ -299,6 +383,21 @@ impl ShardReader for RemoteShard {
 
     async fn watermark(&self, known_manifest_ver: u64) -> Result<ShardRead, LakeError> {
         self.fetch.fetch_watermark(known_manifest_ver).await
+    }
+
+    /// `§173`：**覆写**默认实现 —— 远端来源在**它那边**折，只把标量送回来。
+    ///
+    /// 这是"下推"这个字唯一的落点：默认实现会把行拉回来再折（等价于没下推）。
+    async fn read_table_aggs(
+        &self,
+        table: &str,
+        known_manifest_ver: u64,
+        exclude: &[String],
+        specs: &[yuntun_model::agg::AggSpec],
+    ) -> Result<ShardAggs, LakeError> {
+        self.fetch
+            .fetch_shard_aggs(table, known_manifest_ver, exclude.to_vec(), specs.to_vec())
+            .await
     }
     // `read_table` 用默认实现（枚举 + 逐片 + 水位）；reclaim 用默认空实现（GC 归服务端）
 }

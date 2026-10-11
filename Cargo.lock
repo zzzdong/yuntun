@@ -7074,6 +7074,7 @@ dependencies = [
  "yuntun-format",
  "yuntun-ingest",
  "yuntun-model",
+ "yuntun-shardrpc",
  "yuntun-store",
  "yuntun-testkit",
  "yuntun-wal",

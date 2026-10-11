@@ -1,6 +1,6 @@
 # yuntun 实施操作日志（§169 起）
 
-> 起记时间：2026-10-11（最新：**§172，2026-10-11**）。对应分支：main。
+> 起记时间：2026-10-11（最新：**§173，2026-10-11**）。对应分支：main。
 >
 > **这是什么**：从今天起，**每一刀**（一次成体系的改造）在这里留一节 —— 写清"做了什么、
 > 为什么这么做、边界在哪（**没做什么**）、怎么验的"。它是本项目的**证据出处**：
@@ -321,3 +321,79 @@
 - **顺带审计了 `§171` 那一类的剩余风险**：扫了其它 `wait_for(30s)` 上界（`meta` 的进程用例等），
   它们等的是"选举/进程就绪"（秒级）而不是"必须等满一个 TTL" ⇒ 不存在"上界 == 被等待量"的形状；
   唯一一处正是本刀修的 `compaction_e2e`（GC 租约 TTL 下限 30s vs 30s 上界）。
+
+---
+
+## 173. **N4 上半刀：可分解聚合的下推**（G.2 / 归档 `S5-3`）（2026-10-11）
+
+### 173.0 缺口与这一刀的范围
+
+`ROADMAP.md` 的 N4 写的是「`(table, shard) → owner` + 协调者把冷文件（及谓词/聚合）下推给持有者」，
+验收「对拍逐行相等 + **网络传输量下降一个量级**」。摸底（`code-explorer`）之后先摆清三件事：
+
+- **热数据今天是怎么回来的**：协调者按名录逐个实例 `read_table_excluding` ⇒ `shard.proto` 的
+  `batches_ipc` —— **原始行的 arrow IPC**（`shard.proto:67-70`）；
+- **冷数据今天根本没"下推"**：协调者自己从**共享存储**读全部 manifest 文件
+  （`crates/query/src/table.rs:552+`），`source_instance` **只**用于热读归属（不算文件归属）；
+- **数据面没有聚合能力**：`ShardService` 只持一个 `Arc<dyn ShardReader>`（行语义）——
+  datanode 进程里那个 DataFusion `QueryEngine` 与 RPC handler **够不着**（`main.rs:610` vs `shardrpc`）。
+
+⇒ 这一刀只做**可交付、可验收的那一半**：**可分解聚合的下推**（把网络里的"行"换成"标量"）。
+冷文件的"归属/分配"（S5-2）需要一条"读指定文件/替我这批文件算"的新 RPC，**留作 N4b**；
+谓词与 `GROUP BY` 同样留作后续（见 173.3 的边界）。
+
+### 173.1 做了什么
+
+| # | 层 | 改动 |
+|---|---|---|
+| 1 | **判定层**（`model::agg`，新模块） | `AggKind` / `AggSpec` / `AggScalar` / `PartialAgg` + `fold_batch(es)` / `merge` / `merge_all`。**只收** `count(*)` / `count(col)` / `sum(整数)` / `min` / `max`（整数与字符串）——"为什么"写在模块文档里（可分解 + **精确** 两条） |
+| 2 | **协议**（`shard.proto`） | 新 RPC `FetchShardAggs` + `AggSpecMsg` / `PartialAggMsg` / `FetchShardAggs{Request,Response}`。响应**与请求同序同长**（顺序是契约）；`PartialAggMsg` 用显式 `has_sum` / `has_scalar` 标志表达 NULL（proto3 的 `optional` 不够直白，而"NULL 与 0 必须能分开"） |
+| 3 | **数据面**（`store` + `shardrpc`） | `ShardAggs`；`ShardReader::read_table_aggs`（**默认实现 = 读行 + 折叠**，进程内来源用它）；`ShardFetch::fetch_shard_aggs`（默认同上，**给假实现留路**）；`RemoteShard` 与 `GrpcShardFetch` **覆写**成走新 RPC（这一步才是"下推"的落点）；服务端 handler 直接调本地 `read_table_aggs`（**同一份折叠代码** ⇒ 两端语义逐字相同） |
+| 4 | **协调者**（`query`） | `agg_pushdown::detect`（**形状判定**：拿不准一律不下推）+ `merge_into_cold`（把热的部分状态并进**冷结果的那一行**）；`ReadPath.hot_enabled`（只读冷数据的会话）；`QueryEngine::aggregate_pushdown`（冷的一半交给 DataFusion + 热的一半走聚合 RPC + 合并）；`sql_with_partial` 里先试它 |
+| 5 | **对拍开关** | `with_agg_pushdown(bool)`（默认开）：关掉只为一件事 —— 两条路径跑同一批数据**逐位比**（与 `with_index_pruning` 同一性质，不是运维旋钮） |
+
+### 173.2 四个决定
+
+1. **冷的一半仍然交给 DataFusion，只把热的一半下推**。
+   这样 **schema / 列名 / 类型 / 可空性**都由 DataFusion 给（它是"原路"的产出），我们**只改值**。
+   自己拼一个"看起来一样"的结果集，就是在跟 DataFusion 的列名（`count(*)`）、`count` 的返回类型
+   （`Int64` vs `UInt64`）赛跑 —— 那正是对拍会红的地方。
+2. **下推边界由"可分解 **且** 精确"两条判定**，不是由"能算就算"：
+   `sum` 只收整数（**浮点求和不满足结合律**：`(a+b)+c` 与分部相加的最后几位会不同 ⇒ 对拍不可能逐位相等）；
+   `min/max` 只收整数与字符串（浮点的 `NaN` 在 arrow 里有"视作最大"的特殊口径，要跨节点合并就得先复刻它，
+   而"复刻得差一点"的风险高于收益）。`avg` / `stddev` / `count(distinct)` 一律原路。
+3. **判定只认最窄的形状，拿不准就返回 `None`**（`WHERE` / `GROUP BY` / `HAVING` / `LIMIT` / `ORDER BY` /
+   `DISTINCT` / `QUALIFY` / `INTO` / JOIN / 子查询 / CTE / UNION / 别名 / 表函数 / 表达式参数…）。
+   与状态机那边的纪律方向相反但道理相同：**不下推永远是正确且稍慢的；推错了是结果悄悄错**。
+4. **部分状态必须带"NULL vs 0"的区分**（`has_sum` / `has_scalar`）：空集 `count(*)=0` 而 `sum=NULL`。
+   把 NULL 当 0 会让"空表求和"变成 0 —— 一个**看起来很正常**的错值（这一刀最怕的形态）。
+
+### 173.3 边界（这一刀**没有**做的）
+
+- **谓词不下推**：有 `WHERE` 就整条原路（本刀热的一半只算整表）。⇒ `SELECT count(*) FROM t WHERE …`
+  仍然拉全部行。要做需要把谓词也送过去（那是**另一条契约**：表达式过网）。
+- **`GROUP BY` 不下推**：每个分组各自的部分状态需要一个"分组键 + 状态列表"的响应形状。
+- **`avg` / 浮点 `sum` / `min/max` 浮点列不下推**（见 173.2-2）：这三类在原路里照样正确，只是不过网省不了。
+- **冷文件不分配**（`S5-2`）：协调者仍自己从共享存储读全部冷文件。要做需要"读指定文件"的新 RPC
+  （且要先定"谁来分配"——今天**没有**文件 owner 字段，`source_instance` 只是**热副本**归属）。
+- **`LIMIT` 下推**（`count(*) … LIMIT 1` 这类）：不做，整条原路。
+
+### 173.4 验证
+
+- **对拍（逐位 + schema）**：`crates/query/tests/aggregate_pushdown.rs`
+  `pushed_down_aggregates_match_the_row_path_bit_for_bit` —— 真冷文件（含 NULL）+ 三个真 chunk
+  （含 NULL、含空来源），9 条查询：5 条可下推、4 条必须退回。断言三件事：
+  ① 值与参照**逐位相同**（规范化后比：批次切分与行序不在契约里，值才是）；
+  ② **schema 也相同**（列名/类型被我们动过同样是静默破坏）；
+  ③ **该下推的真的下了推、不该下推的一次都没打**（否则"对拍通过"可能只是原路跑了两遍 —— 那种绿没有意义）。
+- **网络量（`ROADMAP` N4 的验收）**：`pushed_down_pull_moves_scalars_not_rows` —— 假远端按**真实编码**
+  （`shardrpc::encode_batch`）计上网字节：**行路径 244,104 字节 vs 聚合路径 64 字节（3814×）**，
+  3 万行整数。断言 `行 ≥ 聚合 × 10`，并要求两条路的答案一致。
+- **降级语义**（`missing_sources_degrade_the_same_way_for_aggregates`）：`Allow` ⇒ 带标记、点名 `inst-bad`、
+  计数只算拿得到的那部分（**下界**）；`Reject` ⇒ 当场失败并点名。与行路径**逐字同策**。
+- **STALE**（`stale_sources_never_leak_into_a_pushed_down_answer`）：整次尝试失败、点名实例与 STALE
+  （**不降级成 partial**）—— 聚合少算一个来源会静默偏小，这条必须最严。
+- **协议往返**：`crates/shardrpc/tests/grpc_shard_fetch.rs::aggregate_pull_survives_the_wire` ——
+  真 gRPC + 真编码：过网与进程内**逐位相同**、长度/顺序是契约、水位与 `stale` 一起过网、空集是 NULL。
+- **全量**：`cargo test --workspace` **exit=0**（0 failed / 85 段；文档规模行同步后全绿）；
+  `cargo clippy --workspace --all-targets` **0 告警**。

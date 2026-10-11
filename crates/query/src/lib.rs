@@ -16,7 +16,8 @@ pub mod index;
 /// `F.3`：DML 的定位扫描（在一个文件上求谓词，取回命中行号）。
 pub mod locate;
 pub mod partial;
-pub mod stmt;
+pub mod agg_pushdown;
+mod stmt;
 pub mod prune;
 pub mod provider;
 pub mod table;
@@ -84,6 +85,8 @@ pub struct QueryEngine {
     /// 关掉只为一件事 —— **对拍**（同一查询开/关必须逐行一致）。
     /// 不放进 TOML：它不是一个"运维旋钮"，而是那条断言的载体（`table::ReadOptions`）。
     index_pruning: bool,
+    /// **聚合下推开关**（`§173`）：默认开；关掉只为**对拍**（见 [`Self::with_agg_pushdown`]）。
+    agg_pushdown: bool,
 }
 
 /// 一次查询的结果：批次 + **完整性标记**（`crate::partial`）。
@@ -105,6 +108,16 @@ impl QueryOutcome {
     }
 }
 
+/// 一个热来源的**聚合**拉取结果 —— 与 `scan` 的三态**逐字对应**（`§173`）。
+///
+/// 刻意复用同一套三态语义：`Read` = 拿到了；`Missing` = 拿不到（降级 + 点名）；
+/// `Stale` = 还没拿到（刷新重试，**不得当答案**）。两套语义只会在某个边界上漂。
+enum AggOutcome {
+    Read(Vec<yuntun_model::agg::PartialAgg>),
+    Missing(String),
+    Stale(HotReadStale),
+}
+
 impl QueryEngine {
     pub fn new(
         store: std::sync::Arc<dyn object_store::ObjectStore>,
@@ -117,6 +130,8 @@ impl QueryEngine {
             partial_policy: PartialPolicy::default(),
             hot_read_budget: DEFAULT_HOT_READ_BUDGET,
             index_pruning: true,
+            // `§173`：聚合下推默认开（关掉只为对拍）
+            agg_pushdown: true,
         }
     }
 
@@ -141,6 +156,7 @@ impl QueryEngine {
             partial_policy: PartialPolicy::default(),
             hot_read_budget: DEFAULT_HOT_READ_BUDGET,
             index_pruning: true,
+            agg_pushdown: true,
         })
     }
 
@@ -192,6 +208,21 @@ impl QueryEngine {
     ///
     /// 唯一用途是**对拍**：同一批查询在"开"与"关"下必须**逐行一致** ——
     /// 剪错 = 静默少数据，而这条开关就是那个断言的载体（`query/tests/index_parity.rs`）。
+    /// **聚合下推开关**（`§173`）：默认开。
+    ///
+    /// 关掉只为一件事：**对拍**（同一查询在"下推"与"原路"两条路径上必须**逐位相同**）——
+    /// 聚合算错不会报错，只会给出一个偏大/偏小的数字，所以这条开关是那个断言的载体，
+    /// 不是给运维调的旋钮。
+    pub fn with_agg_pushdown(mut self, on: bool) -> Self {
+        self.agg_pushdown = on;
+        self
+    }
+
+    /// 当前聚合下推开关。
+    pub fn agg_pushdown_enabled(&self) -> bool {
+        self.agg_pushdown
+    }
+
     pub fn with_index_pruning(mut self, on: bool) -> Self {
         self.index_pruning = on;
         self
@@ -241,6 +272,27 @@ impl QueryEngine {
         schema: &str,
         partial: std::sync::Arc<PartialSink>,
     ) -> Result<SessionContext, DataFusionError> {
+        self.session_inner(schema, partial, true).await
+    }
+
+    /// **只读冷数据**的会话（`§173`）：聚合下推先用它把"冷的一半"算出来
+    /// （schema / 列名 / 类型由 DataFusion 给，不必手写一个"看起来一样"的结果集）。
+    ///
+    /// 热的那一半由聚合 RPC 单独拉 —— 两边都读会把同一批热数据算两遍。
+    async fn session_cold_only(
+        &self,
+        schema: &str,
+        partial: std::sync::Arc<PartialSink>,
+    ) -> Result<SessionContext, DataFusionError> {
+        self.session_inner(schema, partial, false).await
+    }
+
+    async fn session_inner(
+        &self,
+        schema: &str,
+        partial: std::sync::Arc<PartialSink>,
+        hot_enabled: bool,
+    ) -> Result<SessionContext, DataFusionError> {
         // **读路径的按需保鲜**（`§163`）：会话是所有查询的必经点，缓存不落后于版本才建会话。
         // 冷缓存必刷（否则"进程刚起来 / 装配层没起后台任务"时查询会报 table not found），
         // 其余情况按节流问一次版本、没变则零开销返回。失败不阻断读（见 `ensure_fresh` 的文档）。
@@ -275,10 +327,123 @@ impl QueryEngine {
                     store: self.store.clone(),
                     hot_read_budget: self.hot_read_budget,
                     index_pruning: self.index_pruning,
+                    hot_enabled,
                 },
             )),
         );
         Ok(ctx)
+    }
+
+    /// **聚合下推**（`§173`，G.2 / 归档 `S5-3`）：形状可下推时，把这次聚合查询算成
+    /// "**冷的一半交给 DataFusion** + **热的一半走聚合 RPC**"，然后合并。
+    ///
+    /// 不适用（形状不合 / 结果形状与判定不符）⇒ 返回 `None`，调用方走原路。
+    ///
+    /// 三条与 `scan` **逐字一致**的规则（有两套就会漂）：STALE 必须失败并交给上层刷新重试；
+    /// 拿不到的来源按 partial 策略处置；装配**严格按键序**（并发只改时间，不改结果）。
+    async fn aggregate_pushdown(
+        &self,
+        query: &str,
+        schema: &str,
+    ) -> Result<Option<QueryOutcome>, DataFusionError> {
+        let snapshot = self.catalog.snapshot();
+        let Some(plan) = agg_pushdown::detect(query, schema, &snapshot) else {
+            return Ok(None);
+        };
+
+        // ---- ① 冷的一半：DataFusion，热读关闭 ----
+        //
+        // 为什么不让 DataFusion 顺手把热的一半也算了：那样热数据就只有"行"这一条路能回来
+        // （网络白花），而且**同一批热数据会被算两遍**（一次在冷扫描里、一次在聚合 RPC 里）。
+        let partial = std::sync::Arc::new(PartialSink::new(self.partial_policy));
+        let ctx = self.session_cold_only(schema, partial.clone()).await?;
+        let cold = ctx.sql(query).await?.collect().await?;
+        // 形状判定是**保守**的（拿不准不下推），所以"判定通过但产物形状不对"不该发生；
+        // 真发生了就**原路重跑**，而不是猜一个（正确性优先于省下的那次扫描）。
+        let cold = match cold.as_slice() {
+            [b] if b.num_rows() == 1 && b.num_columns() == plan.specs.len() => b.clone(),
+            _ => {
+                tracing::debug!(
+                    table = %plan.table,
+                    "聚合下推：冷结果的形状与判定不符，退回原路"
+                );
+                return Ok(None);
+            }
+        };
+
+        // ---- ② 热的一半：逐来源下发（只回标量）----
+        let hot = self.catalog.hot_shards();
+        let budget = self.hot_read_budget;
+        let deadline = tokio::time::Instant::now() + budget;
+        // 读侧栅栏（`§28.1`）与 `scan` **同一份集合**：本次快照里可见文件的批次
+        let exclude: Vec<String> = snapshot
+            .get(&plan.table)
+            .map(|t| t.files.iter().map(|f| f.batch_id.clone()).collect())
+            .unwrap_or_default();
+        let snap_ver = snapshot.snapshot;
+
+        let outcomes = futures::future::join_all(hot.iter().map(|(instance, reader)| {
+            let ident = plan.table.clone();
+            let specs = plan.specs.clone();
+            let exclude = exclude.clone();
+            let instance = instance.clone();
+            async move {
+                let outcome = match tokio::time::timeout_at(
+                    deadline,
+                    reader.read_table_aggs(&ident, snap_ver, &exclude, &specs),
+                )
+                .await
+                {
+                    Ok(Ok(a)) if a.stale => AggOutcome::Stale(HotReadStale {
+                        instance: instance.clone(),
+                        table: ident,
+                        known_manifest_ver: snap_ver,
+                        flushed_watermark: a.flushed_watermark,
+                    }),
+                    Ok(Ok(a)) => AggOutcome::Read(a.partials),
+                    Ok(Err(e)) => AggOutcome::Missing(e.to_string()),
+                    Err(_elapsed) => AggOutcome::Missing(format!(
+                        "超出热读预算（{} ms 内未答复）",
+                        budget.as_millis()
+                    )),
+                };
+                (instance, outcome)
+            }
+        }))
+        .await;
+
+        let mut per_source: Vec<Vec<yuntun_model::agg::PartialAgg>> = Vec::with_capacity(hot.len());
+        for (instance, outcome) in outcomes {
+            match outcome {
+                AggOutcome::Read(partials) => per_source.push(partials),
+                AggOutcome::Missing(reason) => {
+                    let source = MissingSource {
+                        table: plan.table.clone(),
+                        instance,
+                        reason,
+                    };
+                    tracing::warn!(
+                        table = %source.table,
+                        instance = %source.instance,
+                        error = %source.reason,
+                        policy = self.partial_policy.as_str(),
+                        "hot shard aggregate unavailable; this source degrades to a PARTIAL result"
+                    );
+                    partial.record(source)?;
+                }
+                AggOutcome::Stale(e) => {
+                    return Err(DataFusionError::External(Box::new(e)));
+                }
+            }
+        }
+
+        // ---- ③ 合并：热的部分状态并进冷结果的那一行 ----
+        let merged = agg_pushdown::merge_into_cold(&cold, &plan.specs, &per_source)
+            .map_err(|e| DataFusionError::Execution(format!("聚合下推合并失败：{e}")))?;
+        Ok(Some(QueryOutcome {
+            batches: vec![merged],
+            partial: partial.read(),
+        }))
     }
 
     /// 热读 STALE 的**重试上限**（`operation-log §61.4` 第 2 条）。
@@ -382,6 +547,12 @@ impl QueryEngine {
         }
         let out = self
             .with_stale_retry("sql", || async {
+                // `§173`：先试**可分解聚合的下推**（形状不合适 ⇒ `None` ⇒ 原路，一个字不变）
+                if self.agg_pushdown
+                    && let Some(out) = self.aggregate_pushdown(query, schema).await?
+                {
+                    return Ok(out);
+                }
                 let partial = std::sync::Arc::new(PartialSink::new(self.partial_policy));
                 let ctx = self.session_with_partial(schema, partial.clone()).await?;
                 let df = ctx.sql(query).await?;

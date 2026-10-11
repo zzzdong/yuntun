@@ -251,3 +251,73 @@ async fn known_batch_ids_fence_survives_the_wire() {
         .unwrap();
     assert_eq!(unrelated.rows(), 3, "不相干的 batch 不得误伤热数据");
 }
+
+/// `§173`：**聚合拉取过网络** —— 只回标量，且**顺序与长度是契约**。
+///
+/// 三条都要钉住：
+/// 1. 值逐位正确（`count(*)` / `count(col)` / `sum` / `min` / `max`，含"空集是 NULL"的语义）；
+/// 2. 与**进程内**同一条 reader 算出来的部分状态**逐位相同**（过网不该改变任何东西）；
+/// 3. 水位与 STALE 一起过网（与行级拉取同一口径）——聚合少一个来源会**静默少算**，
+///    所以这两个字段在聚合响应里更不可能省。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn aggregate_pull_survives_the_wire() {
+    use yuntun_model::agg::{AggKind, AggScalar, AggSpec, PartialAgg};
+
+    let dir = yuntun_testkit::TestDir::tmpfs("wire-agg");
+    let chunk = instance(&dir, "inst-w");
+    write(&chunk, &[3, 1, 2]); // 让 ChunkStore 里真的有数据
+    let local: Arc<dyn ShardReader> = chunk;
+    let addr = serve(local.clone()).await;
+    let remote = remote_reader(&addr).await;
+
+    let specs = vec![
+        AggSpec::count_star(),
+        AggSpec::new(AggKind::Count, "a"),
+        AggSpec::new(AggKind::SumInt, "a"),
+        AggSpec::new(AggKind::Min, "a"),
+        AggSpec::new(AggKind::Max, "a"),
+    ];
+    let over_wire = remote
+        .read_table_aggs(TABLE, 0, &[], &specs)
+        .await
+        .expect("聚合拉取过网络");
+    let in_process = local
+        .read_table_aggs(TABLE, 0, &[], &specs)
+        .await
+        .expect("进程内聚合拉取");
+
+    assert_eq!(
+        over_wire.partials, in_process.partials,
+        "过网与进程内必须逐位相同（契约是按序、按长、按值）"
+    );
+    assert_eq!(over_wire.partials.len(), specs.len(), "长度是契约");
+    assert_eq!(over_wire.partials[0], PartialAgg::Count(3), "count(*)");
+    assert_eq!(over_wire.partials[1], PartialAgg::Count(3), "count(a)");
+    assert_eq!(over_wire.partials[2], PartialAgg::SumInt(Some(6)), "sum");
+    assert_eq!(
+        over_wire.partials[3],
+        PartialAgg::Min(Some(AggScalar::Int(1)))
+    );
+    assert_eq!(
+        over_wire.partials[4],
+        PartialAgg::Max(Some(AggScalar::Int(3)))
+    );
+    assert_eq!(
+        over_wire.flushed_watermark, in_process.flushed_watermark,
+        "水位必须一起过网（与行级拉取同一口径）"
+    );
+    assert_eq!(over_wire.stale, in_process.stale);
+
+    // 空集：`sum`/`min`/`max` 是 NULL（不是 0）—— 这条也会过网
+    let empty = yuntun_testkit::TestDir::tmpfs("wire-agg-empty");
+    let empty_local: Arc<dyn ShardReader> = instance(&empty, "inst-empty");
+    let empty_addr = serve(empty_local).await;
+    let empty_remote = remote_reader(&empty_addr).await;
+    let got = empty_remote
+        .read_table_aggs(TABLE, 0, &[], &specs)
+        .await
+        .expect("空来源也要能答");
+    assert_eq!(got.partials[0], PartialAgg::Count(0));
+    assert_eq!(got.partials[2], PartialAgg::SumInt(None), "空集求和是 NULL");
+    assert_eq!(got.partials[3], PartialAgg::Min(None));
+}

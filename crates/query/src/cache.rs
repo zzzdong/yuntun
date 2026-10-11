@@ -119,6 +119,37 @@ pub struct CatalogSnapshot {
 }
 
 impl CatalogSnapshot {
+    /// **测试用**：只带一张表（schema）的快照 —— 聚合下推的形状判定只读列类型。
+    ///
+    /// 为什么不做成公开 API：生产路径的快照一律由 `LocalCatalog` 构建（写时复制），
+    /// 手搓一份会让"快照里有什么"多出第二处真相。
+    #[cfg(test)]
+    pub(crate) fn from_schema_for_test(
+        ident: &str,
+        schema: arrow::datatypes::SchemaRef,
+    ) -> Self {
+        let (namespace, table) = ident.split_once('.').unwrap_or(("public", ident));
+        let cached = CachedTable {
+            meta: TableMeta {
+                name: table.to_string(),
+                namespace: namespace.to_string(),
+                current_schema_version: 1,
+                ..Default::default()
+            },
+            schema,
+            schema_version: 1,
+            files: Vec::new(),
+            deletions: Vec::new(),
+        };
+        Self {
+            tables: HashMap::from([(ident.to_string(), Arc::new(cached))]),
+            schemas: vec![namespace.to_string()],
+            version: CatalogVersion::default(),
+            snapshot: 0,
+            nodes: Vec::new(),
+        }
+    }
+
     /// 按全限定标识取表（同步、无锁、无网络 —— C7）。
     pub fn get(&self, qualified_table: &str) -> Option<&CachedTable> {
         self.tables.get(qualified_table).map(|t| t.as_ref())

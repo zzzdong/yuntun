@@ -69,6 +69,7 @@
 | **行级删除** | `DELETE FROM t WHERE …`：删除向量（roaring 位图）表达 + 读侧行选择 + WAL `DeletePayload` + 重启重放 + compaction 消费（合并重写时**应用** DV，提交后 `revoke`）；**无 `WHERE` 的全表删**走文件级下线（`purge_table_files`） |
 | **行级更新** | `UPDATE t SET … WHERE …`：**一个 op 承载、原子可见**（DV 与新行文件同一个快照号 ⇒ 看不到"删了没插/插了没删"） |
 | 索引 | **行组级**：写时随 flush 生成 `{batch}.idx`（逐组 min/max + XOR，只给排序列）；读时文件级 → 组级两级剪枝。⚠️ **只对 parquet 生效**，vortex 路径无组级剪枝 |
+| **分布式聚合下推** | `SELECT count(*) / count(c) / sum(整数列) / min / max FROM t`（**无 `WHERE`、无 `GROUP BY`**）在多节点下**只回标量**：热来源在它那边折（`FetchShardAggs`），冷的一半仍由 DataFusion 算，协调者合并 —— 实测 3 万行从 **244KB 降到 64 字节**（`§173`）。其余形状（谓词 / `GROUP BY` / `avg` / 浮点 `sum`）**原路**（正确但不过网省），见 `ARCHITECTURE.md §4` |
 | 元数据 | `SHOW TABLES/COLUMNS/DATABASES`、`DESCRIBE`、`SHOW CREATE TABLE` |
 | 客户端 | mysql CLI / 驱动预编译 / DBeaver+JDBC / ADBC+pyarrow 均已验 |
 | 幂等 | 三通道（SQL 注释 / CLI `--key` / `FlightData.app_metadata`）；**一次请求一次键 + 批次派生键** |
@@ -105,7 +106,7 @@
 
 ## 6. 质量与证据网
 
-规模：**69,247 行 Rust / 20 个 crate / 558 个测试函数 / 用例全绿（⚠️ 并行跑时 2 条计时用例会 flaky，见 §6.1） / clippy 本仓 0 告警**
+规模：**71,396 行 Rust / 20 个 crate / 576 个测试函数 / 用例全绿（⚠️ 并行跑时 2 条计时用例会 flaky，见 §6.1） / clippy 本仓 0 告警**
 （工具链：本机 rustc 1.98.1 + edition 2024；**MSRV 声明 1.95**，由 `vortex 0.86` 顶出，
 **尚未经真·1.95 编译验证**）
 
@@ -160,8 +161,9 @@
 
 **语义**：`UPDATE` 的 `FROM`/`RETURNING`/无 `WHERE` 形态、`ALTER` 的改类型/可空性/重命名（缺载体）、事务、视图。
 
-**分布式**：冷数据归属与下推（partial aggregate 下推 + 冷文件按节点分配，台账 `D-4` 第二半）、
-**任务与租约的"关联视图"**（`/metrics` 今天把"有哪些活"与"谁在做"分两张表报，靠 `task:<表>:<分片>`
+**分布式**：**聚合下推的其余形状**（谓词 / `GROUP BY` / `avg` / 浮点 `sum` —— 今天整条原路）、
+**冷文件按节点分配**（`S5-2`：需要"读指定文件"的新 RPC；台账 `D-4` 第二半仍未兑现）、
+**任务与租约的"关联视图"**（`/metrics` 把"有哪些活"与"谁在做"分两张表报，靠 `task:<表>:<分片>`
 前缀人工对应；G.4 的下一格）、按记录过滤归档（`D-18`）。
 
 **工程化**：真云 S3 + 跨机、端口鉴权、冷读预算、WAL segment 清理闸门（`T6.15`）、spill 复用、MSRV 1.95 真编译。

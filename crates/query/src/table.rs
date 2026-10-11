@@ -95,6 +95,12 @@ pub struct ReadPath {
     /// 关掉只为一件事：**对拍**（同一查询开/关必须**逐行一致**）——
     /// 剪错 = 静默少数据，所以这条开关是那个断言的载体，不是给运维调的旋钮。
     pub index_pruning: bool,
+    /// **热读开关**（`§173`）：默认开。关掉只为一件事 —— 聚合下推时要先用 DataFusion
+    /// 把**冷的一半**算出来（schema/列名/类型都由它给），热的一半由**聚合 RPC** 单独拉。
+    /// 两边都读热数据会把热数据算两遍（重复计数）。
+    ///
+    /// 它不是给运维调的旋钮：只有聚合下推那条路径会关它，且**当次查询**用完即弃。
+    pub hot_enabled: bool,
 }
 
 /// 单个来源的热读结果 —— **够用就好**的三态。
@@ -137,6 +143,8 @@ pub struct YuntunTableProvider {
     hot_read_budget: Duration,
     /// 行组级索引剪枝（`F.4`）：见 [`ReadPath::index_pruning`]。
     index_pruning: bool,
+    /// 热读开关（`§173`）：见 [`ReadPath::hot_enabled`]。
+    hot_enabled: bool,
     /// 索引文件的读取出口（`F.4`）
     store: Arc<dyn object_store::ObjectStore>,
 }
@@ -233,6 +241,7 @@ impl YuntunTableProvider {
             partial,
             hot_read_budget: read.hot_read_budget,
             index_pruning: read.index_pruning,
+            hot_enabled: read.hot_enabled,
             store: read.store,
         }
     }
@@ -467,13 +476,19 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
         // `instance_id`"这条**隐式一致性**变成了正确性前提（夹具/装配稍有不一致就静默失效）。
         let files = table.map(|t| t.files.as_slice()).unwrap_or(&[]);
         let all_batch_ids: Vec<String> = files.iter().map(|f| f.batch_id.clone()).collect();
-        let plan: Vec<_> = self
-            .hot
-            .iter()
-            .map(|(instance, reader)| {
-                (instance.clone(), reader.clone(), all_batch_ids.clone())
-            })
-            .collect();
+        // 【`§173`】**只读冷数据**时（聚合下推的"冷的一半"）把热读整个让开：
+        // 空 plan ⇒ 下面 `join_all` 无来源、标记循环不执行，语义正是"这次不碰热数据"。
+        // 热的那一半由聚合 RPC 单独拉 —— 两边都拉会把同一批热数据**算两遍**（重复计数）。
+        let plan: Vec<_> = if self.hot_enabled {
+            self.hot
+                .iter()
+                .map(|(instance, reader)| {
+                    (instance.clone(), reader.clone(), all_batch_ids.clone())
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let outcomes = futures::future::join_all(plan.into_iter().map(|(instance, reader, exclude)| {
             let ident = self.ident.clone();

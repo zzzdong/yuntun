@@ -1,0 +1,599 @@
+//! `§173`：**可分解聚合的下推**（G.2 / 归档 `S5-3`）—— 四条判据。
+//!
+//! | 判据 | 为什么它是判据而不是"顺手测一下" |
+//! |---|---|
+//! | **对拍**（下推 vs 原路，逐位） | 聚合算错的形态是"**看起来很正常**的数字偏小/偏大"（少一个来源、NULL 当 0、合并顺序变了）—— 只有两条路跑同一批数据逐位比才抓得住 |
+//! | **网络量下降一个量级** | 这是这一刀存在的**理由**（`ROADMAP` 的 N4 验收）：没把"行"换成"标量"就等于没做 |
+//! | **降级语义与行路径一致** | 拿不到来源时聚合**更危险**（计数偏小却像个正常答案）：必须按同一套 partial 策略标记/拒绝 |
+//! | **STALE 必须响亮失败** | 拿旧 manifest 去拉 ⇒ 对方可能已放弃副本，聚合在那个窗口里会**静默少算** |
+//!
+//! 夹具刻意用**真数据**：真 `ChunkStore`（热）+ 真 parquet 文件（冷）——
+//! 这样"冷热两半合起来对不对"才是真的被验过，而不是拿假批次自说自话。
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use arrow::array::Int64Array;
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use futures::future::BoxFuture;
+use yuntun_catalog::{CatalogOps, MemoryCatalog};
+use yuntun_chunk::{ChunkKey, ChunkStore, ChunkStoreConfig, MemoryLedger, SealPolicy};
+use yuntun_model::agg::{AggSpec, PartialAgg};
+use yuntun_model::error::LakeError;
+use yuntun_model::ops::CreateTableRequest;
+use yuntun_query::{LocalCatalog, QueryEngine};
+use yuntun_store::{
+    RemoteShard, ShardAggs, ShardFetch, ShardId, ShardRead, ShardReader, ShardTier, create_store,
+    StoreConfig,
+};
+
+const TABLE: &str = "public.agg";
+const SHARD: &str = "s0";
+const WINDOW: &str = "2026-10-11T10:00";
+
+// ---------------------------------------------------------------- 夹具
+
+fn schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]))
+}
+
+/// 带 NULL 的批次（NULL 语义是聚合最容易错的地方之一）。
+fn batch(vals: &[Option<i64>]) -> RecordBatch {
+    RecordBatch::try_new(schema(), vec![Arc::new(Int64Array::from(vals.to_vec()))]).unwrap()
+}
+
+/// 一个"实例"的热数据（数据留在 chunk 里：本用例测的是读侧）。
+fn instance(dir: &yuntun_testkit::TestDir, id: &str, vals: &[Option<i64>]) -> Arc<ChunkStore> {
+    let store = ChunkStore::new(
+        ChunkStoreConfig {
+            policy: SealPolicy {
+                rows_threshold: usize::MAX,
+                bytes_threshold: usize::MAX,
+                min_resident: Duration::from_secs(3600),
+                max_flush_delay: Duration::from_secs(3600),
+                max_resident: Duration::from_secs(3600),
+                phase_spread: Duration::ZERO,
+            },
+            spill_dir: dir.join("spill"),
+            instance_id: id.into(),
+            wal_segment: 0,
+        },
+        MemoryLedger::new("chunk", 1 << 24),
+    );
+    if !vals.is_empty() {
+        store
+            .append(
+                ChunkKey::new(ShardId::new(TABLE, SHARD, WINDOW), 0),
+                1,
+                schema(),
+                0,
+                vec![batch(vals)],
+                0,
+            )
+            .unwrap();
+    }
+    store
+}
+
+/// 写一个**真 parquet 文件**并提交（冷数据）。
+async fn commit_cold(
+    store: &Arc<dyn object_store::ObjectStore>,
+    catalog: &Arc<dyn CatalogOps>,
+    id: &str,
+    vals: &[Option<i64>],
+) {
+    let bid = format!("cold-{id}");
+    let (path, size, rows) = yuntun_format::write_batch(
+        store,
+        TABLE,
+        SHARD,
+        WINDOW,
+        &bid,
+        &batch(vals),
+        yuntun_format::DataFormat::Parquet,
+    )
+    .await
+    .unwrap();
+    catalog
+        .commit_files(yuntun_model::ops::CommitFilesRequest {
+            table: TABLE.into(),
+            batch_id: bid.clone(),
+            client_request_id: None,
+            client_request_ids: vec![],
+            shard: SHARD.into(),
+            time_window: WINDOW.into(),
+            files: vec![yuntun_model::meta::FileManifest {
+                file_path: path,
+                batch_id: bid,
+                file_size: size,
+                row_count: rows,
+                table: TABLE.into(),
+                shard: SHARD.into(),
+                time_window: WINDOW.into(),
+                source_instance: "cold".into(),
+                ..Default::default()
+            }],
+            schema_version: 1,
+            row_count: rows,
+        })
+        .await
+        .unwrap();
+}
+
+async fn create_table(catalog: &Arc<dyn CatalogOps>) {
+    catalog
+        .create_table(CreateTableRequest {
+            name: "agg".into(),
+            namespace: yuntun_model::ops::DEFAULT_SCHEMA.into(),
+            schema: schema(),
+            partition_cols: vec![],
+            default_format: "parquet".into(),
+            ingest_config: Default::default(),
+        })
+        .await
+        .unwrap();
+}
+
+/// 装配引擎：真 store + 真 catalog + 若干热来源（来源可以是任何 [`ShardReader`]）。
+async fn engine(
+    store: Arc<dyn object_store::ObjectStore>,
+    catalog: Arc<dyn CatalogOps>,
+    sources: Vec<(&str, Arc<dyn ShardReader>)>,
+) -> QueryEngine {
+    let cache = Arc::new(LocalCatalog::new());
+    cache.set_catalog_ops(catalog.clone());
+    for (id, reader) in sources {
+        // 名录是唯一真相：来源必须登记，否则一次刷新就会把它摘掉
+        catalog
+            .register_datanode(yuntun_model::meta::DatanodeMember {
+                instance_id: id.to_string(),
+                address: String::new(),
+                registered_at_ms: 0,
+            })
+            .await
+            .unwrap();
+        cache.set_hot_shards(id, reader);
+    }
+    cache.refresh(&catalog).await.unwrap();
+    QueryEngine::new(store, cache).with_hot_read_budget(Duration::from_secs(5))
+}
+
+/// 把 ChunkStore 包一层，**记录"聚合拉取真的发生了"** —— 否则"对拍通过"可能只是原路跑了两遍，
+/// 那种绿没有意义。
+#[derive(Debug)]
+struct CountingReader {
+    inner: Arc<ChunkStore>,
+    agg_pulls: AtomicUsize,
+}
+
+impl CountingReader {
+    fn new(inner: Arc<ChunkStore>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            agg_pulls: AtomicUsize::new(0),
+        })
+    }
+
+    fn pulls(&self) -> usize {
+        self.agg_pulls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl ShardReader for CountingReader {
+    fn tier(&self) -> ShardTier {
+        self.inner.tier()
+    }
+    fn version(&self) -> u64 {
+        self.inner.version()
+    }
+    async fn shards_of(&self, table: &str) -> Result<Vec<ShardId>, LakeError> {
+        self.inner.shards_of(table).await
+    }
+    async fn read_shard(&self, id: &ShardId, known: u64) -> Result<ShardRead, LakeError> {
+        self.inner.read_shard(id, known).await
+    }
+    async fn read_shard_excluding(
+        &self,
+        id: &ShardId,
+        known: u64,
+        exclude: &[String],
+    ) -> Result<ShardRead, LakeError> {
+        self.inner.read_shard_excluding(id, known, exclude).await
+    }
+    async fn watermark(&self, known: u64) -> Result<ShardRead, LakeError> {
+        self.inner.watermark(known).await
+    }
+    async fn read_table_aggs(
+        &self,
+        table: &str,
+        known: u64,
+        exclude: &[String],
+        specs: &[AggSpec],
+    ) -> Result<ShardAggs, LakeError> {
+        self.agg_pulls.fetch_add(1, Ordering::SeqCst);
+        self.inner.read_table_aggs(table, known, exclude, specs).await
+    }
+}
+
+/// 一个**假的远端**：`fetch_shard` 按真实编码（arrow IPC）计"上网的字节"，
+/// `fetch_shard_aggs` 在**数据旁边**折完只把标量送回来。
+///
+/// 它模拟的正是 `GrpcShardFetch` + 服务端的形状。
+#[derive(Debug)]
+struct WireFetch {
+    inner: Arc<ChunkStore>,
+    row_bytes: AtomicUsize,
+    agg_bytes: AtomicUsize,
+}
+
+impl WireFetch {
+    fn new(inner: Arc<ChunkStore>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            row_bytes: AtomicUsize::new(0),
+            agg_bytes: AtomicUsize::new(0),
+        })
+    }
+}
+
+impl ShardFetch for WireFetch {
+    fn fetch_shards<'a>(
+        &'a self,
+        table: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<ShardId>, LakeError>> {
+        Box::pin(async move { self.inner.shards_of(table).await })
+    }
+
+    fn fetch_shard<'a>(
+        &'a self,
+        id: &'a ShardId,
+        known_manifest_ver: u64,
+        known_batch_ids: Vec<String>,
+    ) -> BoxFuture<'a, Result<ShardRead, LakeError>> {
+        Box::pin(async move {
+            let read = self
+                .inner
+                .read_shard_excluding(id, known_manifest_ver, &known_batch_ids)
+                .await?;
+            // **上网的字节**：与真实服务端同一份编码（`shardrpc::encode_batch`）
+            let mut n = 0usize;
+            for b in &read.batches {
+                n += yuntun_shardrpc::encode_batch(b)?.len();
+            }
+            self.row_bytes.fetch_add(n, Ordering::SeqCst);
+            Ok(read)
+        })
+    }
+
+    fn fetch_watermark<'a>(
+        &'a self,
+        known_manifest_ver: u64,
+    ) -> BoxFuture<'a, Result<ShardRead, LakeError>> {
+        Box::pin(async move { self.inner.watermark(known_manifest_ver).await })
+    }
+
+    /// **服务端那一侧**：在数据旁边折（不过网），只回标量。
+    fn fetch_shard_aggs<'a>(
+        &'a self,
+        table: &'a str,
+        known_manifest_ver: u64,
+        known_batch_ids: Vec<String>,
+        specs: Vec<AggSpec>,
+    ) -> BoxFuture<'a, Result<ShardAggs, LakeError>> {
+        Box::pin(async move {
+            let read = self
+                .inner
+                .read_table_excluding(table, known_manifest_ver, &known_batch_ids)
+                .await?;
+            let partials = yuntun_model::agg::fold_batches(&specs, &read.batches)?;
+            // 上网的字节 = 部分状态那点标量（真实实现是几十字节的 proto）
+            self.agg_bytes.fetch_add(
+                partials.len() * std::mem::size_of::<PartialAgg>(),
+                Ordering::SeqCst,
+            );
+            Ok(ShardAggs {
+                partials,
+                flushed_watermark: read.flushed_watermark,
+                stale: read.stale,
+            })
+        })
+    }
+}
+
+/// 永远答不上的来源（拿不到）。
+#[derive(Debug)]
+struct Unreachable;
+
+#[async_trait::async_trait]
+impl ShardReader for Unreachable {
+    fn tier(&self) -> ShardTier {
+        ShardTier::Memory
+    }
+    fn version(&self) -> u64 {
+        0
+    }
+    async fn shards_of(&self, _table: &str) -> Result<Vec<ShardId>, LakeError> {
+        Err(LakeError::Other("连接被拒绝".into()))
+    }
+    async fn read_shard(&self, _id: &ShardId, _known: u64) -> Result<ShardRead, LakeError> {
+        Err(LakeError::Other("连接被拒绝".into()))
+    }
+    async fn watermark(&self, _known: u64) -> Result<ShardRead, LakeError> {
+        Err(LakeError::Other("连接被拒绝".into()))
+    }
+}
+
+/// 永远 STALE 的来源（水位超前于调用方的 manifest）。
+#[derive(Debug)]
+struct AlwaysStale;
+
+#[async_trait::async_trait]
+impl ShardReader for AlwaysStale {
+    fn tier(&self) -> ShardTier {
+        ShardTier::Memory
+    }
+    fn version(&self) -> u64 {
+        0
+    }
+    async fn shards_of(&self, _table: &str) -> Result<Vec<ShardId>, LakeError> {
+        Ok(vec![ShardId::new(TABLE, SHARD, WINDOW)])
+    }
+    async fn read_shard(&self, _id: &ShardId, _known: u64) -> Result<ShardRead, LakeError> {
+        Ok(ShardRead {
+            batches: Vec::new(),
+            flushed_watermark: 99,
+            stale: true,
+        })
+    }
+    async fn watermark(&self, _known: u64) -> Result<ShardRead, LakeError> {
+        Ok(ShardRead {
+            batches: Vec::new(),
+            flushed_watermark: 99,
+            stale: true,
+        })
+    }
+    async fn read_table_aggs(
+        &self,
+        _table: &str,
+        _known: u64,
+        _exclude: &[String],
+        specs: &[AggSpec],
+    ) -> Result<ShardAggs, LakeError> {
+        Ok(ShardAggs {
+            partials: specs
+                .iter()
+                .map(|s| PartialAgg::empty(s.kind))
+                .collect(),
+            flushed_watermark: 99,
+            stale: true,
+        })
+    }
+}
+
+// ---------------------------------------------------------------- 判据 ①：对拍
+
+/// 把结果规范化成"**有序的行字符串**"再比。
+///
+/// 为什么不直接比 `Vec<RecordBatch>`：① 批次的**切分**不在契约里（DataFusion 的 GROUP BY
+/// 会一组一批）；② 没有 `ORDER BY` 时行序也不在契约里。这两条都不是"值不同"，
+/// 拿它们当判据会让对拍变成抖的 —— 而**值**（含 NULL）才是要逐位比的东西。
+fn rows_of(batches: &[RecordBatch]) -> Vec<String> {
+    let joined = arrow::compute::concat_batches(&batches[0].schema(), batches).unwrap();
+    let mut out: Vec<String> = (0..joined.num_rows())
+        .map(|r| {
+            (0..joined.num_columns())
+                .map(|c| cell(joined.column(c), r))
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn cell(col: &arrow::array::ArrayRef, r: usize) -> String {
+    if col.is_null(r) {
+        return "NULL".to_string();
+    }
+    if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+        return a.value(r).to_string();
+    }
+    if let Some(a) = col.as_any().downcast_ref::<arrow::array::UInt64Array>() {
+        return a.value(r).to_string();
+    }
+    if let Some(a) = col.as_any().downcast_ref::<arrow::array::Float64Array>() {
+        return format!("{:?}", a.value(r));
+    }
+    if let Some(a) = col.as_any().downcast_ref::<arrow::array::StringArray>() {
+        return a.value(r).to_string();
+    }
+    panic!("对拍用了没覆盖的列类型：{:?}", col.data_type());
+}
+
+/// **下推路径与行路径逐位相同**（`ROADMAP` N4 的硬要求）。
+///
+/// 覆盖：冷 + 热合并、`count(*)` / `count(col)` / `sum` / `min` / `max`、NULL 语义、空来源，
+/// 以及**必须退回原路**的形状（`WHERE` / `avg` / `GROUP BY` / 表达式）——
+/// 退回的那些也必须逐位相同（退错了同样是错），而且**不许**偷偷打聚合拉取。
+#[tokio::test]
+async fn pushed_down_aggregates_match_the_row_path_bit_for_bit() {
+    let dir = yuntun_testkit::TestDir::tmpfs("agg-parity");
+    let store: Arc<dyn object_store::ObjectStore> = create_store(&StoreConfig::Memory).unwrap();
+    let catalog: Arc<dyn CatalogOps> = Arc::new(MemoryCatalog::new());
+    create_table(&catalog).await;
+    // 冷：一个真 parquet 文件（含 NULL）；热：两个真 chunk + 一个空来源
+    commit_cold(&store, &catalog, "1", &[Some(10), Some(20), None]).await;
+    let a = CountingReader::new(instance(&dir, "inst-a", &[Some(1), None, Some(3)]));
+    let b = CountingReader::new(instance(&dir, "inst-b", &[Some(-5), Some(7)]));
+    let empty = CountingReader::new(instance(&dir, "inst-c", &[]));
+
+    let sources: Vec<(&str, Arc<dyn ShardReader>)> = vec![
+        ("inst-a", a.clone()),
+        ("inst-b", b.clone()),
+        ("inst-c", empty.clone()),
+    ];
+    let subject = engine(store.clone(), catalog.clone(), sources.clone()).await;
+    // 参照：同一批数据、**关掉下推**（行路径 = DataFusion 自己算）
+    let reference = engine(store.clone(), catalog.clone(), sources)
+        .await
+        .with_agg_pushdown(false);
+
+    let cases = [
+        ("SELECT count(*) FROM agg", true),
+        ("SELECT count(v) FROM agg", true),
+        ("SELECT sum(v) FROM agg", true),
+        ("SELECT min(v), max(v) FROM agg", true),
+        ("SELECT count(v), sum(v), min(v), max(v) FROM agg", true),
+        // 必须退回原路：谓词（本刀不下推 WHERE）、avg、GROUP BY、表达式
+        ("SELECT count(*) FROM agg WHERE v > 0", false),
+        ("SELECT avg(v) FROM agg", false),
+        ("SELECT v, count(*) FROM agg GROUP BY v", false),
+        ("SELECT count(*) + 1 FROM agg", false),
+    ];
+    for (sql, pushable) in cases {
+        let before = a.pulls();
+        let got = subject
+            .sql(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: 下推路径失败：{e}"));
+        let want = reference
+            .sql(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: 参照路径失败：{e}"));
+        // **列名与类型也要一致**：下推路径的结果是"在 DataFusion 的冷结果上改值"，
+        // schema 若被我们动过，客户端拿到的列名/类型就变了（那也是一种静默破坏）。
+        assert_eq!(got[0].schema(), want[0].schema(), "{sql}: schema 必须一致");
+        assert_eq!(rows_of(&got), rows_of(&want), "{sql}: 值必须逐位相同");
+        let after = a.pulls();
+        if pushable {
+            assert!(after > before, "{sql}: 该走聚合下推却没走（拉取次数没变）");
+        } else {
+            assert_eq!(after, before, "{sql}: 不该下推却打了聚合拉取");
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 判据 ②：网络量
+
+/// **下推把"行"换成了"标量"**（`ROADMAP` N4 的验收：下降一个量级）。
+///
+/// 量法用**真实的编码函数**（`shardrpc::encode_batch`，服务端实际发的那种字节），
+/// 而不是"行数 × 8"这种估算。
+#[tokio::test]
+async fn pushed_down_pull_moves_scalars_not_rows() {
+    let dir = yuntun_testkit::TestDir::tmpfs("agg-wire");
+    let store: Arc<dyn object_store::ObjectStore> = create_store(&StoreConfig::Memory).unwrap();
+    let catalog: Arc<dyn CatalogOps> = Arc::new(MemoryCatalog::new());
+    create_table(&catalog).await;
+
+    // 3 万行整数（够大：行路径的 IPC 是几百 KB 量级）
+    let rows: Vec<Option<i64>> = (0..30_000).map(|i| Some((i % 1000) as i64)).collect();
+    let wire = WireFetch::new(instance(&dir, "inst-r", &rows));
+    let source: Arc<dyn ShardReader> = Arc::new(RemoteShard::new(wire.clone()));
+
+    let subject = engine(store.clone(), catalog.clone(), vec![("inst-r", source.clone())]).await;
+    let reference = engine(store.clone(), catalog.clone(), vec![("inst-r", source)])
+        .await
+        .with_agg_pushdown(false);
+
+    let sql = "SELECT count(*), sum(v) FROM agg";
+    let pushed = subject.sql(sql).await.expect("下推路径");
+    let rowed = reference.sql(sql).await.expect("行路径");
+    assert_eq!(pushed, rowed, "省字节的前提是答案一样");
+
+    let agg = wire.agg_bytes.load(Ordering::SeqCst);
+    let rows_bytes = wire.row_bytes.load(Ordering::SeqCst);
+    assert!(agg > 0, "聚合路径必须真的过了一次响应（否则这个对比是假的）");
+    assert!(rows_bytes > 0, "行路径必须真的传过字节（否则这个对比是假的）");
+    eprintln!("【§173 实测】行路径 {rows_bytes} 字节 vs 聚合路径 {agg} 字节（{:.0}×）", rows_bytes as f64 / agg.max(1) as f64);
+    assert!(
+        rows_bytes >= agg * 10,
+        "网络量必须下降一个量级：行路径 {rows_bytes} 字节 vs 聚合路径 {agg} 字节"
+    );
+}
+
+// ---------------------------------------------------------------- 判据 ③：降级语义
+
+/// 拿不到来源时，聚合路径的**降级语义与行路径一致**：`Allow` ⇒ 标记 partial 并点名；
+/// `Reject` ⇒ 当场失败。而且降级后的计数是**下界**（不许看起来像个正常答案）。
+#[tokio::test]
+async fn missing_sources_degrade_the_same_way_for_aggregates() {
+    use yuntun_query::PartialPolicy;
+    let dir = yuntun_testkit::TestDir::tmpfs("agg-partial");
+    let store: Arc<dyn object_store::ObjectStore> = create_store(&StoreConfig::Memory).unwrap();
+    let catalog: Arc<dyn CatalogOps> = Arc::new(MemoryCatalog::new());
+    create_table(&catalog).await;
+
+    let ok: Arc<dyn ShardReader> =
+        CountingReader::new(instance(&dir, "inst-ok", &[Some(1), Some(2), Some(3)]));
+    let bad: Arc<dyn ShardReader> = Arc::new(Unreachable);
+    let sources = vec![("inst-ok", ok), ("inst-bad", bad)];
+
+    // Allow：降级 + 标记（点名缺了谁）
+    let allow = engine(store.clone(), catalog.clone(), sources.clone())
+        .await
+        .with_partial_policy(PartialPolicy::Allow);
+    let out = allow
+        .sql_partial("SELECT count(*) FROM agg")
+        .await
+        .expect("Allow 策略下应当返回带标记的部分结果");
+    assert!(out.is_partial(), "缺了来源却没标记 = 静默少数据");
+    let missing = out.partial.missing();
+    assert_eq!(missing.len(), 1, "只该缺 inst-bad：{missing:?}");
+    assert_eq!(missing[0].instance, "inst-bad");
+    // 计数 = 只算到拿得到的那部分（3 行）——**下界**，这正是 partial 标记要说的
+    let counted = out.batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(counted, 3, "降级后的计数只能是拿得到的那部分");
+
+    // Reject：当场失败（不是返回一个偏小的数字）
+    let reject = engine(store.clone(), catalog.clone(), sources)
+        .await
+        .with_partial_policy(PartialPolicy::Reject);
+    let e = reject
+        .sql_partial("SELECT count(*) FROM agg")
+        .await
+        .expect_err("Reject 策略下应当失败");
+    assert!(
+        e.to_string().contains("inst-bad"),
+        "拒绝时要点名缺了谁：{e}"
+    );
+}
+
+// ---------------------------------------------------------------- 判据 ④：STALE
+
+/// **STALE 绝不进答案**（聚合比行更怕它：少算的来源会让计数偏小而看起来正常）。
+///
+/// 语义与行路径逐字相同：刷新后重试，重试耗尽 ⇒ **响亮失败**（不降级成 partial）。
+#[tokio::test]
+async fn stale_sources_never_leak_into_a_pushed_down_answer() {
+    let dir = yuntun_testkit::TestDir::tmpfs("agg-stale");
+    let store: Arc<dyn object_store::ObjectStore> = create_store(&StoreConfig::Memory).unwrap();
+    let catalog: Arc<dyn CatalogOps> = Arc::new(MemoryCatalog::new());
+    create_table(&catalog).await;
+    let ok: Arc<dyn ShardReader> =
+        CountingReader::new(instance(&dir, "inst-ok", &[Some(1), Some(2)]));
+    let stale: Arc<dyn ShardReader> = Arc::new(AlwaysStale);
+
+    let e = engine(
+        store,
+        catalog,
+        vec![("inst-ok", ok), ("inst-stale", stale)],
+    )
+    .await
+    .sql_partial("SELECT count(*) FROM agg")
+    .await
+    .expect_err("STALE 必须失败（刷新重试上限后照样失败）");
+    let msg = e.to_string();
+    assert!(
+        msg.contains("stale") && msg.contains("inst-stale"),
+        "失败必须点名 STALE 与实例（否则用户看到的是莫名失败）：{msg}"
+    );
+}

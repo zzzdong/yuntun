@@ -23,6 +23,63 @@ service ShardFetch {
   // 实例已放弃某批副本后，分片枚举恰好为空（副本没了），于是"没有分片"被误当成
   // "没有已放弃的数据"（`operation-log §67`，由 `shardrpc` 的往返用例当场抓到）。
   rpc FetchWatermark (FetchWatermarkRequest) returns (FetchWatermarkResponse);
+  // **聚合拉取**（`§173`，G.2 / 归档 `S5-3`）：把"可分解且精确"的聚合下推到**数据所在处**算，
+  // 只回**部分状态（标量）**，绝不回原始行。
+  //
+  // 为什么单独一条 RPC 而不是给 `FetchShard` 加参数：响应类型不同（行 ≠ 标量），
+  // 混在一个响应里就会出现"两个字段只有一个有意义"的形状 —— 那是可以误用的契约。
+  // 边界（哪几种聚合能下推、为什么浮点不行）写在 `yuntun_model::agg` 的模块文档里。
+  rpc FetchShardAggs (FetchShardAggsRequest) returns (FetchShardAggsResponse);
+}
+
+// 一个要算的聚合（`§173`）。
+message AggSpecMsg {
+  // 0 = count(*) / 1 = count(col) / 2 = sum(col) / 3 = min(col) / 4 = max(col)
+  uint32 kind   = 1;
+  // `count(*)` 时为空
+  string column = 2;
+}
+
+message FetchShardAggsRequest {
+  // 全限定表名 `schema.table`。
+  //
+  // 为什么是**表级**而不是分片级：一次查询要的就是"这个来源对这张表的贡献"，
+  // 逐分片发会变成 N 次 RPC（而聚合的收益本来就在"少传数据"上，多几跳就把收益吃掉了）。
+  string table = 1;
+  // 调用方所依据的 manifest 版本（= 它那次查询的 Catalog 快照号）
+  uint64 known_manifest_ver = 2;
+  // 与行级拉取**同一把栅栏**（语义见 `FetchShardRequest.known_batch_ids`）：
+  // 属于这些批次的热副本不得再算一次，否则同一批数据会被算两遍。
+  repeated string known_batch_ids = 3;
+  // 与响应里的 `partials` **按下标一一对应**（顺序是契约的一部分）。
+  repeated AggSpecMsg aggs = 4;
+}
+
+// 一个聚合的部分状态。
+//
+// 用"显式的 has_* 标志"而不是 `optional`：proto3 的 `optional` 在跨语言/跨版本上更绕，
+// 而这里要表达的语义很硬 —— **NULL 与 0 必须能分开**（空集 `sum` 是 NULL，不是 0）。
+message PartialAggMsg {
+  // 0 = count / 1 = sum(int) / 2 = min / 3 = max（用于自查"两边说的是同一件事"）
+  uint32 kind = 1;
+  uint64 count = 2;
+  // sum：`has_sum = false` ⇒ NULL（空集或全 NULL 列）
+  bool has_sum = 3;
+  int64 sum    = 4;
+  // min/max：`has_scalar = false` ⇒ NULL；`scalar_is_text` 决定读哪个字段
+  bool has_scalar   = 5;
+  int64 scalar_int  = 6;
+  string scalar_text = 7;
+  bool scalar_is_text = 8;
+}
+
+message FetchShardAggsResponse {
+  // 与请求 `aggs` **同序同长**（长度不符 = 协议错，调用方应当报错而不是猜）
+  repeated PartialAggMsg partials = 1;
+  uint64 flushed_watermark = 2;
+  // 与行级拉取同一语义：`known_manifest_ver < flushed_watermark` ⇒ 本次可能不完整，
+  // 而且**聚合比行更危险**（少一个来源 = 计数偏小却看起来像个正常数字）
+  bool stale = 3;
 }
 
 message ShardIdMsg {

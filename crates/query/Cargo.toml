@@ -29,6 +29,9 @@ futures = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+# `§173` 的网络量判据要用**真实的编码函数**（服务端实际发的那种字节），
+# 而不是"行数 × 8"的估算 —— 所以把数据面 crate 作为测试依赖引进来。
+yuntun-shardrpc = { path = "../shardrpc" }
 yuntun-testkit = { path = "../testkit" }
 yuntun-ingest = { path = "../ingest" }
 # 仅测试：双实例对拍需要**真的** chunk store 当两个 datanode（库本身只依赖 `ShardReader` 缝）

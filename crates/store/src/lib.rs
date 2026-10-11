@@ -8,7 +8,9 @@
 
 pub mod shard;
 
-pub use shard::{DiskShard, RemoteShard, ShardFetch, ShardId, ShardRead, ShardReader, ShardTier};
+pub use shard::{
+    DiskShard, RemoteShard, ShardAggs, ShardFetch, ShardId, ShardRead, ShardReader, ShardTier,
+};
 
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use std::sync::Arc;

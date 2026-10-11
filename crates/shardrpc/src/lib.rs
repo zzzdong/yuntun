@@ -45,7 +45,7 @@ use tonic::{Request, Response, Status};
 
 use yuntun_model::error::LakeError;
 use yuntun_proto::shard as pb;
-use yuntun_store::{ShardFetch, ShardId, ShardRead, ShardReader};
+use yuntun_store::{ShardAggs, ShardFetch, ShardId, ShardRead, ShardReader};
 
 // ---------------------------------------------------------------- 批次编解码
 
@@ -157,6 +157,43 @@ impl pb::shard_fetch_server::ShardFetch for ShardService {
             batches_ipc,
             flushed_watermark: read.flushed_watermark,
             stale: read.stale,
+        }))
+    }
+
+    /// `§173`：**聚合拉取** —— 在数据所在处折，只回**标量**。
+    ///
+    /// 实现手法是刻意的"不额外发明一套"：直接调本地 reader 的 `read_table_aggs`，
+    /// 而它在服务端的默认实现就是"读行 + 折叠"（服务端本来就在数据旁边）。
+    /// ⇒ 服务端算出来的部分状态与协调者兜底路径算出来的**逐字相同**（同一份代码）。
+    async fn fetch_shard_aggs(
+        &self,
+        req: Request<pb::FetchShardAggsRequest>,
+    ) -> Result<Response<pb::FetchShardAggsResponse>, Status> {
+        let req = req.into_inner();
+        let specs = agg_specs_from_msg(&req.aggs)?;
+        let aggs = self
+            .reader
+            .read_table_aggs(
+                &req.table,
+                req.known_manifest_ver,
+                &req.known_batch_ids,
+                &specs,
+            )
+            .await
+            .map_err(internal)?;
+        if aggs.partials.len() != specs.len() {
+            // 长度不符 = 本地 reader 违反了契约。**响亮失败**：让调用方收到错，
+            // 而不是把"少了一个聚合"的响应当成正常答案（§173 的边界第 2 条）。
+            return Err(Status::internal(format!(
+                "聚合部分状态个数（{}）与请求（{}）不符",
+                aggs.partials.len(),
+                specs.len()
+            )));
+        }
+        Ok(Response::new(pb::FetchShardAggsResponse {
+            partials: aggs.partials.iter().map(partial_to_msg).collect(),
+            flushed_watermark: aggs.flushed_watermark,
+            stale: aggs.stale,
         }))
     }
 }
@@ -331,4 +368,136 @@ impl ShardFetch for GrpcShardFetch {
             })
         })
     }
+
+    /// `§173`：**聚合拉取**（**覆写**了 trait 的默认实现）—— 这一步才是"下推"的落点。
+    ///
+    /// 默认实现会把行拉回来再折（那等价于没下推，网络一点没省）；这里把 specs 送到对端，
+    /// 只把**标量**带回来。
+    fn fetch_shard_aggs<'a>(
+        &'a self,
+        table: &'a str,
+        known_manifest_ver: u64,
+        known_batch_ids: Vec<String>,
+        specs: Vec<yuntun_model::agg::AggSpec>,
+    ) -> BoxFuture<'a, Result<ShardAggs, LakeError>> {
+        Box::pin(async move {
+            let mut c = self.client.clone();
+            let resp = self
+                .call(
+                    "fetch_shard_aggs",
+                    c.fetch_shard_aggs(pb::FetchShardAggsRequest {
+                        table: table.to_string(),
+                        known_manifest_ver,
+                        known_batch_ids,
+                        aggs: specs.iter().map(agg_spec_to_msg).collect(),
+                    }),
+                )
+                .await?;
+            let resp = resp.into_inner();
+            // 长度是契约：**不许**"按短的来"（少一个聚合的结果是错的，而它看起来很正常）
+            if resp.partials.len() != specs.len() {
+                return Err(LakeError::Other(format!(
+                    "shard rpc: fetch_shard_aggs: 部分状态个数（{}）与请求（{}）不符",
+                    resp.partials.len(),
+                    specs.len()
+                )));
+            }
+            let mut partials = Vec::with_capacity(resp.partials.len());
+            for m in &resp.partials {
+                partials.push(partial_from_msg(m)?);
+            }
+            Ok(ShardAggs {
+                partials,
+                flushed_watermark: resp.flushed_watermark,
+                stale: resp.stale,
+            })
+        })
+    }
+}
+
+// ---------------------------------------------------------------- 聚合的消息转换（`§173`）
+
+fn agg_spec_to_msg(s: &yuntun_model::agg::AggSpec) -> pb::AggSpecMsg {
+    pb::AggSpecMsg {
+        kind: s.kind as u32,
+        column: s.column.clone().unwrap_or_default(),
+    }
+}
+
+/// 请求方向：**不懂的 kind 直接报错**（协议里加了新聚合而本节点不认识时，
+/// 静默忽略会变成"少算一个聚合"——那是最坏的一种成功）。
+fn agg_specs_from_msg(
+    msgs: &[pb::AggSpecMsg],
+) -> Result<Vec<yuntun_model::agg::AggSpec>, Status> {
+    let mut out = Vec::with_capacity(msgs.len());
+    for m in msgs {
+        let kind = yuntun_model::agg::AggKind::from_u32(m.kind).ok_or_else(|| {
+            Status::invalid_argument(format!("不认识的聚合种类：{}", m.kind))
+        })?;
+        if kind.needs_column() && m.column.is_empty() {
+            return Err(Status::invalid_argument(format!("{kind:?} 缺列名")));
+        }
+        out.push(yuntun_model::agg::AggSpec {
+            kind,
+            column: (!m.column.is_empty()).then(|| m.column.clone()),
+        });
+    }
+    Ok(out)
+}
+
+fn partial_to_msg(p: &yuntun_model::agg::PartialAgg) -> pb::PartialAggMsg {
+    use yuntun_model::agg::{AggScalar, PartialAgg};
+    let mut msg = pb::PartialAggMsg::default();
+    match p {
+        PartialAgg::Count(c) => {
+            msg.kind = 0;
+            msg.count = *c;
+        }
+        PartialAgg::SumInt(s) => {
+            msg.kind = 1;
+            msg.has_sum = s.is_some();
+            msg.sum = s.unwrap_or(0);
+        }
+        PartialAgg::Min(s) | PartialAgg::Max(s) => {
+            msg.kind = if matches!(p, PartialAgg::Min(_)) { 2 } else { 3 };
+            msg.has_scalar = s.is_some();
+            if let Some(v) = s {
+                match v {
+                    AggScalar::Int(i) => msg.scalar_int = *i,
+                    AggScalar::Text(t) => {
+                        msg.scalar_text = t.clone();
+                        msg.scalar_is_text = true;
+                    }
+                }
+            }
+        }
+    }
+    msg
+}
+
+fn partial_from_msg(m: &pb::PartialAggMsg) -> Result<yuntun_model::agg::PartialAgg, LakeError> {
+    use yuntun_model::agg::{AggScalar, PartialAgg};
+    Ok(match m.kind {
+        0 => PartialAgg::Count(m.count),
+        1 => PartialAgg::SumInt(m.has_sum.then_some(m.sum)),
+        2 | 3 => {
+            let s = if !m.has_scalar {
+                None
+            } else if m.scalar_is_text {
+                Some(AggScalar::Text(m.scalar_text.clone()))
+            } else {
+                Some(AggScalar::Int(m.scalar_int))
+            };
+            if m.kind == 2 {
+                PartialAgg::Min(s)
+            } else {
+                PartialAgg::Max(s)
+            }
+        }
+        other => {
+            return Err(LakeError::Other(format!(
+                "远端返回了不认识的聚合部分状态：kind={other}"
+            )))
+        }
+    })
 }
