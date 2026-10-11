@@ -33,6 +33,7 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use yuntun_model::agg::{AggKind, AggScalar, AggSpec, PartialAgg};
+use yuntun_model::predicate::{CmpOp, Literal, Predicate};
 use yuntun_model::error::LakeError;
 
 use crate::cache::CatalogSnapshot;
@@ -44,6 +45,11 @@ pub struct Pushdown {
     pub table: String,
     /// 与 `SELECT` 列表**同序**的聚合（合并时按这个下标对齐结果列）
     pub specs: Vec<AggSpec>,
+    /// 可选的行过滤（`§176`）：**`None` = 没有 `WHERE`**。
+    ///
+    /// 有 `WHERE` 但**翻译不出来**（算术 / 函数 / `LIKE` / 浮点 / 跨类型…）时，
+    /// [`detect`] 会整体返回 `None`（拿不准不下推）—— 半个谓词比没有谓词危险得多。
+    pub predicate: Option<Predicate>,
 }
 
 /// 判定一条 SQL 能否走聚合下推；不能就返回 `None`（调用方走原路）。
@@ -75,7 +81,149 @@ pub fn detect(sql: &str, default_schema: &str, snapshot: &CatalogSnapshot) -> Op
     if specs.is_empty() {
         return None;
     }
-    Some(Pushdown { table: ident, specs })
+    // `§176`：可选的行过滤。翻译不了 ⇒ **整体不下推**（见 `Pushdown::predicate` 的注释）。
+    let predicate = match &select.selection {
+        None => None,
+        Some(e) => Some(predicate_of(e, &cached.schema)?),
+    };
+    Some(Pushdown {
+        table: ident,
+        specs,
+        predicate,
+    })
+}
+
+/// 把 `WHERE` 表达式翻译成可下推的谓词（`§176`）；**翻译不了就返回 `None`**。
+///
+/// 支持面窄是刻意的（见 `yuntun_model::predicate` 的模块文档）：比较、`IS [NOT] NULL`、`AND`/`OR`、
+/// 括号。其余一律 `None` —— 包括 `NOT`（它需要对三值逻辑取反，而 `NOT UNKNOWN = UNKNOWN`，
+/// 写错一处就会多算行；等有明确需求再收）、算术、`LIKE`/`IN`/`BETWEEN`、函数、浮点字面量、跨类型比较。
+fn predicate_of(expr: &Expr, schema: &arrow::datatypes::Schema) -> Option<Predicate> {
+    use sqlparser::ast::BinaryOperator as BinOp;
+    match expr {
+        Expr::Nested(inner) => predicate_of(inner, schema),
+        Expr::BinaryOp { left, op, right } => match op {
+            BinOp::And => Some(Predicate::And(vec![
+                predicate_of(left, schema)?,
+                predicate_of(right, schema)?,
+            ])),
+            BinOp::Or => Some(Predicate::Or(vec![
+                predicate_of(left, schema)?,
+                predicate_of(right, schema)?,
+            ])),
+            BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
+                let (column, op, value) = comparison(left, op, right, schema)?;
+                Some(Predicate::Cmp { column, op, value })
+            }
+            // 算术 / LIKE / 别的二元运算：不碰
+            _ => None,
+        },
+        Expr::IsNull(inner) => Some(Predicate::IsNull {
+            column: column_of(inner)?,
+            negated: false,
+        }),
+        Expr::IsNotNull(inner) => Some(Predicate::IsNull {
+            column: column_of(inner)?,
+            negated: true,
+        }),
+        _ => None,
+    }
+}
+
+/// `列 <op> 字面量`（**字面量在左边时把比较符翻过来**，如 `5 < v` ⇒ `v > 5`）。
+///
+/// 类型必须对得上且**在支持面内**：整数对 `Int64`、字符串对 `Utf8`。
+/// 对不上（如 `Int64 > 1.5`）⇒ `None`：那是"跨类型比较"，语义细节不值得赌。
+fn comparison(
+    left: &Expr,
+    op: &sqlparser::ast::BinaryOperator,
+    right: &Expr,
+    schema: &arrow::datatypes::Schema,
+) -> Option<(String, CmpOp, Literal)> {
+    use sqlparser::ast::BinaryOperator as BinOp;
+    let flip = |op: &BinOp| -> BinOp {
+        match op {
+            BinOp::Lt => BinOp::Gt,
+            BinOp::LtEq => BinOp::GtEq,
+            BinOp::Gt => BinOp::Lt,
+            BinOp::GtEq => BinOp::LtEq,
+            other => other.clone(),
+        }
+    };
+    let op_of = |op: &BinOp| -> Option<CmpOp> {
+        Some(match op {
+            BinOp::Eq => CmpOp::Eq,
+            BinOp::NotEq => CmpOp::Ne,
+            BinOp::Lt => CmpOp::Lt,
+            BinOp::LtEq => CmpOp::Le,
+            BinOp::Gt => CmpOp::Gt,
+            BinOp::GtEq => CmpOp::Ge,
+            _ => return None,
+        })
+    };
+    // 列在左、字面量在右
+    if let (Some(col), Some(lit)) = (column_of(left), literal_of(right)) {
+        let op = op_of(op)?;
+        return type_ok(schema, &col, &lit).then_some((col, op, lit));
+    }
+    // 字面量在左、列在右 ⇒ 比较符翻过来（`5 < v` 与 `v > 5` 同义）
+    if let (Some(lit), Some(col)) = (literal_of(left), column_of(right)) {
+        let op = op_of(&flip(op))?;
+        return type_ok(schema, &col, &lit).then_some((col, op, lit));
+    }
+    None
+}
+
+/// 一个**普通列引用**（限定名取最后一段：`t.v` ⇒ `v`）。
+fn column_of(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Identifier(i) => Some(i.value.clone()),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => Some(parts[1].value.clone()),
+        _ => None,
+    }
+}
+
+/// 一个**受支持的字面量**（整数 / 单引号字符串）。浮点、布尔、NULL、表达式一律不算。
+fn literal_of(expr: &Expr) -> Option<Literal> {
+    use sqlparser::ast::UnaryOperator as UnOp;
+    match expr {
+        // `-1` 在 AST 里是**一元负号 + 字面量**（不是纯字面量）。负数字面量在谓词里太常见了
+        // （`WHERE v > -1`），所以这里把它**当字面量**收下 —— 它确实只是一个常量，不是算术。
+        // 注意与"`v + 1` 这类真算术"的区别：那个的**内层是列**，这里内层必须是字面量。
+        Expr::UnaryOp {
+            op: UnOp::Minus,
+            expr: inner,
+        } => match literal_of(inner)? {
+            Literal::Int(i) => i.checked_neg().map(Literal::Int),
+            Literal::Text(_) => None,
+        },
+        Expr::UnaryOp {
+            op: UnOp::Plus,
+            expr: inner,
+        } => literal_of(inner),
+        // 注意 sqlparser 0.62：`Expr::Value` 装的是 `ValueWithSpan`，真正的值在 `.value` 上
+        Expr::Value(v) => match &v.value {
+            sqlparser::ast::Value::Number(n, _) => n.parse::<i64>().ok().map(Literal::Int),
+            sqlparser::ast::Value::SingleQuotedString(s) => Some(Literal::Text(s.clone())),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// 列必须存在，且类型与字面量**同族**（否则不下推）。
+fn type_ok(
+    schema: &arrow::datatypes::Schema,
+    column: &str,
+    lit: &Literal,
+) -> bool {
+    let Ok(field) = schema.field_with_name(column) else {
+        return false;
+    };
+    matches!(
+        (field.data_type(), lit),
+        (DataType::Int64, Literal::Int(_)) | (DataType::Utf8, Literal::Text(_))
+    )
 }
 
 /// `SELECT` 里唯一的来源，且**没有别名**（有别名就得处理 `t.c` 与 `a.c` 两种列引用 —— 不必要）。
@@ -132,7 +280,9 @@ fn single_simple_select(q: &Query) -> Option<&Select> {
     if select.distinct.is_some() {
         return None;
     }
-    if select.selection.is_some() || select.prewhere.is_some() || select.having.is_some() {
+    // `WHERE`（`selection`）**不再直接拒绝**：`§176` 起由 `predicate_of` 判定能不能翻译，
+    // 翻译不了就整体不下推。`PREWHERE`（ClickHouse 方言）与 `HAVING` 仍然不碰。
+    if select.prewhere.is_some() || select.having.is_some() {
         return None;
     }
     // `GROUP BY` 有三种写法（`Expressions` / `All` / …）——**只有"空 Expressions"** 才算没有
@@ -418,6 +568,83 @@ mod tests {
             let got = detect(sql, "public", &snap).unwrap_or_else(|| panic!("{sql} 应当可下推"));
             assert_eq!(got.table, "public.cpu", "{sql}");
             assert_eq!(got.specs, want, "{sql}");
+            assert!(got.predicate.is_none(), "{sql} 没有 WHERE");
+        }
+    }
+
+    /// **谓词（`WHERE`）也要能被翻译**（`§176`），包括两个容易写错的地方：
+    /// 字面量在左边时比较符要**翻转**、`AND`/`OR` 按 SQL 的结合与顺序翻译。
+    #[test]
+    fn where_clauses_are_translated_into_pushable_predicates() {
+        let snap = snapshot_with(DataType::Int64);
+        let cases = [
+            (
+                "SELECT count(*) FROM cpu WHERE v > 0",
+                Predicate::Cmp {
+                    column: "v".into(),
+                    op: CmpOp::Gt,
+                    value: Literal::Int(0),
+                },
+            ),
+            (
+                // 字面量在左 ⇒ 必须翻成 `v > 5`（不翻就是**静默错**）
+                "SELECT count(*) FROM cpu WHERE 5 < v",
+                Predicate::Cmp {
+                    column: "v".into(),
+                    op: CmpOp::Gt,
+                    value: Literal::Int(5),
+                },
+            ),
+            (
+                "SELECT sum(v) FROM cpu WHERE v IS NULL",
+                Predicate::IsNull {
+                    column: "v".into(),
+                    negated: false,
+                },
+            ),
+            (
+                "SELECT count(*) FROM cpu WHERE v = 1 AND v <= 3 OR v > 10",
+                Predicate::Or(vec![
+                    Predicate::And(vec![
+                        Predicate::Cmp {
+                            column: "v".into(),
+                            op: CmpOp::Eq,
+                            value: Literal::Int(1),
+                        },
+                        Predicate::Cmp {
+                            column: "v".into(),
+                            op: CmpOp::Le,
+                            value: Literal::Int(3),
+                        },
+                    ]),
+                    Predicate::Cmp {
+                        column: "v".into(),
+                        op: CmpOp::Gt,
+                        value: Literal::Int(10),
+                    },
+                ]),
+            ),
+            (
+                // 负数字面量：AST 里是一元负号，但它是常量 ⇒ 收下
+                "SELECT count(*) FROM cpu WHERE v < -1",
+                Predicate::Cmp {
+                    column: "v".into(),
+                    op: CmpOp::Lt,
+                    value: Literal::Int(-1),
+                },
+            ),
+            (
+                "SELECT max(s) FROM cpu WHERE s = 'x'",
+                Predicate::Cmp {
+                    column: "s".into(),
+                    op: CmpOp::Eq,
+                    value: Literal::Text("x".into()),
+                },
+            ),
+        ];
+        for (sql, want) in cases {
+            let got = detect(sql, "public", &snap).unwrap_or_else(|| panic!("{sql} 应当可下推"));
+            assert_eq!(got.predicate.as_ref(), Some(&want), "{sql}");
         }
     }
 
@@ -426,8 +653,18 @@ mod tests {
     fn everything_else_falls_back() {
         let snap = snapshot_with(DataType::Int64);
         for sql in [
-            // 谓词：热的一半没法只算该算的行（本刀不下推谓词）
-            "SELECT count(*) FROM cpu WHERE v > 1",
+            // 谓词：**翻译不出来就整体不下推**（`§176`）—— 半个谓词比没有谓词危险得多
+            "SELECT count(*) FROM cpu WHERE v LIKE 'a%'",
+            "SELECT count(*) FROM cpu WHERE v > 1.5", // 浮点字面量
+            "SELECT count(*) FROM cpu WHERE v = 'x'", // 跨类型比较
+            "SELECT count(*) FROM cpu WHERE s > 1",   // 同上（列是 Utf8）
+            "SELECT count(*) FROM cpu WHERE nope > 1", // 表里没这列
+            "SELECT count(*) FROM cpu WHERE abs(v) > 1", // 函数
+            "SELECT count(*) FROM cpu WHERE v + 1 > 2", // 算术
+            "SELECT count(*) FROM cpu WHERE v BETWEEN 1 AND 2",
+            "SELECT count(*) FROM cpu WHERE v IN (1, 2)",
+            "SELECT count(*) FROM cpu WHERE NOT (v > 1)", // NOT：三值逻辑取反，本刀不碰
+            "SELECT count(*) FROM cpu WHERE v IS TRUE",
             // 分组：每个分组要各自的部分状态
             "SELECT count(*) FROM cpu GROUP BY v",
             "SELECT count(*) FROM cpu HAVING count(*) > 1",

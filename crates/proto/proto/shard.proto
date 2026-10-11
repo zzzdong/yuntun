@@ -40,6 +40,26 @@ message AggSpecMsg {
   string column = 2;
 }
 
+// 一个**可下推的谓词**（`§176`）。刻意小：只表达"列 与 字面量的比较"、`IS [NOT] NULL`、`AND` / `OR`
+// —— 大到可以表达任意 SQL 的东西就没法"逐字复刻"，而**推错的谓词 = 结果悄悄错**
+// （判定边界写在 `yuntun_model::predicate` 的模块文档里）。
+message PredicateMsg {
+  // 0 = Cmp / 1 = IsNull / 2 = And / 3 = Or
+  uint32 kind = 1;
+  // Cmp / IsNull
+  string column = 2;
+  // Cmp：0=Eq / 1=Ne / 2=Lt / 3=Le / 4=Gt / 5=Ge
+  uint32 op = 3;
+  // Cmp 的字面量：1 = Int / 2 = Text（0 = 未用；浮点字面量**不下推**）
+  uint32 literal_kind = 4;
+  int64 literal_int = 5;
+  string literal_text = 6;
+  // IsNull：`true` ⇒ `IS NOT NULL`
+  bool negated = 7;
+  // And / Or 的子谓词（顺序是契约的一部分）
+  repeated PredicateMsg parts = 8;
+}
+
 message FetchShardAggsRequest {
   // 全限定表名 `schema.table`。
   //
@@ -53,6 +73,9 @@ message FetchShardAggsRequest {
   repeated string known_batch_ids = 3;
   // 与响应里的 `partials` **按下标一一对应**（顺序是契约的一部分）。
   repeated AggSpecMsg aggs = 4;
+  // 可选的行过滤（`§176`）：**缺席 = 不过滤**。语义与 SQL 的 `WHERE` 一致
+  // （只放行 TRUE；NULL 参与的比较是 UNKNOWN ⇒ 不放行）。
+  PredicateMsg predicate = 5;
 }
 
 // 一个聚合的部分状态。

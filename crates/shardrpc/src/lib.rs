@@ -171,6 +171,13 @@ impl pb::shard_fetch_server::ShardFetch for ShardService {
     ) -> Result<Response<pb::FetchShardAggsResponse>, Status> {
         let req = req.into_inner();
         let specs = agg_specs_from_msg(&req.aggs)?;
+        // `§176`：谓词与聚合一起在**数据所在处**生效（缺席 = 不过滤）
+        let predicate = req
+            .predicate
+            .as_ref()
+            .map(predicate_from_msg)
+            .transpose()?
+            .flatten();
         let aggs = self
             .reader
             .read_table_aggs(
@@ -178,6 +185,7 @@ impl pb::shard_fetch_server::ShardFetch for ShardService {
                 req.known_manifest_ver,
                 &req.known_batch_ids,
                 &specs,
+                predicate.as_ref(),
             )
             .await
             .map_err(internal)?;
@@ -379,6 +387,7 @@ impl ShardFetch for GrpcShardFetch {
         known_manifest_ver: u64,
         known_batch_ids: Vec<String>,
         specs: Vec<yuntun_model::agg::AggSpec>,
+        predicate: Option<yuntun_model::predicate::Predicate>,
     ) -> BoxFuture<'a, Result<ShardAggs, LakeError>> {
         Box::pin(async move {
             let mut c = self.client.clone();
@@ -390,6 +399,8 @@ impl ShardFetch for GrpcShardFetch {
                         known_manifest_ver,
                         known_batch_ids,
                         aggs: specs.iter().map(agg_spec_to_msg).collect(),
+                        // `§176`：谓词过网（`None` = 不过滤）
+                        predicate: predicate.as_ref().map(predicate_to_msg),
                     }),
                 )
                 .await?;
@@ -500,4 +511,104 @@ fn partial_from_msg(m: &pb::PartialAggMsg) -> Result<yuntun_model::agg::PartialA
             )))
         }
     })
+}
+
+// ---------------------------------------------------------------- 谓词的消息转换（`§176`）
+
+fn predicate_to_msg(p: &yuntun_model::predicate::Predicate) -> pb::PredicateMsg {
+    use yuntun_model::predicate::{Literal, Predicate};
+    let mut msg = pb::PredicateMsg::default();
+    match p {
+        Predicate::Cmp { column, op, value } => {
+            msg.kind = 0;
+            msg.column = column.clone();
+            msg.op = *op as u32;
+            match value {
+                Literal::Int(i) => {
+                    msg.literal_kind = 1;
+                    msg.literal_int = *i;
+                }
+                Literal::Text(t) => {
+                    msg.literal_kind = 2;
+                    msg.literal_text = t.clone();
+                }
+            }
+        }
+        Predicate::IsNull { column, negated } => {
+            msg.kind = 1;
+            msg.column = column.clone();
+            msg.negated = *negated;
+        }
+        Predicate::And(parts) => {
+            msg.kind = 2;
+            msg.parts = parts.iter().map(predicate_to_msg).collect();
+        }
+        Predicate::Or(parts) => {
+            msg.kind = 3;
+            msg.parts = parts.iter().map(predicate_to_msg).collect();
+        }
+    }
+    msg
+}
+
+/// 请求方向：**不认识的形状一律报错**（与 `agg_specs_from_msg` 同一条纪律 ——
+/// 静默忽略一个谓词 = 把"筛过的数据"当成"没筛"，那是最坏的一种成功）。
+fn predicate_from_msg(
+    m: &pb::PredicateMsg,
+) -> Result<Option<yuntun_model::predicate::Predicate>, Status> {
+    use yuntun_model::predicate::{CmpOp, Literal, Predicate};
+    Ok(Some(match m.kind {
+        0 => {
+            let op = CmpOp::from_u32(m.op)
+                .ok_or_else(|| Status::invalid_argument(format!("不认识的比较符：{}", m.op)))?;
+            let value = match m.literal_kind {
+                1 => Literal::Int(m.literal_int),
+                2 => Literal::Text(m.literal_text.clone()),
+                other => {
+                    return Err(Status::invalid_argument(format!(
+                        "不认识的谓词字面量：{other}"
+                    )))
+                }
+            };
+            if m.column.is_empty() {
+                return Err(Status::invalid_argument("比较谓词缺列名"));
+            }
+            Predicate::Cmp {
+                column: m.column.clone(),
+                op,
+                value,
+            }
+        }
+        1 => {
+            if m.column.is_empty() {
+                return Err(Status::invalid_argument("IS NULL 谓词缺列名"));
+            }
+            Predicate::IsNull {
+                column: m.column.clone(),
+                negated: m.negated,
+            }
+        }
+        2 | 3 => {
+            let mut parts = Vec::with_capacity(m.parts.len());
+            for sub in &m.parts {
+                match predicate_from_msg(sub)? {
+                    Some(p) => parts.push(p),
+                    None => return Err(Status::invalid_argument("子谓词为空")),
+                }
+            }
+            if parts.is_empty() {
+                return Err(Status::invalid_argument("AND/OR 谓词没有子项"));
+            }
+            if m.kind == 2 {
+                Predicate::And(parts)
+            } else {
+                Predicate::Or(parts)
+            }
+        }
+        other => {
+            return Err(Status::invalid_argument(format!(
+                "不认识的谓词种类：{other}"
+            )))
+        }
+    }))
 }

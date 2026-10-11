@@ -278,11 +278,11 @@ async fn aggregate_pull_survives_the_wire() {
         AggSpec::new(AggKind::Max, "a"),
     ];
     let over_wire = remote
-        .read_table_aggs(TABLE, 0, &[], &specs)
+        .read_table_aggs(TABLE, 0, &[], &specs, None)
         .await
         .expect("聚合拉取过网络");
     let in_process = local
-        .read_table_aggs(TABLE, 0, &[], &specs)
+        .read_table_aggs(TABLE, 0, &[], &specs, None)
         .await
         .expect("进程内聚合拉取");
 
@@ -308,13 +308,50 @@ async fn aggregate_pull_survives_the_wire() {
     );
     assert_eq!(over_wire.stale, in_process.stale);
 
+    // `§176`：**谓词也要过网**（只回标量这件事对"带 WHERE 的聚合"同样成立）。
+    // 用具体的数字钉住它：`a > 1` 在 [3, 1, 2] 上应当只剩 3 与 2。
+    {
+        use yuntun_model::predicate::{CmpOp, Literal, Predicate};
+        let spec = vec![
+            AggSpec::count_star(),
+            AggSpec::new(AggKind::SumInt, "a"),
+            AggSpec::new(AggKind::Min, "a"),
+            AggSpec::new(AggKind::Max, "a"),
+        ];
+        let p = Predicate::Cmp {
+            column: "a".into(),
+            op: CmpOp::Gt,
+            value: Literal::Int(1),
+        };
+        let filtered = remote
+            .read_table_aggs(TABLE, 0, &[], &spec, Some(&p))
+            .await
+            .expect("带谓词的聚合拉取");
+        assert_eq!(filtered.partials[0], PartialAgg::Count(2), "只有 3 与 2 放行");
+        assert_eq!(filtered.partials[1], PartialAgg::SumInt(Some(5)));
+        assert_eq!(
+            filtered.partials[2],
+            PartialAgg::Min(Some(AggScalar::Int(2)))
+        );
+        assert_eq!(
+            filtered.partials[3],
+            PartialAgg::Max(Some(AggScalar::Int(3)))
+        );
+        // 与进程内同一条路径逐位相同（谓词两侧的转译不能有任何差别）
+        let local = local
+            .read_table_aggs(TABLE, 0, &[], &spec, Some(&p))
+            .await
+            .expect("进程内带谓词的聚合拉取");
+        assert_eq!(filtered.partials, local.partials);
+    }
+
     // 空集：`sum`/`min`/`max` 是 NULL（不是 0）—— 这条也会过网
     let empty = yuntun_testkit::TestDir::tmpfs("wire-agg-empty");
     let empty_local: Arc<dyn ShardReader> = instance(&empty, "inst-empty");
     let empty_addr = serve(empty_local).await;
     let empty_remote = remote_reader(&empty_addr).await;
     let got = empty_remote
-        .read_table_aggs(TABLE, 0, &[], &specs)
+        .read_table_aggs(TABLE, 0, &[], &specs, None)
         .await
         .expect("空来源也要能答");
     assert_eq!(got.partials[0], PartialAgg::Count(0));

@@ -386,11 +386,13 @@ impl QueryEngine {
             let ident = plan.table.clone();
             let specs = plan.specs.clone();
             let exclude = exclude.clone();
+            let predicate = plan.predicate.clone();
             let instance = instance.clone();
             async move {
                 let outcome = match tokio::time::timeout_at(
                     deadline,
-                    reader.read_table_aggs(&ident, snap_ver, &exclude, &specs),
+                    // `§176`：谓词一起送过去（在**数据所在处**生效，网络里仍只走标量）
+                    reader.read_table_aggs(&ident, snap_ver, &exclude, &specs, predicate.as_ref()),
                 )
                 .await
                 {

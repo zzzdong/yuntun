@@ -69,7 +69,7 @@
 | **行级删除** | `DELETE FROM t WHERE …`：删除向量（roaring 位图）表达 + 读侧行选择 + WAL `DeletePayload` + 重启重放 + compaction 消费（合并重写时**应用** DV，提交后 `revoke`）；**无 `WHERE` 的全表删**走文件级下线（`purge_table_files`） |
 | **行级更新** | `UPDATE t SET … WHERE …`：**一个 op 承载、原子可见**（DV 与新行文件同一个快照号 ⇒ 看不到"删了没插/插了没删"） |
 | 索引 | **行组级**：写时随 flush 生成 `{batch}.idx`（逐组 min/max + XOR，只给排序列）；读时文件级 → 组级两级剪枝。⚠️ **只对 parquet 生效**，vortex 路径无组级剪枝 |
-| **分布式聚合下推** | `SELECT count(*) / count(c) / sum(整数列) / min / max FROM t`（**无 `WHERE`、无 `GROUP BY`**）在多节点下**只回标量**：热来源在它那边折（`FetchShardAggs`），冷的一半仍由 DataFusion 算，协调者合并 —— 实测 3 万行从 **244KB 降到 64 字节**（`§173`）。其余形状（谓词 / `GROUP BY` / `avg` / 浮点 `sum`）**原路**（正确但不过网省），见 `ARCHITECTURE.md §4` |
+| **分布式聚合下推** | `SELECT count(*) / count(c) / sum(整数列) / min / max FROM t`，**含 `WHERE` 谓词**（比较 / `IS [NOT] NULL` / `AND` / `OR`：`§176`）在多节点下**只回标量**：热来源在它那边筛+折（`FetchShardAggs`），冷的一半仍由 DataFusion 算，协调者合并 —— 实测 3 万行从 **244KB 降到 64 字节（3814×，带/不带 `WHERE` 都一样）**。其余形状（`GROUP BY` / `avg` / 浮点 `sum` / 复杂谓词）**原路**（正确但不过网省），见 `ARCHITECTURE.md §4` |
 | 元数据 | `SHOW TABLES/COLUMNS/DATABASES`、`DESCRIBE`、`SHOW CREATE TABLE` |
 | 客户端 | mysql CLI / 驱动预编译 / DBeaver+JDBC / ADBC+pyarrow 均已验 |
 | 幂等 | 三通道（SQL 注释 / CLI `--key` / `FlightData.app_metadata`）；**一次请求一次键 + 批次派生键** |
@@ -107,7 +107,7 @@
 
 ## 6. 质量与证据网
 
-规模：**72,082 行 Rust / 20 个 crate / 580 个测试函数 / 用例全绿（⚠️ 并行跑时 2 条计时用例会 flaky，见 §6.1） / clippy 本仓 0 告警**
+规模：**72,966 行 Rust / 20 个 crate / 591 个测试函数 / 用例全绿（⚠️ 并行跑时 2 条计时用例会 flaky，见 §6.1） / clippy 本仓 0 告警**
 （工具链：本机 rustc 1.98.1 + edition 2024；**MSRV 声明 1.95**，由 `vortex 0.86` 顶出，
 **尚未经真·1.95 编译验证**）
 

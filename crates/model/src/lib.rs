@@ -18,6 +18,7 @@ pub mod batch;
 /// 删除向量（`plan.md` F.3）：行位删除的表达、存储与"保留哪些行"的翻译。
 pub mod dv;
 pub mod agg;
+pub mod predicate;
 pub mod task;
 pub mod error;
 /// 行组级索引文件（`plan.md` F.4）：zone map + XOR filter + 帧编解码。

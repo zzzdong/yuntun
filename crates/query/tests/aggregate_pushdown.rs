@@ -21,6 +21,7 @@ use futures::future::BoxFuture;
 use yuntun_catalog::{CatalogOps, MemoryCatalog};
 use yuntun_chunk::{ChunkKey, ChunkStore, ChunkStoreConfig, MemoryLedger, SealPolicy};
 use yuntun_model::agg::{AggSpec, PartialAgg};
+use yuntun_model::predicate::Predicate;
 use yuntun_model::error::LakeError;
 use yuntun_model::ops::CreateTableRequest;
 use yuntun_query::{LocalCatalog, QueryEngine};
@@ -212,9 +213,12 @@ impl ShardReader for CountingReader {
         known: u64,
         exclude: &[String],
         specs: &[AggSpec],
+        predicate: Option<&Predicate>,
     ) -> Result<ShardAggs, LakeError> {
         self.agg_pulls.fetch_add(1, Ordering::SeqCst);
-        self.inner.read_table_aggs(table, known, exclude, specs).await
+        self.inner
+            .read_table_aggs(table, known, exclude, specs, predicate)
+            .await
     }
 }
 
@@ -282,13 +286,16 @@ impl ShardFetch for WireFetch {
         known_manifest_ver: u64,
         known_batch_ids: Vec<String>,
         specs: Vec<AggSpec>,
+        predicate: Option<Predicate>,
     ) -> BoxFuture<'a, Result<ShardAggs, LakeError>> {
         Box::pin(async move {
             let read = self
                 .inner
                 .read_table_excluding(table, known_manifest_ver, &known_batch_ids)
                 .await?;
-            let partials = yuntun_model::agg::fold_batches(&specs, &read.batches)?;
+            // `§176`：谓词在**数据旁边**生效（与真实服务端同一条代码路径）
+            let partials =
+                yuntun_model::agg::fold_batches_with(&specs, &read.batches, predicate.as_ref())?;
             // 上网的字节 = 部分状态那点标量（真实实现是几十字节的 proto）
             self.agg_bytes.fetch_add(
                 partials.len() * std::mem::size_of::<PartialAgg>(),
@@ -361,6 +368,7 @@ impl ShardReader for AlwaysStale {
         _known: u64,
         _exclude: &[String],
         specs: &[AggSpec],
+        _predicate: Option<&Predicate>,
     ) -> Result<ShardAggs, LakeError> {
         Ok(ShardAggs {
             partials: specs
@@ -447,8 +455,25 @@ async fn pushed_down_aggregates_match_the_row_path_bit_for_bit() {
         ("SELECT sum(v) FROM agg", true),
         ("SELECT min(v), max(v) FROM agg", true),
         ("SELECT count(v), sum(v), min(v), max(v) FROM agg", true),
-        // 必须退回原路：谓词（本刀不下推 WHERE）、avg、GROUP BY、表达式
-        ("SELECT count(*) FROM agg WHERE v > 0", false),
+        // `§176`：带 `WHERE` 的形状（谓词在**数据所在处**生效，网络里仍只走标量）
+        ("SELECT count(*) FROM agg WHERE v > 0", true),
+        ("SELECT count(v), sum(v) FROM agg WHERE v = 5", true),
+        // NULL 的三值逻辑：两边必须一致（`v != 5` 在 NULL 行上不成立）
+        ("SELECT count(*) FROM agg WHERE v != 5", true),
+        ("SELECT count(*) FROM agg WHERE v IS NULL", true),
+        ("SELECT sum(v) FROM agg WHERE v IS NOT NULL", true),
+        ("SELECT count(*) FROM agg WHERE v > 1 AND v < 10", true),
+        ("SELECT count(*) FROM agg WHERE v < -1 OR v > 5", true),
+        // 字面量在左 ⇒ 比较符必须翻转（不翻就是静默错）
+        ("SELECT count(*) FROM agg WHERE 3 <= v", true),
+        // 必须退回原路：翻译不出来的谓词、avg、GROUP BY、表达式
+        // 注：`v LIKE 'a%'` 是**非法的**（Int64 对字符串模式，DataFusion 直接报类型错）
+        // ⇒ 换几个**合法但翻译不出来**的形状
+        ("SELECT count(*) FROM agg WHERE v BETWEEN 1 AND 3", false),
+        ("SELECT count(*) FROM agg WHERE v IN (1, 5)", false),
+        ("SELECT count(*) FROM agg WHERE v > 1.5", false),
+        ("SELECT count(*) FROM agg WHERE abs(v) > 1", false),
+        ("SELECT count(*) FROM agg WHERE NOT (v > 1)", false),
         ("SELECT avg(v) FROM agg", false),
         ("SELECT v, count(*) FROM agg GROUP BY v", false),
         ("SELECT count(*) + 1 FROM agg", false),
@@ -508,10 +533,34 @@ async fn pushed_down_pull_moves_scalars_not_rows() {
     let rows_bytes = wire.row_bytes.load(Ordering::SeqCst);
     assert!(agg > 0, "聚合路径必须真的过了一次响应（否则这个对比是假的）");
     assert!(rows_bytes > 0, "行路径必须真的传过字节（否则这个对比是假的）");
-    eprintln!("【§173 实测】行路径 {rows_bytes} 字节 vs 聚合路径 {agg} 字节（{:.0}×）", rows_bytes as f64 / agg.max(1) as f64);
+    eprintln!(
+        "【§173 实测】无谓词：行 {rows_bytes} 字节 vs 聚合 {agg} 字节（{:.0}×）",
+        rows_bytes as f64 / agg.max(1) as f64
+    );
     assert!(
         rows_bytes >= agg * 10,
         "网络量必须下降一个量级：行路径 {rows_bytes} 字节 vs 聚合路径 {agg} 字节"
+    );
+
+    // `§176`：**带 `WHERE` 的看板查询**同样只走标量 —— 这一刀的全部意义就在这里
+    //（原路的 `WHERE` 是在协调者**拉到全部行之后**才生效的）。
+    let (row0, agg0) = (
+        wire.row_bytes.load(Ordering::SeqCst),
+        wire.agg_bytes.load(Ordering::SeqCst),
+    );
+    let filtered = "SELECT count(*), sum(v) FROM agg WHERE v > 500";
+    let pushed = subject.sql(filtered).await.expect("带谓词的下推路径");
+    let rowed = reference.sql(filtered).await.expect("带谓词的行路径");
+    assert_eq!(pushed, rowed, "带谓词的两条路也必须给出同一个答案");
+    let row_delta = wire.row_bytes.load(Ordering::SeqCst) - row0;
+    let agg_delta = wire.agg_bytes.load(Ordering::SeqCst) - agg0;
+    eprintln!(
+        "【§176 实测】带 WHERE：行 {row_delta} 字节 vs 聚合 {agg_delta} 字节（{:.0}×）",
+        row_delta as f64 / agg_delta.max(1) as f64
+    );
+    assert!(
+        row_delta >= agg_delta * 10,
+        "带谓词时网络量同样要下降一个量级：行路径 {row_delta} 字节 vs 聚合路径 {agg_delta} 字节"
     );
 }
 

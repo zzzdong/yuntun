@@ -23,6 +23,7 @@ use arrow::array::{Array, Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 
 use crate::error::LakeError;
+use crate::predicate::Predicate;
 
 /// 聚合种类（**只有这些能下推**）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,6 +148,21 @@ impl PartialAgg {
 pub fn fold_batch(specs: &[AggSpec], batch: &RecordBatch) -> Result<Vec<PartialAgg>, LakeError> {
     let mut out = Vec::with_capacity(specs.len());
     for spec in specs {
+        // **列缺失 = 全 NULL**（`§176`）：读路径按 `arrow_util::align_batch` 对齐（缺失列补 NULL）
+        // ⇒ 这里必须同样处理，否则 schema 演进过的表会在下推路径上报错、而原路好好儿的。
+        if let Some(name) = spec.column.as_deref()
+            && batch.schema().index_of(name).is_err()
+        {
+            out.push(match spec.kind {
+                AggKind::Count => PartialAgg::Count(0),
+                AggKind::SumInt => PartialAgg::SumInt(None),
+                AggKind::Min => PartialAgg::Min(None),
+                AggKind::Max => PartialAgg::Max(None),
+                // `count(*)` 的列参数恒为 None，走不到这里
+                AggKind::CountStar => PartialAgg::Count(batch.num_rows() as u64),
+            });
+            continue;
+        }
         out.push(match spec.kind {
             AggKind::CountStar => PartialAgg::Count(batch.num_rows() as u64),
             AggKind::Count => {
@@ -187,9 +203,30 @@ pub fn fold_batches(
     specs: &[AggSpec],
     batches: &[RecordBatch],
 ) -> Result<Vec<PartialAgg>, LakeError> {
+    fold_batches_with(specs, batches, None)
+}
+
+/// 同 [`fold_batch`]，但先按谓词**筛掉不放行的行**（`§176`：谓词下推）。
+pub fn fold_batch_with(
+    specs: &[AggSpec],
+    batch: &RecordBatch,
+    predicate: Option<&Predicate>,
+) -> Result<Vec<PartialAgg>, LakeError> {
+    match predicate {
+        None => fold_batch(specs, batch),
+        Some(p) => fold_batch(specs, &crate::predicate::filter_batch(batch, p)?),
+    }
+}
+
+/// 同 [`fold_batches`]，但先按谓词筛行。
+pub fn fold_batches_with(
+    specs: &[AggSpec],
+    batches: &[RecordBatch],
+    predicate: Option<&Predicate>,
+) -> Result<Vec<PartialAgg>, LakeError> {
     let mut acc: Vec<PartialAgg> = specs.iter().map(|s| PartialAgg::empty(s.kind)).collect();
     for b in batches {
-        let part = fold_batch(specs, b)?;
+        let part = fold_batch_with(specs, b, predicate)?;
         for i in 0..acc.len() {
             acc[i] = merge(&acc[i], &part[i])?;
         }
@@ -427,6 +464,43 @@ mod tests {
         // `min/max` 也不收浮点（NaN 口径要先复刻，第一刀不碰）
         let e = fold_batch(&[AggSpec::new(AggKind::Min, "f")], &b).unwrap_err();
         assert!(e.to_string().contains("整数与字符串"), "{e}");
+    }
+
+    /// **列缺失 = 全 NULL**（`§176`）：与读路径的 `align_batch` 同语义，不许报错。
+    #[test]
+    fn a_missing_column_folds_as_all_null() {
+        let b = batch(vec![Some(1), Some(2)]);
+        let specs = vec![
+            AggSpec::new(AggKind::Count, "nope"),
+            AggSpec::new(AggKind::SumInt, "nope"),
+            AggSpec::new(AggKind::Min, "nope"),
+            AggSpec::new(AggKind::Max, "nope"),
+        ];
+        let got = fold_batch(&specs, &b).unwrap();
+        assert_eq!(got[0], PartialAgg::Count(0), "缺失列一个非空值都没有");
+        assert_eq!(got[1], PartialAgg::SumInt(None));
+        assert_eq!(got[2], PartialAgg::Min(None));
+        assert_eq!(got[3], PartialAgg::Max(None));
+    }
+
+    /// 谓词在折叠**之前**生效（`§176`）：等价于"先筛行再算"，NULL 行不放行。
+    #[test]
+    fn a_predicate_filters_rows_before_folding() {
+        use crate::predicate::{CmpOp, Literal, Predicate};
+        let specs = vec![AggSpec::count_star(), AggSpec::new(AggKind::SumInt, "v")];
+        let batches = vec![batch(vec![Some(1), None, Some(5)]), batch(vec![Some(9)])];
+        let p = Predicate::Cmp {
+            column: "v".into(),
+            op: CmpOp::Gt,
+            value: Literal::Int(1),
+        };
+        let got = fold_batches_with(&specs, &batches, Some(&p)).unwrap();
+        assert_eq!(got[0], PartialAgg::Count(2), "只有 5 与 9 放行");
+        assert_eq!(got[1], PartialAgg::SumInt(Some(14)));
+        // 没有谓词时是同一套代码的另一条路径：必须看到全部（含 NULL 带来的差异）
+        let all = fold_batches_with(&specs, &batches, None).unwrap();
+        assert_eq!(all[0], PartialAgg::Count(4));
+        assert_eq!(all[1], PartialAgg::SumInt(Some(15)));
     }
 
     #[test]
