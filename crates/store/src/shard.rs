@@ -104,6 +104,41 @@ pub struct ShardAggs {
     pub stale: bool,
 }
 
+/// **冷文件的就地折叠请求**（`§179`，N4b 的远端冷读）。
+///
+/// 刻意**自足**：要读哪些文件、每份文件上生效哪几份 DV、表结构是什么，全部由请求给。
+/// 理由见 [`fold_cold_files`][yuntun_query::cold::fold_cold_files]：被分配到的节点不许查自己的
+/// 目录（`RemoteCatalog` 没有 `wait_for(version ≥ N)` ⇒ 可能读到**另一个快照** = 静默错）。
+#[derive(Debug, Clone)]
+pub struct ColdReadRequest {
+    /// 全限定表名（标识/日志用 —— **不**用它查目录）
+    pub table: String,
+    /// 表结构（IPC 已解开）：文件里的列按它对齐
+    pub schema: arrow::datatypes::SchemaRef,
+    /// 分配给这一支的文件
+    pub files: Vec<yuntun_model::meta::FileManifest>,
+    /// 锚定在**这些文件**上、且在这次快照下生效的 DV（调用方筛好）
+    pub deletions: Vec<yuntun_model::dv::DeletionEntry>,
+    /// 要算的聚合（含分组与谓词，`§173`/`§176`/`§177`）
+    pub query: yuntun_model::agg::AggQuery,
+}
+
+/// **冷文件的就地折叠能力**（`§179`）：把 [`ColdReadRequest`] 折成部分状态（**标量**）。
+///
+/// 为什么单独一个 trait 而不是挂在 [`ShardReader`] 上：`ShardReader` 是**热数据**的接口
+/// （chunk/WAL，归属绑定），而冷文件**谁都能读**（共享存储）—— 两件事的归属规则不同，
+/// 混在一个 trait 里就会有人以为"冷读也要按实例发现"。
+///
+/// 生产实现在 `crates/datanode`（把 `yuntun_query::cold::fold_cold_files` 包一层）；
+/// **没接 = 不支持**（`serve` 收 `Option`）⇒ 协调者那边按"拿不到"处理。
+#[allow(async_fn_in_trait)]
+pub trait ColdReader: Send + Sync + std::fmt::Debug {
+    fn fold(
+        &self,
+        req: ColdReadRequest,
+    ) -> futures::future::BoxFuture<'_, Result<yuntun_model::agg::AggStates, LakeError>>;
+}
+
 // ---------------------------------------------------------------- 读侧接缝
 
 /// **热数据读接口**：查询侧唯一依赖的热数据入口。

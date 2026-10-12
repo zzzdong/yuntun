@@ -246,6 +246,35 @@ pub fn decode_batch(
     }
 }
 
+/// 把 **schema** 编成 IPC 消息（`§179`：远端冷折叠要把表结构一起送过去 ——
+/// 请求必须**自足**：被分配到的节点不许去查自己的目录）。
+///
+/// 为什么要有这一对：读路径要拿"表结构"来对齐文件里的列（`arrow_util::align_batch`），
+/// 而每个节点自己 catalog 里的 schema 可能是**另一个快照**的（`RemoteCatalog` 没有
+/// `wait_for(version ≥ N)`）⇒ 静默错。所以由**请求**带上它。
+pub fn encode_schema(schema: &arrow::datatypes::Schema) -> Result<Vec<u8>, LakeError> {
+    use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
+    // arrow-ipc 59 的入口是这个（带字典追踪器的那个；schema 没有字典 ⇒ 传个新的）
+    let data = IpcDataGenerator::default().schema_to_bytes_with_dictionary_tracker(
+        schema,
+        &mut DictionaryTracker::new(false),
+        &IpcWriteOptions::default(),
+    );
+    Ok(data.ipc_message.to_vec())
+}
+
+/// 解回 schema（与 [`encode_schema`] 相对）。
+pub fn decode_schema(bytes: &[u8]) -> Result<arrow::datatypes::SchemaRef, LakeError> {
+    let msg = arrow::ipc::root_as_message(bytes)
+        .map_err(|e| LakeError::Other(format!("schema ipc: {e}")))?;
+    let fb = msg
+        .header_as_schema()
+        .ok_or_else(|| LakeError::Other("schema ipc: 消息里没有 schema".into()))?;
+    // arrow-ipc 59：这个转换是**不会失败**的（失败只会来自 root_as_message 那一步）
+    let schema = arrow::ipc::convert::fb_to_schema(fb);
+    Ok(std::sync::Arc::new(schema))
+}
+
 // ---------------- Parquet（回退路径，默认可用）----------------
 
 /// **单个 RowGroup 的最大行数**（显式设定，`operation-log §36`）。
