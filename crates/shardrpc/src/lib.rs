@@ -105,6 +105,14 @@ pub struct RemoteCold {
 }
 
 impl RemoteCold {
+    /// 从**已有的** tonic client 建（`GrpcShardFetch` 复用同一条连接，不重连）。
+    pub fn from_client(
+        client: pb::shard_fetch_client::ShardFetchClient<Channel>,
+        timeout: Duration,
+    ) -> Self {
+        Self { client, timeout }
+    }
+
     pub async fn connect(addr: &str) -> Result<Self, LakeError> {
         let ep = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
             .map_err(|e| LakeError::Other(format!("shard rpc: bad addr {addr}: {e}")))?;
@@ -664,6 +672,16 @@ impl ShardFetch for GrpcShardFetch {
                 stale: resp.stale,
             })
         })
+    }
+    /// `§182`：同一条连接也能做**冷折叠** ⇒ 直接复用（不新建连接）。
+    ///
+    /// 因此冷读不需要另设一张表 / 另管一份生命周期：它与热读器天然是同一批实例，
+    /// 成员摘除时一起消失（`LocalCatalog::set_members` 的裁剪自动覆盖）。
+    fn as_cold(&self) -> Option<std::sync::Arc<dyn ColdReader>> {
+        Some(std::sync::Arc::new(RemoteCold::from_client(
+            self.client.clone(),
+            self.timeout,
+        )))
     }
 }
 

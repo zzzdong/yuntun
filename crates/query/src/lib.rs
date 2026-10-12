@@ -51,6 +51,7 @@ fn hot_read_stale(e: &DataFusionError) -> Option<&HotReadStale> {
 use datafusion::error::DataFusionError;
 use datafusion::execution::memory_pool::GreedyMemoryPool;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
+use arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
 use yuntun_catalog::CatalogOps;
 
@@ -295,11 +296,7 @@ impl QueryEngine {
             .await
     }
 
-    /// **只读冷数据**的会话（`§173`）：聚合下推先用它把"冷的一半"算出来
-    /// （schema / 列名 / 类型由 DataFusion 给，不必手写一个"看起来一样"的结果集）。
-    ///
-    /// 热的那一半由聚合 RPC 单独拉 —— 两边都读会把同一批热数据算两遍。
-    /// **只读冷数据、且只读这几个文件**的会话（`§178`/`§180`：冷文件被分配后，
+    /// **只读冷数据、且只读这几个文件**的会话（`§178`/`§182`：冷文件被分配后，
     /// **本地那一份**走它）。schema / 列名 / 类型仍由 DataFusion 给 —— 那是"与对拍一致"的保证。
     ///
     /// 为什么白名单是**每次查询**的参数而不是引擎字段：分配是"这次查询"的决定
@@ -311,19 +308,6 @@ impl QueryEngine {
         only_files: Vec<String>,
     ) -> Result<SessionContext, DataFusionError> {
         self.session_inner(schema, partial, false, Some(only_files))
-            .await
-    }
-
-    /// **只读冷数据**的会话（`§173`）：聚合下推先用它把"冷的一半"算出来
-    /// （schema / 列名 / 类型由 DataFusion 给），热的那一半由聚合 RPC 单独拉。
-    ///
-    /// 热的那一半由聚合 RPC 单独拉 —— 两边都读会把同一批热数据算两遍。
-    async fn session_cold_only(
-        &self,
-        schema: &str,
-        partial: std::sync::Arc<PartialSink>,
-    ) -> Result<SessionContext, DataFusionError> {
-        self.session_inner(schema, partial, false, self.only_files.clone())
             .await
     }
 
@@ -376,29 +360,24 @@ impl QueryEngine {
         Ok(ctx)
     }
 
-    /// **聚合下推**（`§173`，G.2 / 归档 `S5-3`）：形状可下推时，把这次聚合查询算成
-    /// "**冷的一半交给 DataFusion** + **热的一半走聚合 RPC**"，然后合并。
+    /// **冷的那一半**：只读 `only_files` 这几个冷文件（`§178` 的接缝），热读关闭。
     ///
-    /// 不适用（形状不合 / 结果形状与判定不符）⇒ 返回 `None`，调用方走原路。
+    /// 为什么单独提出来：分配之后它会被调用**两次**（第一次按分配、某节点回退时扩大重算）
+    /// —— 而"形状判定不符 ⇒ 原路"这条语义两处必须一致。
     ///
-    /// 三条与 `scan` **逐字一致**的规则（有两套就会漂）：STALE 必须失败并交给上层刷新重试；
-    /// 拿不到的来源按 partial 策略处置；装配**严格按键序**（并发只改时间，不改结果）。
-    async fn aggregate_pushdown(
+    /// 为什么不让 DataFusion 顺手把热的一半也算了：那样热数据就只有"行"这一条路能回来
+    /// （网络白花），而且**同一批热数据会被算两遍**（一次在冷扫描里、一次在聚合 RPC 里）。
+    async fn cold_half(
         &self,
         query: &str,
+        plan: &agg_pushdown::Pushdown,
         schema: &str,
-    ) -> Result<Option<QueryOutcome>, DataFusionError> {
-        let snapshot = self.catalog.snapshot();
-        let Some(plan) = agg_pushdown::detect(query, schema, &snapshot) else {
-            return Ok(None);
-        };
-
-        // ---- ① 冷的一半：DataFusion，热读关闭 ----
-        //
-        // 为什么不让 DataFusion 顺手把热的一半也算了：那样热数据就只有"行"这一条路能回来
-        // （网络白花），而且**同一批热数据会被算两遍**（一次在冷扫描里、一次在聚合 RPC 里）。
-        let partial = std::sync::Arc::new(PartialSink::new(self.partial_policy));
-        let ctx = self.session_cold_only(schema, partial.clone()).await?;
+        partial: std::sync::Arc<PartialSink>,
+        only_files: &[String],
+    ) -> Result<Option<RecordBatch>, DataFusionError> {
+        let ctx = self
+            .session_cold_files(schema, partial.clone(), only_files.to_vec())
+            .await?;
         let cold_batches = ctx.sql(query).await?.collect().await?;
         // ⚠️ **先拼成一张**：DataFusion 按分区产出批次，分组时几乎必然是**多批**
         // （不分组时也常是 1 批，但不能依赖这个 —— 依赖它就会"判定通过却退回原路"，
@@ -418,9 +397,7 @@ impl QueryEngine {
         // 真发生了就**原路重跑**，而不是猜一个（正确性优先于省下的那次扫描）。
         // `§177`：分组时冷结果是"**每组一行**"（行数由数据决定），不分组时恒为 1 行
         let want_cols = plan.group_by.len() + plan.specs.len();
-        if cold.num_columns() != want_cols
-            || (cold.num_rows() != 1 && plan.group_by.is_empty())
-        {
+        if cold.num_columns() != want_cols || (cold.num_rows() != 1 && plan.group_by.is_empty()) {
             tracing::debug!(
                 table = %plan.table,
                 grouped = !plan.group_by.is_empty(),
@@ -430,6 +407,189 @@ impl QueryEngine {
             );
             return Ok(None);
         }
+        Ok(Some(cold))
+    }
+
+    /// **聚合下推**（`§173`，G.2 / 归档 `S5-3`）：形状可下推时，把这次聚合查询算成
+    /// "**冷的一半交给 DataFusion** + **热的一半走聚合 RPC**"，然后合并。
+    ///
+    /// 不适用（形状不合 / 结果形状与判定不符）⇒ 返回 `None`，调用方走原路。
+    ///
+    /// 三条与 `scan` **逐字一致**的规则（有两套就会漂）：STALE 必须失败并交给上层刷新重试；
+    /// 拿不到的来源按 partial 策略处置；装配**严格按键序**（并发只改时间，不改结果）。
+    async fn aggregate_pushdown(
+        &self,
+        query: &str,
+        schema: &str,
+    ) -> Result<Option<QueryOutcome>, DataFusionError> {
+        let snapshot = self.catalog.snapshot();
+        let Some(plan) = agg_pushdown::detect(query, schema, &snapshot) else {
+            return Ok(None);
+        };
+
+        // ---- ① 冷的一半：**按分配**算（本地一份 + 远端若干份）----
+        //
+        // 冷文件在**共享**对象存储上 ⇒ 任何节点都能读，"谁来读"是调度问题（`§178`：
+        // `placement::assign` 是确定性 + 均衡 + 完整的）。本地那一份仍由 DataFusion 算 ——
+        // **schema / 列名 / 类型由它给**，那是"与对拍逐位相同"的保证；其余按分配交给对应
+        // 节点的冷折叠（只回**标量**，§179/§180）。
+        //
+        // 没有任何节点接得上冷折叠（单机 / 未接线 / 测试假实现）⇒ 全部本地算，
+        // 与改造前**逐字相同**：少一跳网络，也少一处风险。
+        let partial = std::sync::Arc::new(PartialSink::new(self.partial_policy));
+        let cached = snapshot.get(&plan.table);
+        let mut visible: Vec<yuntun_model::meta::FileManifest> = cached
+            .map(|t| t.files.clone())
+            .unwrap_or_default();
+        // `§178` 的引擎级白名单优先：它表达"这个引擎这一支只读这些文件"（对拍与下一刀的载体）。
+        // 分配**作用在它过滤之后的集合上** —— 否则引擎说"只读 A"，分配却把 B 也分进来，
+        // 于是同一个引擎既读 A 又读 B（那种错没有任何报错，只是多读了数据）。
+        if let Some(allow) = &self.only_files {
+            visible.retain(|f| allow.contains(&f.file_path));
+        }
+        let deletions = cached.map(|t| t.deletions.clone()).unwrap_or_default();
+        let table_schema = cached.map(|t| t.schema.clone());
+
+        // 候选节点 = 各热实例里**有冷折叠能力的** + 本地（空 id）
+        let mut nodes: Vec<String> = Vec::new();
+        let mut cold_readers: Vec<(
+            String,
+            std::sync::Arc<dyn yuntun_store::ColdReader>,
+        )> = Vec::new();
+        for (id, reader) in self.catalog.hot_shards() {
+            if let Some(c) = reader.as_cold() {
+                nodes.push(id.clone());
+                cold_readers.push((id, c));
+            }
+        }
+        nodes.push(String::new()); // 本地
+        let assignments = placement::assign(&visible, &nodes);
+        let local_paths: Vec<String> = assignments
+            .iter()
+            .find(|a| a.instance.is_empty())
+            .map(|a| a.files.iter().map(|f| f.file_path.clone()).collect())
+            .unwrap_or_default();
+        let remote_shares: Vec<(String, Vec<yuntun_model::meta::FileManifest>)> = assignments
+            .iter()
+            .filter(|a| !a.instance.is_empty())
+            .map(|a| (a.instance.clone(), a.files.clone()))
+            .collect();
+        tracing::debug!(
+            table = %plan.table,
+            files = visible.len(),
+            local = local_paths.len(),
+            remote = remote_shares.len(),
+            "冷文件分配完成（§178）"
+        );
+
+        let Some(cold) = self
+            .cold_half(query, &plan, schema, partial.clone(), &local_paths)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        // 远端若干份：并发、带同一个预算（"这次查询愿意为冷数据等多久"）。
+        // 拿不到 ⇒ **回退本地读**（不是降级成 partial：那份数据本来就能从共享存储读到，
+        // 把它标成 partial 等于告诉用户"结果可能少"，而真相只是"换个人读"）。
+        let budget = self.hot_read_budget;
+        let deadline = tokio::time::Instant::now() + budget;
+        let aq = yuntun_model::agg::AggQuery {
+            specs: plan.specs.clone(),
+            group_by: plan.group_by.clone(),
+            predicate: plan.predicate.clone(),
+        };
+        let mut remote_states: Vec<yuntun_model::agg::AggStates> = Vec::new();
+        let mut fallback_paths: Vec<String> = Vec::new();
+        if !remote_shares.is_empty() {
+            // 闭包是 `FnMut`（`join_all` 会对每个份额调一次）⇒ 不能 move 捕获，
+            // 先把要带进去的东西克隆到局部
+            let table_ident = plan.table.clone();
+            let schema_arc = table_schema
+                .clone()
+                .unwrap_or_else(|| std::sync::Arc::new(arrow::datatypes::Schema::empty()));
+            let by_id: std::collections::HashMap<&str, std::sync::Arc<dyn yuntun_store::ColdReader>> =
+                cold_readers
+                    .iter()
+                    .map(|(i, c)| (i.as_str(), c.clone()))
+                    .collect();
+            let outs = futures::future::join_all(remote_shares.iter().map(|(id, files)| {
+                // 每次调用各克隆一份再 `move` 进 async 块（`async move` 会把捕获的变量搬走，
+                // 而 `join_all` 的闭包是 `FnMut`、会被调多次）
+                let table_ident = table_ident.clone();
+                let schema_arc = schema_arc.clone();
+                let reader = by_id.get(id.as_str()).cloned();
+                let dvs: Vec<yuntun_model::dv::DeletionEntry> = {
+                    let paths: std::collections::HashSet<&str> =
+                        files.iter().map(|f| f.file_path.as_str()).collect();
+                    deletions
+                        .iter()
+                        .filter(|d| paths.contains(d.file_path.as_str()))
+                        .cloned()
+                        .collect()
+                };
+                let id = id.clone();
+                let files = files.clone();
+                let aq = aq.clone();
+                async move {
+                    let outcome = match reader {
+                        None => AggOutcome::Missing("该节点没有冷折叠能力（未装配 ColdReader）".into()),
+                        Some(r) => {
+                            let req = yuntun_store::ColdReadRequest {
+                                table: table_ident.clone(),
+                                schema: schema_arc.clone(),
+                                files,
+                                deletions: dvs,
+                                query: aq,
+                            };
+                            match tokio::time::timeout_at(deadline, r.fold(req)).await {
+                                Ok(Ok(st)) => AggOutcome::Read(st),
+                                Ok(Err(e)) => AggOutcome::Missing(e.to_string()),
+                                Err(_) => AggOutcome::Missing(format!(
+                                    "超出冷读预算（{} ms 内未答复）",
+                                    budget.as_millis()
+                                )),
+                            }
+                        }
+                    };
+                    (id, outcome)
+                }
+            }))
+            .await;
+            for (id, outcome) in outs {
+                match outcome {
+                    AggOutcome::Read(states) => remote_states.push(states),
+                    AggOutcome::Missing(reason) => {
+                        // 回退本地读：把这一份的文件加进本地清单，重算冷的那一半
+                        tracing::warn!(
+                            table = %plan.table,
+                            instance = %id,
+                            error = %reason,
+                            "cold shard fold unavailable; 这一份回退本地读（不是降级）"
+                        );
+                        if let Some((_, files)) =
+                            remote_shares.iter().find(|(i, _)| i == &id)
+                        {
+                            fallback_paths
+                                .extend(files.iter().map(|f| f.file_path.clone()));
+                        }
+                    }
+                    AggOutcome::Stale(e) => {
+                        return Err(DataFusionError::External(Box::new(e)));
+                    }
+                }
+            }
+        }
+        let cold = if fallback_paths.is_empty() {
+            cold
+        } else {
+            let mut all = local_paths.clone();
+            all.extend(fallback_paths);
+            match self.cold_half(query, &plan, schema, partial.clone(), &all).await? {
+                Some(c) => c,
+                None => return Ok(None),
+            }
+        };
 
         // ---- ② 热的一半：逐来源下发（只回标量）----
         let hot = self.catalog.hot_shards();
@@ -503,18 +663,18 @@ impl QueryEngine {
             }
         }
 
-        // ---- ③ 合并：热的部分状态并进冷结果（不分组 = 并进那一行；分组 = 按**键**并入每一组）----
-        let aq = yuntun_model::agg::AggQuery {
-            specs: plan.specs.clone(),
-            group_by: plan.group_by.clone(),
-            predicate: None, // 冷结果那一半由 DataFusion 自己算了，合并时不需要谓词
-        };
-        let merged = if aq.is_grouped() {
-            agg_pushdown::merge_grouped_into_cold(&cold, &aq, &per_source)
-        } else {
-            agg_pushdown::merge_into_cold(&cold, &plan.specs, &per_source)
+        // ---- ③ 合并：冷（本地那份读回状态）+ 各远端 + 热 ----
+        //
+        // `§181`：合并统一走"读回状态 → 合并 → 拼回"这一对互逆函数，分组与不分组同构。
+        // （`merge_into_cold` / `merge_grouped_into_cold` 现在是它的两个特例。）
+        let mut states = agg_pushdown::states_of_cold_result(&cold, &plan.specs)
+            .map_err(|e| DataFusionError::Execution(format!("聚合下推合并失败：{e}")))?;
+        for more in remote_states.iter().chain(per_source.iter()) {
+            states = yuntun_model::agg::merge_states(&states, more)
+                .map_err(|e| DataFusionError::Execution(format!("聚合下推合并失败：{e}")))?;
         }
-        .map_err(|e| DataFusionError::Execution(format!("聚合下推合并失败：{e}")))?;
+        let merged = agg_pushdown::states_to_batch(&cold.schema(), &plan.specs, &states)
+            .map_err(|e| DataFusionError::Execution(format!("聚合下推合并失败：{e}")))?;
         Ok(Some(QueryOutcome {
             batches: vec![merged],
             partial: partial.read(),

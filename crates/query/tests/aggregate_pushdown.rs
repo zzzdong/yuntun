@@ -20,11 +20,11 @@ use arrow::record_batch::RecordBatch;
 use futures::future::BoxFuture;
 use yuntun_catalog::{CatalogOps, MemoryCatalog};
 use yuntun_chunk::{ChunkKey, ChunkStore, ChunkStoreConfig, MemoryLedger, SealPolicy};
-use yuntun_model::agg::{AggQuery, PartialAgg};
+use yuntun_model::agg::{AggQuery, AggStates, PartialAgg};
 use yuntun_model::error::LakeError;
 use yuntun_model::ops::CreateTableRequest;
 use yuntun_query::{LocalCatalog, QueryEngine};
-use yuntun_store::{
+use yuntun_store::{ColdReader,
     RemoteShard, ShardAggs, ShardFetch, ShardId, ShardRead, ShardReader, ShardTier, create_store,
     StoreConfig,
 };
@@ -688,4 +688,267 @@ async fn stale_sources_never_leak_into_a_pushed_down_answer() {
         msg.contains("stale") && msg.contains("inst-stale"),
         "失败必须点名 STALE 与实例（否则用户看到的是莫名失败）：{msg}"
     );
+}
+
+// ---------------------------------------------------------------- 判据 ⑤：冷文件被分出去（`§182`）
+
+/// 一个**真的会折**的冷折叠实现（与 `RemoteCold` 同一条代码路径：`query::cold`），
+/// 但可以**被打断**（用来验"拿不到就回退本地读"）。
+#[derive(Debug)]
+struct FoldingCold {
+    store: Arc<dyn object_store::ObjectStore>,
+    fail: bool,
+    calls: AtomicUsize,
+}
+
+impl FoldingCold {
+    /// 被调了几次（判据用：证明**真的分出去折了**，而不是本地算了两遍）
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn new(store: Arc<dyn object_store::ObjectStore>, fail: bool) -> Arc<Self> {
+        Arc::new(Self {
+            store,
+            fail,
+            calls: AtomicUsize::new(0),
+        })
+    }
+}
+
+impl ColdReader for FoldingCold {
+    fn fold(
+        &self,
+        req: yuntun_store::ColdReadRequest,
+    ) -> BoxFuture<'_, Result<AggStates, LakeError>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(LakeError::Other("注入的冷折叠失败".into()));
+            }
+            // 与真实远端**同一条代码路径**（协议/服务端那侧由 `cold_fold_rpc.rs` 另验）
+            yuntun_query::cold::fold_cold_files(
+                self.store.clone(),
+                &req.table,
+                req.schema,
+                req.files,
+                req.deletions,
+                &req.query,
+            )
+            .await
+        })
+    }
+}
+
+/// 一个**能接冷折叠**的热读器：热的一半照旧（`ChunkStore`），冷的一半透出 `as_cold()`。
+#[derive(Debug)]
+struct FoldingReader {
+    inner: Arc<ChunkStore>,
+    cold: Option<Arc<dyn ColdReader>>,
+}
+
+#[async_trait::async_trait]
+impl ShardReader for FoldingReader {
+    fn tier(&self) -> ShardTier {
+        self.inner.tier()
+    }
+    fn version(&self) -> u64 {
+        self.inner.version()
+    }
+    async fn shards_of(&self, table: &str) -> Result<Vec<ShardId>, LakeError> {
+        self.inner.shards_of(table).await
+    }
+    async fn read_shard(&self, id: &ShardId, known: u64) -> Result<ShardRead, LakeError> {
+        self.inner.read_shard(id, known).await
+    }
+    async fn read_shard_excluding(
+        &self,
+        id: &ShardId,
+        known: u64,
+        exclude: &[String],
+    ) -> Result<ShardRead, LakeError> {
+        self.inner.read_shard_excluding(id, known, exclude).await
+    }
+    async fn read_table_excluding(
+        &self,
+        table: &str,
+        known: u64,
+        exclude: &[String],
+    ) -> Result<ShardRead, LakeError> {
+        self.inner
+            .read_table_excluding(table, known, exclude)
+            .await
+    }
+    async fn watermark(&self, known: u64) -> Result<ShardRead, LakeError> {
+        self.inner.watermark(known).await
+    }
+    async fn read_table_aggs(
+        &self,
+        table: &str,
+        known: u64,
+        exclude: &[String],
+        query: &AggQuery,
+    ) -> Result<ShardAggs, LakeError> {
+        self.inner.read_table_aggs(table, known, exclude, query).await
+    }
+    fn as_cold(&self) -> Option<Arc<dyn ColdReader>> {
+        self.cold.clone()
+    }
+}
+
+/// `§182`：**冷文件被分给各节点折**，而答案必须与原路**逐位相同**。
+///
+/// 三条形状各跑一遍（不分组 / 带谓词 / 分组）—— 它们走的是同一条"分配 → 折 → 合并"链，
+/// 但合并的形态不同（并进那一行 / 按键并入每一组），漏一种就是漏一类错。
+#[tokio::test]
+async fn cold_files_are_shared_out_and_the_answer_is_unchanged() {
+    let dir = yuntun_testkit::TestDir::tmpfs("agg-cold-share");
+    let store: Arc<dyn object_store::ObjectStore> = create_store(&StoreConfig::Memory).unwrap();
+    let catalog: Arc<dyn CatalogOps> = Arc::new(MemoryCatalog::new());
+    create_table(&catalog).await;
+    // 两个冷文件（分配要把它们切开）
+    commit_cold(&store, &catalog, "s1", &[Some(1), Some(2)]).await;
+    commit_cold(&store, &catalog, "s2", &[Some(10), Some(20)]).await;
+
+    // 两侧的**热数据必须相同**（否则差的那一行分不清是热数据还是冷折叠的错）——
+    // 差别只在"冷的那一半由谁折"。
+    let a = instance(&dir, "inst-a", &[Some(5)]);
+    let b = instance(&dir, "inst-b", &[]);
+    let a_ref = instance(&dir, "inst-a", &[Some(5)]);
+    let b_ref = instance(&dir, "inst-b", &[]);
+    let cold_a = FoldingCold::new(store.clone(), false);
+    let cold_b = FoldingCold::new(store.clone(), false);
+    let reference = engine(
+        store.clone(),
+        catalog.clone(),
+        vec![
+            ("inst-a", a_ref as Arc<dyn ShardReader>),
+            ("inst-b", b_ref as Arc<dyn ShardReader>),
+        ],
+    )
+    .await;
+    let engine = engine(
+        store.clone(),
+        catalog.clone(),
+        vec![
+            (
+                "inst-a",
+                Arc::new(FoldingReader {
+                    inner: a,
+                    cold: Some(cold_a.clone() as Arc<dyn ColdReader>),
+                }) as Arc<dyn ShardReader>,
+            ),
+            (
+                "inst-b",
+                Arc::new(FoldingReader {
+                    inner: b,
+                    cold: Some(cold_b.clone() as Arc<dyn ColdReader>),
+                }) as Arc<dyn ShardReader>,
+            ),
+        ],
+    )
+    .await;
+
+    for sql in [
+        "SELECT count(*), sum(v) FROM agg",
+        "SELECT count(*) FROM agg WHERE v > 3",
+        "SELECT v, count(*) FROM agg GROUP BY v",
+    ] {
+        let before: usize = [cold_a.calls(), cold_b.calls()].into_iter().sum();
+        let got = engine.sql(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let want = reference
+            .sql(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(got[0].schema(), want[0].schema(), "{sql}: schema");
+        assert_eq!(rows_of(&got), rows_of(&want), "{sql}: 值必须逐位相同");
+        let after: usize = [cold_a.calls(), cold_b.calls()].into_iter().sum();
+        assert!(
+            after > before,
+            "{sql}: 冷折叠一次都没被调用 ⇒ 这条绿只是「本地算了两遍」（§173 的同一条纪律）"
+        );
+    }
+}
+
+/// `§182`：**接不上的节点 ⇒ 回退本地读**，不是降级。
+///
+/// 为什么必须是"回退"而不是 partial：那份数据本来就在**共享存储**上、协调者自己就能读，
+/// 把它标成 partial 等于告诉用户"结果可能少"—— 而真相只是"换个人读"。
+#[tokio::test]
+async fn a_node_that_cannot_fold_falls_back_to_local_reading() {
+    let dir = yuntun_testkit::TestDir::tmpfs("agg-cold-fallback");
+    let store: Arc<dyn object_store::ObjectStore> = create_store(&StoreConfig::Memory).unwrap();
+    let catalog: Arc<dyn CatalogOps> = Arc::new(MemoryCatalog::new());
+    create_table(&catalog).await;
+    commit_cold(&store, &catalog, "s1", &[Some(1), Some(2)]).await;
+    commit_cold(&store, &catalog, "s2", &[Some(10), Some(20)]).await;
+
+    let a = instance(&dir, "inst-a", &[]);
+    let cold_a = FoldingCold::new(store.clone(), true); // 永远失败
+    let reference = engine(store.clone(), catalog.clone(), vec![]).await;
+    let engine = engine(
+        store.clone(),
+        catalog.clone(),
+        vec![(
+            "inst-a",
+            Arc::new(FoldingReader {
+                inner: a,
+                cold: Some(cold_a.clone() as Arc<dyn ColdReader>),
+            }) as Arc<dyn ShardReader>,
+        )],
+    )
+    .await;
+
+    let got = engine.sql("SELECT count(*), sum(v) FROM agg").await.unwrap();
+    let want = reference
+        .sql("SELECT count(*), sum(v) FROM agg")
+        .await
+        .unwrap();
+    assert_eq!(rows_of(&got), rows_of(&want), "回退本地读后答案必须不变");
+    assert!(cold_a.calls() > 0, "回退路径要真的调用过远端（否则没验到回退）");
+    // 回退不是降级：**不**该出现 partial 标记（那份数据本地就能读到）
+    let out = engine
+        .sql_partial("SELECT count(*), sum(v) FROM agg")
+        .await
+        .unwrap();
+    assert!(
+        !out.partial.is_partial(),
+        "回退本地读不许留下 partial 标记：{:?}",
+        out.partial.missing()
+    );
+}
+
+/// `§182`：**没接冷折叠的节点**（`as_cold() == None`）⇒ 全本地算，答案不变。
+///
+/// 这条盯的是"老二进制 / 未接线"的混合集群：不能因为一部分节点不会新 RPC 就改变结果。
+#[tokio::test]
+async fn nodes_without_cold_folding_do_not_change_the_answer() {
+    let dir = yuntun_testkit::TestDir::tmpfs("agg-cold-nocold");
+    let store: Arc<dyn object_store::ObjectStore> = create_store(&StoreConfig::Memory).unwrap();
+    let catalog: Arc<dyn CatalogOps> = Arc::new(MemoryCatalog::new());
+    create_table(&catalog).await;
+    commit_cold(&store, &catalog, "s1", &[Some(1), Some(2)]).await;
+
+    let a = instance(&dir, "inst-a", &[Some(5)]);
+    let a_ref = instance(&dir, "inst-a", &[Some(5)]);
+    // 参照：**同样的热数据**，同样没有冷折叠能力 ⇒ 两侧应当逐位相同
+    let reference = engine(
+        store.clone(),
+        catalog.clone(),
+        vec![("inst-a", a_ref as Arc<dyn ShardReader>)],
+    )
+    .await;
+    let engine = engine(
+        store.clone(),
+        catalog.clone(),
+        vec![("inst-a", a as Arc<dyn ShardReader>)],
+    )
+    .await;
+
+    let got = engine.sql("SELECT count(*), sum(v) FROM agg").await.unwrap();
+    let want = reference
+        .sql("SELECT count(*), sum(v) FROM agg")
+        .await
+        .unwrap();
+    assert_eq!(rows_of(&got), rows_of(&want));
 }

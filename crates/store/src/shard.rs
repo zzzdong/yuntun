@@ -269,6 +269,17 @@ pub trait ShardReader: Send + Sync + std::fmt::Debug {
     ///
     /// 默认空实现：远端分片服务的 GC 由其自身负责，不由查询节点驱动。
     fn reclaim(&self, _cached_snapshot: u64) {}
+    /// **冷折叠能力**（`§182`）：这个来源能不能也"读几个冷文件并替我算"。
+    ///
+    /// 默认 `None`（不能）：进程内来源（`ChunkStore`）本来就在数据旁边，没有第二个 RPC 可用；
+    /// 测试假实现同理。**远端来源必须覆写**（[`RemoteShard`] 把它的传输接缝透出来）。
+    ///
+    /// 为什么放在 `ShardReader` 上而不是另设一张表：冷文件在**共享**存储上、谁都能读，
+    /// 所以"谁有传输接缝谁就能算"—— 它与热读器天然是**同一批实例、同一条生命周期**
+    /// （成员摘除时一起消失，`LocalCatalog::set_members` 的裁剪自动覆盖）。
+    fn as_cold(&self) -> Option<std::sync::Arc<dyn ColdReader>> {
+        None
+    }
 }
 
 /// 远端分片服务的**传输接缝**。
@@ -356,6 +367,17 @@ pub trait ShardFetch: Send + Sync {
     fn fetch_version(&self) -> u64 {
         0
     }
+
+    /// **冷折叠能力**（`§182`）：同一个传输接缝能不能也"读几个冷文件并替我算"。
+    ///
+    /// 为什么挂在 `ShardFetch` 上而不是另设一张表：冷文件在**共享**存储上、谁都能读，
+    /// 所以"谁有传输接缝谁就能算"—— 它和热读器天然是**同一批实例、同一条生命周期**
+    /// （成员摘除时一起消失，`set_members` 的裁剪自动覆盖）。
+    ///
+    /// 默认 `None`（不能）：进程内来源与测试假实现都没有第二个 RPC 可用。
+    fn as_cold(&self) -> Option<std::sync::Arc<dyn ColdReader>> {
+        None
+    }
 }
 
 /// 远端分片读取器：把 [`ShardFetch`] 适配成 [`ShardReader`]。
@@ -416,6 +438,11 @@ impl ShardReader for RemoteShard {
 
     async fn watermark(&self, known_manifest_ver: u64) -> Result<ShardRead, LakeError> {
         self.fetch.fetch_watermark(known_manifest_ver).await
+    }
+
+    /// `§182`：远端来源的冷折叠能力来自它的传输接缝（`ShardFetch::as_cold`）。
+    fn as_cold(&self) -> Option<std::sync::Arc<dyn ColdReader>> {
+        self.fetch.as_cold()
     }
 
     /// `§173`：**覆写**默认实现 —— 远端来源在**它那边**折，只把标量送回来。
