@@ -291,11 +291,31 @@ impl QueryEngine {
         schema: &str,
         partial: std::sync::Arc<PartialSink>,
     ) -> Result<SessionContext, DataFusionError> {
-        self.session_inner(schema, partial, true).await
+        self.session_inner(schema, partial, true, self.only_files.clone())
+            .await
     }
 
     /// **只读冷数据**的会话（`§173`）：聚合下推先用它把"冷的一半"算出来
     /// （schema / 列名 / 类型由 DataFusion 给，不必手写一个"看起来一样"的结果集）。
+    ///
+    /// 热的那一半由聚合 RPC 单独拉 —— 两边都读会把同一批热数据算两遍。
+    /// **只读冷数据、且只读这几个文件**的会话（`§178`/`§180`：冷文件被分配后，
+    /// **本地那一份**走它）。schema / 列名 / 类型仍由 DataFusion 给 —— 那是"与对拍一致"的保证。
+    ///
+    /// 为什么白名单是**每次查询**的参数而不是引擎字段：分配是"这次查询"的决定
+    /// （文件集随快照变、节点随名录变），挂在引擎上就会有一次查询改一个共享对象的状态。
+    pub async fn session_cold_files(
+        &self,
+        schema: &str,
+        partial: std::sync::Arc<PartialSink>,
+        only_files: Vec<String>,
+    ) -> Result<SessionContext, DataFusionError> {
+        self.session_inner(schema, partial, false, Some(only_files))
+            .await
+    }
+
+    /// **只读冷数据**的会话（`§173`）：聚合下推先用它把"冷的一半"算出来
+    /// （schema / 列名 / 类型由 DataFusion 给），热的那一半由聚合 RPC 单独拉。
     ///
     /// 热的那一半由聚合 RPC 单独拉 —— 两边都读会把同一批热数据算两遍。
     async fn session_cold_only(
@@ -303,7 +323,8 @@ impl QueryEngine {
         schema: &str,
         partial: std::sync::Arc<PartialSink>,
     ) -> Result<SessionContext, DataFusionError> {
-        self.session_inner(schema, partial, false).await
+        self.session_inner(schema, partial, false, self.only_files.clone())
+            .await
     }
 
     async fn session_inner(
@@ -311,6 +332,7 @@ impl QueryEngine {
         schema: &str,
         partial: std::sync::Arc<PartialSink>,
         hot_enabled: bool,
+        only_files: Option<Vec<String>>,
     ) -> Result<SessionContext, DataFusionError> {
         // **读路径的按需保鲜**（`§163`）：会话是所有查询的必经点，缓存不落后于版本才建会话。
         // 冷缓存必刷（否则"进程刚起来 / 装配层没起后台任务"时查询会报 table not found），
@@ -347,7 +369,7 @@ impl QueryEngine {
                     hot_read_budget: self.hot_read_budget,
                     index_pruning: self.index_pruning,
                     hot_enabled,
-                    only_files: self.only_files.clone(),
+                    only_files,
                 },
             )),
         );

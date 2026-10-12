@@ -467,21 +467,82 @@ pub fn merge_into_cold(
             cold.num_columns()
         )));
     }
-    let mut columns: Vec<arrow::array::ArrayRef> = Vec::with_capacity(specs.len());
-    for (i, spec) in specs.iter().enumerate() {
-        let mut acc = cold_value_of(cold.column(i), spec)?;
-        for per_source in hot {
-            // 不分组 ⇒ 每个来源给的就是"一行"的状态；形状不符 ⇒ 响亮失败
-            let yuntun_model::agg::AggStates::Plain(part) = per_source else {
-                return Err(LakeError::Other(
-                    "聚合下推的前提不成立：不分组的查询却拿到了分组结果".into(),
-                ));
-            };
-            acc = yuntun_model::agg::merge(&acc, &part[i])?;
-        }
-        columns.push(array_of(acc, cold.column(i).data_type())?);
+    let mut states = states_of_cold_result(cold, specs)?;
+    for per_source in hot {
+        states = yuntun_model::agg::merge_states(&states, per_source)?;
     }
-    RecordBatch::try_new(cold.schema(), columns)
+    states_to_batch(&cold.schema(), specs, &states)
+}
+
+/// **冷结果 → 部分状态**（`merge_*_into_cold` 的逆：DataFusion 算出的那一行/每一行读回状态）。
+///
+/// 为什么要这个方向：冷的一半可能被**分配**给多个节点分别算（`§180` 之后），
+/// 而"哪一半在本地算、哪一半送出去"是**每次查询**的决定 —— 但最终输出必须仍是
+/// **一个**带 DataFusion schema/列名的批次。于是流程统一成：
+/// `本地那一份 → 状态 → 与各远端状态合并 → 拼回批次`。
+pub fn states_of_cold_result(
+    cold: &RecordBatch,
+    specs: &[AggSpec],
+) -> Result<yuntun_model::agg::AggStates, LakeError> {
+    let grouped = cold.num_columns() > specs.len();
+    if !grouped {
+        if cold.num_rows() != 1 || cold.num_columns() != specs.len() {
+            return Err(LakeError::Other(format!(
+                "聚合下推的前提不成立：不分组时冷结果应当是 1 行 × {} 列，实际 {} 行 × {} 列",
+                specs.len(),
+                cold.num_rows(),
+                cold.num_columns()
+            )));
+        }
+        let mut states = Vec::with_capacity(specs.len());
+        for (i, spec) in specs.iter().enumerate() {
+            states.push(cold_value_at(cold.column(i), spec, 0)?);
+        }
+        return Ok(yuntun_model::agg::AggStates::Plain(states));
+    }
+    let nk = cold.num_columns() - specs.len();
+    let mut out = Vec::with_capacity(cold.num_rows());
+    for row in 0..cold.num_rows() {
+        let mut key = Vec::with_capacity(nk);
+        for i in 0..nk {
+            key.push(cold_key_at(cold.column(i), row)?);
+        }
+        let states = (0..specs.len())
+            .map(|j| cold_value_at(cold.column(nk + j), &specs[j], row))
+            .collect::<Result<Vec<_>, LakeError>>()?;
+        out.push(yuntun_model::agg::GroupStates { key, states });
+    }
+    // 与热数据同一口径：按键升序（两路合到一起时确定）
+    out.sort_by(|a, b| a.key.cmp(&b.key));
+    Ok(yuntun_model::agg::AggStates::Grouped(out))
+}
+
+/// **部分状态 → 批次**（`states_of_cold_result` 的逆；schema/列名由调用方给 —— 它来自 DataFusion）。
+pub fn states_to_batch(
+    schema: &arrow::datatypes::SchemaRef,
+    specs: &[AggSpec],
+    states: &yuntun_model::agg::AggStates,
+) -> Result<RecordBatch, LakeError> {
+    let mut columns: Vec<arrow::array::ArrayRef> = Vec::with_capacity(schema.fields().len());
+    match states {
+        yuntun_model::agg::AggStates::Plain(p) => {
+            for (state, field) in p.iter().zip(schema.fields()) {
+                columns.push(array_of(state.clone(), field.data_type())?);
+            }
+        }
+        yuntun_model::agg::AggStates::Grouped(g) => {
+            let nk = schema.fields().len() - specs.len();
+            for i in 0..nk {
+                let vals: Vec<KeyPart> = g.iter().map(|x| x.key[i].clone()).collect();
+                columns.push(key_array_of(schema.field(i).data_type(), &vals)?);
+            }
+            for j in 0..specs.len() {
+                let vals: Vec<PartialAgg> = g.iter().map(|x| x.states[j].clone()).collect();
+                columns.push(array_of_many(&vals, schema.field(nk + j).data_type())?);
+            }
+        }
+    }
+    RecordBatch::try_new(schema.clone(), columns)
         .map_err(|e| LakeError::Other(format!("聚合下推结果拼装失败：{e}")))
 }
 
@@ -504,16 +565,12 @@ pub fn merge_grouped_into_cold(
             cold.num_columns()
         )));
     }
+    let cold_states = states_of_cold_result(cold, &query.specs)?;
     let mut acc: BTreeMap<Vec<KeyPart>, Vec<PartialAgg>> = BTreeMap::new();
-    for row in 0..cold.num_rows() {
-        let mut key = Vec::with_capacity(nk);
-        for i in 0..nk {
-            key.push(cold_key_at(cold.column(i), row)?);
+    if let yuntun_model::agg::AggStates::Grouped(g) = cold_states {
+        for grp in g {
+            acc.insert(grp.key, grp.states);
         }
-        let states = (0..query.specs.len())
-            .map(|j| cold_value_at(cold.column(nk + j), &query.specs[j], row))
-            .collect::<Result<Vec<_>, LakeError>>()?;
-        acc.insert(key, states);
     }
     for source in hot {
         let yuntun_model::agg::AggStates::Grouped(groups) = source else {
@@ -537,17 +594,12 @@ pub fn merge_grouped_into_cold(
         }
     }
 
-    let mut columns: Vec<arrow::array::ArrayRef> = Vec::with_capacity(cold.num_columns());
-    for i in 0..nk {
-        let vals: Vec<KeyPart> = acc.keys().map(|k| k[i].clone()).collect();
-        columns.push(key_array_of(cold.column(i).data_type(), &vals)?);
-    }
-    for j in 0..query.specs.len() {
-        let vals: Vec<PartialAgg> = acc.values().map(|st| st[j].clone()).collect();
-        columns.push(array_of_many(&vals, cold.column(nk + j).data_type())?);
-    }
-    RecordBatch::try_new(cold.schema(), columns)
-        .map_err(|e| LakeError::Other(format!("聚合下推结果拼装失败：{e}")))
+    let states = yuntun_model::agg::AggStates::Grouped(
+        acc.into_iter()
+            .map(|(key, states)| yuntun_model::agg::GroupStates { key, states })
+            .collect(),
+    );
+    states_to_batch(&cold.schema(), &query.specs, &states)
 }
 
 /// 冷结果里某个**分组键分量**的取值（NULL 要如实保留 —— 它是一组）。
@@ -602,11 +654,6 @@ fn key_array_of(
             "分组键列的类型不支持：{other:?}"
         ))),
     }
-}
-
-/// 从冷结果的**第一个值**读出部分状态（NULL 要如实保留：`count` 是 0，`sum/min/max` 是 NULL）。
-fn cold_value_of(col: &arrow::array::ArrayRef, spec: &AggSpec) -> Result<PartialAgg, LakeError> {
-    cold_value_at(col, spec, 0)
 }
 
 /// 从冷结果的**第 `row` 行**读出部分状态（分组时每行一组）。
