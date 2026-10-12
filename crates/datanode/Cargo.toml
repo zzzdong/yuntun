@@ -14,6 +14,8 @@ yuntun-catalog = { path = "../catalog" }
 yuntun-wal = { path = "../wal" }
 yuntun-ingest = { path = "../ingest" }
 yuntun-store = { path = "../store" }
+# `§179`：冷折叠的实现要持一个对象存储句柄（类型必须点名 ⇒ 显式依赖）
+object_store = { workspace = true }
 # 压缩 + 孤儿 GC 是**数据进程的第二职能**（`--compaction`），不是独立的第三类进程
 yuntun-compaction = { path = "../compaction" }
 yuntun-shardrpc = { path = "../shardrpc" }

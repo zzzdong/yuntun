@@ -7,6 +7,9 @@ rust-version.workspace = true
 
 [dependencies]
 yuntun-model = { path = "../model" }
+# `§179`：冷折叠要把 **schema** 过网（请求自足）⇒ 复用 format 的 IPC 编解，
+# 而不是在协议两侧各写一份
+yuntun-format = { path = "../format" }
 yuntun-proto = { path = "../proto" }
 yuntun-store = { path = "../store" }
 arrow = { workspace = true }
@@ -22,3 +25,5 @@ yuntun-chunk = { path = "../chunk" }
 yuntun-catalog = { path = "../catalog" }
 yuntun-query = { path = "../query" }
 yuntun-testkit = { path = "../testkit" }
+# `§179` 的往返用例要持一个对象存储（服务端真的读文件）
+object_store = { workspace = true }

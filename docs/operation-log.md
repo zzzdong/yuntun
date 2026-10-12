@@ -1,6 +1,6 @@
 # yuntun 实施操作日志（§169 起）
 
-> 起记时间：2026-10-11（最新：**§179，2026-10-12**）。对应分支：main。
+> 起记时间：2026-10-11（最新：**§180，2026-10-12**）。对应分支：main。
 >
 > **这是什么**：从今天起，**每一刀**（一次成体系的改造）在这里留一节 —— 写清"做了什么、
 > 为什么这么做、边界在哪（**没做什么**）、怎么验的"。它是本项目的**证据出处**：
@@ -819,3 +819,60 @@ count(*) = 24（期间瞬时少行：**降级** 0 次 / **缺口** 2 次）
 - `crates/query/tests/cold_fold.rs` **6/6**（含上面第 2、5、6 条）；
 - `cargo test -p yuntun-query` 全绿（46/4/9/3/6/7/2/4 段）；
 - clippy 与文档判据：见提交信息。
+
+---
+
+## 180. **N4b 第三刀：冷折叠过网**（协议 + 数据面两侧 + 往返判据）（2026-10-12）
+
+`§179` 落了"就地折叠"的**函数**；这一刀把它变成**能过网**的能力，并在两端都接上。
+
+### 180.1 协议：`FetchColdAggs`（自足请求）
+
+请求带 `table`（只作标识）+ **`schema_ipc`** + `files[]{file_path,file_size,row_count}`
++ `dvs[]{dv_id,file_path,batch_id,applied_at,revoked_at,card,store_path}` + `aggs[]` +
+`predicate?` + `group_by[]`；响应复用 `FetchShardAggsResponse`（`partials` 或 `groups`，
+**由请求带不带 `group_by` 决定**）。
+
+**为什么单独一条 RPC 而不是塞进 `FetchShardAggs`**：那条要的是"这个来源的**热数据**"
+（归属绑定，只带栅栏），这条要的是"这几个**冷文件**"（共享、可分配，要带文件清单 + DV + 表结构）
+—— 两种归属规则不同；混在一起就会出现"两个字段只有一个有意义"。
+
+**为什么请求要自足**：被分配到的节点**不许**查自己的目录 —— `RemoteCatalog` 没有
+`wait_for(version ≥ N)`，它可能读到**另一个快照**的文件集/DV 集 ⇒ 静默错（漏一份 DV =
+复活已删的行）。表结构也一样：每个节点自己 catalog 里的 schema 可能是另一个版本的。
+
+### 180.2 两端接线
+
+- **服务端**：`ShardService` 多持一个 `Option<Arc<dyn ColdReader>>`（`with_cold`）；
+  **没接 = 响亮失败**（`unimplemented`）⇒ 协调者按"拿不到"回退，而不是以为它是空结果。
+  `serve` 多一个参数；另拆出 `serve_service`（给"已装配好的服务"用）。
+- **客户端**：`RemoteCold`（`ColdReader` 的远端实现）—— 与 `RemoteShard`（热数据）**分开**：
+  归属规则不同，客户端也不该混。
+- **生产实现**（`datanode::query::NodeCold`）：只需要 `store`，**不碰本节点的 catalog**
+  （请求自足 ⇒ 不需要，也不该用）。装配点在 `main.rs` 的 shard 服务 spawn 处。
+- 顺手把一个重复的"状态 → 消息"提成 `states_to_msg`（两个 handler 共用，不再写两遍）。
+
+### 180.3 判据（`crates/shardrpc/tests/cold_fold_rpc.rs`，3 条）
+
+1. **往返 == 进程内**：过网拿回的部分状态与本地同一条路径折出来的**逐位相同**；
+   且 **DV 生效**（6 行/66 → 删一行后 5 行/64，两边一致）；
+2. **分组也过网**：谓词 + `group_by` 一起 ⇒ 只剩 `10/20/30` 三组、每组 1 行；
+3. **没接冷折叠的节点 ⇒ 响亮失败**（错误里能看出是"没接"，不是"读失败"）。
+
+### 180.4 过程中的三处修正
+
+1. **磁盘满导致链接失败**（`linking with cc failed`）—— 一度以为是代码问题。
+   根因：`/dev/sda3` 只剩 2.8G（rig 的容器卷 + 10G 增量编译缓存）。清掉后 66G 可用。
+   ⇒ 教训：**"构建失败"先看空间**，别急着改代码。
+2. `Arc<ChunkStore>` 擦成 `Arc<dyn ShardReader>`：写在 `let` 注解里不灵，写在**函数调用点**才灵
+   （推断顺序不同）⇒ 测试里改成直接调 `serve(chunk, listener, Some(cold))`。
+3. arrow-ipc 59 的 schema 编码入口是 `schema_to_bytes_with_dictionary_tracker`（带字典追踪器），
+   `DictionaryTracker::new(false)` 要一个参数；`fb_to_schema` 不会失败。
+
+### 180.5 验证
+
+`cold_fold_rpc` **3/3**；`yuntun-shardrpc` / `yuntun-query` / `yuntun-format` / `yuntun-store`
+全绿；全量 `cargo test --workspace` exit=0（文档判据同步后）；clippy **0 告警**。
+
+**仍然没做**：**协调者还没用它**（没有分配下发、没有失败回退本地读）—— 那是下一刀，
+也是这一整条路"用户能看到收益"的那一刀。

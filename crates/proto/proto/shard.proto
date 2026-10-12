@@ -30,6 +30,13 @@ service ShardFetch {
   // 混在一个响应里就会出现"两个字段只有一个有意义"的形状 —— 那是可以误用的契约。
   // 边界（哪几种聚合能下推、为什么浮点不行）写在 `yuntun_model::agg` 的模块文档里。
   rpc FetchShardAggs (FetchShardAggsRequest) returns (FetchShardAggsResponse);
+  // **冷文件的就地折叠**（`§179`，N4b / 归档 `S5-2`）：被分配到的节点读**共享存储**上的
+  // 这几个冷文件，按谓词筛、按分组折，只回**部分状态（标量）**。
+  //
+  // 为什么与 `FetchShardAggs` 分开：那条要的是"这个来源的**热数据**"（归属绑定），
+  // 这条要的是"这几个**冷文件**"（共享、可分配）—— 两种归属规则不同，请求里的东西也不同
+  // （一个只带栅栏，一个要带文件清单 + DV + 表结构）。混在一起会出现"两个字段只有一个有意义"。
+  rpc FetchColdAggs (FetchColdAggsRequest) returns (FetchShardAggsResponse);
 }
 
 // 一个要算的聚合（`§173`）。
@@ -58,6 +65,45 @@ message PredicateMsg {
   bool negated = 7;
   // And / Or 的子谓词（顺序是契约的一部分）
   repeated PredicateMsg parts = 8;
+}
+
+// 一个冷文件的引用（`§179`）：**路径是键**（全局唯一、跨节点无歧义）。
+message ColdFileRefMsg {
+  string file_path = 1;
+  uint64 file_size = 2;
+  uint64 row_count = 3;
+}
+
+// 一份删除向量的登记（`§179`）。读侧按它在共享存储上取位图对象 ⇒ 已删行不许被算进来
+// （漏一份 DV = 复活已删的行，比少数据更糟，而且**不报错**）。
+message ColdDvMsg {
+  string dv_id       = 1;
+  // 锚定的数据文件（本消息只描述"它属于哪个文件"）
+  string file_path   = 2;
+  string batch_id    = 3;
+  uint64 applied_at  = 4;
+  uint64 revoked_at  = 5;
+  uint32 card        = 6;
+  // 位图对象路径（`dv_object_path`）
+  string store_path  = 7;
+}
+
+message FetchColdAggsRequest {
+  // 全限定表名 —— **只作标识**：读哪些文件由 `files` 决定，节点**不**用它查自己的目录
+  // （`RemoteCatalog` 没有 `wait_for(version ≥ N)`，查了就可能读到另一个快照 = 静默错）
+  string table = 1;
+  // **表结构**（arrow IPC）：文件里的列按它对齐（`align_batch`）
+  bytes schema_ipc = 2;
+  // 分配给这一支的文件
+  repeated ColdFileRefMsg files = 3;
+  // 锚定在这些文件上、且在这次快照下生效的 DV
+  repeated ColdDvMsg dvs = 4;
+  // 与响应 `partials` / `groups` 对应的聚合（顺序是契约的一部分）
+  repeated AggSpecMsg aggs = 5;
+  // 可选的行过滤（`§176`）：缺席 = 不过滤
+  PredicateMsg predicate = 6;
+  // 可选的分组键（`§177`）：非空 ⇒ 响应走 `groups`
+  repeated string group_by = 7;
 }
 
 message FetchShardAggsRequest {

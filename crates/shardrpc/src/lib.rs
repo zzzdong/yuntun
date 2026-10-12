@@ -41,11 +41,15 @@ use std::time::Duration;
 use arrow::record_batch::RecordBatch;
 use futures::future::BoxFuture;
 use tokio::net::TcpListener;
+use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
 use yuntun_model::error::LakeError;
 use yuntun_proto::shard as pb;
-use yuntun_store::{ShardAggs, ShardFetch, ShardId, ShardRead, ShardReader};
+use yuntun_model::agg::AggQuery;
+use yuntun_model::dv::DeletionEntry;
+use yuntun_model::meta::FileManifest;
+use yuntun_store::{ColdReadRequest, ColdReader, ShardAggs, ShardFetch, ShardId, ShardRead, ShardReader};
 
 // ---------------------------------------------------------------- 批次编解码
 
@@ -88,16 +92,164 @@ fn internal(e: LakeError) -> Status {
     Status::internal(e.to_string())
 }
 
+// ---------------------------------------------------------------- 客户端（协调者侧，`§179`）
+
+/// **远端冷折叠**：把[`ColdReadRequest`]送过去，拿回标量。
+///
+/// 与 `RemoteShard`（热数据）分开：那条是"这个来源的热数据"（归属绑定），
+/// 这条是"这几个冷文件"（共享、可分配）—— 归属规则不同，客户端也不该混。
+#[derive(Debug)]
+pub struct RemoteCold {
+    client: pb::shard_fetch_client::ShardFetchClient<Channel>,
+    timeout: Duration,
+}
+
+impl RemoteCold {
+    pub async fn connect(addr: &str) -> Result<Self, LakeError> {
+        let ep = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            .map_err(|e| LakeError::Other(format!("shard rpc: bad addr {addr}: {e}")))?;
+        let channel = ep
+            .connect()
+            .await
+            .map_err(|e| LakeError::Other(format!("shard rpc: connect {addr}: {e}")))?;
+        Ok(Self {
+            client: pb::shard_fetch_client::ShardFetchClient::new(channel),
+            timeout: crate::DEFAULT_TIMEOUT,
+        })
+    }
+
+    pub async fn connect_with_timeout(addr: &str, timeout: Duration) -> Result<Self, LakeError> {
+        let ep = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            .map_err(|e| LakeError::Other(format!("shard rpc: bad addr {addr}: {e}")))?;
+        let channel = ep
+            .connect_timeout(timeout)
+            .connect()
+            .await
+            .map_err(|e| LakeError::Other(format!("shard rpc: connect {addr}: {e}")))?;
+        Ok(Self {
+            client: pb::shard_fetch_client::ShardFetchClient::new(channel),
+            timeout,
+        })
+    }
+}
+
+impl RemoteCold {
+    /// 统一的"带超时的 RPC"包装（与 `GrpcShardFetch::call` 同形：
+    /// 超时必须**与其它失败可区分**，`§77` 的降级要把原因带给排障的人）。
+    async fn call<T>(
+        &self,
+        what: &str,
+        fut: impl std::future::Future<Output = Result<T, Status>>,
+    ) -> Result<T, LakeError> {
+        match tokio::time::timeout(self.timeout, fut).await {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(status)) => Err(LakeError::Other(format!("shard rpc: {what}: {status}"))),
+            Err(_elapsed) => Err(LakeError::Other(format!(
+                "shard rpc: {what}: {timeout:?} 内未答复（超出预算，调用方按「拿不到」降级）",
+                timeout = self.timeout
+            ))),
+        }
+    }
+}
+
+impl ColdReader for RemoteCold {
+    fn fold(
+        &self,
+        req: ColdReadRequest,
+    ) -> futures::future::BoxFuture<'_, Result<yuntun_model::agg::AggStates, LakeError>> {
+        Box::pin(async move {
+            let schema_ipc = yuntun_format::encode_schema(&req.schema)
+                .map_err(|e| LakeError::Other(format!("shard rpc: schema 编码失败：{e}")))?;
+            let mut client = self.client.clone();
+            let resp = self
+                .call(
+                    "fetch_cold_aggs",
+                    client.fetch_cold_aggs(pb::FetchColdAggsRequest {
+                        table: req.table.clone(),
+                        schema_ipc,
+                        files: req
+                            .files
+                            .iter()
+                            .map(|f| pb::ColdFileRefMsg {
+                                file_path: f.file_path.clone(),
+                                file_size: f.file_size,
+                                row_count: f.row_count,
+                            })
+                            .collect(),
+                        dvs: req
+                            .deletions
+                            .iter()
+                            .map(|d| pb::ColdDvMsg {
+                                dv_id: d.dv_id.clone(),
+                                file_path: d.file_path.clone(),
+                                batch_id: d.batch_id.clone(),
+                                applied_at: d.applied_at,
+                                revoked_at: d.revoked_at,
+                                card: d.card,
+                                store_path: d.store_path.clone(),
+                            })
+                            .collect(),
+                        aggs: req.query.specs.iter().map(agg_spec_to_msg).collect(),
+                        predicate: req.query.predicate.as_ref().map(predicate_to_msg),
+                        group_by: req.query.group_by.clone(),
+                    }),
+                )
+                .await?;
+            let resp = resp.into_inner();
+            states_from_msg(&resp, &req.query)
+        })
+    }
+}
+
+/// 响应 → 部分状态（客户端侧）。**形状由请求决定**，不符 ⇒ 响亮失败。
+fn states_from_msg(
+    resp: &pb::FetchShardAggsResponse,
+    query: &AggQuery,
+) -> Result<yuntun_model::agg::AggStates, LakeError> {
+    use yuntun_model::agg::AggStates;
+    if query.is_grouped() {
+        let mut gs = Vec::with_capacity(resp.groups.len());
+        for m in &resp.groups {
+            gs.push(group_from_msg(m, query)?);
+        }
+        Ok(AggStates::Grouped(gs))
+    } else {
+        if resp.partials.len() != query.specs.len() {
+            return Err(LakeError::Other(format!(
+                "shard rpc: fetch_cold_aggs: 部分状态个数（{}）与请求（{}）不符",
+                resp.partials.len(),
+                query.specs.len()
+            )));
+        }
+        let mut out = Vec::with_capacity(resp.partials.len());
+        for m in &resp.partials {
+            out.push(partial_from_msg(m)?);
+        }
+        Ok(AggStates::Plain(out))
+    }
+}
+
 // ---------------------------------------------------------------- 服务端（数据节点侧）
 
 /// 数据节点侧的服务：把**本地** [`ShardReader`]（进程内 chunk store）暴露成 gRPC。
 pub struct ShardService {
     reader: Arc<dyn ShardReader>,
+    /// **冷文件的就地折叠**（`§179`）：`None` = 这个节点不接冷折叠（协调者按"拿不到"处理）。
+    ///
+    /// 与 `reader` 分开存是因为它们的**归属规则**不同：`reader` 是**热数据**
+    /// （chunk/WAL，只在本节点）；冷文件在**共享**存储上，谁都能读 ⇒ 谁能读就该谁来算。
+    cold: Option<Arc<dyn ColdReader>>,
 }
 
 impl ShardService {
     pub fn new(reader: Arc<dyn ShardReader>) -> Self {
-        Self { reader }
+        Self { reader, cold: None }
+    }
+
+    /// 接上冷折叠能力（生产由 datanode 装配；测试可直接给一个实现）。
+    pub fn with_cold(mut self, cold: Option<Arc<dyn ColdReader>>) -> Self {
+        self.cold = cold;
+        self
     }
 }
 
@@ -195,50 +347,85 @@ impl pb::shard_fetch_server::ShardFetch for ShardService {
             )
             .await
             .map_err(internal)?;
-        // 形状必须与请求一致（**响亮失败**："少了一个组/少了一个聚合"看起来都像正常答案）
-        let (partials, groups) = match &aggs.states {
-            yuntun_model::agg::AggStates::Plain(p) => {
-                if !query.group_by.is_empty() {
-                    return Err(Status::internal(
-                        "聚合形状不符：请求带了 group_by，却算出不分组的结果".to_string(),
-                    ));
-                }
-                if p.len() != query.specs.len() {
-                    return Err(Status::internal(format!(
-                        "聚合部分状态个数（{}）与请求（{}）不符",
-                        p.len(),
-                        query.specs.len()
-                    )));
-                }
-                (p.iter().map(partial_to_msg).collect(), Vec::new())
-            }
-            yuntun_model::agg::AggStates::Grouped(gs) => {
-                if query.group_by.is_empty() {
-                    return Err(Status::internal(
-                        "聚合形状不符：请求没带 group_by，却算出分组结果".to_string(),
-                    ));
-                }
-                let mut out = Vec::with_capacity(gs.len());
-                for g in gs {
-                    if g.key.len() != query.group_by.len() || g.states.len() != query.specs.len() {
-                        return Err(Status::internal(format!(
-                            "分组状态的形状不符：键 {} 个（请求 {}）、状态 {} 个（请求 {}）",
-                            g.key.len(),
-                            query.group_by.len(),
-                            g.states.len(),
-                            query.specs.len()
-                        )));
-                    }
-                    out.push(group_to_msg(g));
-                }
-                (Vec::new(), out)
-            }
-        };
+        let (partials, groups) = states_to_msg(&aggs.states, &query)?;
         Ok(Response::new(pb::FetchShardAggsResponse {
             partials,
             groups,
             flushed_watermark: aggs.flushed_watermark,
             stale: aggs.stale,
+        }))
+    }
+
+    /// `§179`：**冷文件的就地折叠** —— 读共享存储上的这几个文件，按谓词筛、按分组折，
+    /// 只回**标量**（省字节：回传原始行不省，`§178` 摸底的结论）。
+    ///
+    /// 请求是**自足**的（文件清单 + DV + 表结构都带）⇒ 本节点不必知道"协调者看到的那个快照"
+    /// （它自己的 `RemoteCatalog` 没有 `wait_for(version ≥ N)`，用了就可能读到另一个快照）。
+    async fn fetch_cold_aggs(
+        &self,
+        req: Request<pb::FetchColdAggsRequest>,
+    ) -> Result<Response<pb::FetchShardAggsResponse>, Status> {
+        // 没接 = 不支持：**响亮失败**（让协调者按"拿不到"回退，而不是以为它是空结果）
+        let Some(cold) = self.cold.clone() else {
+            return Err(Status::unimplemented(
+                "本节点未装配冷折叠能力（ColdReader）",
+            ));
+        };
+        let req = req.into_inner();
+        let specs = agg_specs_from_msg(&req.aggs)?;
+        let predicate = req
+            .predicate
+            .as_ref()
+            .map(predicate_from_msg)
+            .transpose()?
+            .flatten();
+        let schema = yuntun_format::decode_schema(&req.schema_ipc).map_err(internal)?;
+        let files: Vec<FileManifest> = req
+            .files
+            .iter()
+            .map(|f| FileManifest {
+                file_path: f.file_path.clone(),
+                file_size: f.file_size,
+                row_count: f.row_count,
+                ..Default::default()
+            })
+            .collect();
+        let deletions: Vec<DeletionEntry> = req
+            .dvs
+            .iter()
+            .map(|d| DeletionEntry {
+                dv_id: d.dv_id.clone(),
+                table: req.table.clone(),
+                file_path: d.file_path.clone(),
+                batch_id: d.batch_id.clone(),
+                applied_at: d.applied_at,
+                revoked_at: d.revoked_at,
+                card: d.card,
+                store_path: d.store_path.clone(),
+            })
+            .collect();
+        let query = AggQuery {
+            specs,
+            group_by: req.group_by.clone(),
+            predicate,
+        };
+        let states = cold
+            .fold(ColdReadRequest {
+                table: req.table.clone(),
+                schema,
+                files,
+                deletions,
+                query: query.clone(),
+            })
+            .await
+            .map_err(internal)?;
+        let (partials, groups) = states_to_msg(&states, &query)?;
+        Ok(Response::new(pb::FetchShardAggsResponse {
+            partials,
+            groups,
+            // 冷折叠**没有水位语义**（文件清单由请求给定，与任何"版本"无关）⇒ 恒 0 / false
+            flushed_watermark: 0,
+            stale: false,
         }))
     }
 }
@@ -248,19 +435,24 @@ impl pb::shard_fetch_server::ShardFetch for ShardService {
 pub async fn serve(
     reader: Arc<dyn ShardReader>,
     listener: TcpListener,
+    cold: Option<Arc<dyn ColdReader>>,
 ) -> Result<(), tonic::transport::Error> {
-    // 把 accept 循环包成 Stream（`serve_with_incoming` 需要）；用 `futures::stream::unfold`
-    // 而不是引入 tokio-stream —— 与 `yuntun_meta::serve` 同一手法，少一个依赖。
+    serve_service(ShardService::new(reader).with_cold(cold), listener).await
+}
+
+/// 起一个**已装配好**的 [`ShardService`]（生产走 [`serve`]；测试/特殊装配用这个）。
+pub async fn serve_service(
+    svc: ShardService,
+    listener: TcpListener,
+) -> Result<(), tonic::transport::Error> {
     let incoming = futures::stream::unfold(listener, |l| async move {
         match l.accept().await {
-            Ok((sock, _addr)) => Some((Ok::<_, std::io::Error>(sock), l)),
+            Ok((sock, _)) => Some((Ok::<_, std::io::Error>(sock), l)),
             Err(e) => Some((Err(e), l)),
         }
     });
     tonic::transport::Server::builder()
-        .add_service(pb::shard_fetch_server::ShardFetchServer::new(ShardService::new(
-            reader,
-        )))
+        .add_service(pb::shard_fetch_server::ShardFetchServer::new(svc))
         .serve_with_incoming(incoming)
         .await
 }
@@ -473,6 +665,52 @@ impl ShardFetch for GrpcShardFetch {
             })
         })
     }
+}
+
+/// 把聚合结果编成消息（两个 handler 共用）。**形状必须与请求一致**：
+/// "少了一个组 / 少了一个聚合"看起来都像正常答案，所以一律响亮失败。
+fn states_to_msg(
+    states: &yuntun_model::agg::AggStates,
+    query: &AggQuery,
+) -> Result<(Vec<pb::PartialAggMsg>, Vec<pb::GroupStatesMsg>), Status> {
+    Ok(match states {
+        yuntun_model::agg::AggStates::Plain(p) => {
+            if !query.group_by.is_empty() {
+                return Err(Status::internal(
+                    "聚合形状不符：请求带了 group_by，却算出不分组的结果".to_string(),
+                ));
+            }
+            if p.len() != query.specs.len() {
+                return Err(Status::internal(format!(
+                    "聚合部分状态个数（{}）与请求（{}）不符",
+                    p.len(),
+                    query.specs.len()
+                )));
+            }
+            (p.iter().map(partial_to_msg).collect(), Vec::new())
+        }
+        yuntun_model::agg::AggStates::Grouped(gs) => {
+            if query.group_by.is_empty() {
+                return Err(Status::internal(
+                    "聚合形状不符：请求没带 group_by，却算出分组结果".to_string(),
+                ));
+            }
+            let mut out = Vec::with_capacity(gs.len());
+            for g in gs {
+                if g.key.len() != query.group_by.len() || g.states.len() != query.specs.len() {
+                    return Err(Status::internal(format!(
+                        "分组状态的形状不符：键 {} 个（请求 {}）、状态 {} 个（请求 {}）",
+                        g.key.len(),
+                        query.group_by.len(),
+                        g.states.len(),
+                        query.specs.len()
+                    )));
+                }
+                out.push(group_to_msg(g));
+            }
+            (Vec::new(), out)
+        }
+    })
 }
 
 // ---------------------------------------------------------------- 聚合的消息转换（`§173`）

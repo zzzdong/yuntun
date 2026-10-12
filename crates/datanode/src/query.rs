@@ -23,8 +23,12 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
+use object_store::ObjectStore;
+
 use yuntun_catalog::CatalogOps;
 use yuntun_query::LocalCatalog;
+use yuntun_query::cold;
+use yuntun_store::{ColdReadRequest, ColdReader};
 use yuntun_shardrpc::GrpcShardFetch;
 use yuntun_store::RemoteShard;
 
@@ -94,4 +98,37 @@ pub(crate) fn spawn_reconcile(
             }
         }
     })
+}
+
+// ---------------------------------------------------------------- 冷文件的就地折叠（`§179`）
+
+/// 数据节点侧的**冷折叠**实现：把请求里那几个冷文件折成部分状态。
+///
+/// 它只需要 `store` —— **刻意不碰本节点的 catalog**：请求是自足的（文件清单 + DV +
+/// 表结构都带），而本节点的 `RemoteCatalog` 没有 `wait_for(version ≥ N)`，
+/// 用它就会读到**另一个快照**（静默错）。真正的折叠逻辑在 `yuntun_query::cold`
+/// （与协调者读路径**同一套代码**）。
+#[derive(Debug)]
+pub struct NodeCold {
+    pub store: Arc<dyn ObjectStore>,
+}
+
+impl ColdReader for NodeCold {
+    fn fold(
+        &self,
+        req: ColdReadRequest,
+    ) -> futures::future::BoxFuture<'_, Result<yuntun_model::agg::AggStates, yuntun_model::error::LakeError>>
+    {
+        Box::pin(async move {
+            cold::fold_cold_files(
+                self.store.clone(),
+                &req.table,
+                req.schema,
+                req.files,
+                req.deletions,
+                &req.query,
+            )
+            .await
+        })
+    }
 }

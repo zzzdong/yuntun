@@ -552,8 +552,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
 
         local_reader = Some(chunks.clone());
+        // `§179`：冷文件的就地折叠 —— 冷文件在**共享**存储上，谁都能读；这个实现只
+        // 需要 `store`（**不碰**本节点的 catalog ⇒ 请求自足，见 `query::cold`）
+        let cold = std::sync::Arc::new(query::NodeCold {
+            store: store.clone(),
+        });
         tokio::spawn(async move {
-            if let Err(e) = yuntun_shardrpc::serve(chunks, listener).await {
+            if let Err(e) = yuntun_shardrpc::serve(chunks, listener, Some(cold)).await {
                 tracing::error!(error = %e, "数据面服务退出");
             }
         });

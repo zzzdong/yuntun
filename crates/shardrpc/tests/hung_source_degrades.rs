@@ -111,7 +111,7 @@ async fn serve_hung() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     tokio::spawn(async move {
-        let _ = serve(Arc::new(HungReader), listener).await;
+        let _ = serve(Arc::new(HungReader), listener, None).await;
     });
     addr
 }
