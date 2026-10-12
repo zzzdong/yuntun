@@ -119,6 +119,43 @@ pub struct CatalogSnapshot {
 }
 
 impl CatalogSnapshot {
+    /// **按给定的文件与 DV 直接拼一份快照**（`§178`：远端冷折叠用）。
+    ///
+    /// 为什么需要它：被分配到的节点**不该**去查自己的目录 —— `RemoteCatalog` 没有
+    /// `wait_for(version ≥ N)`，它可能读到**另一个快照**的文件集/DV 集 ⇒ **静默错**。
+    /// 所以请求必须**自足**：协调者把"要读哪几个文件 + 每份文件上生效的 DV"直接给过来，
+    /// 这里据此拼一份**一次性**快照（不进本地缓存、不参与任何刷新）。
+    ///
+    /// 与生产快照的差别只有"来源"：生产那份由 `LocalCatalog` 从 `CatalogOps` 物化，
+    /// 这一份由请求提供 ⇒ 读路径（可见性 / DV / 对齐 / 格式分流）走的是**同一套代码**。
+    pub(crate) fn from_parts(
+        ident: &str,
+        schema: arrow::datatypes::SchemaRef,
+        files: Vec<FileManifest>,
+        deletions: Vec<yuntun_model::dv::DeletionEntry>,
+    ) -> Self {
+        let (namespace, table) = ident.split_once('.').unwrap_or(("public", ident));
+        let cached = CachedTable {
+            meta: TableMeta {
+                name: table.to_string(),
+                namespace: namespace.to_string(),
+                current_schema_version: 1,
+                ..Default::default()
+            },
+            schema,
+            schema_version: 1,
+            files,
+            deletions,
+        };
+        Self {
+            tables: HashMap::from([(ident.to_string(), Arc::new(cached))]),
+            schemas: vec![namespace.to_string()],
+            version: CatalogVersion::default(),
+            snapshot: 0,
+            nodes: Vec::new(),
+        }
+    }
+
     /// **测试用**：只带一张表（schema）的快照 —— 聚合下推的形状判定只读列类型。
     ///
     /// 为什么不做成公开 API：生产路径的快照一律由 `LocalCatalog` 构建（写时复制），

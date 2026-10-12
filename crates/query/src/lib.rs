@@ -17,6 +17,7 @@ pub mod index;
 pub mod locate;
 pub mod partial;
 pub mod agg_pushdown;
+pub mod cold;
 pub mod placement;
 mod stmt;
 pub mod prune;
