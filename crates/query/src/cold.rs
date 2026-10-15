@@ -30,9 +30,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::datatypes::SchemaRef;
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{Expr, SessionContext, col, lit};
 use yuntun_model::agg::{AggQuery, AggStates};
 use yuntun_model::dv::DeletionEntry;
+use yuntun_model::predicate::{CmpOp, Literal, Predicate};
 use yuntun_model::error::LakeError;
 use yuntun_model::meta::FileManifest;
 
@@ -42,6 +43,63 @@ use crate::table::{ReadPath, YuntunTableProvider};
 
 /// DV 的读取预算：与热读同一个概念（"这次愿意为它等多久"），取一个保守值。
 const DV_BUDGET: Duration = Duration::from_secs(5);
+
+/// 把**可下推的谓词**翻译成 DataFusion 表达式（`§183`）。
+///
+/// 为什么要它：`§182` 把一部分冷读分给了远端，而远端当时是**整文件读** —— 既不按
+/// `FileManifest.stats` 做**文件级**剪枝，也不把条件交给 `ParquetSource` 做**行组级**跳读。
+/// 那不是"少个优化"，而是**分配引入的回退**：同一条查询，分出去的那半边比留在本地的那半边
+/// 多读了数据。把谓词交给 DataFusion 之后，两个半边走的是**同一条读路径**（含剪枝）。
+///
+/// 翻不出来 ⇒ `None`（不剪，只折）：宁可多读，也不许剪错（剪错 = 静默少数据）。
+fn predicate_to_expr(p: &Predicate) -> Option<Expr> {
+    Some(match p {
+        Predicate::Cmp { column, op, value } => {
+            let lhs = col(column);
+            let rhs = match value {
+                Literal::Int(i) => lit(*i),
+                Literal::Text(t) => lit(t.clone()),
+            };
+            match op {
+                CmpOp::Eq => lhs.eq(rhs),
+                CmpOp::Ne => lhs.not_eq(rhs),
+                CmpOp::Lt => lhs.lt(rhs),
+                CmpOp::Le => lhs.lt_eq(rhs),
+                CmpOp::Gt => lhs.gt(rhs),
+                CmpOp::Ge => lhs.gt_eq(rhs),
+            }
+        }
+        Predicate::IsNull { column, negated } => {
+            if *negated {
+                col(column).is_not_null()
+            } else {
+                col(column).is_null()
+            }
+        }
+        Predicate::And(parts) => {
+            let mut out: Option<Expr> = None;
+            for p in parts {
+                let e = predicate_to_expr(p)?;
+                out = Some(match out {
+                    None => e,
+                    Some(acc) => acc.and(e),
+                });
+            }
+            out?
+        }
+        Predicate::Or(parts) => {
+            let mut out: Option<Expr> = None;
+            for p in parts {
+                let e = predicate_to_expr(p)?;
+                out = Some(match out {
+                    None => e,
+                    Some(acc) => acc.or(e),
+                });
+            }
+            out?
+        }
+    })
+}
 
 /// 把**给定的这几个冷文件**按 `query` 折成部分状态。
 ///
@@ -91,13 +149,21 @@ pub async fn fold_cold_files(
         .parse()
         .map_err(|e| LakeError::Other(format!("invalid store url: {e}")))?;
     ctx.register_object_store(&url, store);
-    //  要的是 trait 对象 ⇒ 显式擦一次类型
-    let provider: Arc<dyn datafusion::catalog::TableProvider> = provider;
     // `read_table` 收的是 trait 对象 ⇒ 这里显式擦一次类型
     let provider: Arc<dyn datafusion::catalog::TableProvider> = provider;
-    let batches = ctx
+    let df = ctx
         .read_table(provider)
-        .map_err(|e| LakeError::Other(format!("冷文件折叠：注册失败：{e}")))?
+        .map_err(|e| LakeError::Other(format!("冷文件折叠：注册失败：{e}")))?;
+    // `§183`：**把谓词交给读的那一边** ⇒ 文件级（`FileManifest.stats`）与行组级
+    // （`ParquetSource` 的 footer 统计）剪枝都和本地那半边一样生效。
+    // 翻不出来 ⇒ 不剪（只折）：剪错是静默少数据，多读只是慢。
+    let df = match query.predicate.as_ref().and_then(predicate_to_expr) {
+        Some(e) => df
+            .filter(e)
+            .map_err(|e| LakeError::Other(format!("冷文件折叠：过滤失败：{e}")))?,
+        None => df,
+    };
+    let batches = df
         .collect()
         .await
         .map_err(|e| LakeError::Other(format!("冷文件折叠：读取失败：{e}")))?;

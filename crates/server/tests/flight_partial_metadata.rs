@@ -228,7 +228,12 @@ async fn partial_result_is_visible_in_flight_metadata() {
 
     // ① 可用部分照常给出：降级 ≠ 失败
     let batches = arrow_flight::utils::flight_data_to_batches(&datas).unwrap();
-    assert_eq!(values(&batches), vec![1, 2, 3], "健康来源的数据必须完整返回");
+    // ⚠️ **排序后再比**：没有 `ORDER BY` 时**行序不在契约里**（各来源谁先返回取决于并发调度），
+    // 而批次的切分也不在契约里。拿顺序当判据 ⇒ 满负载跑全量时假失败
+    // （实测出现过 `[3, 4, 1, 2]` vs `[1, 2, 3, 4]` —— 值是全的，只是顺序不同）。
+    let mut got = values(&batches);
+    got.sort();
+    assert_eq!(got, vec![1, 2, 3], "健康来源的数据必须完整返回");
 
     // ② **schema 消息**的 app_metadata 必须带着"结果不完整"这个事实
     let meta = std::str::from_utf8(&datas[0].app_metadata).unwrap();
@@ -270,7 +275,9 @@ async fn complete_result_carries_no_partial_metadata() {
 
     let datas = collect_flight_data(&mut client).await;
     let batches = arrow_flight::utils::flight_data_to_batches(&datas).unwrap();
-    assert_eq!(values(&batches), vec![1, 2, 3, 4]);
+    let mut got = values(&batches);
+    got.sort(); // 同上：行序不在契约里
+    assert_eq!(got, vec![1, 2, 3, 4]);
 
     assert!(
         datas[0].app_metadata.is_empty(),
