@@ -1,6 +1,6 @@
 # yuntun 实施操作日志（§169 起）
 
-> 起记时间：2026-10-11（最新：**§184，2026-10-16**）。对应分支：main。
+> 起记时间：2026-10-11（最新：**§185，2026-10-16**）。对应分支：main。
 >
 > **这是什么**：从今天起，**每一刀**（一次成体系的改造）在这里留一节 —— 写清"做了什么、
 > 为什么这么做、边界在哪（**没做什么**）、怎么验的"。它是本项目的**证据出处**：
@@ -1060,3 +1060,63 @@ MySQL wire（pymysql）、Flight SQL（ADBC）、CLI（Flight 简易轨）——
 - `multi_node_grpc_e2e` 连跑 **5 轮** 5/5（`D-37` 修复前首跑即红）；
 - `yuntun-sql` 37 单测 + 1 集成；`yuntun-query` JSON 2/2；`yuntun-standalone` 5/5
   （含新 SIGTERM 判据）；全量与 clippy 见提交信息。
+
+---
+
+## 185. **SQL 面再补两刀：EXPLAIN / CREATE TABLE ... LIKE + 清理两处文档漂移**（2026-10-16）
+
+### 185.0 为什么是这两个
+
+`§184` 的 60+ 条普查把"明确拒绝"的那一族也列了出来（`EXPLAIN` / `TRUNCATE` /
+`CREATE INDEX` / `RENAME` / `CTAS`）。`TRUNCATE` 已在 `§184` 闭环；剩下两条
+**拒绝得没道理**的：
+
+- `EXPLAIN <查询>`：一个连执行计划都看不到的数据库，没法回答"这条查询为什么慢"。
+  而 DataFusion **原生**渲染计划（`plan_type` / `plan` 两列）—— 拒绝它等于把
+  已经有的能力挡在门外；
+- `CREATE TABLE new LIKE old`：MySQL 客户端/脚本最常见的建表形态之一，
+  此前落在 `parse_create_table` 的 "requires column definitions" 上（1149）。
+
+`CREATE INDEX` / `RENAME` / `CTAS` 继续明确拒绝（前者没有索引 DDL 概念——行组级
+索引是自动的；后两者缺 model 层载体，README 已载明）。
+
+### 185.1 EXPLAIN：转发 + 形态收窄
+
+`Statement::Explain` 进 dispatch：内层是**查询**且无 `FORMAT`/`OPTIONS` 后缀 ⇒
+`stmt.to_string()` 原样转给 DataFusion（`sql_with_partial`，与普通 SELECT 同一条路）。
+
+收窄是刻意的（`§184` 的同一条纪律：不静默忽略选项）：
+- 内层是 DML/DDL ⇒ 明确拒绝（本仓 DML 走自己的 ingest 管线，没有 DataFusion 计划）；
+- `FORMAT JSON` 之类 ⇒ 明确拒绝（DataFusion 的 EXPLAIN 不认，静默忽略会让用户
+  以为拿到了他要的格式；MySQL 方言下这类后缀在 sqlparser 层就报 parse error）。
+
+`EXPLAIN ANALYZE` 可用（DataFusion 原生语义：真跑 + 带 metrics 的计划）。
+
+### 185.2 CREATE TABLE ... LIKE：拷 schema、不拷数据
+
+MySQL 语义三件事：列名/类型/**可空性**逐字段拷贝；新表**空**；源表不动。
+实现落在 dispatch 的 `CreateTable` 臂：`like` 为 `Plain` 形态时，从 catalog 取源表
+`arrow_schema` 直接构造 `ParsedCreateTable`，其余路径（`create_table` + DDL WAL +
+归属 schema 解析）与常规建表**完全同一份**。源表不存在 ⇒ `NotFound`（不静默建空表）。
+
+可空性必须带过来：漏了它，`NOT NULL` 的写入侧校验在新表上静默失效。
+
+### 185.3 两处文档漂移（`D-38`，同类第四次）
+
+1. README §4 写着 `chaos::crash_recovery_no_data_loss` "偶发失败……固定等待后续改
+   轮询" —— `wait_hot_drained` 轮询早在 `§171` 同轮落地，且本轮两次全量
+   （112 段）全绿 ⇒ **过期声明，删**（chaos 稳定性现状并进 OVERVIEW §6.1 的口径）；
+2. OVERVIEW §6.1 写 chaos 恢复上界"60s"，代码是 **120s**（`wait_hot_drained`
+   注释写明：满负载并行时 flush 撞对象存储 IO 竞争 + 退避最多 30s/次，60s 不够）
+   ⇒ 改 120s 并补理由。
+
+教训仍旧（`D-15`/`D-17`/`D-19`/`D-24` 之后第四次）：**"已知限制"区是最容易过期
+的地方** —— 每条要么指向一个活着的判据，要么删。
+
+### 185.4 判据与验证
+
+- `sql/tests/explain.rs` 2 条：计划两行 + 聚合/扫描出现在计划里（证转发了**这条**
+  查询而非 canned 答案）+ ANALYZE 可跑；DML/DDL 明确拒绝且理由点名 EXPLAIN；
+- `server/tests/sql_create_like_e2e.rs` 1 条：schema 逐字段相同（含 NOT NULL）/
+  新表空 / 源表不动 / 新表可写 / 源表不存在 NotFound；
+- 全量与 clippy 见提交信息；`standalone_smoke` 14/14 不变。

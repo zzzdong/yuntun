@@ -559,6 +559,43 @@ impl SqlEngine {
                     partial: out.partial,
                 })
             }
+            // `EXPLAIN <查询>`（`§184` 普查后补）：DataFusion **原生**渲染计划
+            // （plan_type / plan 两列），这里只做转发与形态收窄。
+            //
+            // 为什么收窄：`EXPLAIN INSERT/DDL` 的计划语义与查询不同（DML 走本仓
+            // 自己的 ingest 管线，没有 DataFusion 计划可渲染）⇒ 明确拒绝而不是
+            // 转一句它看不懂的 SQL；`FORMAT`/`OPTIONS`（如 `FORMAT JSON`）同理 ——
+            // DataFusion 的 EXPLAIN 不认这些后缀，静默忽略会让用户以为拿到了
+            // 他要的格式。
+            Statement::Explain {
+                ref statement,
+                ref format,
+                ref options,
+                ..
+            } => {
+                // `ref` 绑定：`stmt` 不被移动，下面才能拿它重组完整语句文本
+                // （`EXPLAIN ANALYZE` / `VERBOSE` 等修饰都在 Display 里）。
+                if !matches!(statement.as_ref(), Statement::Query(_)) {
+                    return Err(SqlError::Unsupported(
+                        "EXPLAIN 只支持查询（SELECT）；DML/DDL 没有执行计划可渲染".into(),
+                    ));
+                }
+                if format.is_some() || options.as_ref().is_some_and(|o| !o.is_empty()) {
+                    return Err(SqlError::Unsupported(
+                        "EXPLAIN 的 FORMAT / OPTIONS 后缀未支持（只给标准两列计划）".into(),
+                    ));
+                }
+                let text = stmt.to_string();
+                let out = self
+                    .query
+                    .sql_with_partial(&text, session.schema())
+                    .await
+                    .map_err(query_error)?;
+                Ok(RawOutcome::Rows {
+                    batches: out.batches,
+                    partial: out.partial,
+                })
+            }
             // `SHOW TABLES [FULL] [FROM/IN <db>]`（`D-32`：限定库优先于会话 schema）
             Statement::ShowTables { show_options, .. } => {
                 let schema = shim::schema_from_options(&show_options, session);
@@ -678,7 +715,32 @@ impl SqlEngine {
             }
             Statement::CreateTable(ct) => {
                 self.check_write()?;
-                let parsed = sql::parse_create_table(&ct).map_err(SqlError::from_lake)?;
+                // `CREATE TABLE new LIKE old`（`§184` 普查后补）：**schema 拷贝**，
+                // 不拷数据（MySQL 语义）。列定义来自源表（catalog 里的 arrow schema），
+                // 其余路径与常规建表完全一致（同一条 create_table + DDL WAL）。
+                let parsed = match &ct.like {
+                    Some(sqlparser::ast::CreateTableLikeKind::Plain(like)) => {
+                        if ct.or_replace {
+                            return Err(SqlError::Unsupported(
+                                "CREATE OR REPLACE TABLE ... LIKE is not supported".into(),
+                            ));
+                        }
+                        // 源表必须存在（拷一个不存在的 schema = 静默建出空表）
+                        let src = sql::resolve_table_ref(&like.name, session);
+                        let meta = self
+                            .catalog
+                            .get_table(&src)
+                            .await
+                            .map_err(SqlError::from_lake)?
+                            .ok_or_else(|| SqlError::NotFound(src.clone()))?;
+                        sql::ParsedCreateTable {
+                            name: sql::table_name_of(&ct.name),
+                            schema: meta.schema().map_err(SqlError::from_lake)?,
+                            if_not_exists: ct.if_not_exists,
+                        }
+                    }
+                    _ => sql::parse_create_table(&ct).map_err(SqlError::from_lake)?,
+                };
                 // 归属 schema：`CREATE TABLE sales.orders` → sales；非限定名 → 会话 schema
                 let qualified = sql::resolve_table_ref(&ct.name, session);
                 let (ns, bare) = yuntun_model::ops::split_qualified(&qualified);

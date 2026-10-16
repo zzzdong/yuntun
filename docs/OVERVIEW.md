@@ -107,7 +107,7 @@
 
 ## 6. 质量与证据网
 
-规模：**77,136 行 Rust / 20 个 crate / 631 个测试函数 / 用例全绿 / clippy 本仓 0 告警**
+规模：**77,573 行 Rust / 20 个 crate / 634 个测试函数 / 用例全绿 / clippy 本仓 0 告警**
 （工具链：本机 rustc 1.98.1 + edition 2024；**MSRV 声明 1.95**，由 `vortex 0.86` 顶出，
 **尚未经真·1.95 编译验证**）
 
@@ -138,7 +138,10 @@
 - **而且不会再回来**：新判据 `wall_clock_assertions_need_a_reviewed_waiver` 禁止"拿用时当判据"，
   除非在该处写明理由并带 `§171` 豁免标记。
 - **验收**：收口后连续 **3 轮** `cargo test --workspace` 全绿（`exit=0`，每轮 104 段）。
-- 历史遗留仍在：`yuntun-chaos` 的恢复上限在 CPU 争抢下曾不足，已放宽到 60s 并写明理由（`§28`）。
+- `yuntun-chaos` 的恢复等待是**轮询**（`wait_hot_drained`，判据 = flush/回收真的落定），
+  上界 120s 只兜"永不退场"：满负载并行时 flush 撞对象存储 IO 竞争、失败后走
+  `note_flush_failure` 退避（最多 30s/次），60s 不够（`§185` 据此把 OVERVIEW 旧的
+  "60s" 口径改成 120s；README §4 里"偶发失败/固定等待待改轮询"的过期 bullet 已删）。
 
 ---
 
