@@ -199,6 +199,28 @@ def t_json_functions():
         assert cur.fetchone()[0] == 20
 
 
+def t_binary_roundtrip():
+    # §186：hex 字面量落原始字节；Binary 结果列按 HEX 文本回传（opensrv 写死
+    # utf8 charset，原样发二进制会让客户端解码失败并错乱协议帧）。
+    # 注意：length()/octet_length() 只收字符串（DataFusion 语义）—— 二进制列的
+    # 字节长度走 length(encode(b,'hex'))/2（encode 是 DataFusion 的 hex 编码）。
+    with mysql_conn() as conn, conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS {T}_bin")
+        cur.execute(f"CREATE TABLE {T}_bin (id INT, b BLOB)")
+        cur.execute(f"INSERT INTO {T}_bin VALUES (1, x'DEADBEEF')")
+        cur.execute(f"INSERT INTO {T}_bin VALUES (2, 'plain')")
+        # 字节长度：hex 串长 / 2（4 字节 / 5 字节）
+        query_until(cur, f"SELECT id, length(encode(b, 'hex')) / 2 FROM {T}_bin ORDER BY id",
+                    ((1, 4), (2, 5)))
+        # 读回 = HEX 文本（信息不丢，可 UNHEX 还原）
+        query_until(cur, f"SELECT id, b FROM {T}_bin ORDER BY id",
+                    ((1, "DEADBEEF"), (2, "706C61696E")))
+        # Binary 结果列（sha256 家族）不许把连接搞崩
+        cur.execute("SELECT sha256('x')")
+        assert len(cur.fetchone()[0]) == 64
+        cur.execute(f"DROP TABLE {T}_bin")
+
+
 # ---------------- Flight SQL 轨 ----------------
 
 def flight_conn():
@@ -241,6 +263,7 @@ def main():
     check("error_codes", t_error_codes)
     check("timestamp_types", t_timestamp_types)
     check("json_functions", t_json_functions)
+    check("binary_roundtrip", t_binary_roundtrip)
     print("== Flight SQL ==")
     check("flight_sql", t_flight_sql)
     check("flight_metadata", t_flight_metadata)

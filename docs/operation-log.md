@@ -1,6 +1,6 @@
 # yuntun 实施操作日志（§169 起）
 
-> 起记时间：2026-10-11（最新：**§185，2026-10-16**）。对应分支：main。
+> 起记时间：2026-10-11（最新：**§187，2026-10-16**）。对应分支：main。
 >
 > **这是什么**：从今天起，**每一刀**（一次成体系的改造）在这里留一节 —— 写清"做了什么、
 > 为什么这么做、边界在哪（**没做什么**）、怎么验的"。它是本项目的**证据出处**：
@@ -1120,3 +1120,89 @@ MySQL 语义三件事：列名/类型/**可空性**逐字段拷贝；新表**空
 - `server/tests/sql_create_like_e2e.rs` 1 条：schema 逐字段相同（含 NOT NULL）/
   新表空 / 源表不动 / 新表可写 / 源表不存在 NotFound；
 - 全量与 clippy 见提交信息；`standalone_smoke` 14/14 不变。
+
+---
+
+## 186. **Binary 数据的三处断链 + 表达式面第二轮普查**（2026-10-16）
+
+### 186.0 怎么发现的
+
+`§184`/`§185` 之后 SQL 面已经补齐到"拒绝得有道理"。本轮做**第二轮普查** ——
+专打**表达式 / 函数 / 查询形态**（子查询、JOIN、窗口、ROLLUP/CUBE、数学/字符串/
+日期函数、类型构造，共 60+ 条）。结论：**DataFusion 55 的能力面基本全敞**——
+八种 JOIN、标量/IN/EXISTS 子查询、派生表、lag/lead/rank/ntile、ROLLUP/CUBE、
+array_agg/string_agg/median/percentile_cont、日期与数学函数全部可用。
+
+但普查抓到一个**硬 bug**：`SELECT sha256('x')` 之后**连接直接死**。
+
+### 186.1 根因：opensrv 写死 charset，Binary 值过不了文本协议
+
+opensrv-mysql 0.7.0 的 `write_column_definitions_41` 把结果集**每一列**的
+charset 硬编码成 `UTF8_GENERAL_CI`（上游没给 Column 留 charset 字段）。
+于是客户端按 UTF-8 解 BLOB 的原始字节：
+
+- pymysql：`UnicodeDecodeError`（`'utf-8' codec can't decode byte 0xb7`），
+  **且错乱后续协议帧**（下一次命令 "Packet sequence number wrong"）；
+- 任何 Binary 结果列（sha256/sha224/sha512 家族）或 Binary 表列都会踩到。
+
+连带发现的第二个 bug：`x'DEADBEEF'` hex 字面量被当**文本**存
+（`length(b) = 8` 而不是 4 —— 存进去的是 8 个 ASCII 字符，**静默改数据**）。
+
+### 186.2 修法（两处，都不动数据路径）
+
+1. **Binary 结果列按 HEX 文本回传**（`sqlwire/encode.rs: hex_upper`）：
+   MySQL `HEX()` 的输出约定，信息不丢（可 UNHEX 还原）、任何客户端都解得动。
+   Flight 轨是 Arrow 原生二进制，不受影响。
+2. **hex 字面量落原始字节**（`sql.rs: Literal::Bytes` + `decode_hex_literal`）：
+   奇数长 / 非 hex 字符明确拒绝（MySQL 同款）；二进制字面量进文本列按 UTF-8
+   解释（非 UTF-8 明确拒绝，不静默替换）。
+
+### 186.3 已知限制（写进 README，不硬修）
+
+- `length()` / `octet_length()` **只收字符串**（DataFusion 55 的函数签名）⇒
+  二进制列字节长度走 `length(encode(b,'hex'))/2`（`encode` 是 DF 的 hex 编码）。
+  MySQL 的 `LENGTH(blob)` 是字节数，这是方言分歧，不是缺陷。
+- `sha512('x')` **字面量**触发 DataFusion 常量折叠（`simplify_expressions`）的
+  上游 bug（Arrow error: non UTF-8）；**列路径正常**（`sha512(col)` ✓），
+  报错明确、不崩连接。不为它关掉优化器规则（代价大于收益）。
+
+### 186.4 判据与验证
+
+- `sqlwire/encode.rs`：`binary_values_are_hex_encoded_for_the_text_protocol`；
+- `sql.rs`：`hex_literal_lands_as_raw_bytes`（含非法 hex 拒绝）；
+- `format`：`vortex_round_trips_binary_columns`（Binary 列 vortex 往返 ——
+  既有往返用例只覆盖 Utf8，这条路径此前是盲区；实测读回类型就是 Binary）；
+- `standalone_smoke.py` 增 `binary_roundtrip`（hex 字面量 → 字节长度 →
+  HEX 读回 → sha256 不崩连接）：**15/15**；
+- 全量与 clippy 见提交信息。
+
+---
+
+## 187. **chaos 水位用例的一条竞态：视图空了不等于 WAL 落了**（2026-10-16）
+
+### 187.0 现象
+
+`§186` 之后的第三轮全量里，`disk_watermark_aborts_oldest_batch_then_releases_segments`
+翻车（16/17）：断言 ③ "WAL 恢复出的批次应全部终态" 读到
+`[("01a1459a-…", Pending)]`。前两轮全量都绿 ⇒ **竞态，不是回归**（且本轮改动
+全在 sql/sqlwire/format/docs，没碰 wal/ingest/cleanup 一行）。
+
+### 187.1 根因
+
+用例 ② 的等待判据是**视图**（`tracker.non_terminal().is_empty()`）—— 而 monitor
+的 abort 是"**先改视图、再异步写 WAL 记录**"。视图空的那一刻，最后一条
+`BatchAbort` 可能还没落盘；立即 `full_recovery()` 就还是 Pending。
+全量并行时 WAL 写入被真实磁盘 IO 竞争拖慢，窗口被放大到能撞上。
+
+这与 `§171` 修的计时 flaky 是**同一族**（拿一个"此刻"的快照当终局），只是
+这次的两个快照分属**两个存储**（内存视图 vs WAL）。
+
+### 187.2 修法：判据还是事件，但事件改成"WAL 也终态"
+
+断言 ③ 从"立即读一次 WAL"改成 `wait_until` **轮询到 WAL 恢复也全终态**
+（上限仍是 `wait_until` 既有的 60s 兜底，防"永不落盘"），轮到了再复核一次完整
+状态把事实钉住。**没有放宽任何正确性断言** —— 修的是"看得太早"。
+
+### 187.3 验证
+
+`yuntun-chaos --lib` **17/17**（3.05s）；`disk_watermark` 单跑连跑 3 轮 3/3。

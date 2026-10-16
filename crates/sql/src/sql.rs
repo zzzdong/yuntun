@@ -473,6 +473,12 @@ enum Literal {
     /// 数值字面量原文（整数 / 浮点）
     Num(String),
     Str(String),
+    /// **二进制**字面量 `x'DEADBEEF'` / `b'0101'` 的解码结果（原始字节）。
+    ///
+    /// 没有它，`x'DEADBEEF'` 会走 `Str("DEADBEEF")` —— 存进去的是**八个 ASCII
+    /// 字符**而不是四个字节（`§186` 实测：`length(b) = 8`）。MySQL 语义里 hex
+    /// 字面量是二进制字符串，落文本等于静默改数据。
+    Bytes(Vec<u8>),
     /// TIMESTAMP '...' 的 ISO8601 解析结果（epoch 纳秒）
     TimestampNs(i64),
     /// DATE '...' 的 ISO 原文
@@ -481,6 +487,25 @@ enum Literal {
     List(Vec<Literal>),
     /// MAP 字面量 `MAP {'k': v, ...}`（DuckDB 形态，键值须为字面量）
     Map(Vec<(Literal, Literal)>),
+}
+
+/// hex 字符串 → 原始字节（`x'DEADBEEF'` 字面量用）。
+///
+/// 奇数长度 / 非 hex 字符 ⇒ 明确错误（MySQL 同样拒绝：`ER_HEX_STRING` 一族）。
+fn decode_hex_literal(s: &str) -> Result<Vec<u8>, LakeError> {
+    if s.len() % 2 != 0 {
+        return Err(LakeError::Other(format!(
+            "hex literal x'{s}' has odd length ({})",
+            s.len()
+        )));
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&s[i..i + 2], 16)
+                .map_err(|_| LakeError::Other(format!("hex literal x'{s}' has invalid digits")))
+        })
+        .collect()
 }
 
 fn literal_of(expr: &Expr) -> Result<Literal, LakeError> {
@@ -548,6 +573,8 @@ fn literal_of(expr: &Expr) -> Result<Literal, LakeError> {
             Value::Null => Ok(Literal::Null),
             Value::Boolean(b) => Ok(Literal::Bool(*b)),
             Value::Number(n, _) => Ok(Literal::Num(n.clone())),
+            // `x'DEADBEEF'` → 原始字节（MySQL 二进制字面量语义，见 `Literal::Bytes`）
+            Value::HexStringLiteral(s) => Ok(Literal::Bytes(decode_hex_literal(s)?)),
             v => v
                 .clone()
                 .into_string()
@@ -885,6 +912,16 @@ fn build_column(field: &Field, n: usize, get: &dyn Fn(usize) -> Literal) -> Resu
                 match get(i) {
                     L::Null => v.push(None),
                     L::Str(s) => v.push(Some(s)),
+                    // 二进制字面量进文本列：MySQL 允许（按 UTF-8 解释）；
+                    // 非 UTF-8 字节明确拒绝（Arrow Utf8 装不下，静默替换 = 改数据）
+                    L::Bytes(b) => v.push(Some(
+                        String::from_utf8(b).map_err(|_| {
+                            LakeError::Other(format!(
+                                "binary literal is not valid UTF-8 for text column {}",
+                                field.name()
+                            ))
+                        })?,
+                    )),
                     other => return Err(bad_lit(&other, field)),
                 }
             }
@@ -895,7 +932,10 @@ fn build_column(field: &Field, n: usize, get: &dyn Fn(usize) -> Literal) -> Resu
             for i in 0..n {
                 match get(i) {
                     L::Null => v.push(None),
+                    // 普通字符串 → UTF-8 字节（文本进二进制列）
                     L::Str(s) => v.push(Some(s.into_bytes())),
+                    // `x'...'` → 原始字节（`§186`：修好之前被当文本存，length 翻倍）
+                    L::Bytes(b) => v.push(Some(b)),
                     other => return Err(bad_lit(&other, field)),
                 }
             }
@@ -1389,6 +1429,43 @@ mod tests {
                 true
             )))
         );
+    }
+
+    /// **`§186` 的判据**：`x'DEADBEEF'` hex 字面量落**二进制列**必须是原始字节。
+    ///
+    /// 反证：修好之前它走 `Str("DEADBEEF")` —— 存进去的是 8 个 ASCII 字符
+    /// （`length(b) = 8`），数据被静默改写。
+    #[test]
+    fn hex_literal_lands_as_raw_bytes() {
+        let t = Arc::new(Schema::new(vec![
+            Field::new("b", DataType::Binary, true),
+            Field::new("s", DataType::Utf8, true),
+        ]));
+        let s = parse("INSERT INTO t VALUES (x'DEADBEEF', x'6869')");
+        let (batch, n) = extract_values(s, &t);
+        assert_eq!(n, 1);
+        let b = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::BinaryArray>()
+            .unwrap();
+        assert_eq!(b.value(0), &[0xDE, 0xAD, 0xBE, 0xEF], "hex 字面量必须是 4 个原始字节");
+        // 文本列：二进制字面量按 UTF-8 解释（MySQL 允许）
+        let s = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(s.value(0), "hi");
+
+        // 非法 hex：奇数长 / 非 hex 字符 ⇒ 明确错误
+        let bad = parse("INSERT INTO t VALUES (x'ABC', 'x')");
+        let (Statement::Insert(ins)) = &bad else { panic!() };
+        let SetExpr::Values(vals) = ins.source.as_ref().unwrap().body.as_ref() else {
+            panic!()
+        };
+        let rows: Vec<Vec<Expr>> = vals.rows.iter().map(|r| r.content.clone()).collect();
+        assert!(build_values_batch(&t, None, &rows).is_err(), "奇数长 hex 必须拒绝");
     }
 
     /// **`D-33` 的判据**：无符号整数家族可建表（README §2.1 写着"含无符号"）。

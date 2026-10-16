@@ -516,6 +516,42 @@ mod vortex_tests {
         }
     }
 
+    /// **`§186` 的判据：Binary 列 vortex 往返**。
+    ///
+    /// 修好之前：Binary 列写进 vortex 再读出会炸
+    /// （`Arrow error: Encountered non UTF-8 data`）—— vortex 的 arrow 入口把
+    /// Binary 当 Utf8 处理，读回时按 UTF-8 校验二进制字节。既有往返用例只覆盖
+    /// Utf8（`batch()` 没有 Binary 列）⇒ 这条路径一直是盲区。
+    #[test]
+    fn vortex_round_trips_binary_columns() {
+        use arrow::array::BinaryArray;
+        let b = arrow::record_batch::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("b", DataType::Binary, true),
+            ])),
+            vec![
+                Arc::new(arrow::array::Int64Array::from(vec![1i64, 2, 3])),
+                Arc::new(BinaryArray::from_opt_vec(vec![
+                    Some(&[0xDE, 0xAD, 0xBE, 0xEF][..]),
+                    Some(&[0x00, 0xFF][..]),
+                    None,
+                ])),
+            ],
+        )
+        .unwrap();
+        let bytes = encode_batch(&b, DataFormat::Vortex).expect("vortex 编码应当成功");
+        let out = decode_batch(&bytes, DataFormat::Vortex).expect("vortex 解码应当成功");
+        let got = concat_batches(&out[0].schema(), &out).expect("拼回");
+        assert_eq!(got.num_rows(), 3);
+        eprintln!("DECODED SCHEMA: {:?}", got.schema().fields().iter().map(|f| (f.name(), f.data_type())).collect::<Vec<_>>());
+        // 读回的 b 列：按目标类型 cast 后逐值相同（物理类型可以是 BinaryView 等）
+        let col = arrow::compute::cast(got.column(1), &DataType::Binary)
+            .unwrap_or_else(|e| panic!("Binary 列 cast 失败：{e}"));
+        let want = arrow::compute::cast(b.column(1), &DataType::Binary).unwrap();
+        assert_eq!(col.as_ref(), want.as_ref(), "Binary 列必须逐值相同");
+    }
+
     /// **体积对照**（`T9.x` 的第三件）：**两种数据形状**，各把两个数字摆出来。
     ///
     /// ⚠️ **不断言"谁更小"**：压缩率取决于数据形状 —— 下面两份数据就是反例：

@@ -1769,6 +1769,18 @@ async fn disk_watermark_aborts_oldest_batch_then_releases_segments() {
     .await;
 
     // ③ WAL 侧的终态必须与视图一致（视图同步不是"只改内存"）
+    //
+    // ⚠️ **必须轮询等 WAL，不能立即读**：② 等的判据是**视图**（`tracker`）空，
+    // 而 monitor 的 abort 是"先改视图、再异步写 WAL 记录"—— 视图空的那一刻
+    // 最后一条 `BatchAbort` 可能还没落盘，立即 `full_recovery` 会读到 Pending
+    // （`§187` 实测抓到一次：全量并行时 WAL 写入被 IO 竞争拖慢）。
+    // 判据仍是事件（WAL 恢复也全终态），不是墙钟。
+    wait_until("WAL 侧仍有非终态批次", || {
+        let rec = setup.ingestor.wal.full_recovery().unwrap();
+        rec.states.states.values().all(|s| s.is_terminal()).then(|| ())
+    })
+    .await;
+    // 终态后复核一次完整状态（顺带把"全部终态"这个事实钉在断言里）
     let rec = setup.ingestor.wal.full_recovery().unwrap();
     assert!(
         rec.states.states.values().all(|s| s.is_terminal()),

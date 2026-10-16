@@ -124,11 +124,18 @@ pub async fn write_row<W: tokio::io::AsyncWrite + Send + Unpin>(
             }
             DataType::Binary => {
                 let v = col.as_any().downcast_ref::<BinaryArray>().unwrap();
-                rw.write_col(v.value(row).to_vec())?;
+                // **HEX 文本回传**（`§186`）：opensrv-mysql 0.7.0 把结果集**每一列**的
+                // charset 硬编码成 utf8_general_ci（`writers.rs: write_column_definitions_41`
+                // 写死 UTF8_GENERAL_CI），于是客户端按 UTF-8 解 BLOB 的原始字节 ——
+                // `SELECT sha256('x')` 这类 Binary 结果会让 pymysql 抛 UnicodeDecodeError
+                // **并错乱后续协议帧**（连接直接死）。
+                // 十六进制文本任何客户端都解得动，且信息不丢（可 UNHEX 还原），
+                // 与 MySQL `HEX()` 的输出约定一致。Flight 轨（Arrow 原生）不受影响。
+                rw.write_col(hex_upper(v.value(row)))?;
             }
             DataType::LargeBinary => {
                 let v = col.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
-                rw.write_col(v.value(row).to_vec())?;
+                rw.write_col(hex_upper(v.value(row)))?;
             }
             DataType::Date32 => {
                 let v = col.as_any().downcast_ref::<Date32Array>().unwrap();
@@ -230,6 +237,20 @@ pub fn format_date(days: i32) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// 原始字节 → 大写 HEX 文本（MySQL `HEX()` 的输出约定）。
+///
+/// 存在的原因见 `write_row` 的 Binary 分支：文本协议下 Binary 值不能原样发
+/// （opensrv 写死 utf8 charset ⇒ 客户端按 UTF-8 解二进制 ⇒ 崩 + 协议帧错乱）。
+pub fn hex_upper(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        // write! 到 String 不会失败
+        let _ = write!(s, "{b:02X}");
+    }
+    s
+}
+
 /// Howard Hinnant `civil_from_days`：epoch 天数 → (年, 月, 日)。
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
@@ -309,5 +330,20 @@ mod tests {
             arrow_to_mysql_type(&DataType::Timestamp(TimeUnit::Microsecond, None)),
             ColumnType::MYSQL_TYPE_DATETIME
         );
+        assert_eq!(
+            arrow_to_mysql_type(&DataType::Binary),
+            ColumnType::MYSQL_TYPE_BLOB
+        );
+    }
+
+    /// **`§186` 的判据**：Binary 值必须 HEX 文本化（opensrv 写死 utf8 charset，
+    /// 原样发二进制会让客户端解码失败并错乱协议帧）。
+    #[test]
+    fn binary_values_are_hex_encoded_for_the_text_protocol() {
+        assert_eq!(hex_upper(b""), "");
+        assert_eq!(hex_upper(&[0xDE, 0xAD, 0xBE, 0xEF]), "DEADBEEF");
+        assert_eq!(hex_upper(&[0x00, 0xFF, 0x10]), "00FF10");
+        // 与 MySQL HEX() 同款：大写、无分隔、两倍长
+        assert_eq!(hex_upper("hi".as_bytes()), "6869");
     }
 }
