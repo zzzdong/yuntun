@@ -26,7 +26,7 @@ use sqlparser::ast::{
     DataType as SqlDataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName,
     Statement,
 };
-use sqlparser::ast::{ExactNumberInfo, TimezoneInfo, Value};
+use sqlparser::ast::{ExactNumberInfo, TimezoneInfo, Value, ValueWithSpan};
 use sqlparser::dialect::{Dialect as SqlDialect, GenericDialect};
 use sqlparser::parser::Parser;
 use yuntun_model::error::LakeError;
@@ -42,7 +42,25 @@ pub fn parse_single(sql: &str) -> Result<Statement, LakeError> {
 }
 
 /// 按方言的单语句解析（wire 协议会话传入 MySQL/PG 方言）。
+///
+/// **方言回退**（`§189/U2`）：用会话方言解析失败时，再拿 **Generic** 试一次。
+///
+/// 为什么需要它：`ALTER TABLE … ADD COLUMN IF NOT EXISTS` 是 MariaDB/PG 的语法，
+/// **MySQL 本身没有**（`MySqlDialect` 会报 `found: EXISTS`），而我们的 DDL 层早已支持
+/// 这个形态（[`parse_alter_table`] 的 `if_not_exists`）。MySQL 客户端发过来就直接被
+/// 解析器挡在门外 —— README 却写着"含 `IF [NOT] EXISTS`"。
+///
+/// 回退是**超集**而不是替换：先按会话方言走（MySQL 客户端的报错位置仍按 MySQL 语法给），
+/// 只有它不认时才放宽。两者都不认 ⇒ 报**会话方言**那条错误（对客户端更有意义）。
 pub fn parse_single_with(dialect: &dyn SqlDialect, sql: &str) -> Result<Statement, LakeError> {
+    match parse_single_strict(dialect, sql) {
+        Ok(s) => Ok(s),
+        Err(primary) => parse_single_strict(&GenericDialect {}, sql).map_err(|_| primary),
+    }
+}
+
+/// 单次严格解析（不含回退）。
+fn parse_single_strict(dialect: &dyn SqlDialect, sql: &str) -> Result<Statement, LakeError> {
     let stmts = Parser::parse_sql(dialect, sql)
         .map_err(|e| LakeError::Other(format!("SQL parse error: {e}")))?;
     if stmts.len() != 1 {
@@ -155,10 +173,91 @@ pub fn show_tables_batch(schema_name: &str, tables: &[String]) -> RecordBatch {
 // ------------------------------------------------------------ CREATE TABLE
 
 /// CREATE TABLE 解析结果。
+#[derive(Debug, Clone)]
 pub struct ParsedCreateTable {
     pub name: String,
     pub schema: SchemaRef,
     pub if_not_exists: bool,
+    /// **分区键/排序列**（`WITH (partition_by = 'ts')`，`§189/U1`）。
+    ///
+    /// 它是"这一列是事件时间"的**显式声明**，下游三处共用它：
+    /// ① 攒批窗口归属（`dt=<window>` 目录）② 文件级 `stats`（min/max 剪枝）
+    /// ③ 行组级 `.idx`（zone map + XOR）。
+    /// 没声明 ⇒ 下游回退到"列名恰为 `event_time`"（老行为，见 `model::meta::sort_columns_for`）。
+    pub partition_cols: Vec<String>,
+}
+
+/// 建表选项里能认的键（`CREATE TABLE … WITH (k = 'v')`）。
+pub const OPT_PARTITION_BY: &str = "partition_by";
+
+/// 从 `WITH (...)` 里取出分区键（**列必须真实存在**，否则明确拒绝）。
+///
+/// 为什么拒绝而不是静默忽略：写错列名而"建表成功"⇒ 剪枝永远不生效且不报错，
+/// 正是本项目最忌的形态（静默劣化）。
+fn partition_cols_from_options(ct: &CreateTable, schema: &SchemaRef) -> Result<Vec<String>, LakeError> {
+    let opts = match &ct.table_options {
+        sqlparser::ast::CreateTableOptions::With(v) => v,
+        _ => return Ok(Vec::new()),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for o in opts {
+        // `WITH (k = v)` ⇒ `SqlOption::KeyValue { key: Ident, value: Expr }`
+        let (key, expr) = match o {
+            sqlparser::ast::SqlOption::KeyValue { key, value } => (key, value),
+            // 其余形态（Ident / Clustered / Partition …）一律拒绝：静默忽略 = 用户以为声明了
+            other => {
+                return Err(LakeError::Other(format!(
+                    "CREATE TABLE ... WITH (...) 只接受 `{OPT_PARTITION_BY} = '列名'`，实际：{other}"
+                )))
+            }
+        };
+        let key = key.value.to_ascii_lowercase();
+        if key != OPT_PARTITION_BY {
+            return Err(LakeError::Other(format!(
+                "unknown table option `{key}` in CREATE TABLE ... WITH (...)（只接受 `{OPT_PARTITION_BY}`）"
+            )));
+        }
+        // 值形态：`'ts'`（引号串）或 `ts`（标识符）
+        let value = match expr {
+            Expr::Value(ValueWithSpan {
+                value: Value::SingleQuotedString(s),
+                ..
+            }) => s.trim().to_string(),
+            Expr::Value(ValueWithSpan {
+                value: Value::DoubleQuotedString(s),
+                ..
+            }) => s.trim().to_string(),
+            Expr::Identifier(i) => i.value.clone(),
+            other => {
+                return Err(LakeError::Other(format!(
+                    "WITH ({OPT_PARTITION_BY} = ...) 的值应为列名（'ts' 或 ts），实际：{other}"
+                )))
+            }
+        };
+        if value.is_empty() {
+            return Err(LakeError::Other(format!(
+                "WITH ({OPT_PARTITION_BY} = ...) 的列名不能为空"
+            )));
+        }
+        if schema.column_with_name(&value).is_none() {
+            return Err(LakeError::Other(format!(
+                "WITH ({OPT_PARTITION_BY} = '{value}')：表里没有列 `{value}`（现有列：{}）",
+                schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        if out.contains(&value) {
+            return Err(LakeError::Other(format!(
+                "WITH ({OPT_PARTITION_BY} = ...) 重复声明了列 `{value}`"
+            )));
+        }
+        out.push(value);
+    }
+    Ok(out)
 }
 
 /// `CREATE TABLE` 列定义 → Arrow Schema（plan §4.3：ColumnDef 的 DataType → Arrow）。
@@ -188,10 +287,13 @@ pub fn parse_create_table(ct: &CreateTable) -> Result<ParsedCreateTable, LakeErr
             "invalid table name in CREATE TABLE".into(),
         ));
     }
+    let schema = Arc::new(Schema::new(fields));
+    let partition_cols = partition_cols_from_options(ct, &schema)?;
     Ok(ParsedCreateTable {
         name,
-        schema: Arc::new(Schema::new(fields)),
+        schema,
         if_not_exists: ct.if_not_exists,
+        partition_cols,
     })
 }
 
@@ -493,7 +595,7 @@ enum Literal {
 ///
 /// 奇数长度 / 非 hex 字符 ⇒ 明确错误（MySQL 同样拒绝：`ER_HEX_STRING` 一族）。
 fn decode_hex_literal(s: &str) -> Result<Vec<u8>, LakeError> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(LakeError::Other(format!(
             "hex literal x'{s}' has odd length ({})",
             s.len()
@@ -1886,5 +1988,79 @@ mod tests {
         let names = b.column(2).as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(names.value(0), "a", "排序输出");
         assert_eq!(names.value(1), "b");
+    }
+
+    /// **`§189/U1`**：`WITH (partition_by = 'ts')` 声明分区键 —— 以及"声明错了必须响亮"。
+    #[test]
+    fn partition_by_option_is_parsed_and_validated() {
+        let ct = match parse("CREATE TABLE t (ts BIGINT, v INT) WITH (partition_by = 'ts')") {
+            Statement::CreateTable(ct) => ct,
+            other => panic!("应当是 CreateTable：{other:?}"),
+        };
+        let p = parse_create_table(&ct).expect("声明应当成功");
+        assert_eq!(p.partition_cols, vec!["ts".to_string()]);
+
+        // 标识符形态（不带引号）同样接受
+        let ct2 = match parse("CREATE TABLE t (ts BIGINT) WITH (partition_by = ts)") {
+            Statement::CreateTable(ct) => ct,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            parse_create_table(&ct2).unwrap().partition_cols,
+            vec!["ts".to_string()]
+        );
+
+        // 没带 WITH ⇒ 空（下游回退到 event_time）
+        let ct3 = match parse("CREATE TABLE t (ts BIGINT)") {
+            Statement::CreateTable(ct) => ct,
+            other => panic!("{other:?}"),
+        };
+        assert!(parse_create_table(&ct3).unwrap().partition_cols.is_empty());
+
+        // ① 列不存在：必须报错（静默忽略 = 用户以为声明了，剪枝却永远不生效）
+        let ct4 = match parse("CREATE TABLE t (ts BIGINT) WITH (partition_by = 'nope')") {
+            Statement::CreateTable(ct) => ct,
+            other => panic!("{other:?}"),
+        };
+        let e = parse_create_table(&ct4).unwrap_err().to_string();
+        assert!(e.contains("nope") && e.contains("ts"), "错误要点名列：{e}");
+
+        // ② 未知键：拒绝（不接受"以后再加的键"静默通过）
+        let ct5 = match parse("CREATE TABLE t (ts BIGINT) WITH (sort_by = 'ts')") {
+            Statement::CreateTable(ct) => ct,
+            other => panic!("{other:?}"),
+        };
+        assert!(parse_create_table(&ct5)
+            .unwrap_err()
+            .to_string()
+            .contains("sort_by"));
+    }
+
+    /// **`§189/U2`**：方言回退 —— MySQL 语法里没有 `ADD COLUMN IF NOT EXISTS`
+    /// （MariaDB/PG 才有），但我们的 DDL 层早已支持 ⇒ 不该被解析器挡在门外。
+    #[test]
+    fn mysql_dialect_falls_back_to_generic_for_extended_ddl() {
+        use sqlparser::dialect::MySqlDialect;
+        // MySQL 方言自己**不认**这条（严格解析应当失败）
+        assert!(
+            parse_single_strict(&MySqlDialect {}, "ALTER TABLE t ADD COLUMN IF NOT EXISTS b INT")
+                .is_err(),
+            "MySqlDialect 本就不支持该语法（回退机制的前提）"
+        );
+        // 走 `parse_single_with` ⇒ 回退到 Generic ⇒ 成功，且 `if_not_exists` 为真
+        let st = parse_single_with(&MySqlDialect {}, "ALTER TABLE t ADD COLUMN IF NOT EXISTS b INT")
+            .expect("回退后应当解析成功");
+        let Statement::AlterTable(alter) = &st else {
+            panic!("应当是 AlterTable：{st:?}")
+        };
+        let parsed = parse_alter_table(alter).expect("解析为 SchemaChange");
+        assert!(parsed.idempotent, "IF NOT EXISTS ⇒ 幂等标记为真");
+
+        // 回退**不是**放宽到什么都收：两种方言都不认的仍然报错
+        assert!(
+            parse_single_with(&MySqlDialect {}, "ALTER TABLE t ADD COLUMN IF EXISTS x INT")
+                .is_err(),
+            "两种方言都不认的语句仍必须拒绝（回退不等于兜底接受）"
+        );
     }
 }

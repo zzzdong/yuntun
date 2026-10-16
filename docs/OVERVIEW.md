@@ -107,7 +107,7 @@
 
 ## 6. 质量与证据网
 
-规模：**77,922 行 Rust / 20 个 crate / 638 个测试函数 / 用例全绿 / clippy 本仓 0 告警**
+规模：**78,416 行 Rust / 20 个 crate / 641 个测试函数 / 用例全绿 / clippy 本仓 0 告警**
 （工具链：本机 rustc 1.98.1 + edition 2024；**MSRV 1.95 已真编译验证**（`§188`：
 `rustup run 1.95.0 cargo check --workspace --all-targets` EXIT=0、0 告警）——
 下界由 `vortex 0.86` 顶出，全仓按 1.95 要求）

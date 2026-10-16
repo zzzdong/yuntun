@@ -628,12 +628,92 @@ pub fn compute_stats_lite(
 }
 
 /// 默认排序列：event_time（业务约定，缺失时无排序列）。
+///
+/// ⚠️ **别再直接调它**（`§189/U1`）：它是"列名硬编码"的老行为 —— 表的时间列不叫
+/// `event_time` 时它返回空 ⇒ 文件级 stats 与行组级 `.idx` **整套剪枝静默失效**。
+/// 新调用点用 [`sort_columns_for`]（声明优先，本函数只作为回退）。
 pub fn default_sort_columns(schema: &SchemaRef) -> Vec<String> {
     if schema.field_with_name("event_time").is_ok() {
         vec!["event_time".to_string()]
     } else {
         Vec::new()
     }
+}
+
+/// **排序列 = 表声明的分区键，回退到 `event_time`**（`§189/U1`）。
+///
+/// 它的产出同时喂给三处（必须同一个列集，否则会出现"文件级剪一半、组级剪另一半"
+/// 这种解释不清的状态，见 `flush.rs` 的注释）：
+///
+/// 1. `FileManifest.stats`（min/max ⇒ 查询侧**文件级剪枝**，`prune.rs`）；
+/// 2. 行组级索引 `.idx`（zone map + XOR ⇒ **组级剪枝**）；
+/// 3. 攒批窗口归属（`dt=<window>` 目录，见 [`partition_time_ms`]）。
+///
+/// `declared` 里**不存在于 schema 的列会被丢弃**（schema 演进删列后仍要能工作），
+/// 全丢了就回退 —— 宁可少剪，也不许拿着不存在的列去算统计。
+pub fn sort_columns_for(schema: &SchemaRef, declared: &[String]) -> Vec<String> {
+    let cols: Vec<String> = declared
+        .iter()
+        .filter(|c| schema.column_with_name(c.as_str()).is_some())
+        .cloned()
+        .collect();
+    if !cols.is_empty() {
+        return cols;
+    }
+    default_sort_columns(schema)
+}
+
+/// 从批次里取**事件时间（毫秒）**：`declared` 优先，回退列名 `event_time`。
+///
+/// 为什么集中在这里（`§189/U1`）：老实现 `extract_event_time_ms` 只认
+/// `Int64`/`Timestamp(ms)` 两档，而 **SQL 建的 `TIMESTAMP` 列一律是
+/// `Timestamp(ns)`** ⇒ 即便列名叫 `event_time`，用 SQL 建表也拿不到事件时间，
+/// 窗口只能退回"到达时间"（`dt=` 目录失去数据语义）。这里按刻度逐档换算。
+///
+/// 取的是**第一行非 null 值**：窗口归属只需要"这批数据大概落在哪"，不需要精确边界
+/// （批内跨窗口由 chunk 的 seal 策略负责）。
+pub fn partition_time_ms(
+    batch: &arrow::record_batch::RecordBatch,
+    declared: &[String],
+) -> Option<i64> {
+    use arrow::array::{
+        Array, Date32Array, Int64Array, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray,
+    };
+    let schema = batch.schema();
+    let name = declared
+        .iter()
+        .find(|c| schema.column_with_name(c.as_str()).is_some())
+        .cloned()
+        .or_else(|| {
+            schema
+                .column_with_name("event_time")
+                .map(|_| "event_time".to_string())
+        })?;
+    let idx = schema.column_with_name(&name)?.0;
+    let arr = batch.column(idx);
+    if arr.null_count() == arr.len() {
+        return None;
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
+        return Some(a.value(0));
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<TimestampMillisecondArray>() {
+        return Some(a.value(0));
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<TimestampSecondArray>() {
+        return Some(a.value(0) * 1_000);
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+        return Some(a.value(0) / 1_000);
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<TimestampNanosecondArray>() {
+        return Some(a.value(0) / 1_000_000);
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<Date32Array>() {
+        return Some(i64::from(a.value(0)) * 86_400_000);
+    }
+    None
 }
 
 /// 数值类型提升格中的秩（详细设计 §8.1）：

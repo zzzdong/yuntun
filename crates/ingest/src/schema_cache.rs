@@ -55,6 +55,41 @@ impl SchemaCache {
     }
 }
 
+/// 表的**分区键**（`WITH (partition_by=…)`，§189/U1）缓存。
+///
+/// 为什么单独一份：写入热路径每条批次都要用它算窗口归属，而它只在 **DDL** 时变
+/// （建表 / 删列）—— 每次都去问 Catalog 等于给写路径加一次元数据往返。
+/// 与 `SchemaCache` 同套路（ADR-6 的本地缓存纪律）。
+#[derive(Default)]
+pub struct PartitionCache {
+    inner: RwLock<HashMap<String, Vec<String>>>,
+}
+
+impl PartitionCache {
+    /// 该表声明的分区列（**没有声明 / 表不存在 ⇒ 空**，调用方回退到 `event_time`）。
+    pub async fn get(
+        &self,
+        catalog: &Arc<dyn CatalogOps>,
+        table: &str,
+    ) -> Vec<String> {
+        if let Some(c) = self.inner.read().await.get(table) {
+            return c.clone();
+        }
+        let cols = catalog
+            .get_table(table)
+            .await
+            .ok()
+            .flatten()
+            .map(|m| m.partition_cols.clone())
+            .unwrap_or_default();
+        self.inner
+            .write()
+            .await
+            .insert(table.to_string(), cols.clone());
+        cols
+    }
+}
+
 /// Schema 判定 + OCC 演进循环（详细设计 §5.2 伪码的 `loop { ... }`）。
 /// 返回本次写入应使用的 schema_version；成功时缓存已同步到最新。
 ///

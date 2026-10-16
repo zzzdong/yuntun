@@ -29,7 +29,7 @@ use yuntun_store::ShardId;
 use yuntun_wal::writer::WalWriter;
 use uuid::Uuid;
 
-use crate::accumulator::{extract_event_time_ms, now_ms};
+use crate::accumulator::now_ms;
 use crate::flush::{flush_chunk_with_id, recommit_into_catalog, FlushDeps, LiveBatchTracker};
 use crate::schema_cache::{resolve_schema_version, SchemaCache};
 use crate::source::{IngestBatch, IngestSource, Receipt};
@@ -136,6 +136,8 @@ pub struct Ingestor {
     pub store: Arc<dyn object_store::ObjectStore>,
     pub tracker: Arc<LiveBatchTracker>,
     pub schema_cache: Arc<SchemaCache>,
+    /// 表 → 声明的分区键（§189/U1）：写路径算窗口归属用，只在 DDL 时变 ⇒ 缓存。
+    pub partition_cache: Arc<crate::schema_cache::PartitionCache>,
     /// chunk 层：写入侧热缓冲 + 读侧热数据视图 + 内存背压（架构 §2）。
     /// 与查询侧共享同一实例（读己之写）；分离部署时查询侧改注入 `RemoteShard`。
     pub chunks: Arc<ChunkStore>,
@@ -232,6 +234,7 @@ impl Ingestor {
             store,
             tracker: Arc::new(LiveBatchTracker::new()),
             schema_cache: Arc::new(SchemaCache::default()),
+            partition_cache: Arc::new(crate::schema_cache::PartitionCache::default()),
             chunks,
             replay_skip: Mutex::new(Vec::new()),
             force_flush_tx,
@@ -379,7 +382,13 @@ impl Ingestor {
         .await?;
 
         // ⑤ 写 WAL（组提交 fsync）—— await 完成 = 已 fsync = 数据已持久化
-        let event_time = extract_event_time_ms(&b.record_batch);
+        //
+        // 事件时间来自**表声明的分区键**（`WITH (partition_by=…)`，§189/U1）；
+        // 没声明才回退到列名 `event_time`。多刻度（s/ms/µs/ns/date）换算见
+        // `model::meta::partition_time_ms` —— 老实现只认 Int64(ms)/Timestamp(ms)，
+        // 于是 SQL 建的 `TIMESTAMP`（= ns）列**永远拿不到**，窗口只能退回到达时间。
+        let declared = self.partition_cache.get(&self.catalog, &table).await;
+        let event_time = yuntun_model::meta::partition_time_ms(&b.record_batch, &declared);
         let received_ms = b
             .received_at
             .duration_since(std::time::UNIX_EPOCH)

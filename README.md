@@ -105,7 +105,7 @@ SQL 支持面（详见 `docs/OVERVIEW.md` §4；多协议接入设计在 `docs/a
 |---|---|
 | 查询 | `SELECT`（含 CTE / 聚合 / `information_schema.*`）、`EXPLAIN [ANALYZE] <查询>`（DataFusion 原生计划：`logical_plan` / `physical_plan` 两列），非限定表名 `FROM t` 直接可用 |
 | 写入 | `INSERT ... VALUES` / `INSERT ... SELECT` / `TRUNCATE TABLE`（= 无 `WHERE` 全表删：文件级下线，表定义保留，`§184`） |
-| DDL | `CREATE TABLE`（`IF NOT EXISTS` / `NOT NULL` / `CREATE TABLE new LIKE old`（拷 schema 不拷数据，`§184`）；类型：`TINYINT/SMALLINT/INT/BIGINT`（含无符号）、`FLOAT/DOUBLE`、`BOOLEAN`、`DATE`、`DATETIME/TIMESTAMP`、`DECIMAL(p,s)`、`CHAR/VARCHAR(n)/TEXT/STRING`、`JSON/JSONB`（→ UTF8 文本存储）、`BINARY/VARBINARY/BLOB`（`x'DEADBEEF'` hex 字面量落**原始字节**；MySQL wire 轨读回按 **HEX 文本**回传 —— opensrv 0.7.0 把结果集 charset 写死成 utf8，原样发二进制会搞崩客户端，`§186`；Flight 轨是 Arrow 原生二进制。`length()`/`octet_length()` 只收字符串 ⇒ 二进制字节长度用 `length(encode(b,'hex'))/2`）、`ARRAY<T>`、`MAP(K,V)`（嵌套元素递归支持，Parquet round-trip 无损；`T[]` 方括号形态仅 Flight/Generic 轨可解析，MySQL 轨请写 `ARRAY<T>`）/ `DROP TABLE`（`IF EXISTS`）/ `CREATE DATABASE` / `DROP DATABASE`（均 WAL 权威，重启可恢复；非空库删除报 1008）；**`ALTER TABLE ADD/DROP COLUMN`**（含 `IF [NOT] EXISTS`；OCC 演进、走 raft，旧文件缺列按 null 对齐 —— 改类型 / 可空性 / 重命名**明确拒绝**） |
+| DDL | `CREATE TABLE`（`IF NOT EXISTS` / `NOT NULL` / `CREATE TABLE new LIKE old`（拷 schema 不拷数据，`§184`）；类型：`TINYINT/SMALLINT/INT/BIGINT`（含无符号）、`FLOAT/DOUBLE`、`BOOLEAN`、`DATE`、`DATETIME/TIMESTAMP`、`DECIMAL(p,s)`、`CHAR/VARCHAR(n)/TEXT/STRING`、`JSON/JSONB`（→ UTF8 文本存储）、`BINARY/VARBINARY/BLOB`（`x'DEADBEEF'` hex 字面量落**原始字节**；MySQL wire 轨读回按 **HEX 文本**回传 —— opensrv 0.7.0 把结果集 charset 写死成 utf8，原样发二进制会搞崩客户端，`§186`；Flight 轨是 Arrow 原生二进制。`length()`/`octet_length()` 只收字符串 ⇒ 二进制字节长度用 `length(encode(b,'hex'))/2`）、`ARRAY<T>`、`MAP(K,V)`（嵌套元素递归支持，Parquet round-trip 无损；`T[]` 方括号形态仅 Flight/Generic 轨可解析，MySQL 轨请写 `ARRAY<T>`）；**表选项 `WITH (partition_by = 'ts')`** = 声明事件时间/分区键（`§189`）/ `DROP TABLE`（`IF EXISTS`）/ `CREATE DATABASE` / `DROP DATABASE`（均 WAL 权威，重启可恢复；非空库删除报 1008）；**`ALTER TABLE ADD/DROP COLUMN`**（`ADD [COLUMN] IF NOT EXISTS` / `DROP [COLUMN] IF EXISTS` 均可（前者是 MariaDB/PG 语法，MySQL 轨经**方言回退**接受，`§189`）；OCC 演进、走 raft，旧文件缺列按 null 对齐 —— 改类型 / 可空性 / 重命名**明确拒绝**） |
 | 元数据 | `SHOW TABLES/FULL TABLES`、`SHOW COLUMNS/FULL COLUMNS`、`DESCRIBE`、`SHOW CREATE TABLE`、`SHOW DATABASES`、`SHOW VARIABLES`、`SHOW COLLATION/CHARSET/ENGINES/KEYS` |
 | 方言兼容 | `SET` / `USE` / `BEGIN` / `COMMIT` / `ROLLBACK` = no-op（单语句自动提交） |
 | 不支持 | `UPDATE` / `DELETE` / `ALTER TABLE` 的**改类型·可空性·重命名** / `CREATE TABLE AS SELECT` / `CREATE OR REPLACE` / 复杂类型（`STRUCT` 等）/ `_BINARY` 字面量 / MySQL JSON 路径操作符 `->` `->>`（用 JSON 函数替代）/ 视图 / 存储过程 / 事务语义 → 明确报错（绝不静默返回错误结果）；加列除 SQL `ALTER TABLE ADD COLUMN` 外，也走写入侧 schema 演化（ingest / Flight DoPut） |
@@ -169,6 +169,23 @@ java -cp "$JAR:scripts" dbeaver_jdbc_probe
   （UAF #66/#67、OK 包合规 #75/#78 等）仅存在于 git。0.1 以 sqlwire 的
   `PacketFramedReader`（按包边界分帧）规避 UAF；后续建议把依赖切到上游 git 固定 rev，
   届时可移除该适配器（`vendor/opensrv-mysql/` 仅为分析用拷贝，未接入构建）。
+
+### 分区键（事件时间列 / 时间分片）
+
+列存的收益来自"跳过数据"。yuntun 的窗口归属（`dt=<window>` 目录）、文件级 min/max 剪枝、
+行组级 `.idx`（zone map + XOR）三处**共用同一个列集** —— 它就是**分区键**：
+
+```sql
+CREATE TABLE logs (ts TIMESTAMP, level TEXT, msg TEXT) WITH (partition_by = 'ts');
+```
+
+- 声明后：`dt=` 目录按**数据时间**对齐（不是到达时间）、文件带 `ts` 的 min/max（查询可整文件跳过）、
+  并生成 `.idx`（Parquet 可再跳行组）；
+- **未声明** ⇒ 回退到"列名恰为 `event_time`"；对不上就**三处全关**（不报错 —— 静默劣化，
+  所以生产表请显式声明）；
+- 列名写错 / 键名写错 ⇒ **建表即报错**（点名缺哪个列），不会静默建成一张剪不了的表。
+
+> 时间刻度支持 `TIMESTAMP`（ns）/ µs / ms / s 与 `BIGINT`（毫秒）、`DATE`。
 
 ### 多 schema（MySQL 的 database）
 

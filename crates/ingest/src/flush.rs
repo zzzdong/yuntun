@@ -194,7 +194,18 @@ pub async fn flush_chunk_with_id(
     //   此时 manifest 的 `index_path` 留空 = 如实声明"该文件没有索引"（读侧退回全读）；
     // * **列集**：与 manifest 的 `stats` **同一个来源**（`default_sort_columns`）——
     //   索引只给排序列做（`plan.md` F.4 的决定），不另设一套列清单。
-    let sort_cols = yuntun_model::meta::default_sort_columns(&merged.schema());
+    // 排序列 = **表声明的分区键**（§189/U1），回退 `event_time`。
+    // 老实现只认 `event_time` 这个硬编码名字 ⇒ 其它名字的时间列（ts/time/…）写出来的
+    // 文件**没有 stats 也没有 .idx**，查询侧两套剪枝一次都没生效过（且不报错）。
+    let declared = deps
+        .catalog
+        .get_table(&input.shard.table)
+        .await
+        .ok()
+        .flatten()
+        .map(|m| m.partition_cols)
+        .unwrap_or_default();
+    let sort_cols = yuntun_model::meta::sort_columns_for(&merged.schema(), &declared);
     let (index_path, index_size) = match write_index(deps, &file_path, &merged, &sort_cols).await {
         Ok(x) => x,
         Err(e) => {

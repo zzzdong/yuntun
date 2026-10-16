@@ -737,6 +737,9 @@ impl SqlEngine {
                             name: sql::table_name_of(&ct.name),
                             schema: meta.schema().map_err(SqlError::from_lake)?,
                             if_not_exists: ct.if_not_exists,
+                            // LIKE 拷的是**表定义**：分区键属于定义，不拷就会让副本
+                            // 悄悄丢掉"哪列是事件时间"（`§185` + `§189/U1`）
+                            partition_cols: meta.partition_cols.clone(),
                         }
                     }
                     _ => sql::parse_create_table(&ct).map_err(SqlError::from_lake)?,
@@ -761,7 +764,10 @@ impl SqlEngine {
                     name: bare.to_string(),
                     namespace: ns.to_string(),
                     schema: parsed.schema.clone(),
-                    partition_cols: vec![],
+                    // 分区键（`§189/U1`）：`WITH (partition_by = 'ts')` 声明的事件时间列。
+                    // 下游的窗口归属 / 文件级 stats / 行组级 .idx 全靠它 —— 没它就退化成
+                    // "列名恰为 event_time"（老行为，且对绝大多数表 = 剪枝全关）。
+                    partition_cols: parsed.partition_cols.clone(),
                     default_format: default_format.clone(),
                     ingest_config: yuntun_model::meta::IngestConfig::standard(),
                 };

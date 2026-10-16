@@ -1,6 +1,6 @@
 # yuntun 实施操作日志（§169 起）
 
-> 起记时间：2026-10-11（最新：**§188，2026-10-16**）。对应分支：main。
+> 起记时间：2026-10-11（最新：**§189，2026-10-17**）。对应分支：main。
 >
 > **这是什么**：从今天起，**每一刀**（一次成体系的改造）在这里留一节 —— 写清"做了什么、
 > 为什么这么做、边界在哪（**没做什么**）、怎么验的"。它是本项目的**证据出处**：
@@ -1255,3 +1255,79 @@ ingestor/WAL 的命令通道，函数结束时一丢，客户端拿到的是
 
 `yuntun-client --test cli_e2e` 1/1；`yuntun-sql` 全绿（38 + 2 + 1）；
 MSRV 1.95 全 workspace check EXIT=0；全量与 clippy 见提交信息。
+
+---
+
+## 189. **U1 分区键可声明 + U2 加列方言回退**（2026-10-17）
+
+### 189.0 来源：用户的 5 项要求 + 先核实再排序
+
+用户提了 5 项（鉴权 / 查询管理 / EXPLAIN / DDL 增删列 / 分片分区键），并要求
+"先做计划与优先级分析"。核实结论（全部**实测**，不是读代码猜的）：
+
+| 项 | 结论 |
+|---|---|
+| EXPLAIN | ✅ `§185` 已落地（连 `EXPLAIN ANALYZE` 都通） |
+| DDL 增删列 | ✅ 早已落地；**缺口一处**：`ADD COLUMN IF NOT EXISTS` 在 MySQL 轨被解析器挡住 |
+| 分片/分区键 | ⚠️ 字面有一半（`dt=<window>/shard=<shard>`），但机制**对绝大多数表是关的** |
+| 鉴权 | ❌ trust-only；opensrv 有 `authenticate` 钩子可做（且其默认 salt 是固定值，需覆盖） |
+| 查询管理 | ❌ `SHOW PROCESSLIST`/`KILL QUERY` 都报 1149；全仓无并发闸门 |
+
+⇒ 排序（写进 `ROADMAP §5.2`）：**U1 分区键（P0）> U2 加列缺口（P0）> U3 鉴权（P1）
+> U4 查询管理（P1）> U5 冷读预算（P2）**。
+
+### 189.1 U1 的发现过程：两套剪枝机制一直没生效
+
+普查时起两张表——列名 `event_time` 与列名 `ts`，其余全同。flush 之后：
+
+```text
+public/t_et/dt=1970-01-01T00:00/.../01a145cb-....idx     ← 有索引
+public/t_et/dt=1970-01-01T00:00/.../01a145cb-....vortex
+public/t_ts/dt=2026-10-16T17:37/.../01a145cb-....vortex   ← 无索引，dt = 到达时间
+```
+
+往上追：`default_sort_columns()` **只认列名 `event_time`**（`extract_event_time_ms`
+同样）。于是除了恰好叫 `event_time` 的表，其它表：
+
+* `stats` 为空 ⇒ 查询侧**文件级 min/max 剪枝**（`§129` 那套）不生效；
+* 不写 `.idx` ⇒ **行组级 zone map + XOR**（F.4 那套）不生效；
+* 窗口退化为**到达时间** ⇒ `dt=` 目录失去数据时间语义。
+
+三件事**都不报错** —— 静默劣化。更狠的一层：SQL 的 `TIMESTAMP` 列一律是
+`Timestamp(ns)`，而提取只认 `Int64(ms)`/`Timestamp(ms)` ⇒ **即便叫 `event_time`，
+用 SQL 建表也享受不到**。
+
+### 189.2 U1 的改动
+
+| 层 | 内容 |
+|---|---|
+| `sql` | `CREATE TABLE … WITH (partition_by = 'ts')` → `ParsedCreateTable.partition_cols`；列不存在 / 键名不认识 / 重复 ⇒ **建表即报错**（点名现有列） |
+| `sql` | `CREATE TABLE … LIKE`（`§185`）一并**拷贝分区键**（它属于表定义） |
+| `model` | `sort_columns_for(schema, declared)`（声明优先，丢弃已被删掉的列，回退 `event_time`）；`partition_time_ms(batch, declared)`（多刻度 s/ms/µs/ns/date + `BIGINT` 毫秒 + `DATE`） |
+| `ingest` | 写路径窗口归属改用它（`PartitionCache`：只在 DDL 时变，故缓存）；flush 的 `stats` 与 `.idx` 改用它（**同一个列集** —— 否则会出现"文件级剪一半、组级剪另一半"） |
+
+载体用的是**早已存在且贯穿 proto/catalog 的 `TableMeta.partition_cols`**
+（此前所有建表都传 `vec![]`）⇒ 不需要动 schema 格式或快照格式。
+
+### 189.3 U2：`ADD COLUMN IF NOT EXISTS` 是**方言**问题，不是 DDL 问题
+
+`MySqlDialect` 不认它（MySQL 确实没这个语法，MariaDB/PG 才有），而 DDL 层
+`parse_alter_table` 早就支持 `if_not_exists`。修法：`parse_single_with` 加
+**方言回退** —— 会话方言不认就再用 Generic 试一次，两者都不认才报**会话方言**那条错
+（对客户端更有意义）。**回退不是兜底接受**：`ADD COLUMN IF EXISTS x INT`
+（两种方言都不认）实测仍被拒。
+
+### 189.4 判据
+
+- `ingest/tests/partition_key_e2e.rs`：**同表对拍**（同 schema、同数据、同一时刻写入，
+  唯一变量 = 有没有声明）⇒ 声明侧 `time_window == 数据时间` + `stats` 含 `ts` +
+  `.idx` 非空；未声明侧窗口 ≠ 数据时间、无 `.idx`（**反证**：否则①没有鉴别力）；
+- `sql`：`partition_by_option_is_parsed_and_validated`（4 种形态 + 2 种拒绝）、
+  `mysql_dialect_falls_back_to_generic_for_extended_ddl`（含"回退不等于兜底"）；
+- 真实例：`WITH (partition_by='ts')` 的表 `dt=2026-05-01T10:00`（数据时间）+ 生成 `.idx`。
+
+### 189.5 边界
+
+- `WITH (...)` 目前**只接受** `partition_by` 一个键（其余键明确报错，不给"以后再说"留口子）；
+- 分区键只驱动**窗口归属 + stats + idx**，不做 `PARTITION BY` 的目录枚举（sqlparser 不解析该语法）；
+- U3（鉴权）/ U4（查询管理）/ U5（冷读预算）未动，见 `ROADMAP §5.2`。

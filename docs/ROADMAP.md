@@ -92,7 +92,7 @@
 | **D-24** | **"计划/改造指南"里的状态列大面积过期**（`plan.md §5.1` 的 B/C/D 三组写"未开始"而 §7 全 ✅；`refactor.md` 的 S3–S6 写"未开始"；参数表把 `spread` 默认写成 5s） | `§168`（同类漂移第四次：`D-15`/`D-17`/`D-19`/`D-24`） | ✅ **本轮根治形态**：不再"回填旧表"，而是**归档重建**（`§170`）+ 保留可机核判据 + 每几刀审一次本文件 §5 的状态列 |
 | **D-25** | **`purge_table_files` 之后不重算任务目录** ⇒ 残留一条指向空分片的待办（每轮白抢一次租约；"待办消失不了"是 `§169` 明确要避免的形态） | 本轮审计（`§169` 的 `refresh_task` 挂在 commit/revoke/apply 上，`purge` 漏了；`protects_at` 语义已确认会让这些文件不再计数） | ✅ **已闭环（`§172`）**：`purge_table_files` 末尾按受影响 `(table, shard)` 重算；用例 `purge_drops_the_task_of_every_touched_shard`（反证：注掉重算 ⇒ 红，报出残留 `files=2` 的待办）；**远端形态**另有用例 `remote_task_directory_follows_purge` |
 
-### 4.0 新开并已闭环（`§172` / `§184`–`§187`）
+### 4.0 新开并已闭环（`§172` / `§184`–`§189`）
 
 | # | 偏差 / 缺口 | 现状（证据） | 决定 / 下一步 |
 |---|---|---|---|
@@ -104,6 +104,8 @@
 | **D-37** | **raft 选举竞态型 flaky**：`wait_some_leader` 抓到**瞬时** leader 后接 `wait_leader_agreement(leader)`，两次调用之间发生二次选举 ⇒ 等一个已经不是 leader 的 id 达成一致，30s 后红（全量首跑实测抓到一次：`leader=1` 而实际 `term 2 / leader 2`；第二轮全绿 ⇒ 竞态而非回归） | `crates/meta/tests/multi_node_grpc_e2e.rs`（3 处同形态） | ✅ **已闭环（`§184`）**：初始选主统一改 `wait_settled_leader`（**等一致**而不是"抓一个再等它一致"）；这正是该文件 §104 注释自己踩过的坑（愈合用例里已用 `wait_settled_leader`，初始选主漏了） |
 | **D-38** | **两处文档漂移（同类第四次，`D-15`/`D-17`/`D-19`/`D-24` 之后）**：① README §4 写着 `chaos::crash_recovery_no_data_loss` "偶发失败……断言的固定等待后续改轮询" —— 实际 `wait_hot_drained` 轮询早已落地（`§171` 同轮），且本轮两次全量（112 段）全绿；② OVERVIEW §6.1 写 chaos 恢复上界"已放宽到 60s"，代码是 **120s**（`wait_hot_drained` 注释写明理由：满负载并行时 flush 撞对象存储 IO 竞争 + `note_flush_failure` 退避最多 30s/次，60s 不够） | `README.md §4` / `docs/OVERVIEW.md §6.1` vs `crates/chaos/src/lib.rs:795` | ✅ **已闭环（`§185`）**：删掉 README 的过期 bullet（chaos 稳定性现状并进 §6.1 的口径）；OVERVIEW 的 60s 改 120s 并补一句理由。教训仍旧：**"已知限制"区是最容易过期的地方** —— 每条要么指向一个活着的判据，要么删 |
 | **D-39** | **Binary 数据在 MySQL wire 上会把连接搞崩**：opensrv-mysql 0.7.0 把结果集**每一列**的 charset 硬编码成 utf8_general_ci（`writers.rs` 写死），客户端按 UTF-8 解 BLOB 的原始字节 ⇒ `SELECT sha256('x')` 让 pymysql 抛 UnicodeDecodeError **并错乱后续协议帧**（连接直接死）；连带 `x'DEADBEEF'` hex 字面量被当**文本**存（`length = 8` 而不是 4，静默改数据） | `§186` 表达式普查实测（sha256/连接死 + hex 字面量） | ✅ **已闭环（`§186`）**：① Binary 结果列按 **HEX 文本**回传（`encode.rs: hex_upper`，MySQL `HEX()` 约定，信息不丢、任何客户端都解得动；Flight 轨 Arrow 原生不受影响）；② 新增 `Literal::Bytes` + `decode_hex_literal`，hex 字面量落原始字节（非法 hex 明确拒绝）。**已知限制**：`length()`/`octet_length()` 只收字符串（DataFusion 语义）⇒ 二进制字节长度走 `length(encode(b,'hex'))/2`；`sha512('x')` **字面量**触发 DataFusion 常量折叠的上游 bug（列路径正常，报错明确不崩） |
+| **D-41** | **`ALTER TABLE ADD COLUMN IF NOT EXISTS` 在 MySQL 轨被解析器挡住**：README §2.1 写着"含 `IF [NOT] EXISTS`"，而 `MySqlDialect` **不认**这条（MariaDB/PG 才有该语法）⇒ MySQL 客户端发过去直接报 `found: EXISTS`；DDL 层其实早已支持（`parse_alter_table` 的 `if_not_exists`） | `§189` 实测：MySQL 轨 `ADD COLUMN IF NOT EXISTS` → 1149；Generic/PG 轨 OK | ✅ **已闭环（`§189/U2`）**：`parse_single_with` 加**方言回退**（会话方言不认 ⇒ 用 Generic 再试一次）。回退是**超集**而非兜底：两者都不认仍报会话方言那条错；`ADD COLUMN IF EXISTS x INT` 实测仍被拒 |
+| **D-42** | **分区键/排序列被硬编码成列名 `event_time`**：`extract_event_time_ms`（窗口归属）+ `default_sort_columns`（stats + `.idx`）只认这一个名字 ⇒ 时间列叫 `ts`/`time`/`created_at` 的表：**窗口退化为到达时间、`stats` 为空、不写 `.idx`**，文件级与行组级两套剪枝**一次都没生效过**且不报错。叠加：SQL 的 `TIMESTAMP` 列一律 `Timestamp(ns)`，而提取只认 `Int64(ms)`/`Timestamp(ms)` ⇒ 即便列名叫 `event_time` 也享受不到 | `§189` 实测：`event_time` 表 flush 出 `.idx`、`ts` 表没有；`dt=` 分别为数据时间 / 到达时间 | ✅ **已闭环（`§189/U1`）**：`CREATE TABLE … WITH (partition_by='ts')` 声明（列名/键名写错**建表即报错**），存进**已有的 `TableMeta.partition_cols`**（贯穿 proto/catalog）；`model::meta::sort_columns_for`（声明优先，回退 `event_time`，丢掉已删列）+ `partition_time_ms`（多刻度 s/ms/µs/ns/date）；ingest 的窗口归属与 flush 的 stats/idx 共用它；`CREATE TABLE … LIKE` 一并拷贝。判据：同表对拍 e2e（声明 vs 未声明） |
 | **D-40** | **chaos 水位用例的视图/WAL 竞态**（`§171` 同族第五次）：断言"WAL 恢复全终态"在**视图**空之后立即读 WAL —— monitor 的 abort 是先改视图再异步写 WAL ⇒ 全量并行（真实磁盘 IO 竞争）时最后一条 `BatchAbort` 未落盘，读到 Pending（第三轮全量实测翻车一次；前两轮绿 ⇒ 竞态非回归） | `crates/chaos/src/lib.rs` 水位用例断言 ③ | ✅ **已闭环（`§187`）**：改成轮询到 **WAL 恢复也全终态**（`wait_until` 既有 60s 兜底）再复核。**没有放宽任何正确性断言** —— 修的是"看得太早"；chaos 段 17/17（3.05s） |
 | **D-29** | **`apply_update` 与 `drop_shard` 之后不重算任务目录**（与 `D-25` 同族）：UPDATE 既**加新文件**又**改 DV**、`drop_shard` 让**整个分片下线** ⇒ 待办该出现/该消失而没变 | 本刀动手前的接线审计（`refresh_task` 的调用点少了这两个入口；`ARCHITECTURE.md §6` 现在把**入口清单**写出来了） | ✅ **已闭环（`§172`）**：两个入口都补上重算（时钟用 op 携带的 `now`/`now_secs`）；用例 `update_recomputes_the_task` / `drop_shard_drops_the_task`；不变量 **I8** 扩写为"任何改文件或 DV 的入口都要重算" |
 | **D-30** | **`yuntun-datanode --meta` 只接一个 contact point** ⇒ 那一台**不是 leader** 时，这个数据节点的**所有写都失败**（协议其实带了 leader hint，但重试只能在**已知地址集合**里换） | `tests/datanode_cluster.sh smoke` 实测失败在 ③：`code: 'Internal error', message: "非 leader（可重试）：not leader (leader hint 2)"`（根因：`RemoteCatalog::connect(vec![addr])` 只有一个 client；`§167` 那次跑通只是**恰巧** leader 是 mn1） | ✅ **已闭环（`§172`）**：`--meta` 改成**逗号分隔的种子列表**（compose 给全三台）+ 帮助文本写明；rig 复跑 EXIT=0。**未做**：跟随 leader hint（需要 id→地址映射），留在 172.3 的边界里 |
@@ -189,7 +191,42 @@
 | **S7** | **一键验收**：`scripts/standalone_smoke.py`（MySQL wire 11 项 + Flight SQL 2 项）入仓，读己之写用轮询不赌时序 | 对新实例 EXIT=0；进 README §5 表 | ✅ `§184` |
 | **S8** | **文档对齐**：README JSON 路径示例改分步参数（`D-34`）、`tests/README.md` 补内容、`OVERVIEW.md` 规模行/能力矩阵同步 | `docs_consistency` 全绿 | ✅ `§184` |
 
+### 5.2 U 组（用户能力组，2026-10-17 立）：单机作为"完整简易列数据库"的补强
+
+> 来源：用户提出的 5 项（鉴权 / 查询管理 / EXPLAIN / DDL 增删列 / 分片分区键）
+> + 据此做的现状核实。**先核实再排序**：其中 2 项已落地，1 项的真实价值与字面不同。
+
+#### 5.2.0 现状核实（`§189` 的实测证据，不是凭印象）
+
+| 用户提的项 | 实测结论 |
+|---|---|
+| ③ EXPLAIN | ✅ **已落地（`§185`）**，连 `EXPLAIN ANALYZE` 都通（转发 DataFusion 原生计划）。只拒绝 `FORMAT/OPTIONS` 后缀 |
+| ④ DDL 增删列 | ✅ **早已落地**（`ALTER TABLE ADD/DROP COLUMN`，OCC + raft + WAL 重放）。⚠️ **缺口一处**：`ADD COLUMN IF NOT EXISTS` **解析失败**，而 README §2.1 写着"含 `IF [NOT] EXISTS`" ⇒ 文档漂移 |
+| ⑤ 分片/分区键 | ⚠️ **字面已有一半（路径里有 `dt=<window>/shard=<shard>`），但机制对绝大多数表是关的**：时间语义**硬编码在列名 `event_time`** 上 —— `extract_event_time_ms`（窗口归属）、`default_sort_columns`（stats + `.idx`）**只认这一个名字**。实测：列名 `event_time` 的表 flush 出 `.idx`；列名 `ts` 的表 **没有 `.idx`、stats 为空 ⇒ 文件级 min/max 剪枝与行组级 zone map 全部静默失效**（`§129`/F.4 那两套机制一次都没生效过） |
+| ① 鉴权 | ❌ trust-only。opensrv **有** `authenticate` 钩子（`MysqlShim` 的方法）+ `mysql_native_password` 默认插件 ⇒ 可做；但其默认 `salt()` 是**固定字符串**（重放风险）⇒ 必须覆盖成随机 |
+| ② 查询管理 | ❌ 全无：`SHOW PROCESSLIST` / `KILL QUERY` 都报 1149；全仓**没有**并发闸门（无 `Semaphore`/`max_concurrent`） |
+
+#### 5.2.1 优先级（价值 ÷ 成本 ÷ 风险）
+
+| # | 事项 | 优先级 | 为什么是这个位置 |
+|---|---|---|---|
+| **U1** | **分区键/排序列可声明**（第 ⑤ 项的实质） | **P0** | 它是"列数据库"核心收益（跳过多少数据）的开关。今天两套剪枝机制**写好了却对 99% 的表不生效**，且不报错 —— 这正是本项目最忌的失败形态。语法 `CREATE TABLE … WITH (partition_by='ts')` 已被 sqlparser 解析成 `CreateTableOptions::With`（实测），载体用**已存在且贯穿 proto/catalog 的 `partition_cols`**（`§189`） |
+| **U2** | `ALTER TABLE ADD COLUMN IF NOT EXISTS` | **P0** | 半天成本，修的是**文档与实现不符**（本项目四次栽在这类漂移上）；且它是 DDL 幂等脚本的常用形态 |
+| **U3** | **登录鉴权**（第 ① 项） | **P1** | 出局域网部署的**硬前提**，但价值只在部署时兑现；风险在中（多协议一致、口令存储、随机 salt）。默认仍 trust ⇒ 不破坏既有部署 |
+| **U4** | **查询管理**（第 ② 项） | **P1** | 可观测 + 防过载；成本中（注册表 + 取消 + 闸门），风险低 |
+| **U5** | 冷读预算（`D-20`） | **P2** | 与 U1 同源（vortex 整文件解码 ⇒ 单文件内存/IO 无上界）；先量数再定方案（ROADMAP §4 的 D-20 原文就是"先量"） |
+
+**我另行建议的改进**（基于现状，价值高于上面部分项）：
+
+- **A = U1**（分区键）：如上，最高。
+- **B = U5**（冷读预算）：standalone 的稳定性硬伤 —— 一个大表全表扫没有上界。
+- **C 时间刻度**：SQL `TIMESTAMP` 一律落 `Timestamp(ns)`，而窗口提取只认 `Int64(ms)` / `Timestamp(ms)` ⇒ **即使用 `event_time TIMESTAMP` 也享受不到窗口与剪枝**。并入 U1 一并修（多刻度）。
+- **不做**：`CREATE USER` / 权限矩阵（`GRANT`）⇒ 用户表走配置（`[sql.mysql].users`，字段已在），不做用户 DDL（简易库的合理边界，写进"不做"）。
+
 ### 5.1 不做（明确写下，避免走回头路）
+
+- ❌ `CREATE USER` / `GRANT` 权限矩阵（U3 只做**登录鉴权**：配置里的账号 + 口令校验，不做授权粒度）；
+- ❌ `PARTITION BY` 语法（sqlparser 不解析 → 用 `WITH (partition_by=…)`）；
 
 - ❌ shard 路由 / 归属迁移 / rebalance；❌ chunk 信息进 raft；❌ 心跳走 raft；
 - ❌ spill 参与权威判定；❌ 独立 ingestor / queryd 进程（需要时用 `yuntun-datanode --no-ingest`）；
