@@ -1,6 +1,6 @@
 # yuntun 实施操作日志（§169 起）
 
-> 起记时间：2026-10-11（最新：**§187，2026-10-16**）。对应分支：main。
+> 起记时间：2026-10-11（最新：**§188，2026-10-16**）。对应分支：main。
 >
 > **这是什么**：从今天起，**每一刀**（一次成体系的改造）在这里留一节 —— 写清"做了什么、
 > 为什么这么做、边界在哪（**没做什么**）、怎么验的"。它是本项目的**证据出处**：
@@ -1206,3 +1206,52 @@ charset 硬编码成 `UTF8_GENERAL_CI`（上游没给 Column 留 charset 字段�
 ### 187.3 验证
 
 `yuntun-chaos --lib` **17/17**（3.05s）；`disk_watermark` 单跑连跑 3 轮 3/3。
+
+---
+
+## 188. **CLI 进程级 e2e + MSRV 1.95 真编译验证**（2026-10-16）
+
+### 188.0 两个"声明了没验"的收口
+
+`§184` 起把 standalone 的 SQL/协议面补齐之后，剩下两笔**证据欠账**：
+
+1. **`yuntun-cli` 只有解析层用例**：`cli.rs` 测 help/用法错（不需要服务端），
+   `client_e2e.rs` 测 SDK（不经过 shell）—— 而用户真正用的路是"shell 里敲
+   `yuntun-cli`"，此前只有手工冒烟。`README §1` 拿 CLI 当最小闭环之一，
+   这条路上一个用例都没有。
+2. **MSRV 1.95 只声明未验证**（`Cargo.toml` 注释原话："本机镜像装不到 1.94，
+   故尚未真验证"）：`vortex 0.86` 把下界顶到 1.95，而"声明了没验"正是本项目
+   纪律里最防的那类（`D-*` 台账里四次栽在同处）。
+
+### 188.1 CLI e2e：子进程 + 真服务
+
+`client/tests/cli_e2e.rs`：起 in-process Flight 服务（`[store] memory` +
+tmpfs WAL），然后**全部走子进程**跑 `yuntun-cli` —— exit code、stdout/stderr
+分流、`--format` 输出形状都是 CLI 契约：
+
+DDL（打印 `OK`）→ CSV 导入（回执 `inserted 3 rows`，行数取自回执而非输入）→
+聚合查询轮询到可见（读己之写，不赌时序）→ 三种 `--format`（table/csv/json）→
+`tables` / `schema` → 不存在的表退 1 且 stderr 有错。
+
+踩到并写进注释的一个坑：**夹具必须把 `Lakehouse` 交出去保活** —— 它持有
+ingestor/WAL 的命令通道，函数结束时一丢，客户端拿到的是
+"命令通道断开"（Internal error）而不是连不上（`client_e2e.rs` 早就是这么做的，
+本文件第一次跑栽在这）。
+
+### 188.2 MSRV 1.95：真装真编
+
+`rustup install 1.95.0`（官方 dist server； tuna 镜像上没有 1.95.0）+
+`rustup run 1.95.0 cargo check --workspace --all-targets`：
+
+**EXIT=0，0 error，0 warning**（首轮 2m01s；复验 2.22s）。
+
+过程中修掉一条自己引入的 `unused_parens`（`let (Statement::Insert(ins)) = &bad`，
+`§186` 的 hex 字面量用例）—— 1.95 的 lint 与本机 1.98 一致，没有版本间差异。
+
+口径同步：`Cargo.toml` 的 MSRV 注释从"尚未真验证"改成"已验证 + 换依赖后复跑"；
+`OVERVIEW §6` 工具链行同步；`ROADMAP N7` 的 MSRV 一项划掉。
+
+### 188.3 验证
+
+`yuntun-client --test cli_e2e` 1/1；`yuntun-sql` 全绿（38 + 2 + 1）；
+MSRV 1.95 全 workspace check EXIT=0；全量与 clippy 见提交信息。

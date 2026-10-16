@@ -1460,7 +1460,7 @@ mod tests {
 
         // 非法 hex：奇数长 / 非 hex 字符 ⇒ 明确错误
         let bad = parse("INSERT INTO t VALUES (x'ABC', 'x')");
-        let (Statement::Insert(ins)) = &bad else { panic!() };
+        let Statement::Insert(ins) = &bad else { panic!() };
         let SetExpr::Values(vals) = ins.source.as_ref().unwrap().body.as_ref() else {
             panic!()
         };
