@@ -28,3 +28,5 @@ arrow-flight = { workspace = true }
 futures = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }
+# `D-36` 判据：向子进程发**真** SIGTERM（`Child::kill` 发的是 SIGKILL，测不到优雅关闭）
+libc = "0.2"

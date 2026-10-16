@@ -213,26 +213,48 @@ pub const MAP_KEY_FIELD_NAME: &str = "key";
 pub const MAP_VALUE_FIELD_NAME: &str = "value";
 
 /// sqlparser DataType → Arrow DataType（MVP 映射表；不支持类型明确拒绝）。
+///
+/// **无符号家族**（`D-33`）：sqlparser 0.62 把 `<INT> UNSIGNED` 解析成**独立变体**
+/// （`IntUnsigned` 等）而不是 `Int(_)` + 标志位 —— 漏接它们 = README 写着"含无符号"
+/// 而 `CREATE TABLE t (a INT UNSIGNED)` 直接 1105。映射口径：
+/// - 整型 → 对应 `UInt8/16/32/64`（`MEDIUMINT UNSIGNED` → `UInt32`：值域到 1677 万，
+///   `UInt16` 装不下，落小类型是**静默截断**）；
+/// - 浮点 `*Unsigned` → `Float64`：无符号浮点只是浮点（没有 `Float64Unsigned` 这种 Arrow 类型，
+///   `DoubleUnsigned` 在 MySQL 里也只影响显示宽度）。
 pub fn map_column_type(dt: &SqlDataType) -> Result<DataType, LakeError> {
     let t = match dt {
         SqlDataType::Boolean => DataType::Boolean,
         SqlDataType::TinyInt(_) => DataType::Int8,
+        SqlDataType::TinyIntUnsigned(_) => DataType::UInt8,
         SqlDataType::SmallInt(_) => DataType::Int16,
+        SqlDataType::SmallIntUnsigned(_) => DataType::UInt16,
+        SqlDataType::MediumInt(_) => DataType::Int32,
+        SqlDataType::MediumIntUnsigned(_) => DataType::UInt32, // 值域超 UInt16，见模块文档
         SqlDataType::Int(_) | SqlDataType::Integer(_) => DataType::Int32,
+        SqlDataType::IntUnsigned(_) | SqlDataType::IntegerUnsigned(_) => DataType::UInt32,
         SqlDataType::BigInt(_) => DataType::Int64,
+        SqlDataType::BigIntUnsigned(_) => DataType::UInt64,
         SqlDataType::Int8(_) => DataType::Int8,
+        SqlDataType::Int8Unsigned(_) => DataType::UInt8,
         SqlDataType::Int16 => DataType::Int16,
         SqlDataType::Int32 => DataType::Int32,
         SqlDataType::Int64 => DataType::Int64,
+        SqlDataType::Int2(_) => DataType::Int16,
+        SqlDataType::Int2Unsigned(_) => DataType::UInt16,
+        SqlDataType::Int4(_) => DataType::Int32,
+        SqlDataType::Int4Unsigned(_) => DataType::UInt32,
         SqlDataType::UInt8 => DataType::UInt8,
         SqlDataType::UInt16 => DataType::UInt16,
         SqlDataType::UInt32 => DataType::UInt32,
         SqlDataType::UInt64 => DataType::UInt64,
         SqlDataType::Real => DataType::Float32,
+        SqlDataType::RealUnsigned => DataType::Float32,
         SqlDataType::Float(_)
         | SqlDataType::Double(_)
         | SqlDataType::DoublePrecision
-        | SqlDataType::DoubleUnsigned(_) => DataType::Float64,
+        | SqlDataType::DoubleUnsigned(_)
+        | SqlDataType::DoublePrecisionUnsigned
+        | SqlDataType::FloatUnsigned(_) => DataType::Float64,
         SqlDataType::Char(_)
         | SqlDataType::Varchar(_)
         | SqlDataType::Text
@@ -1367,6 +1389,35 @@ mod tests {
                 true
             )))
         );
+    }
+
+    /// **`D-33` 的判据**：无符号整数家族可建表（README §2.1 写着"含无符号"）。
+    ///
+    /// 反证：修好之前这五种写法**全部** 1105（sqlparser 0.62 把 `INT UNSIGNED`
+    /// 解析成独立变体 `IntUnsigned`，映射表没接）⇒ 文档声明与实现不符。
+    /// `MEDIUMINT UNSIGNED` 映射 `UInt32` 而不是 `UInt16`：值域 0..16,777,215
+    /// 超过 `UInt16`，落小类型是**静默截断**。
+    #[test]
+    fn create_table_accepts_unsigned_integers() {
+        let cases = [
+            ("a TINYINT UNSIGNED", DataType::UInt8),
+            ("a SMALLINT UNSIGNED", DataType::UInt16),
+            ("a MEDIUMINT UNSIGNED", DataType::UInt32),
+            ("a INT UNSIGNED", DataType::UInt32),
+            ("a INTEGER UNSIGNED", DataType::UInt32),
+            ("a BIGINT UNSIGNED", DataType::UInt64),
+            ("a INT(10) UNSIGNED", DataType::UInt32), // 显示宽度不影响映射
+            ("a INT SIGNED", DataType::Int32),        // SIGNED 照旧
+            ("a DOUBLE UNSIGNED", DataType::Float64), // 无符号浮点只是浮点
+        ];
+        for (col, want) in cases {
+            let p = parse_create_table(&match parse(&format!("CREATE TABLE t ({col})")) {
+                Statement::CreateTable(ct) => ct,
+                other => panic!("{col}: {other}"),
+            })
+            .unwrap_or_else(|e| panic!("{col} 必须可建表：{e}"));
+            assert_eq!(p.schema.field(0).data_type(), &want, "{col}");
+        }
     }
 
     // ---- ALTER TABLE（F.2）----

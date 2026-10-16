@@ -1,6 +1,6 @@
 # yuntun 实施操作日志（§169 起）
 
-> 起记时间：2026-10-11（最新：**§183，2026-10-15**）。对应分支：main。
+> 起记时间：2026-10-11（最新：**§184，2026-10-16**）。对应分支：main。
 >
 > **这是什么**：从今天起，**每一刀**（一次成体系的改造）在这里留一节 —— 写清"做了什么、
 > 为什么这么做、边界在哪（**没做什么**）、怎么验的"。它是本项目的**证据出处**：
@@ -1000,3 +1000,63 @@ schema/列名的批次。于是流程统一成：`本地那一份 → 状态 →
 
 `cold_fold_pruning` 3/3；`yuntun-query` / `yuntun-shardrpc` / `yuntun-model` 全绿
 （含 §176/§177 的 31 条对拍与 §182 的 3 条分配判据）；全量与 clippy 见提交信息。
+
+---
+
+## 184. **S 组：Standalone 完备性收口 —— 单机即一个完整的简易列数据库**（2026-10-16）
+
+### 184.0 缺口是怎么定出来的：先真跑一遍，再对着文档逐条核
+
+`§183` 收在分布式查询上，而"单机交付"这一格从 `§90` 之后就没有被整体验过。
+本轮的做法是**先跑后改**：起真二进制（`yuntun --config`），三条轨各打一遍 ——
+MySQL wire（pymysql）、Flight SQL（ADBC）、CLI（Flight 简易轨）—— 做了一张
+**60+ 条 SQL 面的行为普查**，再把普查结果与 README §2.1 的声明逐条对。
+
+结论分两半：**宣称的能力基本都真**（CRUD/DDL/DML/多 schema/预编译/JSON 函数/
+压缩/恢复/重启持久化全部实测通过）；但**有七处"文档说有、实际没有/不一样"或
+"能跑但关不干净"**——全部登记进 `ROADMAP.md §4.0`（`D-32`…`D-37`）并本轮闭环。
+
+### 184.1 七处缺口与修法（每条都有反证用例）
+
+| # | 缺口 | 修法 | 判据 |
+|---|---|---|---|
+| `D-37` | **raft 选举竞态型 flaky**：`wait_some_leader` 抓瞬时 leader 后接 `wait_leader_agreement`，两次调用间二次选举 ⇒ 等一个已不是 leader 的 id 达成一致，30s 后红（全量首跑实测抓到一次：抓到的 `leader=1`，实际已换 `term 2 / leader 2`；第二轮全绿 ⇒ 竞态非回归） | 三处初始选主统一改 `wait_settled_leader`（**等全体一致**，不是"抓一个再等它一致"）——该文件 §104 的愈合用例早就用的是它，初始选主漏了 | `multi_node_grpc_e2e` 连跑 5 轮 5/5 |
+| `D-32` | **`SHOW TABLES FROM <db>` 忽略限定符**：答的是**当前会话库**的表（连 public 时 `FROM sales` 也列 public 的表）。不报错、只答非所问 ⇒ 最难发现的那类 | `shim::schema_from_options`（取 `show_in.parent_name` 最后一段；无限定回落会话 schema）；两条轨都修（shim 单列 `Tables_in_<限定库>` + dispatch 三列 `table_schema`）。顺带把 `SHOW FULL TABLES` 补成 MySQL 两列（加 `Table_type`） | `sql/tests/show_tables_from.rs` 9 条断言（两库交叉 + 列名 + 不存在库空结果）；反证：注掉限定符提取 ⇒ 红（答出 public 的表） |
+| `D-33` | **无符号整数全被拒**而 README 写着"含无符号"：sqlparser 0.62 把 `INT UNSIGNED` 解析成**独立变体**（`IntUnsigned`），映射表没接 ⇒ 建表即 1105 | 补齐 `*Unsigned` 家族（→ `UInt8/16/32/64`）。两个口径决定：`MEDIUMINT UNSIGNED → UInt32`（值域 1677 万超 `UInt16`，落小类型是**静默截断**）；浮点 `*Unsigned → Float64`（无符号浮点只是浮点） | `create_table_accepts_unsigned_integers` 9 种写法逐一对拍 |
+| `D-35` | **`TRUNCATE TABLE` 不支持**（报 1149）：清表只能 `DELETE FROM t`（无 WHERE 走文件级下线）或 DROP+CREATE，而 TRUNCATE 是客户端/脚本最常用的清空形态 | 复用**同一条数据路径**：抽出 `dml_prologue`（check_write → force_flush → 分片租约）供 DELETE/TRUNCATE 共用，TRUNCATE 直落 `execute_purge`（文件级下线）。**不新造路径**——新造的那条最可能漏的就是 force_flush（"删完在途数据又回来"）。多表/分区/CASCADE/IDENTITY 选项明确拒绝（无分区表与级联概念，静默忽略比拒绝危险） | `server/tests/sql_truncate_e2e.rs` 2 条：语义+保留表定义+形态拒绝+NotFound；**在途数据不复活**（长攒批窗口下 TRUNCATE 后等 4s 不复活） |
+| `D-36` | **standalone 只处理 SIGINT**：systemd / `docker stop` 发 SIGTERM ⇒ 进程**直接死**（WAL 不封口、后台任务不 join、WAL/spill/meta 目录租约不释放 ⇒ 下次启动等锁） | 信号处理改 SIGINT+SIGTERM 双路（`tokio::select!`），收尾流程不变 | `standalone_e2e.rs` 新增：SIGTERM 后 30s 内退出且**退 0**，且**同目录能再起实例**（三处租约都放了——`D-11` 的教训） |
+| `D-34` | **README 的 JSON 路径示例是错的**：写着 `json_get_int(doc, 'a.b')`，而 `datafusion-functions-json` 的路径是**分步参数**（`json_get_int(doc, 'a', 'b')`）⇒ 照文档写嵌套取值恒 NULL（不报错 ⇒ 静默错答案） | 改文档（README §2.1 + 能力表），并补用例把两个事实都钉住：分步参数取得到；点号串是**单个键** `"a.b"`（miss ⇒ NULL，是**现状语义**不是缺陷——防下一位再去"修"一个没错的实现） | `json_nested_path_is_step_arguments_not_dot_string` |
+| — | **`T[]` 数组语法只在高炉 Generic 轨可解析**（MySQL 轨的 MySqlDialect 不开 `supports_array_typedef_with_brackets`） | **决定不改代码**：MySQL 协议本身没有数组类型，`INT[]` 是 DuckDB/PG 写法；为它写 28 个方法的方言委派包装是纯维护负担。改文档口径：`ARRAY<T>` 两轨通用，`T[]` 仅 Flight/Generic 轨 | README §2.1 类型行写明；`ARRAY<INT>` 两轨均有既有用例 |
+
+### 184.2 一键验收：`scripts/standalone_smoke.py`（S7）
+
+把本轮的全部发现固化成**一条命令的冒烟**：MySQL wire 12 项
+（CRUD / 聚合 / 元数据 / DELETE+UPDATE / TRUNCATE / 加列删列 / 无符号类型 /
+多 schema / prepared / 错误码 1146 / 时间类型 / JSON 函数）+ Flight SQL 2 项
+（查询 + `information_schema`），退出码即结论。
+
+三条工程纪律写进脚本（都是本轮踩出来的）：
+1. **读己之写用轮询不赌时序**：可见性上界 = 1 个攒批 scan 周期（文档化行为），
+   写入后立刻查可能差最后一批；
+2. **表名/库名带运行唯一后缀**：上一轮失败的运行会留下"非空 smoke_db"，
+   把下一轮的 `DROP DATABASE IF EXISTS` 打成 1008（本项目设计：非空库不删）——
+   唯一后缀让重复跑幂等；
+3. **pymysql 的 `with conn` 退出即 close**：再调 `conn.close()` 报 "Already closed"
+   （本轮第一个冒烟版本就是这么全红的——**脚本自己的 bug**，不是服务的）。
+
+### 184.3 边界（**没有**做的）
+
+- **没有动任何数据路径**：TRUNCATE 复用 purge、SHOW 修的是元数据分流、
+  类型修的是映射表——写入/查询/压缩/恢复一行未改；
+- **没有造方言委派包装**（`T[]`，见 184.1 最后一行的决定）；
+- **`DROP DATABASE IF EXISTS` 对非空库仍报 1008**：这是 README 载明的设计
+  （MySQL 实际是连表一起删）——口径未动，只把冒烟脚本改成先删表再删库；
+- **raft 选举竞态只修了测试**（`D-37`）：产线多节点 raft 的选主行为未动
+  （那部分有 `§104`/`§111` 的既有结论）。
+
+### 184.4 验证
+
+- `scripts/standalone_smoke.py`：**14/14**（连跑两轮，唯一后缀生效）；
+- `multi_node_grpc_e2e` 连跑 **5 轮** 5/5（`D-37` 修复前首跑即红）；
+- `yuntun-sql` 37 单测 + 1 集成；`yuntun-query` JSON 2/2；`yuntun-standalone` 5/5
+  （含新 SIGTERM 判据）；全量与 clippy 见提交信息。

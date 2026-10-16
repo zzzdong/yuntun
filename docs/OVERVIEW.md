@@ -63,8 +63,8 @@
 
 | 维度 | 现状 |
 |---|---|
-| SQL 语义 | `crates/sql` 是**唯一实现**，两端口共用；`SELECT` / CTE / 聚合 / `information_schema` / 8 个 JSON 函数，DataFusion 55 执行 |
-| 写入 | `INSERT … VALUES` / `INSERT … SELECT` / Flight `DoPut` / CLI（CSV/JSONL/Parquet）；三条入口汇入**同一 ingest 管线** |
+| SQL 语义 | `crates/sql` 是**唯一实现**，两端口共用；`SELECT` / CTE / 聚合 / `information_schema` / 8 个 JSON 函数（嵌套路径 = 分步参数 `json_get_int(doc,'a','b')`，`§184`），DataFusion 55 执行 |
+| 写入 | `INSERT … VALUES` / `INSERT … SELECT` / `TRUNCATE TABLE`（= 无 `WHERE` 全表删，文件级下线）/ Flight `DoPut` / CLI（CSV/JSONL/Parquet）；四条入口汇入**同一 ingest/DML 管线** |
 | DDL | `CREATE/DROP TABLE`、`CREATE/DROP DATABASE`、**`ALTER TABLE ADD/DROP COLUMN`**（OCC 演进、走 raft） |
 | **行级删除** | `DELETE FROM t WHERE …`：删除向量（roaring 位图）表达 + 读侧行选择 + WAL `DeletePayload` + 重启重放 + compaction 消费（合并重写时**应用** DV，提交后 `revoke`）；**无 `WHERE` 的全表删**走文件级下线（`purge_table_files`） |
 | **行级更新** | `UPDATE t SET … WHERE …`：**一个 op 承载、原子可见**（DV 与新行文件同一个快照号 ⇒ 看不到"删了没插/插了没删"） |
@@ -107,7 +107,7 @@
 
 ## 6. 质量与证据网
 
-规模：**76,375 行 Rust / 20 个 crate / 625 个测试函数 / 用例全绿（⚠️ 并行跑时 2 条计时用例会 flaky，见 §6.1） / clippy 本仓 0 告警**
+规模：**77,136 行 Rust / 20 个 crate / 631 个测试函数 / 用例全绿 / clippy 本仓 0 告警**
 （工具链：本机 rustc 1.98.1 + edition 2024；**MSRV 声明 1.95**，由 `vortex 0.86` 顶出，
 **尚未经真·1.95 编译验证**）
 

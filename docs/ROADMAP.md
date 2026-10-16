@@ -21,6 +21,7 @@
 | F 组 | SQL 形式的 schema 变更 / DELETE·UPDATE / 行组级索引 | ✅ 已落地（`§142`–`§158`） |
 | G 组 | 多 datanode 协作与分布式任务 | 🟡 **G.0 ✅（`§166`）/ G.1 代码 ✅（`§169`，文档收尾在本轮）/ G.3 ✅（`§167`）/ G.2 ⏳ / G.4 ⏳** |
 | 阶段 4（下一阶段，**N 组**） | 从"分布式就绪"→"可运维、可交付" | ⏳ 见 §5 |
+| **S 组（本轮，`§184`）** | **Standalone 完备性收口：单机即一个完整的简易列数据库** | 🔄 见 §5.2 |
 
 **里程碑账**（归档 `plan.md §8.3/§8.4` 的门槛）：
 
@@ -91,10 +92,16 @@
 | **D-24** | **"计划/改造指南"里的状态列大面积过期**（`plan.md §5.1` 的 B/C/D 三组写"未开始"而 §7 全 ✅；`refactor.md` 的 S3–S6 写"未开始"；参数表把 `spread` 默认写成 5s） | `§168`（同类漂移第四次：`D-15`/`D-17`/`D-19`/`D-24`） | ✅ **本轮根治形态**：不再"回填旧表"，而是**归档重建**（`§170`）+ 保留可机核判据 + 每几刀审一次本文件 §5 的状态列 |
 | **D-25** | **`purge_table_files` 之后不重算任务目录** ⇒ 残留一条指向空分片的待办（每轮白抢一次租约；"待办消失不了"是 `§169` 明确要避免的形态） | 本轮审计（`§169` 的 `refresh_task` 挂在 commit/revoke/apply 上，`purge` 漏了；`protects_at` 语义已确认会让这些文件不再计数） | ✅ **已闭环（`§172`）**：`purge_table_files` 末尾按受影响 `(table, shard)` 重算；用例 `purge_drops_the_task_of_every_touched_shard`（反证：注掉重算 ⇒ 红，报出残留 `files=2` 的待办）；**远端形态**另有用例 `remote_task_directory_follows_purge` |
 
-### 4.0 本轮新开（`§172`，均已闭环）
+### 4.0 新开并已闭环（`§172` / `§184`）
 
 | # | 偏差 / 缺口 | 现状（证据） | 决定 / 下一步 |
 |---|---|---|---|
+| **D-32** | **`SHOW TABLES FROM <db>` 忽略 schema 限定符**：sqlparser 的 `ShowTables` 带可选 `db_name`，shim 只读 `session.schema()` ⇒ `SHOW TABLES FROM sales` 答的是**当前库**的表（`§184` 实测：连 `public` 时列出 public 三张表） | `crates/sql/src/shim.rs:167` | ✅ **已闭环（`§184`）**：有 `db_name` 时按它过滤（列名 `Tables_in_<db>` 同步改成该库）；反证用例（两库各一张表，交叉断言） |
+| **D-33** | **无符号整数类型全部被拒**，而 README §2.1 写着"`TINYINT/SMALLINT/INT/BIGINT`（含无符号）"：sqlparser 0.62 把 `INT UNSIGNED` 解析成独立变体（`IntUnsigned` 等），`map_column_type` 没接 ⇒ `CREATE TABLE t (a INT UNSIGNED)` 启动即 1105 | `crates/sql/src/sql.rs:216`（`§184` 实测 5 种写法全拒） | ✅ **已闭环（`§184`）**：补齐 `*Unsigned` 变体映射（`TINYINT/SMALLINT/INT/INTEGER/BIGINT UNSIGNED → UInt8/16/32/32/64`；`MEDIUMINT UNSIGNED → UInt32`——值域超 `UInt16`，落 `UInt16` 会静默截断；浮点 `*Unsigned` 一律 `Float64`：无符号浮点只是浮点）。README 声明由此变成真的 |
+| **D-34** | **README 的 JSON 路径示例是错的**：写着 `json_get_int(doc, 'a.b')`（点号串），而 `datafusion-functions-json` 的路径是**分步参数**（`json_get_int(doc, 'a', 'b')`）；照 README 写嵌套取值恒得 NULL（不报错 ⇒ 静默错答案） | `§184` 实测：`'a.b' → NULL`、`'a','b' → 7` | ✅ **已闭环（`§184`）**：README/OVERVIEW 示例改成分步参数；`json_functions.rs` 补嵌套路径用例（钉住"点号串是 miss"这个现状，免得下一位再去"修"一个没错的实现） |
+| **D-35** | **`TRUNCATE TABLE` 不支持**：清空一张表只能 `DELETE FROM t`（无 WHERE 走文件级下线）或 DROP+CREATE；而 `TRUNCATE` 是 MySQL 客户端/脚本最常用的清空形态，被拒之列外 | `§184` 普查：报 1149 "only SELECT / … are supported" | ✅ **已闭环（`§184`）**：`TRUNCATE [TABLE] t [IN schema]` 复用一个已存在的入口（无 `WHERE` 的全表删 = `purge_table_files`），**不新造数据路径**；`IF EXISTS`？**不加**（MySQL 无此形态，加了就是发明方言） |
+| **D-36** | **standalone 只处理 SIGINT**：`ctrl_c()` 不管 SIGTERM ⇒ systemd/docker stop 发 SIGTERM 时进程**直接死**（无优雅关闭：WAL 不封口、后台任务不 join、目录租约不释放——下一次启动要等锁） | `crates/standalone/src/main.rs:69` | ✅ **已闭环（`§184`）**：信号处理改 SIGINT+SIGTERM 双路（`tokio::select!`），关闭流程不变 |
+| **D-37** | **raft 选举竞态型 flaky**：`wait_some_leader` 抓到**瞬时** leader 后接 `wait_leader_agreement(leader)`，两次调用之间发生二次选举 ⇒ 等一个已经不是 leader 的 id 达成一致，30s 后红（全量首跑实测抓到一次：`leader=1` 而实际 `term 2 / leader 2`；第二轮全绿 ⇒ 竞态而非回归） | `crates/meta/tests/multi_node_grpc_e2e.rs`（3 处同形态） | ✅ **已闭环（`§184`）**：初始选主统一改 `wait_settled_leader`（**等一致**而不是"抓一个再等它一致"）；这正是该文件 §104 注释自己踩过的坑（愈合用例里已用 `wait_settled_leader`，初始选主漏了） |
 | **D-29** | **`apply_update` 与 `drop_shard` 之后不重算任务目录**（与 `D-25` 同族）：UPDATE 既**加新文件**又**改 DV**、`drop_shard` 让**整个分片下线** ⇒ 待办该出现/该消失而没变 | 本刀动手前的接线审计（`refresh_task` 的调用点少了这两个入口；`ARCHITECTURE.md §6` 现在把**入口清单**写出来了） | ✅ **已闭环（`§172`）**：两个入口都补上重算（时钟用 op 携带的 `now`/`now_secs`）；用例 `update_recomputes_the_task` / `drop_shard_drops_the_task`；不变量 **I8** 扩写为"任何改文件或 DV 的入口都要重算" |
 | **D-30** | **`yuntun-datanode --meta` 只接一个 contact point** ⇒ 那一台**不是 leader** 时，这个数据节点的**所有写都失败**（协议其实带了 leader hint，但重试只能在**已知地址集合**里换） | `tests/datanode_cluster.sh smoke` 实测失败在 ③：`code: 'Internal error', message: "非 leader（可重试）：not leader (leader hint 2)"`（根因：`RemoteCatalog::connect(vec![addr])` 只有一个 client；`§167` 那次跑通只是**恰巧** leader 是 mn1） | ✅ **已闭环（`§172`）**：`--meta` 改成**逗号分隔的种子列表**（compose 给全三台）+ 帮助文本写明；rig 复跑 EXIT=0。**未做**：跟随 leader hint（需要 id→地址映射），留在 172.3 的边界里 |
 | **D-31** | **服务端标了 `partial` 却没人读**：Flight 的 `app_metadata` 带着"结果不完整 + 缺失来源"（有判据守着服务端写对了），但**客户端 SDK 与 CLI 都没解析它** ⇒ 用户只看到一个**偏小却很正常**的数字，`D-23` 那类观测因此**无法归因**（"少行"同时指降级与缺口，而两者处置相反） | `§174.0`（rig 判据 ⑥ 当时只数 `== 21`，既不看 partial 也看不见 +3 方向） | ✅ **已闭环（`§174`）**：SDK 加 `query_full` / `query_stream_full` + `PartialNotice`（看第一条 `FlightData` 的 `app_metadata`）；CLI 往 **stderr** 打稳定标记 `WARN: partial result`（stdout 只放数据）；rig 判据 ⑥ 据此把"瞬时少行"拆成**降级**（不算失败）与**缺口**（当场失败）；e2e 覆盖"完整不许报 / 降级必须报并点名 / CLI 退 0 且不污染 stdout" |
@@ -161,6 +168,23 @@
 | **N5** | **正确性待查**：`D-23`（行数瞬时不可见）复现与归因 | ✅ **已达成（`§174` + `§175`）**：机制定案（`refresh()` 号先于清单发布 ⇒ 载荷失败后增量漏掉 `== since` 的墓碑与产物）、修复（号只与载荷一起落地）、**确定性用例**（假 metaserver 触发那条缝；反证 ⇒ 红）。观测口径的缺口一并修好（`D-31`：CLI/SDK 报 partial，rig 判据能分开"降级"与"缺口"） | 属"可能错数据"的一类：**先查清再谈其它** |
 | **N6** | **工程化（外部依赖重）**：真云 S3（TLS/签名/限流/503 退避）+ 跨机跑 T8 那套；端口鉴权（`S3-6` 剩余半）；冷读预算（`D-20`/`§88.6`） | 真云/跨机实测数据入库；鉴权用例；冷读超预算**明确失败或标记**而不是无限等 | 里程碑用的是"共享目录"形态；真实部署的延迟与失败语义只在真云 + 跨机上才真 |
 | **N7** | **小项**：`T6.15`（TTL 分片移除 + WAL segment 清理闸门）、spill 复用（P2）、MSRV 1.95 真编译验证、`D-18` 定案、MySQL 轨 `partial` 标记（被上游 `opensrv` 卡住） | 各自一条用例/一次真构建 | 不阻塞主线，但每项都对应一条"声明了没验"的欠账 |
+
+### 5.2 本轮：Standalone 完备性收口（**S 组**，`§184`）
+
+> **目标**：单机（`yuntun` 单二进制 + 一份 TOML）就是一个**完整的简易列数据库** ——
+> 起得来、连得上、CRUD/DDL/DML 全形态可用、关得干净、留得下证据。准入 = 本节全绿 + 全量测试/clippy 0 告警。
+> 方法：先**真跑一遍**（冒烟脚本逐条过），把"文档说有、实际没有/不一样"的记进台账，再逐条闭环。
+
+| # | 事项 | 验收 | 状态 |
+|---|---|---|---|
+| **S1** | **功能清单与路线图**：对 standalone 做一次全端口普查（MySQL wire / Flight SQL / CLI），产出功能矩阵并登记缺口 | 本表 + 台账 `D-32`…`D-37` | ✅ `§184` |
+| **S2** | **测试可信**：修 raft 选举竞态型 flaky（`D-37`，初始选主改 `wait_settled_leader`） | `multi_node_grpc_e2e` 连续跑不红 | ✅ `§184` |
+| **S3** | **元数据正确性**：`SHOW TABLES [FULL] FROM <db>` 按限定符过滤（`D-32`） | 反证用例（两库交叉断言） | ✅ `§184` |
+| **S4** | **类型面补齐**：无符号整数（`D-33`）+ 数组语法口径（`T[]` 仅 Flight/Generic 轨；`ARRAY<T>` 两轨通用 —— MySQL 协议无数组类型，不为它写 28 方法的方言委派） | `CREATE TABLE` 各无符号写法可建可查；README 类型行口径与实现一致 | ✅ `§184` |
+| **S5** | **DML 面补齐**：`TRUNCATE TABLE`（`D-35`，复用无 WHERE 全表删的文件级下线，不新造数据路径） | 清空后可查空、可再写；与 `DELETE FROM t` 同一后果 | ✅ `§184` |
+| **S6** | **关得干净**：standalone 双信号优雅退出（`D-36`） | SIGTERM 后走完整收尾（后台 join + 目录租约释放） | ✅ `§184` |
+| **S7** | **一键验收**：`scripts/standalone_smoke.py`（MySQL wire 11 项 + Flight SQL 2 项）入仓，读己之写用轮询不赌时序 | 对新实例 EXIT=0；进 README §5 表 | ✅ `§184` |
+| **S8** | **文档对齐**：README JSON 路径示例改分步参数（`D-34`）、`tests/README.md` 补内容、`OVERVIEW.md` 规模行/能力矩阵同步 | `docs_consistency` 全绿 | ✅ `§184` |
 
 ### 5.1 不做（明确写下，避免走回头路）
 

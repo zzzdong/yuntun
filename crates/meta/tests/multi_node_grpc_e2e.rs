@@ -315,15 +315,11 @@ async fn three_nodes_replicate_over_grpc_and_survive_leader_loss() {
     };
 
     // ---- ③ 选主 + 达成一致 ----
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let leader = loop {
-        if let Some(l) = leader_of(&clients).await {
-            break l;
-        }
-        assert!(Instant::now() < deadline, "30s 内没选出 leader");
-        tokio::time::sleep(Duration::from_millis(30)).await;
-    };
-    wait_leader_agreement(&clients, &IDS, leader).await;
+    // `wait_settled_leader`（等**全体一致**），不用 `wait_some_leader` + `wait_leader_agreement`：
+    // 后者先"抓一个自称 leader 的"再"等全体认它"——两次调用之间若发生二次选举
+    // （raft 的 term 竞争在启动期完全可能），等的就是一个**已经不是 leader** 的 id，
+    // 30s 后必红（`§184` 全量实测抓到一次：抓到 leader=1，实际已换成 term 2 / leader 2）。
+    let leader = wait_settled_leader(&clients, &IDS).await;
 
     // ---- ④ 写：3 个 op 经过**网络复制**到多数派 ----
     let r_schema = propose_following_leader(&clients, &IDS, create_schema_op("analytics", 1_000)).await;
@@ -664,9 +660,8 @@ async fn partitioned_leader_cannot_commit_and_heals_without_loss() {
         m
     };
 
-    // ---- ③ 选主 ----
-    let leader = wait_some_leader(&clients, &IDS).await;
-    wait_leader_agreement(&clients, &IDS, leader).await;
+    // ---- ③ 选主（等**全体一致**；`D-37`：不用"抓一个再等它一致"的竞态形态）----
+    let leader = wait_settled_leader(&clients, &IDS).await;
 
     // ---- ④ 分区**之前**先提交一份：它要跨过"换主 + 分区 + 愈合"活下来 ----
     assert!(
@@ -942,8 +937,8 @@ async fn compaction_with_lagging_follower_should_keep_committing() {
         m
     };
 
-    let leader = wait_some_leader(&clients, &IDS).await;
-    wait_leader_agreement(&clients, &IDS, leader).await;
+    // 初始选主同样用 `wait_settled_leader`（`D-37`：等全体一致，不抓瞬时 leader）
+    let leader = wait_settled_leader(&clients, &IDS).await;
     assert!(
         propose_following_leader(&clients, &IDS, create_schema_op("analytics", 1_000))
             .await

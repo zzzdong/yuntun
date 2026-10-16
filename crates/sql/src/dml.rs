@@ -78,13 +78,55 @@ impl SqlEngine {
     ) -> Result<RawOutcome, SqlError> {
         self.check_write()?;
         let table = parse_delete_target(del, session)?;
+        let (shards, leases) = self.dml_prologue(&table).await?;
+        // **无 `WHERE` ⇒ 整表清除**（设计 §7）：走**文件级下线**，不生成任何 DV。
+        // 分流放在这里（拿到租约之后）：两条路的外部纪律是同一组租约，只是内部形态不同。
+        let out = if del.selection.is_none() {
+            self.execute_purge(&table, &shards).await
+        } else {
+            self.execute_delete_inner(del, session, &shards).await
+        };
+        leases.release().await;
+        out
+    }
+
+    /// **`TRUNCATE [TABLE] t`**（`D-35`）= **无 `WHERE` 的全表删**：同一条路径、同一后果。
+    ///
+    /// 为什么复用它而不是新写一条：清空一张表的全部纪律（`check_write` → 在途数据落盘 →
+    /// 分片租约 → 文件级下线 → 刷缓存）已经在"无 `WHERE` 的 `DELETE`"上验过（`F.3f`）；
+    /// `TRUNCATE` 与它的差别**只在语句长相**。新造一条路径 = 两套纪律迟早漂
+    /// （漂的那一格叫"purge 之后在途数据又落回来"—— 本文件注释里反复出现的那条）。
+    ///
+    /// 与 MySQL 的差别只有一条：MySQL 的 `TRUNCATE` 是 DDL（隐式提交、不可回滚），
+    /// 这里没有事务语义，所以"DELETE 的全表形态"与它逐字等价。
+    pub(crate) async fn execute_truncate(
+        &self,
+        name: &sqlparser::ast::ObjectName,
+        session: &SessionCtx,
+    ) -> Result<RawOutcome, SqlError> {
+        self.check_write()?;
+        let table = crate::sql::resolve_table_ref(name, session);
+        if table.is_empty() {
+            return Err(SqlError::Unsupported("invalid TRUNCATE target table".into()));
+        }
+        let (shards, leases) = self.dml_prologue(&table).await?;
+        let out = self.execute_purge(&table, &shards).await;
+        leases.release().await;
+        out
+    }
+
+    /// DML 公共前奏：**在途数据落盘 → 列分片 → 取 `(table, shard)` 租约**。
+    ///
+    /// `DELETE`（带/不带 `WHERE`）与 `TRUNCATE`（`D-35`）共用 —— 三条语句的并发纪律
+    /// （与合并互斥、分片粒度、全或不）必须是**同一份代码**：加新入口就是加新漏洞。
+    async fn dml_prologue(&self, table: &str) -> Result<(Vec<String>, LeaseSet), SqlError> {
         // ⓪ **在途数据先落盘**，再求分片、再取锁（顺序不能换！）：
         //    在途数据此刻不属于任何文件 ⇒ ① 它扫不到（**漏删**）② 它所在的分片**还不存在**，
         //    于是"先取锁后 flush"必然在 flush 造出新分片时报"分片集合变了"（实测就是这么炸的）。
         //    flush 之后文件集合才稳定，分片集合才有意义。
         let flushed = self
             .ingest_side()?
-            .force_flush(&table)
+            .force_flush(table)
             .await
             .map_err(SqlError::from_lake)?;
         if flushed.chunks > 0 {
@@ -98,12 +140,12 @@ impl SqlEngine {
         // ① 租约：**`(table, shard)` 粒度**（设计 §6.1/评审四 R11）——
         //    只锁"这次要改的那几个分片"，而不是整张表：合并的工作单元是 `compact_shard`
         //    （分钟级），表级互斥会让"同表里另一个分片的删除"白等几分钟。
-        //    **按用途键排序、全或无**（评审五 R19）：两个并发 DML 以不同顺序增量取锁会死锁。
-        let shards = self.visible_shards(&table).await?;
+        //    **按用途键排序、全或不**（评审五 R19）：两个并发 DML 以不同顺序增量取锁会死锁。
+        let shards = self.visible_shards(table).await?;
         let holder = format!("dml-{}", Uuid::now_v7());
         let leases = LeaseSet::acquire(
             self.catalog.clone(),
-            &table,
+            table,
             &shards,
             &holder,
             DML_LEASE_TTL_MS,
@@ -111,15 +153,7 @@ impl SqlEngine {
         )
         .await
         .map_err(SqlError::from_lake)?;
-        // **无 `WHERE` ⇒ 整表清除**（设计 §7）：走**文件级下线**，不生成任何 DV。
-        // 分流放在这里（拿到租约之后）：两条路的外部纪律是同一组租约，只是内部形态不同。
-        let out = if del.selection.is_none() {
-            self.execute_purge(&table, &shards).await
-        } else {
-            self.execute_delete_inner(del, session, &shards).await
-        };
-        leases.release().await;
-        out
+        Ok((shards, leases))
     }
 
     /// 表在**此刻**可见文件上的分片集合（去重升序）—— DML 取租约的输入。

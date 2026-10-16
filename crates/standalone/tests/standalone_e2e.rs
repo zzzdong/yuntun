@@ -163,3 +163,69 @@ async fn standalone_binary_serves_flight_end_to_end() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// **`D-36` 的判据：SIGTERM 走优雅关闭**。
+///
+/// systemd / `docker stop` 发的是 SIGTERM；只处理 SIGINT 时进程**直接死** ——
+/// WAL 不封口、后台任务不 join、WAL/spill/meta 目录租约不释放。
+/// 这里断言三件事：
+///
+/// ① 进程在有限时间内退出（不是挂住）；
+/// ② 退出码是 **0**（走完了收尾：serve 返回 → join 后台任务 → 正常返回）；
+/// ③ **目录租约真的放了** —— 同一个 WAL/spill/meta 目录能再起一个实例
+///    （`D-11` 的教训：fjall 目录锁由 loopback gRPC 任务持有，不 join 就不放锁）。
+///
+/// 反证：把 main 的信号处理改回只认 SIGINT ⇒ 本用例的 ① 超时失败。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn standalone_exits_gracefully_on_sigterm_and_releases_its_dirs() {
+    let dir = tmpdir("standalone-sigterm");
+    let (mut child, _addr) = spawn_yuntun(&dir).await;
+
+    // 发**真** SIGTERM（`Child::kill` 是 SIGKILL，测不到优雅路径）
+    let rc = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(rc, 0, "SIGTERM 发送失败（errno 见 rc）");
+
+    // ① 有限时间内退出（收尾要 join 的任务有界；给 30s 上限防挂住）
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(st) = child.try_wait().expect("try_wait") {
+            break st;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "SIGTERM 之后 30s 还没退出 —— 优雅关闭没走完（大概率有任务没 join）"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    // ② 退出码 0（优雅收尾后正常返回）
+    assert_eq!(status.code(), Some(0), "SIGTERM 应走优雅关闭（退 0）：{status:?}");
+
+    // ③ 同一目录能再起一个实例（WAL/spill/meta 三处租约都放了）
+    let (mut child2, addr2) = spawn_yuntun(&dir).await;
+    let mut client = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while client.is_none() {
+        match tonic::transport::Endpoint::from_shared(format!("http://{addr2}"))
+            .expect("endpoint")
+            .connect()
+            .await
+        {
+            Ok(c) => client = Some(FlightServiceClient::new(c)),
+            Err(_) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "SIGTERM 后同目录起第二个实例连不上（目录锁没放？）"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+    let mut client = client.unwrap();
+    let batches = sql(&mut client, "SHOW DATABASES").await;
+    assert!(
+        batches.iter().map(|b| b.num_rows()).sum::<usize>() >= 1,
+        "第二个实例必须能服务（证明第一个把目录让出来了）"
+    );
+    let _ = child2.kill();
+    let _ = child2.wait();
+}

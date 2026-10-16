@@ -66,8 +66,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     {
         let token = shutdown.clone();
         tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("SIGINT received, shutting down gracefully");
+            // **双信号**（`D-36`）：systemd / docker stop 发的是 **SIGTERM**，
+            // 只处理 SIGINT 会让进程在"直接死"与"优雅关闭"之间**选前者** ——
+            // WAL 不封口、后台任务不 join、WAL/spill 目录租约不释放
+            // （下一次启动还要等锁）。两条信号共用同一份收尾流程。
+            let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("SIGINT received, shutting down gracefully");
+                }
+                _ = term.recv() => {
+                    tracing::info!("SIGTERM received, shutting down gracefully");
+                }
+            }
             token.cancel();
         });
     }

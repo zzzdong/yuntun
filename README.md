@@ -104,12 +104,12 @@ SQL 支持面（详见 `docs/OVERVIEW.md` §4；多协议接入设计在 `docs/a
 | 类别 | 支持 |
 |---|---|
 | 查询 | `SELECT`（含 CTE / 聚合 / `information_schema.*`），非限定表名 `FROM t` 直接可用 |
-| 写入 | `INSERT ... VALUES` / `INSERT ... SELECT` |
-| DDL | `CREATE TABLE`（`IF NOT EXISTS` / `NOT NULL`；类型：`TINYINT/SMALLINT/INT/BIGINT`（含无符号）、`FLOAT/DOUBLE`、`BOOLEAN`、`DATE`、`DATETIME/TIMESTAMP`、`DECIMAL(p,s)`、`CHAR/VARCHAR(n)/TEXT/STRING`、`JSON/JSONB`（→ UTF8 文本存储）、`BINARY/VARBINARY/BLOB`、`ARRAY<T>` / `T[]`、`MAP(K,V)`（嵌套元素递归支持，Parquet round-trip 无损）/ `DROP TABLE`（`IF EXISTS`）/ `CREATE DATABASE` / `DROP DATABASE`（均 WAL 权威，重启可恢复）；**`ALTER TABLE ADD/DROP COLUMN`**（含 `IF [NOT] EXISTS`；OCC 演进、走 raft，旧文件缺列按 null 对齐 —— 改类型 / 可空性 / 重命名**明确拒绝**） |
+| 写入 | `INSERT ... VALUES` / `INSERT ... SELECT` / `TRUNCATE TABLE`（= 无 `WHERE` 全表删：文件级下线，表定义保留，`§184`） |
+| DDL | `CREATE TABLE`（`IF NOT EXISTS` / `NOT NULL`；类型：`TINYINT/SMALLINT/INT/BIGINT`（含无符号）、`FLOAT/DOUBLE`、`BOOLEAN`、`DATE`、`DATETIME/TIMESTAMP`、`DECIMAL(p,s)`、`CHAR/VARCHAR(n)/TEXT/STRING`、`JSON/JSONB`（→ UTF8 文本存储）、`BINARY/VARBINARY/BLOB`、`ARRAY<T>`、`MAP(K,V)`（嵌套元素递归支持，Parquet round-trip 无损；`T[]` 方括号形态仅 Flight/Generic 轨可解析，MySQL 轨请写 `ARRAY<T>`）/ `DROP TABLE`（`IF EXISTS`）/ `CREATE DATABASE` / `DROP DATABASE`（均 WAL 权威，重启可恢复；非空库删除报 1008）；**`ALTER TABLE ADD/DROP COLUMN`**（含 `IF [NOT] EXISTS`；OCC 演进、走 raft，旧文件缺列按 null 对齐 —— 改类型 / 可空性 / 重命名**明确拒绝**） |
 | 元数据 | `SHOW TABLES/FULL TABLES`、`SHOW COLUMNS/FULL COLUMNS`、`DESCRIBE`、`SHOW CREATE TABLE`、`SHOW DATABASES`、`SHOW VARIABLES`、`SHOW COLLATION/CHARSET/ENGINES/KEYS` |
 | 方言兼容 | `SET` / `USE` / `BEGIN` / `COMMIT` / `ROLLBACK` = no-op（单语句自动提交） |
 | 不支持 | `UPDATE` / `DELETE` / `ALTER TABLE` 的**改类型·可空性·重命名** / `CREATE TABLE AS SELECT` / `CREATE OR REPLACE` / 复杂类型（`STRUCT` 等）/ `_BINARY` 字面量 / MySQL JSON 路径操作符 `->` `->>`（用 JSON 函数替代）/ 视图 / 存储过程 / 事务语义 → 明确报错（绝不静默返回错误结果）；加列除 SQL `ALTER TABLE ADD COLUMN` 外，也走写入侧 schema 演化（ingest / Flight DoPut） |
-| JSON 函数 | `json_get / json_get_{str,int,float,bool,json,array}` / `json_as_text` / `json_contains` / `json_length` / `json_object_keys` / `json_from_scalar`（`datafusion-functions-json` 0.55）。**路径不带 `$`**：`json_get_int(doc, 'a.b')`；`json_get` 返回 JSON 变体联合（wire 按文本回传） |
+| JSON 函数 | `json_get / json_get_{str,int,float,bool,json,array}` / `json_as_text` / `json_contains` / `json_length` / `json_object_keys` / `json_from_scalar`（`datafusion-functions-json` 0.55）。**路径是分步参数、不带 `$`**：`json_get_int(doc, 'a', 'b')` 取嵌套键；`json_get_int(doc, 'a.b')` 是**单个键** `"a.b"`（miss ⇒ NULL，不是嵌套遍历，`§184` 钉住这个语义）；数组下标直接给数字：`json_get_int(arr, 1)`；`json_get` 返回 JSON 变体联合（wire 按文本回传） |
 
 ### 2.2 DBeaver（MySQL）连接
 
@@ -231,6 +231,7 @@ scripts/.venv/bin/pip install -r scripts/requirements.txt -i https://mirrors.ali
 | `scripts/pyarrow_smoke.py <flight地址>` | Flight SQL：ADBC 查询 + 元数据 + 原始 Flight prepared 写入（**需 demo 种子实例**，见 §4 时间精度条目） |
 | `scripts/pyarrow_sqlinfo_smoke.py <flight地址>` | Flight SQL：`GetSqlInfo` 信息项 |
 | `scripts/pymysql_smoke.py <mysql地址>` | MySQL wire：T1 文本协议（DDL/INSERT/SELECT/SHOW/错误码 1146）+ T2 预编译 |
+| `scripts/standalone_smoke.py <mysql地址> <flight地址>` | **standalone 全功能冒烟**（`§184`）：MySQL wire 12 项（CRUD/聚合/元数据/DML/TRUNCATE/加列删列/无符号类型/多 schema/prepared/错误码/时间类型/JSON 函数）+ Flight SQL 2 项（查询 + `information_schema`）；退出码即结论 |
 | `scripts/flight_stream_smoke.py <flight地址> <表> [批数 行数]` | Flight `do_get` 流式（S1.10）：灌数 + ADBC 流式读取 + 服务端 RSS 采样（`0 0` = 只读模式） |
 | `scripts/dbeaver_jdbc_probe.java` | DBeaver / JDBC：T3 元数据与预览（需 `javac` + Connector/J） |
 | `scripts/s3_smoke.sh` | 真实 S3（SeaweedFS / MinIO）**网络读写**：flush → HTTP PUT 可见于桶；**删 WAL** 重启后冷读 → HTTP GET。`S3_ENDPOINT` / `S3_BUCKET` 可配（见 `docs/archive/operation-log.md` §101） |

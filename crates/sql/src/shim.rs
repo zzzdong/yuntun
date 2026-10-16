@@ -163,12 +163,27 @@ pub(crate) async fn intercept(
                 .collect();
             strings_result(&["Database"], &rows)
         }
-        // SHOW TABLES：MySQL 语义单列（Tables_in_<db>）——**当前 schema** 的表
-        Statement::ShowTables { .. } => {
-            let names = engine.list_tables_in(session.schema()).await?;
-            let rows: Vec<Vec<String>> = names.into_iter().map(|n| vec![n]).collect();
-            let col = format!("Tables_in_{}", session.schema());
-            strings_result(&[col.as_str()], &rows)
+        // SHOW TABLES：MySQL 语义（Tables_in_<db>）——**限定库**的表
+        // （`D-32`：`SHOW TABLES FROM/IN <db>` 曾忽略限定符，答成当前库的表）
+        Statement::ShowTables {
+            full,
+            show_options,
+            ..
+        } => {
+            let schema = schema_from_options(show_options, session);
+            let names = engine.list_tables_in(&schema).await?;
+            if *full {
+                // SHOW FULL TABLES = 两列（MySQL 同款）：第二列 Table_type。
+                // 无视图 ⇒ 恒 "BASE TABLE"；只给一列会让按列名取值的客户端少一列。
+                let rows: Vec<Vec<String>> = names
+                    .into_iter()
+                    .map(|n| vec![n, "BASE TABLE".to_string()])
+                    .collect();
+                strings_result(&[&format!("Tables_in_{schema}"), "Table_type"], &rows)
+            } else {
+                let rows: Vec<Vec<String>> = names.into_iter().map(|n| vec![n]).collect();
+                strings_result(&[&format!("Tables_in_{schema}")], &rows)
+            }
         }
         Statement::ShowColumns {
             show_options,
@@ -553,6 +568,28 @@ fn table_from_options(
         .and_then(|i| i.parent_name.as_ref())
         // 表引用 → 全限定标识（`SHOW COLUMNS FROM sales.orders` 支持跨 schema）
         .map(|n| crate::sql::resolve_table_ref(n, session))
+}
+
+/// `SHOW TABLES FROM/IN <db>` 的限定库名（**裸 schema 名**；无限定 → 会话 schema）。
+///
+/// 与 [`table_from_options`] 的差别：那边要的是**表**（`resolve_table_ref` 会把
+/// 单段名补成 `schema.table` 全限定），这边要的是**库**本身 —— `SHOW TABLES FROM sales`
+/// 的 `sales` 是 schema，不是"当前库下一张叫 sales 的表"（`D-32` 的根因正是这个混淆）。
+pub(crate) fn schema_from_options(
+    opts: &sqlparser::ast::ShowStatementOptions,
+    session: &SessionCtx,
+) -> String {
+    opts.show_in
+        .as_ref()
+        .and_then(|i| i.parent_name.as_ref())
+        // 取**最后一段**标识符：`yuntun.sales` / `sales` 都 → `sales`
+        // （catalog 名可带可不带，与 `CREATE DATABASE` 的取名口径一致）
+        .and_then(|n| {
+            n.0.iter()
+                .rev()
+                .find_map(|p| p.as_ident().map(|i| i.value.clone()))
+        })
+        .unwrap_or_else(|| session.schema().to_string())
 }
 
 /// 无 FROM 的探测查询：全部投影为 @@var 或 DATABASE()/SCHEMA() 时返回 canned 行。

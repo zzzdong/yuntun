@@ -20,3 +20,7 @@ sqlparser = { workspace = true, features = ["visitor"] }
 uuid = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# 集成测试（`tests/show_tables_from.rs`）起只读引擎跑 SQL：多线程运行时
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

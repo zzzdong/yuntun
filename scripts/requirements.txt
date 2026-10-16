@@ -12,6 +12,7 @@
 #   scripts/.venv/bin/python scripts/pyarrow_smoke.py <flight地址>
 #   scripts/.venv/bin/python scripts/pyarrow_sqlinfo_smoke.py <flight地址>
 #   scripts/.venv/bin/python scripts/pymysql_smoke.py <mysql地址>
+#   scripts/.venv/bin/python scripts/standalone_smoke.py <mysql地址> <flight地址>
 
 # ---- Flight SQL 轨（S1.5/S1.6 冒烟：pyarrow_smoke.py / pyarrow_sqlinfo_smoke.py）----
 pyarrow>=14

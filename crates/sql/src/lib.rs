@@ -522,6 +522,26 @@ impl SqlEngine {
         match stmt {
             // `F.3`：`DELETE FROM t WHERE …`（写侧前端，见 `dml` 模块文档的六步顺序）
             Statement::Delete(delete) => self.execute_delete(&delete, session).await,
+            // `D-35`：`TRUNCATE [TABLE] t` = 无 `WHERE` 的全表删（文件级下线）。
+            // 只认单表 + 无可选项：分区 / CASCADE / IDENTITY / ON CLUSTER 一律明确拒绝
+            // （本仓没有分区表与级联概念，"静默忽略选项"比拒绝危险得多）。
+            Statement::Truncate(tr) => {
+                if tr.table_names.len() != 1 {
+                    return Err(SqlError::Unsupported(
+                        "TRUNCATE 只支持单表（多表请分开写）".into(),
+                    ));
+                }
+                if tr.partitions.is_some()
+                    || tr.cascade.is_some()
+                    || tr.identity.is_some()
+                    || tr.on_cluster.is_some()
+                {
+                    return Err(SqlError::Unsupported(
+                        "TRUNCATE 的分区 / CASCADE / IDENTITY / ON CLUSTER 选项未支持".into(),
+                    ));
+                }
+                self.execute_truncate(&tr.table_names[0].name, session).await
+            }
             // `F.3e-2`：`UPDATE t SET … WHERE …` —— 删 + 插**一个 op**（原子可见，见 `dml` 模块文档）
             Statement::Update(update) => self.execute_update(&update, session).await,
             Statement::Query(q) => {
@@ -539,10 +559,12 @@ impl SqlEngine {
                     partial: out.partial,
                 })
             }
-            Statement::ShowTables { .. } => {
-                let names = self.list_tables_in(session.schema()).await?;
+            // `SHOW TABLES [FULL] [FROM/IN <db>]`（`D-32`：限定库优先于会话 schema）
+            Statement::ShowTables { show_options, .. } => {
+                let schema = shim::schema_from_options(&show_options, session);
+                let names = self.list_tables_in(&schema).await?;
                 Ok(RawOutcome::Rows {
-                    batches: vec![sql::show_tables_batch(session.schema(), &names)],
+                    batches: vec![sql::show_tables_batch(&schema, &names)],
                     // 元数据类结果不读热数据 ⇒ 恒完整
                     partial: PartialRead::default(),
                 })
@@ -849,8 +871,9 @@ impl SqlEngine {
                 Ok(RawOutcome::Affected(0))
             }
             other => Err(SqlError::Unsupported(format!(
-                "only SELECT / SHOW TABLES / SHOW DATABASES / INSERT / CREATE TABLE / \
-                 ALTER TABLE (ADD|DROP COLUMN) / DROP TABLE / CREATE DATABASE / DROP DATABASE \
+                "only SELECT / SHOW TABLES / SHOW DATABASES / INSERT / DELETE / UPDATE / \
+                 CREATE TABLE / ALTER TABLE (ADD|DROP COLUMN) / DROP TABLE / TRUNCATE TABLE / \
+                 CREATE DATABASE / DROP DATABASE \
                  are supported, got: {}",
                 crate::sql::sql_snippet(&other.to_string())
             ))),

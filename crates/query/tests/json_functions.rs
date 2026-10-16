@@ -63,6 +63,38 @@ async fn json_functions_on_utf8_column() {
     assert_eq!(v, None, "str 键取 int → NULL");
 }
 
+/// **`D-34`：嵌套路径的语法是「分步参数」**（`json_get_int(doc, 'a', 'b')`）。
+///
+/// README 曾经写着 `json_get_int(doc, 'a.b')`（点号串）—— 那是**文档错误**：
+/// 路径按**单个 key** 解释，`'a.b'` 找的是名字叫 `"a.b"` 的键 ⇒ 恒 NULL
+/// （不报错 ⇒ 静默错答案，最难发现的那类）。本用例把两个事实都钉住：
+/// 分步参数取得到值；点号串是 miss（**现状**，不是待修缺陷）。
+#[tokio::test]
+async fn json_nested_path_is_step_arguments_not_dot_string() {
+    let mut ctx = SessionContext::new();
+    datafusion_functions_json::register_all(&mut ctx).unwrap();
+
+    let schema = Arc::new(Schema::new(vec![Field::new("doc", DataType::Utf8, true)]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(vec![Some(
+            r#"{"a": {"b": 7}, "arr": [10, 20]}"#,
+        )]))],
+    )
+    .unwrap();
+    ctx.register_batch("t", batch).unwrap();
+
+    // ① 分步参数：逐层取到嵌套键
+    let v = scalar_int(&mut ctx, "SELECT json_get_int(doc, 'a', 'b') AS v FROM t").await;
+    assert_eq!(v, Some(7));
+    // ② 数组下标是**数字参数**（从 0 计）
+    let v = scalar_int(&mut ctx, "SELECT json_get_int(doc, 'arr', 1) AS v FROM t").await;
+    assert_eq!(v, Some(20));
+    // ③ 点号串 = 单个 key `"a.b"` ⇒ miss（现状语义，防下一位再去"修"没错的实现）
+    let v = scalar_int(&mut ctx, "SELECT json_get_int(doc, 'a.b') AS v FROM t").await;
+    assert_eq!(v, None, "'a.b' 是单个键名，不是嵌套路径");
+}
+
 async fn scalar_display(ctx: &mut SessionContext, sql: &str) -> String {
     let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
     let col = batches[0].column(0);
