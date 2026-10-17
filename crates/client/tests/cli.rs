@@ -8,7 +8,10 @@ use std::process::Command;
 const BIN: &str = env!("CARGO_BIN_EXE_yuntun-cli");
 
 fn run(args: &[&str]) -> std::process::Output {
-    Command::new(BIN).args(args).output().expect("跑 yuntun-cli")
+    Command::new(BIN)
+        .args(args)
+        .output()
+        .expect("跑 yuntun-cli")
 }
 
 #[test]

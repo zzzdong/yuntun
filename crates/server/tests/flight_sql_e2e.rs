@@ -21,8 +21,8 @@ use arrow_flight::{Action, FlightData, FlightDescriptor, PutResult};
 use futures::StreamExt;
 use prost::Message;
 use yuntun_model::ops::CreateTableRequest;
-use yuntun_server::flight::command_bytes;
 use yuntun_server::Lakehouse;
+use yuntun_server::flight::command_bytes;
 
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![

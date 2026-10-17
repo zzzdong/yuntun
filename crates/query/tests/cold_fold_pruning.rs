@@ -21,10 +21,10 @@ use std::sync::Arc;
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use yuntun_model::agg::{AggKind, AggQuery, AggSpec, AggStates, PartialAgg};
-use yuntun_model::meta::{compute_stats_lite, FileManifest, StatisticsLite};
-use yuntun_model::predicate::{CmpOp, Literal, Predicate};
 use yuntun_format::DataFormat;
+use yuntun_model::agg::{AggKind, AggQuery, AggSpec, AggStates, PartialAgg};
+use yuntun_model::meta::{FileManifest, StatisticsLite, compute_stats_lite};
+use yuntun_model::predicate::{CmpOp, Literal, Predicate};
 use yuntun_query::cold;
 use yuntun_store::{StoreConfig, create_store};
 
@@ -171,6 +171,8 @@ async fn a_file_allowed_by_the_filter_is_still_counted() {
         op: CmpOp::Gt,
         value: Literal::Int(0),
     };
-    let got = fold(store.clone(), vec![a, b], Some(p)).await.expect("两边都放行");
+    let got = fold(store.clone(), vec![a, b], Some(p))
+        .await
+        .expect("两边都放行");
     assert_eq!(got, (4, Some(303)), "1+2+100+200");
 }

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema};
 use yuntun_catalog::{CatalogOps, MemoryCatalog};
 use yuntun_model::meta::FileManifest;
-use yuntun_model::ops::{CommitFilesRequest, CreateTableRequest, ManifestDelta, CatalogVersion};
+use yuntun_model::ops::{CatalogVersion, CommitFilesRequest, CreateTableRequest, ManifestDelta};
 use yuntun_query::LocalCatalog;
 
 fn schema() -> arrow::datatypes::SchemaRef {
@@ -77,11 +77,7 @@ async fn full_reload_then_incremental_touches_only_changed_table() {
     assert_eq!(out.tables_refreshed, 1, "只重拉 t1");
 
     let snap = view.snapshot();
-    assert_eq!(
-        snap.tables["public.t1"].files.len(),
-        2,
-        "t1 拉到新文件"
-    );
+    assert_eq!(snap.tables["public.t1"].files.len(), 2, "t1 拉到新文件");
     let t2_after = snap.tables["public.t2"].clone();
     assert!(
         Arc::ptr_eq(&t2_before, &t2_after),
@@ -161,15 +157,15 @@ async fn failed_refresh_keeps_previous_snapshot_and_records_error() {
     commit(&cat, "t1", "b1").await;
 
     let view = Arc::new(LocalCatalog::new());
-    view.refresh(&(cat.clone() as Arc<dyn CatalogOps>)).await.unwrap();
+    view.refresh(&(cat.clone() as Arc<dyn CatalogOps>))
+        .await
+        .unwrap();
     let good = view.snapshot();
     assert_eq!(good.get("public.t1").unwrap().files.len(), 1);
     assert!(view.last_error().is_none());
 
     // 换成一个"读表失败"的 Catalog（模拟 metanode 短暂不可用）
-    let broken: Arc<dyn CatalogOps> = Arc::new(BrokenCatalog {
-        inner: cat.clone(),
-    });
+    let broken: Arc<dyn CatalogOps> = Arc::new(BrokenCatalog { inner: cat.clone() });
     let res = view.refresh(&broken).await;
     assert!(res.is_err(), "刷新应返回错误给调用方（便于打点/告警）");
     assert!(view.last_error().is_some(), "错误必须被记录");
@@ -207,7 +203,9 @@ impl CatalogOps for BrokenCatalog {
         now_ms: u64,
         ttl_ms: u64,
     ) -> Result<yuntun_model::meta::LeaseGrant, yuntun_model::LakeError> {
-        self.inner.acquire_lease(purpose, holder, now_ms, ttl_ms).await
+        self.inner
+            .acquire_lease(purpose, holder, now_ms, ttl_ms)
+            .await
     }
     async fn renew_lease(
         &self,
@@ -217,7 +215,9 @@ impl CatalogOps for BrokenCatalog {
         now_ms: u64,
         ttl_ms: u64,
     ) -> Result<bool, yuntun_model::LakeError> {
-        self.inner.renew_lease(purpose, holder, epoch, now_ms, ttl_ms).await
+        self.inner
+            .renew_lease(purpose, holder, epoch, now_ms, ttl_ms)
+            .await
     }
     async fn release_lease(
         &self,
@@ -268,7 +268,9 @@ impl CatalogOps for BrokenCatalog {
     async fn dv_object_paths(&self) -> Result<Vec<String>, yuntun_model::LakeError> {
         self.inner.dv_object_paths().await
     }
-    async fn list_tasks(&self) -> Result<Vec<yuntun_model::task::CompactionTask>, yuntun_model::LakeError> {
+    async fn list_tasks(
+        &self,
+    ) -> Result<Vec<yuntun_model::task::CompactionTask>, yuntun_model::LakeError> {
         self.inner.list_tasks().await
     }
     async fn list_leases(
@@ -307,7 +309,9 @@ impl CatalogOps for BrokenCatalog {
     async fn list_tables(
         &self,
     ) -> Result<Vec<yuntun_model::meta::TableMeta>, yuntun_model::LakeError> {
-        Err(yuntun_model::LakeError::Other("metanode unavailable".into()))
+        Err(yuntun_model::LakeError::Other(
+            "metanode unavailable".into(),
+        ))
     }
     async fn evolve_schema(
         &self,
@@ -333,7 +337,9 @@ impl CatalogOps for BrokenCatalog {
         snapshot: u64,
         shard_filter: Option<&str>,
     ) -> Result<Vec<FileManifest>, yuntun_model::LakeError> {
-        self.inner.list_visible_files(table, snapshot, shard_filter).await
+        self.inner
+            .list_visible_files(table, snapshot, shard_filter)
+            .await
     }
     async fn drop_shard(&self, t: &str, s: &str) -> Result<u64, yuntun_model::LakeError> {
         self.inner.drop_shard(t, s).await
@@ -341,10 +347,7 @@ impl CatalogOps for BrokenCatalog {
     async fn drop_table(&self, n: &str) -> Result<(), yuntun_model::LakeError> {
         self.inner.drop_table(n).await
     }
-    async fn check_idempotency(
-        &self,
-        k: &str,
-    ) -> Result<Option<String>, yuntun_model::LakeError> {
+    async fn check_idempotency(&self, k: &str) -> Result<Option<String>, yuntun_model::LakeError> {
         self.inner.check_idempotency(k).await
     }
     async fn record_idempotency(
@@ -366,10 +369,7 @@ impl CatalogOps for BrokenCatalog {
             manifest_ver: u64::MAX,
         }
     }
-    async fn manifest_delta(
-        &self,
-        since: u64,
-    ) -> Result<ManifestDelta, yuntun_model::LakeError> {
+    async fn manifest_delta(&self, since: u64) -> Result<ManifestDelta, yuntun_model::LakeError> {
         self.inner.manifest_delta(since).await
     }
     async fn commit_compaction(

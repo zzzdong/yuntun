@@ -283,14 +283,22 @@ async fn prefetch_payload_semantics() {
     // ---- ① 纯版本探测（tables 空）→ **零载荷**（设计 §3.2 的"无变化零开销"路径）----
     let probe = prefetch(&mut client, 0, 0, false, vec![]).await;
     assert!(
-        probe.payload.as_ref().expect("载荷字段应存在").tables.is_empty(),
+        probe
+            .payload
+            .as_ref()
+            .expect("载荷字段应存在")
+            .tables
+            .is_empty(),
         "只要版本号时不该带表载荷（那会让'零开销'变成'每次搬全部元数据'）"
     );
     assert!(!probe.full_reload, "版本探测不该要求重建缓存");
     // 两次结构变更（建 schema + 建表）→ schema_ver=2；提交只推 manifest_ver（设计 §6.3 两组版本号）
     assert_eq!(probe.schema_ver, 2, "两组版本号都要给：{probe:?}");
     assert!(probe.manifest_ver >= 1, "提交过文件 → manifest_ver >= 1");
-    assert!(probe.snapshot > 0, "快照号也要给（客户端据此对齐 manifest 语义）");
+    assert!(
+        probe.snapshot > 0,
+        "快照号也要给（客户端据此对齐 manifest 语义）"
+    );
 
     // ---- ② 版本没变（since = 当前）→ 版本号原样回，客户端据此**跳过刷新** ----
     let same = prefetch(
@@ -301,18 +309,14 @@ async fn prefetch_payload_semantics() {
         vec![],
     )
     .await;
-    assert_eq!((same.schema_ver, same.manifest_ver), (probe.schema_ver, probe.manifest_ver));
+    assert_eq!(
+        (same.schema_ver, same.manifest_ver),
+        (probe.schema_ver, probe.manifest_ver)
+    );
     assert!(same.payload.as_ref().unwrap().tables.is_empty());
 
     // ---- ③ 差量：请求存在的表 → 只回它；请求不存在的表 → **不在载荷里**（= 已删）----
-    let delta = prefetch(
-        &mut client,
-        0,
-        0,
-        false,
-        vec!["public.cpu", "public.gone"],
-    )
-    .await;
+    let delta = prefetch(&mut client, 0, 0, false, vec!["public.cpu", "public.gone"]).await;
     let names: Vec<String> = delta
         .payload
         .as_ref()
@@ -321,18 +325,31 @@ async fn prefetch_payload_semantics() {
         .iter()
         .map(|t| t.name.clone())
         .collect();
-    assert_eq!(names, vec!["public.cpu".to_string()], "只回请求里**存在**的表：{names:?}");
+    assert_eq!(
+        names,
+        vec!["public.cpu".to_string()],
+        "只回请求里**存在**的表：{names:?}"
+    );
     assert!(!delta.full_reload);
     let cpu = &delta.payload.as_ref().unwrap().tables[0];
     assert_eq!(cpu.current_schema_version, 1, "建表即 version 1");
     assert_eq!(cpu.default_format, "parquet");
     assert_eq!(cpu.namespace, "public");
-    assert!(!cpu.arrow_schema.is_empty(), "Arrow schema 必须随载荷走（缓存要能解出 schema）");
-    assert!(cpu.ingest_config.is_some(), "有配置时必须带（optional 的存在性有语义）");
+    assert!(
+        !cpu.arrow_schema.is_empty(),
+        "Arrow schema 必须随载荷走（缓存要能解出 schema）"
+    );
+    assert!(
+        cpu.ingest_config.is_some(),
+        "有配置时必须带（optional 的存在性有语义）"
+    );
 
     // ---- ④ full=true → 全部表（忽略 tables）+ 要求重建缓存 ----
     let all = prefetch(&mut client, 0, 0, true, vec![]).await;
-    assert!(all.full_reload, "full=true 必须置 full_reload（客户端要丢本地缓存）");
+    assert!(
+        all.full_reload,
+        "full=true 必须置 full_reload（客户端要丢本地缓存）"
+    );
     let all_names: Vec<String> = all
         .payload
         .as_ref()

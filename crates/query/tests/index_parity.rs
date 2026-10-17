@@ -22,7 +22,7 @@ use std::sync::Arc;
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use yuntun_catalog::{CatalogOps, MemoryCatalog};
-use yuntun_model::index::{IndexFile, INDEX_GROUP_ROWS};
+use yuntun_model::index::{INDEX_GROUP_ROWS, IndexFile};
 use yuntun_model::meta::FileManifest;
 use yuntun_model::ops::{CommitFilesRequest, CreateTableRequest};
 use yuntun_query::{LocalCatalog, QueryEngine};
@@ -56,11 +56,8 @@ fn batch() -> (arrow::record_batch::RecordBatch, usize) {
     ts.push(5_000_000); // 第 3 组（只有 1 行）：验证"尾巴组"也算得对
     let rows = ts.len();
     (
-        arrow::record_batch::RecordBatch::try_new(
-            schema(),
-            vec![Arc::new(Int64Array::from(ts))],
-        )
-        .unwrap(),
+        arrow::record_batch::RecordBatch::try_new(schema(), vec![Arc::new(Int64Array::from(ts))])
+            .unwrap(),
         rows,
     )
 }
@@ -86,7 +83,11 @@ fn parquet_and_index() -> (Vec<u8>, Vec<u8>, usize) {
 }
 
 /// 建表 + 写入"一个真文件 + 真索引 + 真 manifest"，返回引擎。
-async fn engine_with_data() -> (Arc<dyn object_store::ObjectStore>, QueryEngine, Arc<dyn CatalogOps>) {
+async fn engine_with_data() -> (
+    Arc<dyn object_store::ObjectStore>,
+    QueryEngine,
+    Arc<dyn CatalogOps>,
+) {
     let store = yuntun_store::create_store(&yuntun_store::StoreConfig::Memory).unwrap();
     let catalog: Arc<dyn CatalogOps> = Arc::new(MemoryCatalog::new());
     catalog
@@ -330,9 +331,14 @@ async fn index_is_written_and_registered_by_flush() {
     );
 
     // 对象真的在，而且解得回来、形状对得上
-    let bytes = yuntun_store::get_bytes(&*store, &f.index_path).await.unwrap();
+    let bytes = yuntun_store::get_bytes(&*store, &f.index_path)
+        .await
+        .unwrap();
     assert_eq!(bytes.len() as u64, f.index_size, "登记的字节数与对象一致");
     let idx = IndexFile::from_bytes(&bytes).expect("索引必须能被解回");
-    assert!(idx.matches_shape(f.row_count), "索引形状必须与 manifest 一致");
+    assert!(
+        idx.matches_shape(f.row_count),
+        "索引形状必须与 manifest 一致"
+    );
     assert_eq!(idx.groups.len(), 1, "4 行 ⇒ 一个组");
 }

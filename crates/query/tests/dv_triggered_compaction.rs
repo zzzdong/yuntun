@@ -176,7 +176,11 @@ async fn a_single_file_with_a_big_deletion_is_compacted_by_the_dv() {
         .unwrap();
     assert_eq!(files.len(), 1, "重写成一个文件（不是新增一个）");
     assert_eq!(files[0].row_count, 800, "产物里只剩没被删的行");
-    assert_eq!(fx.rows().await, vec![800], "**行数不变**（重写不得改变行集）");
+    assert_eq!(
+        fx.rows().await,
+        vec![800],
+        "**行数不变**（重写不得改变行集）"
+    );
     assert!(
         fx.catalog
             .list_deletions(&format!("public.{TABLE}"), new_snap)
@@ -191,7 +195,10 @@ async fn a_single_file_with_a_big_deletion_is_compacted_by_the_dv() {
 #[tokio::test]
 async fn a_tiny_deletion_does_not_trigger_a_rewrite() {
     let fx = fixture(5_000, 5).await;
-    assert!(try_compact(&fx).await.is_none(), "删 5 行不值得重写 5000 行的文件");
+    assert!(
+        try_compact(&fx).await.is_none(),
+        "删 5 行不值得重写 5000 行的文件"
+    );
     // 而且**读侧照样是对的**（不重写 ≠ 删不掉：DV 还在，读侧一直在应用它）
     assert_eq!(fx.rows().await, vec![4_995]);
     assert_eq!(
@@ -223,11 +230,32 @@ async fn a_low_ratio_deletion_does_not_trigger_a_rewrite() {
 #[test]
 fn the_trigger_needs_both_guards() {
     let cfg = yuntun_compaction::CompactionConfig::default();
-    assert!(yuntun_compaction::dv_worth_compacting(&cfg, 1_200, 2_000), "60% ⇒ 是");
-    assert!(yuntun_compaction::dv_worth_compacting(&cfg, 1_000, 10_000), "10% 且 1000 行 ⇒ 是（正好踩线）");
-    assert!(!yuntun_compaction::dv_worth_compacting(&cfg, 999, 2_000), "下界差一行 ⇒ 否");
-    assert!(!yuntun_compaction::dv_worth_compacting(&cfg, 1_500, 20_000), "7.5% ⇒ 否");
-    assert!(!yuntun_compaction::dv_worth_compacting(&cfg, 0, 2_000), "没删 ⇒ 否");
-    assert!(!yuntun_compaction::dv_worth_compacting(&cfg, 10, 0), "空文件 ⇒ 否");
-    assert!(!yuntun_compaction::dv_worth_compacting(&cfg, 99, 10), "位图比行数还多（损坏）⇒ 否");
+    assert!(
+        yuntun_compaction::dv_worth_compacting(&cfg, 1_200, 2_000),
+        "60% ⇒ 是"
+    );
+    assert!(
+        yuntun_compaction::dv_worth_compacting(&cfg, 1_000, 10_000),
+        "10% 且 1000 行 ⇒ 是（正好踩线）"
+    );
+    assert!(
+        !yuntun_compaction::dv_worth_compacting(&cfg, 999, 2_000),
+        "下界差一行 ⇒ 否"
+    );
+    assert!(
+        !yuntun_compaction::dv_worth_compacting(&cfg, 1_500, 20_000),
+        "7.5% ⇒ 否"
+    );
+    assert!(
+        !yuntun_compaction::dv_worth_compacting(&cfg, 0, 2_000),
+        "没删 ⇒ 否"
+    );
+    assert!(
+        !yuntun_compaction::dv_worth_compacting(&cfg, 10, 0),
+        "空文件 ⇒ 否"
+    );
+    assert!(
+        !yuntun_compaction::dv_worth_compacting(&cfg, 99, 10),
+        "位图比行数还多（损坏）⇒ 否"
+    );
 }

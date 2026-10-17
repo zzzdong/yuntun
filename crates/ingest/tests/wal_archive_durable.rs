@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use object_store::ObjectStore;
-use yuntun_ingest::wal_archive::{archive_once, restore, ArchiveConfig};
+use yuntun_ingest::wal_archive::{ArchiveConfig, archive_once, restore};
 use yuntun_model::wal_record::{DataPayload, Record};
 use yuntun_wal::{WalConfig, WalReader, WalWriter};
 
@@ -89,7 +89,9 @@ async fn write_and_maybe_archive(
     .await
     .expect("开 WAL");
     for i in 0..N {
-        wal.append(data_record(i as u64)).await.expect("append 应当成功");
+        wal.append(data_record(i as u64))
+            .await
+            .expect("append 应当成功");
     }
     if !with_archive {
         return 0;

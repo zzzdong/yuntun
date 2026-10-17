@@ -84,7 +84,11 @@ impl Proc {
             let _ = r.read_to_string(&mut buf);
             *sink.lock().unwrap() = buf;
         });
-        Self { child, stdout, stderr }
+        Self {
+            child,
+            stdout,
+            stderr,
+        }
     }
 
     fn start(meta: SocketAddr, dir: &std::path::Path) -> Self {
@@ -212,7 +216,8 @@ where
 async fn datanode_merges_files_from_shared_storage_and_commits_via_raft() {
     // ---- ① metanode（进程内 + 真 gRPC 服务）----
     let meta_dir = tmpdir("dn-compact-meta");
-    let node = yuntun_meta::MetaNode::open(&meta_dir, 1, vec![1], HashMap::new()).expect("起单节点");
+    let node =
+        yuntun_meta::MetaNode::open(&meta_dir, 1, vec![1], HashMap::new()).expect("起单节点");
     let h = node.handle();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let meta_addr = listener.local_addr().unwrap();
@@ -341,7 +346,8 @@ async fn only_one_compactor_holds_the_lease_and_it_is_taken_over_when_it_dies() 
 
     // ---- metanode（进程内）----
     let meta_dir = tmpdir("lease-meta");
-    let node = yuntun_meta::MetaNode::open(&meta_dir, 1, vec![1], HashMap::new()).expect("起单节点");
+    let node =
+        yuntun_meta::MetaNode::open(&meta_dir, 1, vec![1], HashMap::new()).expect("起单节点");
     let h = node.handle();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let meta_addr = listener.local_addr().unwrap();
@@ -391,10 +397,7 @@ async fn only_one_compactor_holds_the_lease_and_it_is_taken_over_when_it_dies() 
     .await;
     let first = holder(&h).expect("应当有持有者");
     // `§166`：持有者是 `gc-{instance_id}`（GC 作业的租约身份）
-    let first_id = first
-        .strip_prefix("gc-")
-        .unwrap_or(&first)
-        .to_string();
+    let first_id = first.strip_prefix("gc-").unwrap_or(&first).to_string();
     assert!(
         first_id == "d1" || first_id == "d2",
         "持有者必须是本用例的两个节点之一：{first}"

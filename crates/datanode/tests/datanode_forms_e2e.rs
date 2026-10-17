@@ -29,9 +29,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arrow_flight::flight_service_client::FlightServiceClient;
+use arrow_flight::sql::CommandStatementQuery;
 use arrow_flight::{FlightData, FlightDescriptor};
 use futures::StreamExt as _;
-use arrow_flight::sql::CommandStatementQuery;
 use tokio::net::TcpListener;
 
 use yuntun_catalog::CatalogOps as _;
@@ -59,11 +59,9 @@ fn tmpdir(tag: &str) -> PathBuf {
 }
 
 fn schema() -> Arc<arrow::datatypes::Schema> {
-    Arc::new(arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
-        "a",
-        arrow::datatypes::DataType::Int64,
-        true,
-    )]))
+    Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("a", arrow::datatypes::DataType::Int64, true),
+    ]))
 }
 
 /// 预置数据节点的 WAL（它启动后回放 ⇒ 热数据在**另一个进程**里长出来）。
@@ -333,7 +331,12 @@ fn roster(h: &yuntun_meta::NodeHandle) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-async fn wait_until<F: Fn() -> bool>(f: F, within: Duration, what: &str, stderr: &Arc<Mutex<String>>) {
+async fn wait_until<F: Fn() -> bool>(
+    f: F,
+    within: Duration,
+    what: &str,
+    stderr: &Arc<Mutex<String>>,
+) {
     let deadline = Instant::now() + within;
     while !f() {
         assert!(
@@ -413,7 +416,8 @@ async fn sql(
 async fn ingest_form_writes_and_query_form_reads_it_over_the_wire() {
     // ---- ① metanode（进程内 + 真 gRPC 服务）----
     let meta_dir = tmpdir("qd-meta");
-    let node = yuntun_meta::MetaNode::open(&meta_dir, 1, vec![1], HashMap::new()).expect("起单节点");
+    let node =
+        yuntun_meta::MetaNode::open(&meta_dir, 1, vec![1], HashMap::new()).expect("起单节点");
     let h = node.handle();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let meta_addr = listener.local_addr().unwrap();
@@ -452,10 +456,7 @@ async fn ingest_form_writes_and_query_form_reads_it_over_the_wire() {
     .await;
 
     // ---- ③b 元数据面拿到了表：这就是 `replay_wal_ddl` 经 raft 写进去的 ----
-    let t = client_catalog
-        .get_table(TABLE)
-        .await
-        .expect("读表元数据");
+    let t = client_catalog.get_table(TABLE).await.expect("读表元数据");
     assert!(
         t.is_some(),
         "数据节点的 WAL DDL 必须重放进元数据面（否则查询节点根本不知道有这张表）"
@@ -467,9 +468,12 @@ async fn ingest_form_writes_and_query_form_reads_it_over_the_wire() {
 
     // ---- ⑤ 客户端发 SQL：数据在**另一个进程**里（只查询形态自己没有热数据） ----
     let mut client = flight_client(qd_addr).await;
-    let got = sql(&mut client, &format!("SELECT a FROM yuntun.{TABLE} ORDER BY a"))
-        .await
-        .expect("查询应成功");
+    let got = sql(
+        &mut client,
+        &format!("SELECT a FROM yuntun.{TABLE} ORDER BY a"),
+    )
+    .await
+    .expect("查询应成功");
     assert_eq!(
         got,
         vec![1, 2, 3],
@@ -519,7 +523,8 @@ async fn ingest_form_writes_and_query_form_reads_it_over_the_wire() {
 async fn two_writers_parity_with_single_node_serial() {
     // ---- ① metanode（进程内 + 真 gRPC 服务）----
     let meta_dir = tmpdir("mw-meta");
-    let node = yuntun_meta::MetaNode::open(&meta_dir, 1, vec![1], HashMap::new()).expect("起单节点");
+    let node =
+        yuntun_meta::MetaNode::open(&meta_dir, 1, vec![1], HashMap::new()).expect("起单节点");
     let h = node.handle();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let meta_addr = listener.local_addr().unwrap();
@@ -566,8 +571,16 @@ async fn two_writers_parity_with_single_node_serial() {
 
     // ---- ④ 表已进元数据面（两个节点的 WAL DDL 都重放过；重复的那次应被容忍）----
     let deadline = Instant::now() + Duration::from_secs(15);
-    while client_catalog.get_table(TABLE).await.expect("读表元数据").is_none() {
-        assert!(Instant::now() < deadline, "两个写进程的 WAL DDL 应把表带进元数据面");
+    while client_catalog
+        .get_table(TABLE)
+        .await
+        .expect("读表元数据")
+        .is_none()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "两个写进程的 WAL DDL 应把表带进元数据面"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
@@ -575,9 +588,12 @@ async fn two_writers_parity_with_single_node_serial() {
     let mut q = Proc::spawn_query_only_with_cold(&dir_a, meta_addr, Some(&cold));
     let qd_addr = q.wait_sql_listening();
     let mut client = flight_client(qd_addr).await;
-    let got = sql(&mut client, &format!("SELECT a FROM yuntun.{TABLE} ORDER BY a"))
-        .await
-        .expect("查询应成功");
+    let got = sql(
+        &mut client,
+        &format!("SELECT a FROM yuntun.{TABLE} ORDER BY a"),
+    )
+    .await
+    .expect("查询应成功");
     assert_eq!(
         got,
         vec![1, 2, 3, 4, 5, 6],
@@ -699,7 +715,8 @@ async fn wait_rows(
 async fn two_concurrent_writers_real_ingest_parity() {
     // ---- ① metanode（进程内 + 真 gRPC 服务）----
     let meta_dir = tmpdir("cm-meta");
-    let node = yuntun_meta::MetaNode::open(&meta_dir, 1, vec![1], HashMap::new()).expect("起单节点");
+    let node =
+        yuntun_meta::MetaNode::open(&meta_dir, 1, vec![1], HashMap::new()).expect("起单节点");
     let h = node.handle();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let meta_addr = listener.local_addr().unwrap();
@@ -747,8 +764,16 @@ async fn two_concurrent_writers_real_ingest_parity() {
 
     // ---- ④ 表已进元数据面（两个节点的 WAL DDL 都重放过；重复的那次应被容忍）----
     let deadline = Instant::now() + Duration::from_secs(15);
-    while client_catalog.get_table(TABLE).await.expect("读表元数据").is_none() {
-        assert!(Instant::now() < deadline, "两个写进程的 WAL DDL 应把表带进元数据面");
+    while client_catalog
+        .get_table(TABLE)
+        .await
+        .expect("读表元数据")
+        .is_none()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "两个写进程的 WAL DDL 应把表带进元数据面"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 

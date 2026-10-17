@@ -159,7 +159,11 @@ async fn members_carry_data_plane_addresses() {
 
     let got = cache.members();
     let ids: Vec<&str> = got.iter().map(|m| m.instance_id.as_str()).collect();
-    assert_eq!(ids, vec!["inst-a", "inst-b"], "成员表按 ID 有序（取值确定）");
+    assert_eq!(
+        ids,
+        vec!["inst-a", "inst-b"],
+        "成员表按 ID 有序（取值确定）"
+    );
     assert_eq!(got[0].address, None, "同进程实例没有网络地址");
     assert_eq!(
         got[1].address.as_deref(),

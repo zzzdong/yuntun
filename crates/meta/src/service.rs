@@ -17,7 +17,7 @@ use tonic::{Request, Response, Status};
 
 use raft::eraftpb::Message;
 
-use crate::{trace_on, MembersView, MetaError, NodeHandle};
+use crate::{MembersView, MetaError, NodeHandle, trace_on};
 use yuntun_proto::meta as pb;
 
 /// 等一个提案被 raft 应用的上限。
@@ -59,9 +59,8 @@ impl pb::meta_server::Meta for MetaService {
         req: Request<pb::ProposeRequest>,
     ) -> Result<Response<pb::ProposeResponse>, Status> {
         let r = req.into_inner();
-        let op = r
-            .op
-            .ok_or_else(|| Status::invalid_argument("op 为空（ProposeRequest.op 必填）"))?;
+        let op =
+            r.op.ok_or_else(|| Status::invalid_argument("op 为空（ProposeRequest.op 必填）"))?;
 
         // ⚠️ raft 的"等应用到状态机"是**阻塞**的（`recv_timeout`）。直接在 async 函数里等，
         // 会占住 tokio 的工作线程 —— 一个被拖住的提案就能把整个服务拖停。

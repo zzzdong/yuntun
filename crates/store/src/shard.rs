@@ -210,7 +210,8 @@ pub trait ShardReader: Send + Sync + std::fmt::Debug {
         table: &str,
         known_manifest_ver: u64,
     ) -> Result<ShardRead, LakeError> {
-        self.read_table_excluding(table, known_manifest_ver, &[]).await
+        self.read_table_excluding(table, known_manifest_ver, &[])
+            .await
     }
 
     /// 同 [`Self::read_table`]，但带**读侧栅栏**（`exclude` 见 [`Self::read_shard_excluding`]）。

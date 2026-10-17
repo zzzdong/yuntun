@@ -125,11 +125,18 @@ async fn force_flush_lands_in_flight_rows_and_leaves_no_pending_chunk() {
     );
     assert_eq!(committed_rows(&catalog).await, 0, "前提：还没落盘就查不到");
 
-    let done = ingestor.force_flush(&format!("public.{TABLE}")).await.unwrap();
+    let done = ingestor
+        .force_flush(&format!("public.{TABLE}"))
+        .await
+        .unwrap();
     assert_eq!(done.rows, 3, "落盘的行数就是刚才写进去的行数");
     assert!(done.chunks >= 1, "至少落盘一个 chunk");
 
-    assert_eq!(committed_rows(&catalog).await, 3, "强制 flush 之后必须查得到");
+    assert_eq!(
+        committed_rows(&catalog).await,
+        3,
+        "强制 flush 之后必须查得到"
+    );
     let pending: Vec<_> = ingestor
         .chunks()
         .chunk_ids_of_table(&format!("public.{TABLE}"))
@@ -148,7 +155,10 @@ async fn force_flush_lands_in_flight_rows_and_leaves_no_pending_chunk() {
     );
 
     // 幂等：再调一次没有东西可 flush
-    let again = ingestor.force_flush(&format!("public.{TABLE}")).await.unwrap();
+    let again = ingestor
+        .force_flush(&format!("public.{TABLE}"))
+        .await
+        .unwrap();
     assert_eq!(again, Default::default(), "已落盘的表再强制 flush 是 no-op");
 
     shutdown.cancel();

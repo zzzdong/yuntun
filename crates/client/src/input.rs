@@ -196,15 +196,27 @@ mod tests {
         let b = &batches[0];
         assert_eq!(b.schema().field(0).name(), "ts");
         assert_eq!(
-            b.column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0),
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
             100
         );
         assert_eq!(
-            b.column(1).as_any().downcast_ref::<StringArray>().unwrap().value(1),
+            b.column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(1),
             "b"
         );
         assert_eq!(
-            b.column(2).as_any().downcast_ref::<Float64Array>().unwrap().value(1),
+            b.column(2)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(1),
             2.5
         );
         let _ = std::fs::remove_file(&path);
@@ -256,11 +268,19 @@ mod tests {
         let b = &batches[0];
         assert_eq!(b.schema().field(0).name(), "ts");
         assert_eq!(
-            b.column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0),
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
             42
         );
         assert_eq!(
-            b.column(2).as_any().downcast_ref::<Float64Array>().unwrap().value(0),
+            b.column(2)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0),
             3.0
         );
         let _ = std::fs::remove_file(&path);
@@ -276,7 +296,10 @@ mod tests {
             InputFormat::from_path(Path::new("/tmp/a.parquet")),
             InputFormat::Parquet
         );
-        assert_eq!(InputFormat::from_path(Path::new("a.jsonl")), InputFormat::Jsonl);
+        assert_eq!(
+            InputFormat::from_path(Path::new("a.jsonl")),
+            InputFormat::Jsonl
+        );
         assert_eq!(InputFormat::from_path(Path::new("a.csv")), InputFormat::Csv);
     }
 }

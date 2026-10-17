@@ -10,8 +10,8 @@ use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use yuntun_catalog::{CatalogOps, MemoryCatalog};
 use yuntun_ingest::{Ingestor, IngestorConfig};
-use yuntun_model::ops::CreateTableRequest;
 use yuntun_model::IngestBatch;
+use yuntun_model::ops::CreateTableRequest;
 
 fn table_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]))
@@ -197,7 +197,10 @@ async fn wal_backlog_counts_fsynced_but_unabsorbed_records() {
     shutdown.cancel();
     let _ = handle.await;
 
-    assert_eq!(backlog, 0, "吸收完成后积压必须归零（空闲时谎报积压会误导运维）");
+    assert_eq!(
+        backlog, 0,
+        "吸收完成后积压必须归零（空闲时谎报积压会误导运维）"
+    );
     assert!(ingestor.absorbed_seq() > wal.synced_seq());
     // 数据确实进了 chunk（可见性承诺），只是还没落盘
     let rows: usize = ingestor
@@ -274,7 +277,10 @@ async fn sealed_chunk_survives_satisfies_wal_recovery_contract() {
     shutdown.cancel();
     let _ = handle.await;
 
-    assert_eq!(rows, 1, "fsync 后一个扫描周期内必须可查（可见性上界绑 WAL）");
+    assert_eq!(
+        rows, 1,
+        "fsync 后一个扫描周期内必须可查（可见性上界绑 WAL）"
+    );
     let snap = catalog.current_snapshot().await;
     assert!(
         catalog

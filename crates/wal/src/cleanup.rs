@@ -12,7 +12,7 @@ use crate::writer::WalWriter;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use yuntun_model::batch::{now_ms, BatchState};
+use yuntun_model::batch::{BatchState, now_ms};
 use yuntun_model::error::LakeError;
 use yuntun_model::wal_record::Record;
 
@@ -193,7 +193,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
-    use yuntun_model::batch::{is_terminal, BatchStatus};
+    use yuntun_model::batch::{BatchStatus, is_terminal};
 
     struct MapView(pub Mutex<HashMap<String, BatchState>>);
 

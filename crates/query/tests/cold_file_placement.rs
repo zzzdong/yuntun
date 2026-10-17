@@ -149,7 +149,12 @@ async fn an_empty_allowlist_reads_nothing_but_still_answers() {
     create_table(&catalog).await;
     commit_file(&store, &catalog, "b-a", &[Some(1), Some(2)]).await;
 
-    let none = engine(store.clone(), &catalog, Some(vec!["p/does-not-exist".into()])).await;
+    let none = engine(
+        store.clone(),
+        &catalog,
+        Some(vec!["p/does-not-exist".into()]),
+    )
+    .await;
     assert_eq!(
         counts(&none, Q).await,
         (0, None),
@@ -185,7 +190,11 @@ async fn assignments_split_the_data_evenly_and_add_up_to_the_whole() {
 
     let whole = engine(store.clone(), &catalog, None).await;
     let (wc, ws) = counts(&whole, Q).await;
-    assert_eq!((wc, ws), (10, Some(286)), "前提：全量是 10 行（6+10+50+220）");
+    assert_eq!(
+        (wc, ws),
+        (10, Some(286)),
+        "前提：全量是 10 行（6+10+50+220）"
+    );
 
     // 分给两个"节点"（其中一个就是本地 —— 空实例 id）
     // 本地（空实例 id）+ dn1 —— 调用方要把**自己**也放进去
@@ -203,6 +212,9 @@ async fn assignments_split_the_data_evenly_and_add_up_to_the_whole() {
         sum_c += c;
         sum_s += s.unwrap_or(0);
     }
-    assert_eq!(sum_c, wc, "各份的**行数**之和必须等于全量（漏/重都在这里现形）");
+    assert_eq!(
+        sum_c, wc,
+        "各份的**行数**之和必须等于全量（漏/重都在这里现形）"
+    );
     assert_eq!(sum_s, ws.unwrap(), "各份的**求和**之和也必须等于全量");
 }

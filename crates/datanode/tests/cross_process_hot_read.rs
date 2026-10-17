@@ -330,4 +330,3 @@ async fn second_process_on_the_same_private_dir_is_rejected() {
         "被拒的进程不该打印监听地址（它连 WAL 都不该打开）"
     );
 }
-

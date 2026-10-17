@@ -19,13 +19,13 @@ use uuid::Uuid;
 use yuntun_catalog::CatalogOps;
 use yuntun_chunk::store::ChunkFlushInput;
 use yuntun_model::arrow_util::align_batch;
-use yuntun_model::batch::{apply_record, BatchStateMap};
+use yuntun_model::batch::{BatchStateMap, apply_record};
 use yuntun_model::error::LakeError;
 use yuntun_model::meta::compute_stats_lite;
 use yuntun_model::ops::CommitFilesRequest;
 use yuntun_model::wal_record::{
-    BatchAbortPayload, BatchCommittedPayload, BatchPendingPayload, BatchS3WrittenPayload, DataPayload,
-    Record,
+    BatchAbortPayload, BatchCommittedPayload, BatchPendingPayload, BatchS3WrittenPayload,
+    DataPayload, Record,
 };
 use yuntun_wal::writer::WalWriter;
 
@@ -176,7 +176,8 @@ pub async fn flush_chunk_with_id(
     deps.catalog.record_in_flight(&batch_id, now).await?;
 
     // ⑤ 编码写对象存储
-    let (file_path, file_size) = match write_to_object_store(deps, input, &batch_id, &merged).await {
+    let (file_path, file_size) = match write_to_object_store(deps, input, &batch_id, &merged).await
+    {
         Ok(x) => x,
         Err(e) => {
             // 保持非终态，等超时监控 abort（幂等重试场景见 §5.6）
@@ -358,8 +359,12 @@ pub async fn recommit_into_catalog(
             // 恢复重提交同样从 WAL 派生键集合（`BatchState.wal_seq_range` 一直在记）。
             // ⚠️ 尽力而为：若该区间所在的 WAL 段已被回收，则只能退回 `batch_id` 幂等
             //（数据不会重复写，只是"同键重试"可能漏判 —— 属已知边界）。
-            client_request_ids: collect_idempotency_keys(deps, st.wal_seq_range.0, st.wal_seq_range.1)
-                .unwrap_or_default(),
+            client_request_ids: collect_idempotency_keys(
+                deps,
+                st.wal_seq_range.0,
+                st.wal_seq_range.1,
+            )
+            .unwrap_or_default(),
             shard: st.shard.clone(),
             time_window: st.time_window.clone(),
             files,

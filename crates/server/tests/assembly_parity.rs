@@ -41,10 +41,7 @@ struct Observed {
 fn temp_base(tag: &str) -> std::path::PathBuf {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let p = std::env::temp_dir().join(format!(
-        "yuntun-assembly-{tag}-{}-{n}",
-        std::process::id()
-    ));
+    let p = std::env::temp_dir().join(format!("yuntun-assembly-{tag}-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&p).expect("建临时目录");
     p
 }
@@ -103,7 +100,10 @@ async fn observe(lh: &Lakehouse) -> Observed {
         tables,
         version: (v.schema_ver, v.manifest_ver),
         files,
-        created_at_is_seconds: metas.iter().map(|m| m.created_at < 100_000_000_000).collect(),
+        created_at_is_seconds: metas
+            .iter()
+            .map(|m| m.created_at < 100_000_000_000)
+            .collect(),
     }
 }
 

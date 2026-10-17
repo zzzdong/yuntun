@@ -60,12 +60,15 @@ impl Fx {
         // 这次教训）—— 夹具的临时目录必须落在已被忽略的地方，并在 `Drop` 里自己收掉。
         let base = std::env::var("CARGO_TARGET_TMPDIR")
             .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().to_string());
-        let root = format!("{base}/dist-{}-{}", std::process::id(), uuid::Uuid::now_v7());
+        let root = format!(
+            "{base}/dist-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        );
         std::fs::create_dir_all(&root).unwrap();
-        let store = yuntun_store::create_store(&yuntun_store::StoreConfig::Local {
-            root: root.clone(),
-        })
-        .unwrap();
+        let store =
+            yuntun_store::create_store(&yuntun_store::StoreConfig::Local { root: root.clone() })
+                .unwrap();
         let catalog = Arc::new(MemoryCatalog::new());
         catalog
             .create_table(CreateTableRequest {
@@ -78,7 +81,11 @@ impl Fx {
             })
             .await
             .unwrap();
-        Self { store, catalog, root }
+        Self {
+            store,
+            catalog,
+            root,
+        }
     }
 
     /// 在 `shard` 上提交 `files` 个文件（每个 `rows` 行）。
@@ -228,7 +235,10 @@ async fn fence_follows_the_declared_lease_purpose() {
         .catalog
         .commit_compaction(&[], vec![FileManifest::default()], 0, &shard_purpose)
         .await;
-    assert!(fenced.is_err(), "分片租约的水位必须拦住分片提交：{fenced:?}");
+    assert!(
+        fenced.is_err(),
+        "分片租约的水位必须拦住分片提交：{fenced:?}"
+    );
 
     // ② 用**不低于**水位的代次提交 ⇒ 放行（栅栏是"代次落后"而不是"有人在持有"）
     let ok = fx
@@ -273,7 +283,10 @@ async fn gc_lease_is_exclusive_and_can_be_handed_over() {
     assert!(!b.granted, "同一时刻只能有一个节点在清孤儿");
 
     // 归还之后别人可以接（接手方不必干等 TTL）
-    fx.catalog.release_lease(GC_LEASE, "gc-a", a.epoch).await.unwrap();
+    fx.catalog
+        .release_lease(GC_LEASE, "gc-a", a.epoch)
+        .await
+        .unwrap();
     let b2 = fx
         .catalog
         .acquire_lease(GC_LEASE, "gc-b", 60_000, 1_000)
@@ -348,7 +361,10 @@ async fn task_directory_appears_and_disappears_with_the_work() {
     assert_eq!(tasks.len(), 1, "应当有一条待办：{tasks:?}");
     assert_eq!(tasks[0].table, "public.dist");
     assert_eq!(tasks[0].shard, "s0");
-    assert_eq!(tasks[0].files, 5, "待办要带上「有多少个文件」（运维据此判断轻重）");
+    assert_eq!(
+        tasks[0].files, 5,
+        "待办要带上「有多少个文件」（运维据此判断轻重）"
+    );
     assert_eq!(
         tasks[0].reason(),
         yuntun_model::task::TaskReason::Files,

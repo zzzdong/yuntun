@@ -117,7 +117,13 @@ mod tests {
         assert!(extract("/* not_idempotency_key=x */ SELECT 1").is_none());
         // 空值 / 超长值
         assert!(extract("/* idempotency_key= */ SELECT 1").is_none());
-        assert!(extract(&format!("/* idempotency_key={} */ SELECT 1", "a".repeat(300))).is_none());
+        assert!(
+            extract(&format!(
+                "/* idempotency_key={} */ SELECT 1",
+                "a".repeat(300)
+            ))
+            .is_none()
+        );
         // 未闭合注释 → None（交给解析器报错）
         assert!(extract("/* idempotency_key=abc").is_none());
     }

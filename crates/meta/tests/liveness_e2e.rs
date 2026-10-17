@@ -63,8 +63,11 @@ async fn heartbeat_keeps_a_datanode_alive_and_silence_evicts_it() {
     }
 
     // ① 注册（走 raft 的 op）⇒ 进名录
-    h.propose(register_op("inst-a", "10.0.0.7:50051"), Duration::from_secs(5))
-        .expect("注册应提交");
+    h.propose(
+        register_op("inst-a", "10.0.0.7:50051"),
+        Duration::from_secs(5),
+    )
+    .expect("注册应提交");
     assert_eq!(roster(&h), vec!["inst-a".to_string()]);
 
     // ② 心跳的返回值：在名录里 = true；不在 = false（**它就是"该重新注册"的信号**）

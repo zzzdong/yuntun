@@ -15,8 +15,8 @@ use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
-use yuntun_server::config::MetricsSection;
 use yuntun_server::Lakehouse;
+use yuntun_server::config::MetricsSection;
 
 fn config(wal_dir: &str, store_root: &str) -> yuntun_server::Config {
     yuntun_server::Config::from_toml(&format!(
@@ -89,7 +89,10 @@ fn gauge(text: &str, name: &str) -> f64 {
 async fn metrics_http_serves_the_three_endpoints_and_stops_on_shutdown() {
     // ⑤ 配置：默认关 + TOML 段能读
     let default_section = MetricsSection::default();
-    assert!(!default_section.enabled, "默认必须是关（否则每个进程都去抢端口）");
+    assert!(
+        !default_section.enabled,
+        "默认必须是关（否则每个进程都去抢端口）"
+    );
     let cfg_with_metrics = yuntun_server::Config::from_toml(
         r#"
 [store]
@@ -105,9 +108,11 @@ listen = "127.0.0.1:19999"
     assert!(cfg_with_metrics.metrics.enabled);
     assert_eq!(cfg_with_metrics.metrics.listen, "127.0.0.1:19999");
     // 老配置（没有 [metrics] 段）照样能读 ⇒ 落到默认（关）
-    assert!(!config("/tmp/yuntun-metrics-wal", "/tmp/yuntun-metrics-store")
-        .metrics
-        .enabled);
+    assert!(
+        !config("/tmp/yuntun-metrics-wal", "/tmp/yuntun-metrics-store")
+            .metrics
+            .enabled
+    );
 
     let guard = yuntun_testkit::TestDir::tmpfs("metrics-http");
     let base = guard.string();
@@ -191,8 +196,14 @@ listen = "127.0.0.1:19999"
         keys(&direct),
         "HTTP 出来的字段集必须与结构体一致（否则就是少了一个指标）"
     );
-    assert_eq!(served["chunk"]["budget_bytes"], direct["chunk"]["budget_bytes"]);
-    assert_eq!(served["query"]["limit_bytes"], direct["query"]["limit_bytes"]);
+    assert_eq!(
+        served["chunk"]["budget_bytes"],
+        direct["chunk"]["budget_bytes"]
+    );
+    assert_eq!(
+        served["query"]["limit_bytes"],
+        direct["query"]["limit_bytes"]
+    );
 
     // ② 协议面：healthz / 404 / 405
     let (status, body) = http_get(addr, "/healthz").await;

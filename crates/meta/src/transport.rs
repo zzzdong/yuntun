@@ -79,9 +79,9 @@
 //! —— `spawn_node` 只依赖 [`PeerTransport`] trait。
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
 use std::time::Duration;
 
 use protobuf::Message as PbMessage;
@@ -291,13 +291,7 @@ impl GrpcTransport {
                 .map_err(|e| format!("节点 {id} 的地址 {addr:?} 非法（期望 host:port）：{e}"))?;
             let (imp_tx, imp_rx) = tokio::sync::mpsc::channel::<Message>(SEND_QUEUE);
             let (be_tx, be_rx) = tokio::sync::mpsc::channel::<Message>(BEST_EFFORT_QUEUE);
-            handle.spawn(send_loop(
-                id,
-                addr,
-                imp_rx,
-                be_rx,
-                stats.clone(),
-            ));
+            handle.spawn(send_loop(id, addr, imp_rx, be_rx, stats.clone()));
             important.insert(id, imp_tx);
             best_effort.insert(id, be_tx);
         }
@@ -327,8 +321,13 @@ impl PeerTransport for GrpcTransport {
         let (be_tx, be_rx) = tokio::sync::mpsc::channel::<Message>(BEST_EFFORT_QUEUE);
         // ⚠️ **不能 `tokio::spawn`**：调用方是 raft 驱动线程（`std::thread`），那里没有运行时上下文
         // ⇒ 用存下来的 `Handle`（`§118` 实测：`tokio::spawn` 在这里直接 panic，把驱动线程带走）
-        self.handle
-            .spawn(send_loop(id, addr.to_string(), imp_rx, be_rx, self.stats.clone()));
+        self.handle.spawn(send_loop(
+            id,
+            addr.to_string(),
+            imp_rx,
+            be_rx,
+            self.stats.clone(),
+        ));
         self.important.write().unwrap().insert(id, imp_tx);
         self.best_effort.write().unwrap().insert(id, be_tx);
         eprintln!("[meta:transport] 已加入 peer {id}（{addr}）");

@@ -246,10 +246,26 @@ mod tests {
             (5, ddl_op::DROP_TABLE, "public.t".to_string()),
             (9, ddl_op::CREATE_TABLE, "public.t".to_string()),
         ];
-        assert_eq!(liveness_at(&tl, 0, "public.t"), (true, 0), "没有 DDL ⇒ 存活、世代 0");
+        assert_eq!(
+            liveness_at(&tl, 0, "public.t"),
+            (true, 0),
+            "没有 DDL ⇒ 存活、世代 0"
+        );
         assert_eq!(liveness_at(&tl, 1, "public.t"), (true, 1));
-        assert_eq!(liveness_at(&tl, 6, "public.t"), (false, 1), "DROP 之后不存活");
-        assert_eq!(liveness_at(&tl, 9, "public.t"), (true, 2), "同名重建 ⇒ 世代 +1");
-        assert_eq!(liveness_at(&tl, 9, "public.other"), (true, 0), "别的表不受影响");
+        assert_eq!(
+            liveness_at(&tl, 6, "public.t"),
+            (false, 1),
+            "DROP 之后不存活"
+        );
+        assert_eq!(
+            liveness_at(&tl, 9, "public.t"),
+            (true, 2),
+            "同名重建 ⇒ 世代 +1"
+        );
+        assert_eq!(
+            liveness_at(&tl, 9, "public.other"),
+            (true, 0),
+            "别的表不受影响"
+        );
     }
 }

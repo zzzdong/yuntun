@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use yuntun_model::error::WalError;
 use yuntun_model::wal_record::{
-    record_crc, FileHeader, Record, FILE_HEADER_SIZE, RECORD_HEADER_SIZE, WAL_MAGIC,
+    FILE_HEADER_SIZE, FileHeader, RECORD_HEADER_SIZE, Record, WAL_MAGIC, record_crc,
 };
 
 /// segment 文件名：`{seq:020}.wal`

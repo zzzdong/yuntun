@@ -13,29 +13,31 @@
 //!
 //! 注：分片存储形态（内存分片 / 磁盘分片）属于存储层，见 `yuntun-store::shard`。
 
+pub mod agg;
 pub mod arrow_util;
 pub mod batch;
 /// 删除向量（`plan.md` F.3）：行位删除的表达、存储与"保留哪些行"的翻译。
 pub mod dv;
-pub mod agg;
-pub mod predicate;
-pub mod task;
 pub mod error;
 /// 行组级索引文件（`plan.md` F.4）：zone map + XOR filter + 帧编解码。
 pub mod index;
 pub mod meta;
 pub mod ops;
+pub mod predicate;
 pub mod private_dir;
 pub mod schema;
 pub mod snapshot;
+pub mod task;
 pub mod wal_record;
 
 pub use batch::{BatchState, BatchStatus};
 pub use error::LakeError;
 pub use meta::*;
-pub use snapshot::{decode_payload, encode_payload, frame, unframe, CatalogStateSnapshot, Unframed};
 pub use ops::*;
-pub use schema::{apply_change, classify, SchemaChange, SchemaChangeKind, SchemaCompatibility};
+pub use schema::{SchemaChange, SchemaChangeKind, SchemaCompatibility, apply_change, classify};
+pub use snapshot::{
+    CatalogStateSnapshot, Unframed, decode_payload, encode_payload, frame, unframe,
+};
 use std::time::SystemTime;
 pub use wal_record::{DdlPayload, Record, RecordType};
 /// 归一化写入单元 —— 下游完全不感知协议差异（详细设计 §3.1 / ADR-13）。

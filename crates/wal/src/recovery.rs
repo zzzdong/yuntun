@@ -17,7 +17,7 @@
 use crate::config::WalConfig;
 use crate::segment::{list_segments, load_segment};
 use std::collections::HashMap;
-use yuntun_model::batch::{apply_record, BatchStateMap};
+use yuntun_model::batch::{BatchStateMap, apply_record};
 use yuntun_model::error::{LakeError, WalError};
 
 /// 单个 segment 的元信息（清理线程用）。

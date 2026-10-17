@@ -202,9 +202,7 @@ fn validate(args: &Args) -> Result<(), String> {
         );
     }
     if args.no_ingest && args.meta.is_empty() {
-        return Err(
-            "--no-ingest 的形态没有本地数据：必须给 --meta（热数据全靠名录发现）".into(),
-        );
+        return Err("--no-ingest 的形态没有本地数据：必须给 --meta（热数据全靠名录发现）".into());
     }
     if args.no_ingest && args.compaction {
         return Err(
@@ -289,8 +287,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = <Args as Parser>::parse();
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
     if let Err(e) = validate(&args) {
@@ -390,17 +387,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // ---- 数据侧：WAL → DDL 重放 → Ingestor → 数据面服务 + 入册/心跳 ----
         // 【`durable`，`§127`】先把归档里的 WAL 段拉回来 —— 顺序是硬要求：必须在
         // `WalWriter::open` **之前**（它会挑本地最大的 seq 续写，归档段得先躺在那儿）。
-        let archive_cfg =
-            args.wal_archive_prefix
-                .as_ref()
-                .map(|p| yuntun_ingest::ArchiveConfig {
-                    prefix: p.clone(),
-                    instance_id: args.instance_id.clone(),
-                    interval: std::time::Duration::from_secs(args.wal_archive_interval_secs.max(1)),
-                    // datanode 侧暂时保持**全归档**（老行为）：按表口径的开关先在 standalone
-                    // 落地（`§162`），datanode 要多一个 CLI 参数 —— 记在 §162.3 的边界里。
-                    all_tables: true,
-                });
+        let archive_cfg = args
+            .wal_archive_prefix
+            .as_ref()
+            .map(|p| yuntun_ingest::ArchiveConfig {
+                prefix: p.clone(),
+                instance_id: args.instance_id.clone(),
+                interval: std::time::Duration::from_secs(args.wal_archive_interval_secs.max(1)),
+                // datanode 侧暂时保持**全归档**（老行为）：按表口径的开关先在 standalone
+                // 落地（`§162`），datanode 要多一个 CLI 参数 —— 记在 §162.3 的边界里。
+                all_tables: true,
+            });
         if let Some(ac) = &archive_cfg {
             match yuntun_ingest::restore(ac, &wal_root, 0, store.as_ref()).await {
                 Ok(0) => {}
@@ -482,16 +479,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 interval_secs = ac.interval.as_secs(),
                 "WAL 归档已启用（durable）：RPO ≤ 间隔 + 一次上传"
             );
-            let _archiver =
-                yuntun_ingest::spawn_archiver(
-                    ac,
-                    wal_root.clone(),
-                    0,
-                    store.clone(),
-                    // datanode 侧暂不按表（`all_tables: true`）⇒ 不需要目录句柄（`§162.3`）
-                    None,
-                    shutdown.clone(),
-                );
+            let _archiver = yuntun_ingest::spawn_archiver(
+                ac,
+                wal_root.clone(),
+                0,
+                store.clone(),
+                // datanode 侧暂不按表（`all_tables: true`）⇒ 不需要目录句柄（`§162.3`）
+                None,
+                shutdown.clone(),
+            );
         }
 
         // **压缩 + 孤儿 GC 角色**（数据进程的第二职能，`--compaction` 打开）。
@@ -513,8 +509,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 // 与写入侧**同一个格式**：合并必须读得懂自己写出去的东西
                 format: ingestor.cfg.default_format,
             });
-            let _compaction =
-                yuntun_compaction::spawn_compaction_loop(compactor, shutdown.clone());
+            let _compaction = yuntun_compaction::spawn_compaction_loop(compactor, shutdown.clone());
             let _gc = yuntun_compaction::spawn_orphan_cleanup_with_interval(
                 store.clone(),
                 catalog.clone(),
@@ -627,9 +622,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         //   从设计里的一句话变成可调用的行为；
         // - 只查询形态（`--no-ingest`）：没有本地数据、没有 WAL ⇒ **只读**（保持原样）。
         let flight = match &sql_ingestor {
-            Some(ing) => {
-                yuntun_server::FlightServer::new(ing.clone(), engine, catalog.clone())
-            }
+            Some(ing) => yuntun_server::FlightServer::new(ing.clone(), engine, catalog.clone()),
             None => yuntun_server::FlightServer::new_readonly(engine, catalog.clone()),
         };
         let svc = arrow_flight::flight_service_server::FlightServiceServer::new(flight);

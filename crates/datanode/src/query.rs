@@ -28,9 +28,9 @@ use object_store::ObjectStore;
 use yuntun_catalog::CatalogOps;
 use yuntun_query::LocalCatalog;
 use yuntun_query::cold;
-use yuntun_store::{ColdReadRequest, ColdReader};
 use yuntun_shardrpc::GrpcShardFetch;
 use yuntun_store::RemoteShard;
+use yuntun_store::{ColdReadRequest, ColdReader};
 
 /// **按名录装配热读器**（`§71.5` 遗留第 3 条）。
 ///
@@ -57,19 +57,18 @@ pub(crate) async fn reconcile_hot_readers(
         // 建连失败 / 超时**只影响这一个成员**：一个地址不通不该让**别的**成员接不上线
         // （此前是 `?` 直接中断整轮巡检 —— 一个坏成员就能让新成员永远不上线）。
         // 巡检是幂等的：下一轮会补，期间该成员按"读不到"参与 partial 判定。
-        let fetch =
-            match GrpcShardFetch::connect_with_timeout(&m.address, hot_read_timeout).await {
-                Ok(f) => Arc::new(f),
-                Err(e) => {
-                    tracing::warn!(
-                        instance = %m.instance_id,
-                        address = %m.address,
-                        error = %e,
-                        "热读器建连失败或超时；跳过该成员，下一轮重试"
-                    );
-                    continue;
-                }
-            };
+        let fetch = match GrpcShardFetch::connect_with_timeout(&m.address, hot_read_timeout).await {
+            Ok(f) => Arc::new(f),
+            Err(e) => {
+                tracing::warn!(
+                    instance = %m.instance_id,
+                    address = %m.address,
+                    error = %e,
+                    "热读器建连失败或超时；跳过该成员，下一轮重试"
+                );
+                continue;
+            }
+        };
         cache.set_hot_shards(m.instance_id.clone(), Arc::new(RemoteShard::new(fetch)));
         tracing::info!(instance = %m.instance_id, address = %m.address, "热读器已接线");
         added += 1;
@@ -117,8 +116,10 @@ impl ColdReader for NodeCold {
     fn fold(
         &self,
         req: ColdReadRequest,
-    ) -> futures::future::BoxFuture<'_, Result<yuntun_model::agg::AggStates, yuntun_model::error::LakeError>>
-    {
+    ) -> futures::future::BoxFuture<
+        '_,
+        Result<yuntun_model::agg::AggStates, yuntun_model::error::LakeError>,
+    > {
         Box::pin(async move {
             cold::fold_cold_files(
                 self.store.clone(),

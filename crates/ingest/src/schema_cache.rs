@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use yuntun_catalog::CatalogOps;
 use yuntun_model::error::LakeError;
-use yuntun_model::schema::{classify, SchemaCompatibility};
+use yuntun_model::schema::{SchemaCompatibility, classify};
 
 /// 本地缓存的表 schema。
 #[derive(Debug, Clone)]
@@ -67,11 +67,7 @@ pub struct PartitionCache {
 
 impl PartitionCache {
     /// 该表声明的分区列（**没有声明 / 表不存在 ⇒ 空**，调用方回退到 `event_time`）。
-    pub async fn get(
-        &self,
-        catalog: &Arc<dyn CatalogOps>,
-        table: &str,
-    ) -> Vec<String> {
+    pub async fn get(&self, catalog: &Arc<dyn CatalogOps>, table: &str) -> Vec<String> {
         if let Some(c) = self.inner.read().await.get(table) {
             return c.clone();
         }
@@ -199,8 +195,8 @@ mod tests {
             assert_eq!(v, 2);
         }
         cache.update("t", sch(&[("a", DataType::Int64)]), 1).await; // 过期版本 + 过期 schema
-                                                                    // 传入含新列的 schema：基于过期 v1 判定 NeedsEvolve → OCC 冲突（actual=2）
-                                                                    // → 拉取新 schema 重新判定 → Compatible → 返回 2（§5.2 OCC 重试循环）
+        // 传入含新列的 schema：基于过期 v1 判定 NeedsEvolve → OCC 冲突（actual=2）
+        // → 拉取新 schema 重新判定 → Compatible → 返回 2（§5.2 OCC 重试循环）
         let incoming = sch(&[("a", DataType::Int64), ("other", DataType::Int64)]);
         let version = resolve_schema_version(&catalog, &cache, "t", &incoming)
             .await

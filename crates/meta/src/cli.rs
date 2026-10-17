@@ -102,9 +102,9 @@ pub struct Peer {
 /// 地址在这里**做成 gRPC 端点再校验一次**：写错一个 `--peer` 若只表现为"集群永远选不出
 /// leader"（消息发不出去且不报错），排查成本极高 —— 启动期报出来最省事。
 fn parse_peer(s: &str) -> Result<Peer, String> {
-    let (id, addr) = s.split_once('@').ok_or_else(|| {
-        format!("取值应为 <id>@<host:port>（如 2@127.0.0.1:9001），收到 {s:?}")
-    })?;
+    let (id, addr) = s
+        .split_once('@')
+        .ok_or_else(|| format!("取值应为 <id>@<host:port>（如 2@127.0.0.1:9001），收到 {s:?}"))?;
     let id = id
         .trim()
         .parse::<u64>()
@@ -285,11 +285,23 @@ mod tests {
     #[test]
     fn explicit_voters_are_sorted_and_deduped() {
         let a = run(&[
-            "--id", "2", "--dir", "/tmp/x", "--voters", "3,1,2,2", "--listen", "0.0.0.0:7000",
+            "--id",
+            "2",
+            "--dir",
+            "/tmp/x",
+            "--voters",
+            "3,1,2,2",
+            "--listen",
+            "0.0.0.0:7000",
             // 多节点：别的 voter 必须有地址（否则 normalize 拒绝，见另一条用例）
-            "--peer", "1@127.0.0.1:9001,3@127.0.0.1:9003",
+            "--peer",
+            "1@127.0.0.1:9001,3@127.0.0.1:9003",
         ]);
-        assert_eq!(a.voters, vec![1, 2, 3], "成员表要归一化（顺序/重复都不该影响语义）");
+        assert_eq!(
+            a.voters,
+            vec![1, 2, 3],
+            "成员表要归一化（顺序/重复都不该影响语义）"
+        );
         assert_eq!(a.listen.to_string(), "0.0.0.0:7000");
     }
 
@@ -310,8 +322,14 @@ mod tests {
             (vec!["--id", "1"], "--dir"),
             (vec!["--id", "1", "--dir", "/tmp/x", "--wat"], "--wat"),
             (vec!["--id", "abc", "--dir", "/tmp/x"], "--id"),
-            (vec!["--id", "1", "--dir", "/tmp/x", "--listen", "not-an-addr"], "--listen"),
-            (vec!["--id", "1", "--dir", "/tmp/x", "--voters", "1,x"], "--voters"),
+            (
+                vec!["--id", "1", "--dir", "/tmp/x", "--listen", "not-an-addr"],
+                "--listen",
+            ),
+            (
+                vec!["--id", "1", "--dir", "/tmp/x", "--voters", "1,x"],
+                "--voters",
+            ),
         ] {
             let e = parse(&args).unwrap_err();
             assert!(
@@ -334,9 +352,15 @@ mod tests {
     #[test]
     fn help_is_not_an_error() {
         // clap 用 `DisplayHelp` 表示"这不是错"；调用方据此退 0
-        assert_eq!(parse(&["--help"]).unwrap_err().kind(), ErrorKind::DisplayHelp);
+        assert_eq!(
+            parse(&["--help"]).unwrap_err().kind(),
+            ErrorKind::DisplayHelp
+        );
         // `--version` 同理
-        assert_eq!(parse(&["--version"]).unwrap_err().kind(), ErrorKind::DisplayVersion);
+        assert_eq!(
+            parse(&["--version"]).unwrap_err().kind(),
+            ErrorKind::DisplayVersion
+        );
     }
 
     /// 多节点：给全 `--peer` 才能过；缺一个就**早失败**并列出缺哪个。
@@ -344,22 +368,45 @@ mod tests {
     fn multi_voter_requires_peer_address_for_each_other_node() {
         // 给全 → 过
         let a = run(&[
-            "--id", "1", "--dir", "/tmp/x", "--voters", "1,2,3",
-            "--peer", "2@127.0.0.1:9002,3@127.0.0.1:9003",
+            "--id",
+            "1",
+            "--dir",
+            "/tmp/x",
+            "--voters",
+            "1,2,3",
+            "--peer",
+            "2@127.0.0.1:9002,3@127.0.0.1:9003",
         ]);
-        assert_eq!(a.peer_map().get(&2).map(String::as_str), Some("127.0.0.1:9002"));
+        assert_eq!(
+            a.peer_map().get(&2).map(String::as_str),
+            Some("127.0.0.1:9002")
+        );
 
         // 缺一个 → 报错里点名
         let a = parse(&[
-            "--id", "1", "--dir", "/tmp/x", "--voters", "1,2,3", "--peer", "2@127.0.0.1:9002",
-        ]).unwrap();
+            "--id",
+            "1",
+            "--dir",
+            "/tmp/x",
+            "--voters",
+            "1,2,3",
+            "--peer",
+            "2@127.0.0.1:9002",
+        ])
+        .unwrap();
         let e = a.normalize().unwrap_err();
         assert!(e.contains("[3]"), "应点名缺节点 3：{e}");
 
         // 列了自己也无妨（忽略即可，不该报错）
         let a = run(&[
-            "--id", "1", "--dir", "/tmp/x", "--voters", "1,2",
-            "--peer", "1@127.0.0.1:9001,2@127.0.0.1:9002",
+            "--id",
+            "1",
+            "--dir",
+            "/tmp/x",
+            "--voters",
+            "1,2",
+            "--peer",
+            "1@127.0.0.1:9001,2@127.0.0.1:9002",
         ]);
         assert_eq!(a.peer_map().len(), 2);
     }
@@ -380,9 +427,16 @@ mod tests {
     #[test]
     fn duplicate_peer_id_is_rejected() {
         let a = parse(&[
-            "--id", "1", "--dir", "/tmp/x", "--voters", "1,2",
-            "--peer", "2@127.0.0.1:9002,2@127.0.0.1:9003",
-        ]).unwrap();
+            "--id",
+            "1",
+            "--dir",
+            "/tmp/x",
+            "--voters",
+            "1,2",
+            "--peer",
+            "2@127.0.0.1:9002,2@127.0.0.1:9003",
+        ])
+        .unwrap();
         let e = a.normalize().unwrap_err();
         assert!(e.contains("出现了多次"), "{e}");
     }
@@ -410,13 +464,17 @@ mod tests {
         assert!(e.contains("已有数据"), "{e}");
 
         // ③ 正确搭配都放行
-        assert!(run(&["--id", "1", "--dir", tmp.to_str().unwrap()])
-            .check_bootstrap()
-            .is_ok());
+        assert!(
+            run(&["--id", "1", "--dir", tmp.to_str().unwrap()])
+                .check_bootstrap()
+                .is_ok()
+        );
         let empty = tmp.join("fresh");
-        assert!(run(&["--id", "1", "--dir", empty.to_str().unwrap(), "--init"])
-            .check_bootstrap()
-            .is_ok());
+        assert!(
+            run(&["--id", "1", "--dir", empty.to_str().unwrap(), "--init"])
+                .check_bootstrap()
+                .is_ok()
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

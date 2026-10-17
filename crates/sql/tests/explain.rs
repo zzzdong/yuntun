@@ -40,10 +40,7 @@ fn engine() -> SqlEngine {
     // 否则"表已建但快照里没有"= NotFound（与生产里 spawn_refresh 的职责同源）
     let cache = Arc::new(LocalCatalog::new());
     {
-        let (cache, catalog) = (
-            cache.clone(),
-            catalog.clone() as Arc<dyn CatalogOps>,
-        );
+        let (cache, catalog) = (cache.clone(), catalog.clone() as Arc<dyn CatalogOps>);
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
                 .block_on(cache.refresh(&catalog))
@@ -98,7 +95,9 @@ async fn explain_renders_the_plan_for_queries() {
     assert!(plan.contains("TableScan"), "逻辑计划应含扫描：{plan}");
 
     // ③ `EXPLAIN ANALYZE` 真的跑（DataFusion 原生语义）
-    let batches = run("EXPLAIN ANALYZE SELECT 1").await.expect("EXPLAIN ANALYZE");
+    let batches = run("EXPLAIN ANALYZE SELECT 1")
+        .await
+        .expect("EXPLAIN ANALYZE");
     assert!(batches.iter().map(|b| b.num_rows()).sum::<usize>() >= 1);
 }
 

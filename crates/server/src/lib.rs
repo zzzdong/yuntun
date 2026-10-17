@@ -4,13 +4,13 @@
 //! + Compactor + WAL 超时监控，并启动 Arrow Flight gRPC 服务。
 
 pub mod config;
+pub mod flight;
 /// 指标 HTTP 导出（`T6.12` 的那一格）：`/metrics`、`/metrics.json`、`/healthz`。
 pub mod metrics_http;
-pub mod flight;
 
 pub use config::Config;
-pub use metrics_http::{prometheus_text, spawn_metrics};
 pub use flight::FlightServer;
+pub use metrics_http::{prometheus_text, spawn_metrics};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -334,7 +334,6 @@ fn dir_bytes(dir: &std::path::Path) -> u64 {
         .unwrap_or(0)
 }
 
-
 impl Lakehouse {
     /// 按配置装配全部组件（不启动服务）。
     pub async fn build(cfg: &Config) -> Result<Self, yuntun_model::error::LakeError> {
@@ -342,94 +341,97 @@ impl Lakehouse {
     }
 
     /// 起**进程内 1 节点 metanode**，返回连它的 `RemoteCatalog`（设计 §3.3 的 standalone 形态）。
-///
-/// # 为什么走 **loopback gRPC** 而不是直接调 `NodeHandle`
-///
-/// 为了让 standalone 与分布式走**同一条代码路径**。直接调句柄会得到"本地一条路、远端另一条路"，
-/// 两者的差异只会在上线时暴露 —— 那正是设计禁止的分叉（`§3.3`：禁止分叉）。
-/// 代价是每个写多一次 loopback 往返（同机、量级可忽略），换来的是**同一份代码被两种形态验证**。
-///
-/// # 目录
-///
-/// `[meta] dir` 省略 → **进程内临时目录**（每个 `Lakehouse` 一个，互不干扰；测试友好），
-/// 并打 warn（重启即新集群）。生产请在配置里显式给（`standalone` 的默认路径是 `./data/meta`）。
-async fn build_embedded_catalog(
-    cfg: &Config,
-    shutdown: &CancellationToken,
-) -> Result<
-    (
-        Arc<dyn CatalogOps>,
-        yuntun_meta::MetaNode,
-        tokio::task::JoinHandle<()>,
-    ),
-    yuntun_model::error::LakeError,
-> {
-    use std::collections::HashMap;
+    ///
+    /// # 为什么走 **loopback gRPC** 而不是直接调 `NodeHandle`
+    ///
+    /// 为了让 standalone 与分布式走**同一条代码路径**。直接调句柄会得到"本地一条路、远端另一条路"，
+    /// 两者的差异只会在上线时暴露 —— 那正是设计禁止的分叉（`§3.3`：禁止分叉）。
+    /// 代价是每个写多一次 loopback 往返（同机、量级可忽略），换来的是**同一份代码被两种形态验证**。
+    ///
+    /// # 目录
+    ///
+    /// `[meta] dir` 省略 → **进程内临时目录**（每个 `Lakehouse` 一个，互不干扰；测试友好），
+    /// 并打 warn（重启即新集群）。生产请在配置里显式给（`standalone` 的默认路径是 `./data/meta`）。
+    async fn build_embedded_catalog(
+        cfg: &Config,
+        shutdown: &CancellationToken,
+    ) -> Result<
+        (
+            Arc<dyn CatalogOps>,
+            yuntun_meta::MetaNode,
+            tokio::task::JoinHandle<()>,
+        ),
+        yuntun_model::error::LakeError,
+    > {
+        use std::collections::HashMap;
 
-    let dir = match &cfg.meta.dir {
-        Some(d) => d.clone(),
-        None => {
-            // 每个实例一个目录：同一个进程里可能起多个 Lakehouse（测试就是），
-            // 共用一个目录会让它们互相看到对方的表（现象是莫名其妙的 TableAlreadyExists）。
-            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            std::env::temp_dir().join(format!(
-                "yuntun-meta-{}-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0),
-                n
-            ))
+        let dir = match &cfg.meta.dir {
+            Some(d) => d.clone(),
+            None => {
+                // 每个实例一个目录：同一个进程里可能起多个 Lakehouse（测试就是），
+                // 共用一个目录会让它们互相看到对方的表（现象是莫名其妙的 TableAlreadyExists）。
+                static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                std::env::temp_dir().join(format!(
+                    "yuntun-meta-{}-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0),
+                    n
+                ))
+            }
+        };
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            yuntun_model::error::LakeError::Io(format!("建 meta 目录 {} 失败：{e}", dir.display()))
+        })?;
+
+        // 单 voter：raft 不需要任何对端（`MetaNode::open` 对多节点会要求 peer 地址）
+        let node = yuntun_meta::MetaNode::open(&dir, 1, vec![1], HashMap::new()).map_err(|e| {
+            yuntun_model::error::LakeError::Other(format!("起嵌入式 metanode 失败：{e}"))
+        })?;
+        if !node.wait_leader(Duration::from_secs(10)) {
+            return Err(yuntun_model::error::LakeError::Other(
+                "嵌入式 metanode 10s 内未当选 leader（单节点组正常在几十毫秒内选出来）".into(),
+            ));
         }
-    };
-    std::fs::create_dir_all(&dir).map_err(|e| {
-        yuntun_model::error::LakeError::Io(format!("建 meta 目录 {} 失败：{e}", dir.display()))
-    })?;
 
-    // 单 voter：raft 不需要任何对端（`MetaNode::open` 对多节点会要求 peer 地址）
-    let node = yuntun_meta::MetaNode::open(&dir, 1, vec![1], HashMap::new())
-        .map_err(|e| yuntun_model::error::LakeError::Other(format!("起嵌入式 metanode 失败：{e}")))?;
-    if !node.wait_leader(Duration::from_secs(10)) {
-        return Err(yuntun_model::error::LakeError::Other(
-            "嵌入式 metanode 10s 内未当选 leader（单节点组正常在几十毫秒内选出来）".into(),
-        ));
-    }
-
-    let listener = tokio::net::TcpListener::bind(&cfg.meta.listen).await.map_err(|e| {
-        yuntun_model::error::LakeError::Io(format!("绑定 {} 失败：{e}", cfg.meta.listen))
-    })?;
-    let addr = listener.local_addr().map_err(|e| {
-        yuntun_model::error::LakeError::Io(format!("取监听地址失败：{e}"))
-    })?;
-    let served = node.handle();
-    // ⚠️ 这个任务**持有 `NodeHandle`（其中含一份 `FjallStorage`）⇒ 它持有 fjall 的目录锁**。
-    // 所以它必须：① 随 `shutdown` 退出 ② 把 `JoinHandle` 交出去让调用方能 join
-    //（否则"同一进程内重启"永远是 `FjallError: Locked` —— 台账 `D-11`）。
-    let sd = shutdown.clone();
-    let meta_grpc = tokio::spawn(async move {
-        tokio::select! {
-            r = yuntun_meta::serve(served, listener) => {
-                // 服务错误在这里只能打日志：`serve` 只在监听器层面失败
-                if let Err(e) = r {
-                    eprintln!("[meta] 嵌入式 gRPC 服务退出：{e}");
+        let listener = tokio::net::TcpListener::bind(&cfg.meta.listen)
+            .await
+            .map_err(|e| {
+                yuntun_model::error::LakeError::Io(format!("绑定 {} 失败：{e}", cfg.meta.listen))
+            })?;
+        let addr = listener
+            .local_addr()
+            .map_err(|e| yuntun_model::error::LakeError::Io(format!("取监听地址失败：{e}")))?;
+        let served = node.handle();
+        // ⚠️ 这个任务**持有 `NodeHandle`（其中含一份 `FjallStorage`）⇒ 它持有 fjall 的目录锁**。
+        // 所以它必须：① 随 `shutdown` 退出 ② 把 `JoinHandle` 交出去让调用方能 join
+        //（否则"同一进程内重启"永远是 `FjallError: Locked` —— 台账 `D-11`）。
+        let sd = shutdown.clone();
+        let meta_grpc = tokio::spawn(async move {
+            tokio::select! {
+                r = yuntun_meta::serve(served, listener) => {
+                    // 服务错误在这里只能打日志：`serve` 只在监听器层面失败
+                    if let Err(e) = r {
+                        eprintln!("[meta] 嵌入式 gRPC 服务退出：{e}");
+                    }
+                }
+                _ = sd.cancelled() => {
+                    tracing::info!("嵌入式 metanode 的 gRPC 服务随 shutdown 退出（释放目录句柄）");
                 }
             }
-            _ = sd.cancelled() => {
-                tracing::info!("嵌入式 metanode 的 gRPC 服务随 shutdown 退出（释放目录句柄）");
-            }
-        }
-    });
+        });
 
-    let remote = yuntun_meta::RemoteCatalog::connect(vec![addr.to_string()]).map_err(|e| {
-        yuntun_model::error::LakeError::Other(format!("连嵌入式 metanode 失败：{e}"))
-    })?;
-    tracing::info!(dir = %dir.display(), addr = %addr, "catalog 装配为 embedded metanode（1 节点 raft + loopback gRPC）");
-    Ok((Arc::new(remote), node, meta_grpc))
-}
+        let remote = yuntun_meta::RemoteCatalog::connect(vec![addr.to_string()]).map_err(|e| {
+            yuntun_model::error::LakeError::Other(format!("连嵌入式 metanode 失败：{e}"))
+        })?;
+        tracing::info!(dir = %dir.display(), addr = %addr, "catalog 装配为 embedded metanode（1 节点 raft + loopback gRPC）");
+        Ok((Arc::new(remote), node, meta_grpc))
+    }
 
-/// 同 build，但注入外部 shutdown（standalone 主循环使用）。
+    /// 同 build，但注入外部 shutdown（standalone 主循环使用）。
     pub async fn build_with_shutdown(
         cfg: &Config,
         shutdown: CancellationToken,
@@ -596,7 +598,9 @@ async fn build_embedded_catalog(
         cache.set_catalog_ops(catalog.clone());
         // 节点列表进入快照（S2-4）：standalone = 本节点；R4 起由成员发现提供。
         // 放在快照里是为了让"分片归属"与 schema/manifest 同一版本，避免跨版本拼计划。
-        cache.set_members(vec![yuntun_query::Member::local(cfg.chunk.instance_id.clone())]);
+        cache.set_members(vec![yuntun_query::Member::local(
+            cfg.chunk.instance_id.clone(),
+        )]);
         // 本实例也**登记进名录**：刷新时会用名录整体替换成员表（`§69`），
         // 不登记就等于刷新一次把自己摘掉（`§70.5` 的"自动发现"闭环）。
         // 地址为空 = 同进程实例（没有数据面地址）。
@@ -624,8 +628,7 @@ async fn build_embedded_catalog(
                     .into(),
             ));
         }
-        let hot_read_budget =
-            std::time::Duration::from_secs(cfg.query.hot_read_budget_secs);
+        let hot_read_budget = std::time::Duration::from_secs(cfg.query.hot_read_budget_secs);
         // query 执行区内存池 = 另一块独立预算，超限直接报错而不抢 chunk 内存（架构 §2.8）
         let query = Arc::new(
             QueryEngine::with_query_memory_limit(
@@ -886,13 +889,11 @@ pub async fn spawn_mysql(
 /// 比较用**定长**（不提前退出）：令牌比对不该通过耗时泄露前缀。
 fn token_interceptor(
     token: Option<String>,
-) -> impl FnMut(
-    tonic::Request<()>,
-) -> Result<tonic::Request<()>, tonic::Status>
-       + Clone
-       + Send
-       + Sync
-       + 'static {
+) -> impl FnMut(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>
++ Clone
++ Send
++ Sync
++ 'static {
     move |req: tonic::Request<()>| {
         // `None` = 未配置令牌 ⇒ 全部放行（默认形态；保留拦截器是为了让服务类型统一，
         // 否则"开/关鉴权"会让 `impl Service` 的具体类型不同 → 装配处无法共用一段代码）
@@ -963,25 +964,18 @@ pub async fn serve_flight_on(
     auth_token: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let catalog: Arc<dyn CatalogOps> = lakehouse.catalog.clone();
-    let inner = FlightServer::new(
-        lakehouse.ingestor.clone(),
-        lakehouse.query.clone(),
-        catalog,
-    )
-    .with_sql(lakehouse.sql.clone());
+    let inner = FlightServer::new(lakehouse.ingestor.clone(), lakehouse.query.clone(), catalog)
+        .with_sql(lakehouse.sql.clone());
     let svc = arrow_flight::flight_service_server::FlightServiceServer::with_interceptor(
         inner,
         token_interceptor(auth_token.map(|s| s.to_string())),
     );
     tonic::transport::Server::builder()
         .add_service(svc)
-        .serve_with_incoming_shutdown(
-            tokio_stream::wrappers::TcpListenerStream::new(listener),
-            {
-                let token = lakehouse.shutdown.clone();
-                async move { token.cancelled().await }
-            },
-        )
+        .serve_with_incoming_shutdown(tokio_stream::wrappers::TcpListenerStream::new(listener), {
+            let token = lakehouse.shutdown.clone();
+            async move { token.cancelled().await }
+        })
         .await?;
     Ok(())
 }

@@ -55,7 +55,12 @@ fn roster(h: &yuntun_meta::NodeHandle) -> Vec<String> {
 }
 
 /// 轮询到条件成立（带超时与可读的失败信息）。
-async fn wait_until<F: Fn() -> bool>(f: F, within: Duration, what: &str, stderr: &Arc<Mutex<String>>) {
+async fn wait_until<F: Fn() -> bool>(
+    f: F,
+    within: Duration,
+    what: &str,
+    stderr: &Arc<Mutex<String>>,
+) {
     let deadline = Instant::now() + within;
     while !f() {
         assert!(
@@ -71,7 +76,8 @@ async fn wait_until<F: Fn() -> bool>(f: F, within: Duration, what: &str, stderr:
 async fn datanode_registers_keeps_alive_and_is_evicted_when_it_dies() {
     // ---- ① metanode：进程内起**真** gRPC 服务，巡检口径调到秒级 ----
     let meta_dir = tmpdir("membership-meta");
-    let node = yuntun_meta::MetaNode::open(&meta_dir, 1, vec![1], HashMap::new()).expect("起单节点");
+    let node =
+        yuntun_meta::MetaNode::open(&meta_dir, 1, vec![1], HashMap::new()).expect("起单节点");
     let h = node.handle();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

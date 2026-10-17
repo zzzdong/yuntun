@@ -76,8 +76,8 @@ impl StmtKind {
 
 /// 判定一条 SQL 的类型；**解析失败**时返回可读的原因（不是 sqlparser 的原始报错）。
 pub fn classify(sql: &str) -> Result<StmtKind, String> {
-    let stmts = Parser::parse_sql(&GenericDialect {}, sql)
-        .map_err(|e| format!("SQL 解析失败：{e}"))?;
+    let stmts =
+        Parser::parse_sql(&GenericDialect {}, sql).map_err(|e| format!("SQL 解析失败：{e}"))?;
     // 多语句：只按**第一条**判定（其余的留给后续一刀的"多语句事务"语义，现在不猜）
     let Some(first) = stmts.into_iter().next() else {
         return Err("空语句".to_string());
@@ -114,7 +114,11 @@ mod tests {
             "EXPLAIN SELECT 1",
             "SHOW TABLES",
         ] {
-            assert_eq!(classify(q).unwrap(), StmtKind::Query, "{q} 应当原样交给 DataFusion");
+            assert_eq!(
+                classify(q).unwrap(),
+                StmtKind::Query,
+                "{q} 应当原样交给 DataFusion"
+            );
             assert!(!classify(q).unwrap().routed(), "{q} 不该被分流");
         }
     }

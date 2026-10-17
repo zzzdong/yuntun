@@ -32,9 +32,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use tokio_util::sync::CancellationToken;
 use yuntun_catalog::{CatalogOps, MemoryCatalog};
 use yuntun_ingest::{Ingestor, IngestorConfig};
+use yuntun_model::IngestBatch;
 use yuntun_model::meta::{FileManifest, IngestConfig};
 use yuntun_model::ops::CreateTableRequest;
-use yuntun_model::IngestBatch;
 
 /// `pad` = 行宽（payload 列字节数）。1KB 行是 metrics/traces 的现实形态
 /// （`bench.rs` 的 12 列 schema ≈ 1KB/行）—— **P0 ② 的结论对行宽极敏感**：
@@ -62,7 +62,9 @@ fn make_batch(
             (0..rows).map(|i| base_ms + i as i64).collect::<Vec<_>>(),
         )),
         Arc::new(Float64Array::from(
-            (0..rows).map(|i| (i % 100) as f64 / 10.0).collect::<Vec<_>>(),
+            (0..rows)
+                .map(|i| (i % 100) as f64 / 10.0)
+                .collect::<Vec<_>>(),
         )),
         Arc::new(StringArray::from(vec![format!("host-{seed}"); rows])),
     ];
@@ -73,8 +75,7 @@ fn make_batch(
         // xorshift per-row + per-char，熵足够高；真实 JSON payload 半可压 —— 用不可压是**保守上界**。
         let payloads: Vec<String> = (0..rows)
             .map(|i| {
-                let mut h = (seed as u64 + 1)
-                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                let mut h = (seed as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)
                     ^ (i as u64 + 1).wrapping_mul(0x2545_F491_4F6C_DD1D);
                 let mut v = Vec::with_capacity(pad);
                 for _ in 0..pad {
@@ -227,8 +228,12 @@ struct Args {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let args = <Args as clap::Parser>::parse();
-    let (secs, shards, batch_rows, batches_per_sec) =
-        (args.secs, args.shards, args.batch_rows, args.batches_per_sec);
+    let (secs, shards, batch_rows, batches_per_sec) = (
+        args.secs,
+        args.shards,
+        args.batch_rows,
+        args.batches_per_sec,
+    );
     let (max_flush_delay, phase_spread, rows_threshold) =
         (args.max_flush_delay, args.phase_spread, args.rows_threshold);
     let (pad, bytes_threshold_mb) = (args.pad, args.bytes_threshold_mb);
@@ -362,7 +367,11 @@ async fn main() {
     };
     println!(
         "读侧消费              : {}（chunk 内存归还只由读侧触发）",
-        if reader { "有（模拟客户端每 200ms 拉取）" } else { "**无**（复现写多读少路径）" }
+        if reader {
+            "有（模拟客户端每 200ms 拉取）"
+        } else {
+            "**无**（复现写多读少路径）"
+        }
     );
 
     let t_start = Instant::now();
@@ -414,7 +423,8 @@ async fn main() {
     let mut stable = 0;
     let last_write_ms = now_ms();
     let last_window_close_ms = (last_write_ms / 60_000 + 1) * 60_000;
-    let hard_until_ms = last_window_close_ms + (max_flush_delay + phase_spread) as i64 * 1000 + 10_000;
+    let hard_until_ms =
+        last_window_close_ms + (max_flush_delay + phase_spread) as i64 * 1000 + 10_000;
     let drain_deadline = Instant::now() + Duration::from_secs(max_flush_delay + phase_spread + 130);
     while Instant::now() < drain_deadline {
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -603,7 +613,10 @@ async fn main() {
     }
 
     println!("---- P0 证据 ----");
-    println!("写入                  : {sent_rows} rows in {write_secs:.1}s ({:.0} rows/s)，实际落盘 {rows} rows", sent_rows as f64 / write_secs);
+    println!(
+        "写入                  : {sent_rows} rows in {write_secs:.1}s ({:.0} rows/s)，实际落盘 {rows} rows",
+        sent_rows as f64 / write_secs
+    );
     println!(
         "文件数                : {}（{:.0} 文件/天，{:.1} MB/天）",
         files.len(),
@@ -648,8 +661,9 @@ async fn main() {
         "chunk 内存水位峰值    : {:.0} MiB / {} MiB（resident_bytes）；最高背压档 = {}",
         peak_used.load(std::sync::atomic::Ordering::SeqCst) as f64 / 1048576.0,
         512,
-        ["Normal", "Soft(60%)", "Hard(80%)", "Reject(95%)"]
-            [peak_pressure.load(std::sync::atomic::Ordering::SeqCst).min(3)]
+        ["Normal", "Soft(60%)", "Hard(80%)", "Reject(95%)"][peak_pressure
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .min(3)]
     );
     println!(
         "相位让位次数          : {}（> 0 = 内存水位迫使提前 flush，削峰临时失效；0 = 削峰生效）",

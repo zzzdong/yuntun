@@ -39,15 +39,13 @@
 //!   代价：新行**不走 `Data` 攒批**，而是在 op 之前先落成一个文件（每个源文件一个产物）。
 
 use arrow::datatypes::SchemaRef;
-use sqlparser::ast::{
-    Assignment, AssignmentTarget, Delete, Expr, FromTable, TableFactor, Update,
-};
+use sqlparser::ast::{Assignment, AssignmentTarget, Delete, Expr, FromTable, TableFactor, Update};
 use uuid::Uuid;
 
 use yuntun_catalog::LeaseSet;
 use yuntun_model::dv::{DeletionEntry, DvBitmap, dv_object_path};
-use yuntun_model::ops::qualified_name;
 use yuntun_model::meta::FileManifest;
+use yuntun_model::ops::qualified_name;
 use yuntun_model::wal_record::{
     DeletePayload, FileDeletion, NewFilePayload, PurgePayload, Record, UpdatePayload,
 };
@@ -107,7 +105,9 @@ impl SqlEngine {
         self.check_write()?;
         let table = crate::sql::resolve_table_ref(name, session);
         if table.is_empty() {
-            return Err(SqlError::Unsupported("invalid TRUNCATE target table".into()));
+            return Err(SqlError::Unsupported(
+                "invalid TRUNCATE target table".into(),
+            ));
         }
         let (shards, leases) = self.dml_prologue(&table).await?;
         let out = self.execute_purge(&table, &shards).await;
@@ -224,7 +224,11 @@ impl SqlEngine {
     /// 幂等键（`purge_id`）**每次执行都新生成**：SQL 语句没有"请求 id"这个概念，
     /// 同一个 id 只用于**重放**（`replay_wal_dml`）—— 于是"用户再执行一次 `DELETE FROM t`"
     /// 是**一次新的清除**（`DELETE` 本就该如此），而"重放同一条 WAL 记录"是空操作。
-    async fn execute_purge(&self, table: &str, held_shards: &[String]) -> Result<RawOutcome, SqlError> {
+    async fn execute_purge(
+        &self,
+        table: &str,
+        held_shards: &[String],
+    ) -> Result<RawOutcome, SqlError> {
         // 表必须存在（与带 WHERE 那条路一致：不存在的表报 `NotFound`，而不是"清了个空"）
         if self
             .catalog
@@ -237,7 +241,10 @@ impl SqlEngine {
         }
         let ingest = self.ingest_side()?.clone();
         // ① 在途数据先落盘
-        let flushed = ingest.force_flush(table).await.map_err(SqlError::from_lake)?;
+        let flushed = ingest
+            .force_flush(table)
+            .await
+            .map_err(SqlError::from_lake)?;
         if flushed.chunks > 0 {
             tracing::debug!(
                 table = %table,
@@ -344,7 +351,8 @@ impl SqlEngine {
         let mut entries: Vec<DeletionEntry> = Vec::new();
         let mut affected: i64 = 0;
         for f in &files {
-            let positions = locate(&store, f, &schema, predicate, existing.get(&f.file_path)).await?;
+            let positions =
+                locate(&store, f, &schema, predicate, existing.get(&f.file_path)).await?;
             if positions.is_empty() {
                 continue;
             }
@@ -397,15 +405,12 @@ impl SqlEngine {
 
         // ⑤ 目录（单快照原子）
         let file_count = entries.len();
-        let snap = self.catalog
-            .apply_deletions(entries)
-            .await
-            .map_err(|e| {
-                SqlError::from_lake(yuntun_model::error::LakeError::Other(format!(
-                    "删除已写入 WAL（dv_id={dv_id}）但没进目录：{e} —— \
+        let snap = self.catalog.apply_deletions(entries).await.map_err(|e| {
+            SqlError::from_lake(yuntun_model::error::LakeError::Other(format!(
+                "删除已写入 WAL（dv_id={dv_id}）但没进目录：{e} —— \
                      重启后 `replay_wal_dml` 会把它收敛进来，**不要再删一次**"
-                )))
-            })?;
+            )))
+        })?;
 
         // ⑥ 本进程的读缓存：删除必须**立刻**可见（§5.2）
         self.query
@@ -444,10 +449,12 @@ impl SqlEngine {
             let bytes = yuntun_store::get_bytes(store.as_ref(), &e.store_path)
                 .await
                 .map_err(SqlError::from_lake)?;
-            let dv = DvBitmap::from_bytes(&bytes)
-                .map_err(|err| SqlError::from_lake(yuntun_model::error::LakeError::Other(
-                    format!("{err}（表 {table} 的 {}）", e.dv_id),
-                )))?;
+            let dv = DvBitmap::from_bytes(&bytes).map_err(|err| {
+                SqlError::from_lake(yuntun_model::error::LakeError::Other(format!(
+                    "{err}（表 {table} 的 {}）",
+                    e.dv_id
+                )))
+            })?;
             out.entry(e.file_path.clone())
                 .and_modify(|cur| cur.union_with(&dv))
                 .or_insert(dv);
@@ -472,7 +479,9 @@ fn parse_delete_target(del: &Delete, session: &SessionCtx) -> Result<String, Sql
         return Err(SqlError::Unsupported("DELETE … USING 未支持".into()));
     }
     if del.returning.is_some() || del.output.is_some() {
-        return Err(SqlError::Unsupported("DELETE … RETURNING/OUTPUT 未支持".into()));
+        return Err(SqlError::Unsupported(
+            "DELETE … RETURNING/OUTPUT 未支持".into(),
+        ));
     }
     if !del.order_by.is_empty() || del.limit.is_some() {
         return Err(SqlError::Unsupported(
@@ -494,9 +503,7 @@ fn parse_delete_target(del: &Delete, session: &SessionCtx) -> Result<String, Sql
         return Err(SqlError::Unsupported("DELETE 里的 JOIN 未支持".into()));
     }
     let TableFactor::Table { name, .. } = &twj.relation else {
-        return Err(SqlError::Unsupported(
-            "DELETE 的目标必须是普通表名".into(),
-        ));
+        return Err(SqlError::Unsupported("DELETE 的目标必须是普通表名".into()));
     };
     let qualified = crate::sql::resolve_table_ref(name, session);
     if qualified.is_empty() {
@@ -504,7 +511,10 @@ fn parse_delete_target(del: &Delete, session: &SessionCtx) -> Result<String, Sql
     }
     // 归一化为全限定名（目录里一律是全限定）
     let (ns, bare) = yuntun_model::ops::split_qualified(&qualified);
-    Ok(qualified_name(if ns.is_empty() { session.schema() } else { ns }, bare))
+    Ok(qualified_name(
+        if ns.is_empty() { session.schema() } else { ns },
+        bare,
+    ))
 }
 
 impl SqlEngine {
@@ -555,7 +565,10 @@ impl SqlEngine {
         let ingest = self.ingest_side()?.clone();
         let store = ingest.store.clone();
         // ⓪ 在途数据先落盘（同 DELETE：分片集合要在 flush **之后**求才有意义）
-        let flushed = ingest.force_flush(&table).await.map_err(SqlError::from_lake)?;
+        let flushed = ingest
+            .force_flush(&table)
+            .await
+            .map_err(SqlError::from_lake)?;
         if flushed.chunks > 0 {
             tracing::debug!(
                 table = %table,
@@ -871,10 +884,7 @@ fn drop_already_deleted(
             batch.num_rows()
         )));
     }
-    let keep: arrow::array::BooleanArray = positions
-        .iter()
-        .map(|p| !dv.contains(*p))
-        .collect();
+    let keep: arrow::array::BooleanArray = positions.iter().map(|p| !dv.contains(*p)).collect();
     let kept_positions: Vec<u32> = positions
         .iter()
         .zip(keep.iter())

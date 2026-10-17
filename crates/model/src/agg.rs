@@ -19,9 +19,9 @@
 //!
 //! 这两条是**边界**而不是性能取舍：越过它们的后果是"结果悄悄错一点"。
 
-use std::collections::BTreeMap;
 use arrow::array::{Array, Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
+use std::collections::BTreeMap;
 
 use crate::error::LakeError;
 use crate::predicate::Predicate;
@@ -241,10 +241,11 @@ pub fn fold_batches_with(
 /// 合并两个部分状态（同一种聚合）。
 pub fn merge(a: &PartialAgg, b: &PartialAgg) -> Result<PartialAgg, LakeError> {
     match (a, b) {
-        (PartialAgg::Count(x), PartialAgg::Count(y)) => Ok(PartialAgg::Count(
-            x.checked_add(*y)
-                .ok_or_else(|| LakeError::Other("count 溢出 u64".into()))?,
-        )),
+        (PartialAgg::Count(x), PartialAgg::Count(y)) => {
+            Ok(PartialAgg::Count(x.checked_add(*y).ok_or_else(|| {
+                LakeError::Other("count 溢出 u64".into())
+            })?))
+        }
         (PartialAgg::SumInt(x), PartialAgg::SumInt(y)) => Ok(PartialAgg::SumInt(match (x, y) {
             (None, None) => None,
             (Some(v), None) | (None, Some(v)) => Some(*v),
@@ -361,9 +362,13 @@ pub fn fold_query(query: &AggQuery, batches: &[RecordBatch]) -> Result<AggStates
         };
         for row in 0..work.num_rows() {
             let key = key_of(&work, &query.group_by, row)?;
-            let states = acc
-                .entry(key)
-                .or_insert_with(|| query.specs.iter().map(|s| PartialAgg::empty(s.kind)).collect());
+            let states = acc.entry(key).or_insert_with(|| {
+                query
+                    .specs
+                    .iter()
+                    .map(|s| PartialAgg::empty(s.kind))
+                    .collect()
+            });
             for (i, spec) in query.specs.iter().enumerate() {
                 states[i] = merge(&states[i], &fold_one(spec, &work, row)?)?;
             }
@@ -383,8 +388,12 @@ pub fn merge_states(a: &AggStates, b: &AggStates) -> Result<AggStates, LakeError
         (AggStates::Plain(x), AggStates::Plain(y)) => {
             let mut out = Vec::with_capacity(x.len());
             for i in 0..x.len().max(y.len()) {
-                let lhs = x.get(i).ok_or_else(|| mismatch("plain", x.len(), y.len()))?;
-                let rhs = y.get(i).ok_or_else(|| mismatch("plain", x.len(), y.len()))?;
+                let lhs = x
+                    .get(i)
+                    .ok_or_else(|| mismatch("plain", x.len(), y.len()))?;
+                let rhs = y
+                    .get(i)
+                    .ok_or_else(|| mismatch("plain", x.len(), y.len()))?;
                 out.push(merge(lhs, rhs)?);
             }
             Ok(AggStates::Plain(out))
@@ -424,11 +433,7 @@ fn mismatch(what: &str, a: usize, b: usize) -> LakeError {
 }
 
 /// 一行在该分组键上的取值（**列缺失 = NULL**，与 `fold_batch` 同口径）。
-fn key_of(
-    batch: &RecordBatch,
-    group_by: &[String],
-    row: usize,
-) -> Result<Vec<KeyPart>, LakeError> {
+fn key_of(batch: &RecordBatch, group_by: &[String], row: usize) -> Result<Vec<KeyPart>, LakeError> {
     let mut out = Vec::with_capacity(group_by.len());
     for name in group_by {
         let Ok(idx) = batch.schema().index_of(name) else {
@@ -482,10 +487,7 @@ fn scalar_at(col: &dyn Array, row: usize) -> Result<AggScalar, LakeError> {
     )))
 }
 
-fn min_of(
-    a: &Option<AggScalar>,
-    b: &Option<AggScalar>,
-) -> Result<Option<AggScalar>, LakeError> {
+fn min_of(a: &Option<AggScalar>, b: &Option<AggScalar>) -> Result<Option<AggScalar>, LakeError> {
     Ok(match (a, b) {
         (None, x) | (x, None) => x.clone(),
         (Some(x), Some(y)) => Some(if x.cmp(y)? == std::cmp::Ordering::Greater {
@@ -496,10 +498,7 @@ fn min_of(
     })
 }
 
-fn max_of(
-    a: &Option<AggScalar>,
-    b: &Option<AggScalar>,
-) -> Result<Option<AggScalar>, LakeError> {
+fn max_of(a: &Option<AggScalar>, b: &Option<AggScalar>) -> Result<Option<AggScalar>, LakeError> {
     Ok(match (a, b) {
         (None, x) | (x, None) => x.clone(),
         (Some(x), Some(y)) => Some(if x.cmp(y)? == std::cmp::Ordering::Less {
@@ -612,7 +611,11 @@ mod tests {
             AggSpec::new(AggKind::Max, "v"),
         ];
         let empty = fold_batch(&specs, &batch(vec![])).unwrap();
-        assert_eq!(empty[0], PartialAgg::SumInt(None), "空集求和是 NULL，不是 0");
+        assert_eq!(
+            empty[0],
+            PartialAgg::SumInt(None),
+            "空集求和是 NULL，不是 0"
+        );
         assert_eq!(empty[1], PartialAgg::Min(None));
         assert_eq!(empty[2], PartialAgg::Max(None));
 
@@ -638,11 +641,8 @@ mod tests {
             AggSpec::new(AggKind::Max, "v"),
         ];
         let one = fold_batches(&specs, &[batch(vec![Some(5), Some(-2), None])]).unwrap();
-        let split = fold_batches(
-            &specs,
-            &[batch(vec![Some(5)]), batch(vec![Some(-2), None])],
-        )
-        .unwrap();
+        let split =
+            fold_batches(&specs, &[batch(vec![Some(5)]), batch(vec![Some(-2), None])]).unwrap();
         assert_eq!(one, split, "分批折叠必须与一次折叠相同");
         assert_eq!(one[1], PartialAgg::SumInt(Some(3)));
         assert_eq!(one[2], PartialAgg::Min(Some(AggScalar::Int(-2))));
@@ -730,10 +730,7 @@ mod tests {
     // ------------------------------------------------------ 分组聚合（`§177`）
 
     /// 两列：`v` 整数（分组键用）、`s` 字符串（分组键用）。
-    fn batch2(
-        vals: Vec<Option<i64>>,
-        names: Vec<Option<&str>>,
-    ) -> RecordBatch {
+    fn batch2(vals: Vec<Option<i64>>, names: Vec<Option<&str>>) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("v", DataType::Int64, true),
             Field::new("s", DataType::Utf8, true),

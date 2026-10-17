@@ -39,7 +39,12 @@ struct Cli {
     /// （落点为显式给定的 contact point，见 `yuntun-client::Client::connect`）。
     ///
     /// `global`：可以放在子命令前面或后面，两种写法都行。
-    #[arg(long, env = "YUNTUN_ADDR", default_value = "127.0.0.1:50051", global = true)]
+    #[arg(
+        long,
+        env = "YUNTUN_ADDR",
+        default_value = "127.0.0.1:50051",
+        global = true
+    )]
     addr: String,
 
     /// Flight 访问令牌（`§190`）：服务端配了 `[server].auth_token` 时必须给。
@@ -239,9 +244,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         } => {
             let client = Client::connect_with_token(&addr, token.as_deref()).await?;
             // 目标表 schema：取不到说明表不存在（CREATE TABLE 请先执行）
-            let target = client.table_schema(&table).await.map_err(|e| {
-                format!("读取表 {table} schema 失败（表是否已创建？）：{e}")
-            })?;
+            let target = client
+                .table_schema(&table)
+                .await
+                .map_err(|e| format!("读取表 {table} schema 失败（表是否已创建？）：{e}"))?;
             // 显式 --format 优先；否则按文件扩展名推断（stdin 默认 csv）
             let format = match format {
                 Some(f) => f.into(),
@@ -281,7 +287,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 );
             }
             if written > 0 {
-                println!("数据约 {visible} 秒内可查（读己之写：攒批内存视图；落对象存储另有攒批窗口）");
+                println!(
+                    "数据约 {visible} 秒内可查（读己之写：攒批内存视图；落对象存储另有攒批窗口）"
+                );
             }
             Ok(())
         }

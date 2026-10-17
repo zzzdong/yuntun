@@ -136,7 +136,11 @@ async fn setup() -> Fx {
     cache.refresh(&catalog).await.unwrap();
     // 协调者视角的引擎（用来对拍）
     let _engine = QueryEngine::new(store.clone(), cache);
-    Fx { store, a_path, files }
+    Fx {
+        store,
+        a_path,
+        files,
+    }
 }
 
 /// 起一个"接了冷折叠"的服务端，返回已连接的客户端。
@@ -199,7 +203,9 @@ async fn cold_fold_survives_the_wire_and_honours_dvs() {
     .await
     .expect("进程内");
     assert_eq!(over_wire, local, "过网与进程内必须逐位相同");
-    let AggStates::Plain(p) = over_wire else { panic!() };
+    let AggStates::Plain(p) = over_wire else {
+        panic!()
+    };
     assert_eq!(p[0], PartialAgg::Count(6));
     assert_eq!(p[1], PartialAgg::SumInt(Some(66)));
 
@@ -235,7 +241,9 @@ async fn cold_fold_survives_the_wire_and_honours_dvs() {
     .await
     .expect("进程内（带 DV）");
     assert_eq!(over_wire, local, "带 DV 也必须逐位相同");
-    let AggStates::Plain(p) = over_wire else { panic!() };
+    let AggStates::Plain(p) = over_wire else {
+        panic!()
+    };
     assert_eq!(p[0], PartialAgg::Count(5), "DV 生效：少一行");
     assert_eq!(p[1], PartialAgg::SumInt(Some(64)), "66 - 2");
 }
@@ -264,7 +272,9 @@ async fn grouped_cold_fold_survives_the_wire() {
         })
         .await
         .expect("分组过网");
-    let AggStates::Grouped(g) = got else { panic!("应当分组") };
+    let AggStates::Grouped(g) = got else {
+        panic!("应当分组")
+    };
     let keys: Vec<i64> = g
         .iter()
         .map(|x| match x.key[0] {

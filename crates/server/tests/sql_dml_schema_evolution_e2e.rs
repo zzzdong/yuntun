@@ -102,7 +102,10 @@ async fn rows_v_c(
         let v = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         let c = b.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
         for i in 0..b.num_rows() {
-            out.push((v.value(i), if c.is_null(i) { None } else { Some(c.value(i)) }));
+            out.push((
+                v.value(i),
+                if c.is_null(i) { None } else { Some(c.value(i)) },
+            ));
         }
     }
     out
@@ -260,7 +263,13 @@ async fn dml_respects_schema_evolution_on_old_files() {
     );
     assert_eq!(
         rows_v_c(&mut client).await,
-        vec![(1, Some(9)), (2, Some(9)), (3, None), (4, None), (5, Some(51))]
+        vec![
+            (1, Some(9)),
+            (2, Some(9)),
+            (3, None),
+            (4, None),
+            (5, Some(51))
+        ]
     );
 
     // ④ 缺列文件上的 DELETE：老文件那两行（c 仍是 NULL）要被删掉
@@ -280,7 +289,10 @@ async fn dml_respects_schema_evolution_on_old_files() {
         col_i64(&mut client, "SELECT v FROM t WHERE c = 9 ORDER BY v").await,
         vec![1, 2]
     );
-    assert_eq!(execute_update_sql(&mut client, "UPDATE t SET c = 9 WHERE c = 9").await, 2);
+    assert_eq!(
+        execute_update_sql(&mut client, "UPDATE t SET c = 9 WHERE c = 9").await,
+        2
+    );
     let _ = &mut session;
     shutdown.cancel();
 }

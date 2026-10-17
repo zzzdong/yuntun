@@ -227,7 +227,11 @@ async fn add_and_drop_column_end_to_end() {
     assert_eq!(version_of(&lakehouse, "public.t").await, 1);
 
     // 旧数据：两行，**没有 c 列** —— 这就是"旧 schema_version 的文件"
-    let n = execute_update(&mut client, "INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y')").await;
+    let n = execute_update(
+        &mut client,
+        "INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y')",
+    )
+    .await;
     assert_eq!(n, 2);
     // 这一步是验收②的**前提**：旧数据必须先真的落成文件（否则测的还是热数据那条路）
     wait_for_files(&lakehouse, "public.t").await;
@@ -384,7 +388,10 @@ async fn ddl_on_readonly_engine_is_readably_rejected() {
     // 只读装配：`new_readonly`（查询节点形态 —— 没有 Ingestor，策略也声明只读）
     let ro = SqlEngine::new_readonly(lakehouse.query.clone(), lakehouse.catalog.clone());
     let mut session = SessionCtx::default();
-    let err = match ro.execute("ALTER TABLE t ADD COLUMN c INT", &mut session).await {
+    let err = match ro
+        .execute("ALTER TABLE t ADD COLUMN c INT", &mut session)
+        .await
+    {
         Ok(_) => panic!("只读形态必须拒绝 DDL（绝不能静默成功）"),
         Err(e) => e,
     };
@@ -463,11 +470,7 @@ async fn concurrent_ddl_has_exactly_one_winner() {
             .unwrap();
         let schema = meta.schema().unwrap();
         assert_eq!(
-            schema
-                .fields()
-                .iter()
-                .filter(|f| f.name() == "c")
-                .count(),
+            schema.fields().iter().filter(|f| f.name() == "c").count(),
             1,
             "第 {i} 轮：列 c 只能出现一次"
         );

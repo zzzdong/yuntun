@@ -37,16 +37,16 @@ use arrow_flight::sql::{
     Searchable, SqlInfo, SqlSupportedTransaction, TicketStatementQuery, XdbcDataType,
 };
 use arrow_flight::{
-    encode::FlightDataEncoderBuilder, error::FlightError, Action, ActionType, Criteria, Empty,
-    FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse,
-    PollInfo, PutResult, SchemaAsIpc, SchemaResult, Ticket,
+    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
+    HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaAsIpc, SchemaResult, Ticket,
+    encode::FlightDataEncoderBuilder, error::FlightError,
 };
 use futures::StreamExt;
 use prost::Message;
 use tonic::{Request, Response, Status, Streaming};
 use yuntun_catalog::CatalogOps;
-use yuntun_ingest::source::{extract_table_shard, IngestBatch};
 use yuntun_ingest::Ingestor;
+use yuntun_ingest::source::{IngestBatch, extract_table_shard};
 use yuntun_model::error::LakeError;
 use yuntun_query::QueryEngine;
 use yuntun_sql::session::SessionCtx;
@@ -410,7 +410,6 @@ impl FlightServer {
             .cloned()
             .ok_or_else(|| Status::not_found(format!("unknown prepared statement: {id}")))
     }
-
 }
 
 /// DoPut 分流结果。
@@ -692,14 +691,17 @@ impl FlightService for FlightServer {
                     dataset_schema: dataset_schema.into(),
                     parameter_schema: Vec::new().into(), // MVP 不支持绑定参数
                 };
-                self.prepared.lock().expect("prepared lock poisoned").insert(
-                    handle.trim_start_matches(PS_PREFIX).to_string(),
-                    PreparedEntry {
-                        // S1.8：prepared 语句可携带幂等键（SQL 注释通道）
-                        idempotency_key: yuntun_sql::idempotency::extract(&req.query),
-                        sql: req.query,
-                    },
-                );
+                self.prepared
+                    .lock()
+                    .expect("prepared lock poisoned")
+                    .insert(
+                        handle.trim_start_matches(PS_PREFIX).to_string(),
+                        PreparedEntry {
+                            // S1.8：prepared 语句可携带幂等键（SQL 注释通道）
+                            idempotency_key: yuntun_sql::idempotency::extract(&req.query),
+                            sql: req.query,
+                        },
+                    );
                 return Ok(Response::new(Box::pin(tokio_stream::iter(vec![Ok(
                     arrow_flight::Result {
                         body: result.as_any().encode_to_vec().into(),

@@ -246,7 +246,10 @@ mod tests {
             p.verify("yuntun", b"other-salt!!", &good).is_err(),
             "换 salt 重放必须拒绝（固定 salt 就能过的攻击面）"
         );
-        assert!(p.verify("nobody", &salt, &good).is_err(), "不存在的用户拒绝");
+        assert!(
+            p.verify("nobody", &salt, &good).is_err(),
+            "不存在的用户拒绝"
+        );
         // 空 auth-data（客户端没给口令）⇒ 拒绝（该用户有口令）
         assert!(p.verify("yuntun", &salt, &[]).is_err());
     }
@@ -255,7 +258,10 @@ mod tests {
     fn empty_password_user_accepts_empty_response() {
         let p = policy(&[("guest", "")]);
         assert!(p.verify("guest", b"salt", &[]).is_ok());
-        assert!(p.verify("guest", b"salt", &native_scramble(b"salt", "x")).is_err());
+        assert!(
+            p.verify("guest", b"salt", &native_scramble(b"salt", "x"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -268,9 +274,11 @@ mod tests {
     /// 配置解析：**写错的值必须报错**，不静默回退成 trust。
     #[test]
     fn config_parsing_is_explicit() {
-
         // 显式 trust + 无用户 ⇒ trust（不破坏既有部署）
-        assert_eq!(AuthPolicy::from_config("trust", &[]).unwrap().mode(), AuthMode::Trust);
+        assert_eq!(
+            AuthPolicy::from_config("trust", &[]).unwrap().mode(),
+            AuthMode::Trust
+        );
         // 配了用户 ⇒ 自动切换（即便 auth 写成 trust）
         let p = AuthPolicy::from_config("trust", &[("a", "b")]).unwrap();
         assert_eq!(p.mode(), AuthMode::NativePassword);

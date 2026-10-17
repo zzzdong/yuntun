@@ -197,10 +197,7 @@ fn commit_op(batch_id: &str, key: &str, rows: u64, now: u64) -> pb::Op {
     }
 }
 
-async fn propose(
-    c: &mut MetaClient<tonic::transport::Channel>,
-    op: pb::Op,
-) -> pb::ProposeResponse {
+async fn propose(c: &mut MetaClient<tonic::transport::Channel>, op: pb::Op) -> pb::ProposeResponse {
     c.propose(pb::ProposeRequest {
         op: Some(op),
         request_id: b"rid".to_vec(),
@@ -262,7 +259,10 @@ fn process_survives_sigkill_and_recovers_state() {
             !dup.accepted,
             "崩溃重启后同一个幂等键必须命中（accepted=false）—— 否则状态机没恢复干净"
         );
-        assert_eq!(dup.manifest_ver, manifest_ver, "manifest_ver 必须与崩溃前一致");
+        assert_eq!(
+            dup.manifest_ver, manifest_ver,
+            "manifest_ver 必须与崩溃前一致"
+        );
         assert_eq!(dup.schema_ver, schema_ver, "schema_ver 必须与崩溃前一致");
 
         // 日志不倒退 + 追平到最新（重启后 raft 会重放；给它一点时间）
@@ -291,7 +291,10 @@ fn process_survives_sigkill_and_recovers_state() {
         // 仍然能服务：再写一笔必须是**新的**（不是幂等命中）
         let fresh = propose(&mut c, commit_op("b2", "key-b2", 5, 2_000)).await;
         assert!(fresh.accepted, "崩溃重启后必须还能接受新写入");
-        assert!(fresh.manifest_ver > manifest_ver, "新提交必须推进 manifest_ver");
+        assert!(
+            fresh.manifest_ver > manifest_ver,
+            "新提交必须推进 manifest_ver"
+        );
     });
 
     p2.kill9();
@@ -385,7 +388,10 @@ fn cli_surface_is_clap_managed() {
         assert!(help.contains(flag), "--help 里应列出 {flag}：\n{help}");
     }
 
-    let out = Command::new(BIN).arg("--version").output().expect("跑二进制");
+    let out = Command::new(BIN)
+        .arg("--version")
+        .output()
+        .expect("跑二进制");
     assert!(out.status.success(), "--version 必须退 0");
     assert!(String::from_utf8_lossy(&out.stdout).contains("metanode"));
 

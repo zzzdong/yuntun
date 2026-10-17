@@ -35,8 +35,8 @@ use yuntun_catalog::CatalogOps;
 use yuntun_model::error::LakeError;
 use yuntun_model::meta::{FileManifest, IdempotencyRecord, TableMeta};
 use yuntun_model::ops::{
-    qualified_name, split_qualified, CatalogVersion, CommitFilesRequest, CommitFilesResponse,
-    CreateTableRequest, EvolveSchemaRequest, EvolveSchemaResponse, ManifestDelta,
+    CatalogVersion, CommitFilesRequest, CommitFilesResponse, CreateTableRequest,
+    EvolveSchemaRequest, EvolveSchemaResponse, ManifestDelta, qualified_name, split_qualified,
 };
 use yuntun_proto::meta as pb;
 use yuntun_proto::meta::meta_client::MetaClient;
@@ -175,7 +175,7 @@ impl RemoteCatalog {
                     return Err(LakeError::Other(format!(
                         "Propose 超时（{}s）：提案可能已提交，**不自动重试**（调用方按幂等键重试是安全的）",
                         WRITE_TIMEOUT.as_secs()
-                    )))
+                    )));
                 }
             }
         }
@@ -278,7 +278,12 @@ impl RemoteCatalog {
             c.datanodes = p
                 .datanodes
                 .iter()
-                .map(|m| (m.instance_id.clone(), crate::op::datanode_member_from_proto(m)))
+                .map(|m| {
+                    (
+                        m.instance_id.clone(),
+                        crate::op::datanode_member_from_proto(m),
+                    )
+                })
                 .collect();
         }
 
@@ -417,7 +422,8 @@ impl RemoteCatalog {
         // 文件：upsert（**墓碑保留** —— 见 `Cache::files` 的注释）
         for f in &payload.files {
             if let Some(m) = f.manifest.as_ref() {
-                c.files.insert(f.batch_id.clone(), op::manifest_from_proto_pub(m));
+                c.files
+                    .insert(f.batch_id.clone(), op::manifest_from_proto_pub(m));
             }
         }
 
@@ -497,7 +503,10 @@ fn normalize(name: &str) -> String {
 /// 而 SQL 层的错误码（`ER_NO_SUCH_TABLE` 等）就是从这些变体来的。
 fn map_status(st: tonic::Status) -> LakeError {
     let md = st.metadata();
-    let kind = md.get("err-kind").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let kind = md
+        .get("err-kind")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let subject = md
         .get("err-subject")
         .and_then(|v| v.to_str().ok())
@@ -541,8 +550,7 @@ fn decode_grant(result: &[u8]) -> Result<yuntun_model::meta::LeaseGrant, LakeErr
             "lease op 未返回结果（服务端没接线 ProposeResponse.result？）".into(),
         ));
     }
-    prost::Message::decode(result)
-        .map_err(|e| LakeError::Other(format!("decode LeaseGrant: {e}")))
+    prost::Message::decode(result).map_err(|e| LakeError::Other(format!("decode LeaseGrant: {e}")))
 }
 
 #[async_trait::async_trait]
@@ -837,7 +845,10 @@ impl CatalogOps for RemoteCatalog {
         Ok(self.cached(|c| c.tables.values().cloned().collect()))
     }
 
-    async fn table_schema(&self, name: &str) -> Result<Option<(arrow::datatypes::SchemaRef, u64)>, LakeError> {
+    async fn table_schema(
+        &self,
+        name: &str,
+    ) -> Result<Option<(arrow::datatypes::SchemaRef, u64)>, LakeError> {
         self.refresh().await?;
         let meta = self.cached(|c| c.tables.get(&normalize(name)).cloned());
         match meta {
@@ -1081,13 +1092,17 @@ impl CatalogOps for RemoteCatalog {
             .await?;
         self.refresh_best_effort().await;
         // 用 UFCS 解码：这里不额外引 `prost::Message` 进作用域（避免与既有导入打架）
-        let detail = <pb::PurgeFilesResult as prost::Message>::decode(&*r.result)
-            .unwrap_or_default();
+        let detail =
+            <pb::PurgeFilesResult as prost::Message>::decode(&*r.result).unwrap_or_default();
         Ok(yuntun_catalog::PurgeOutcome {
             snapshot: self.cached(|c| c.snapshot),
             files: detail.files as usize,
             revoked: detail.revoked as usize,
-            rows: if detail.rows != 0 { detail.rows } else { r.affected },
+            rows: if detail.rows != 0 {
+                detail.rows
+            } else {
+                r.affected
+            },
         })
     }
 
@@ -1327,5 +1342,4 @@ mod tests {
             "默认必须保留全部墓碑（回收会限制可查的旧快照，必须是显式选择）"
         );
     }
-
 }

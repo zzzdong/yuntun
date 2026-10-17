@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 use arrow::array::Int64Array;
 use yuntun_server::Lakehouse;
-use yuntun_sql::session::SessionCtx;
 use yuntun_sql::SqlResult;
+use yuntun_sql::session::SessionCtx;
 
 fn config(base: &str, rows_threshold: u64, cache_ttl_secs: u64) -> yuntun_server::Config {
     yuntun_server::Config::from_toml(&format!(

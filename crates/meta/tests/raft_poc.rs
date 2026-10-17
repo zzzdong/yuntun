@@ -95,9 +95,7 @@ fn ops() -> Vec<pb::Op> {
 #[test]
 fn three_node_cluster_converges_on_proposed_ops() {
     let cluster = yuntun_meta::Cluster::start();
-    let leader = cluster
-        .wait_leader(T)
-        .expect("三节点应在超时内选出 leader");
+    let leader = cluster.wait_leader(T).expect("三节点应在超时内选出 leader");
 
     for op in ops() {
         cluster.propose(op, T).expect("leader 在位时提议应成功");
@@ -133,9 +131,15 @@ fn three_node_cluster_converges_on_proposed_ops() {
     // 语义断言（不止编码相等：要确认 op 真的落进了状态机）
     let c0 = &canon[0].1;
     let text = String::from_utf8_lossy(c0);
-    assert!(text.contains("ns analytics"), "create_schema 未生效：{text}");
+    assert!(
+        text.contains("ns analytics"),
+        "create_schema 未生效：{text}"
+    );
     assert!(text.contains("table public.cpu"), "create_table 未生效");
-    assert!(text.contains("file b1") && text.contains("file b2"), "commit_files 未生效");
+    assert!(
+        text.contains("file b1") && text.contains("file b2"),
+        "commit_files 未生效"
+    );
     assert_eq!(leader, cluster.wait_leader(T).unwrap(), "leader 应保持稳定");
 }
 
@@ -156,7 +160,11 @@ fn leader_kill_reelects_and_keeps_committed_ops() {
     cluster.kill(old_leader);
     assert_eq!(cluster.alive(), 2, "剩两个节点 = 多数派仍在");
 
-    let survivors: Vec<u64> = PEERS.iter().copied().filter(|id| *id != old_leader).collect();
+    let survivors: Vec<u64> = PEERS
+        .iter()
+        .copied()
+        .filter(|id| *id != old_leader)
+        .collect();
     // 重新选主：必须由**存活节点**当选
     let deadline = std::time::Instant::now() + T;
     let new_leader = loop {
@@ -176,10 +184,7 @@ fn leader_kill_reelects_and_keeps_committed_ops() {
 
     // 新 leader 必须能继续接活（写入不中断）
     cluster
-        .propose(
-            commit_op("public.cpu", "b3", 30, 1_004),
-            T,
-        )
+        .propose(commit_op("public.cpu", "b3", 30, 1_004), T)
         .expect("新 leader 必须能继续提交");
 
     // 已提交数据（含换主前的 b1/b2）在两个存活节点上都必须在
@@ -240,16 +245,10 @@ fn follower_behind_catches_up_via_snapshot() {
 
     // 建 schema/表（PoC 的 op 语义：commit 要求表已存在）
     cluster
-        .propose(
-            create_schema_op("analytics", 1_000),
-            T,
-        )
+        .propose(create_schema_op("analytics", 1_000), T)
         .expect("建 schema");
     cluster
-        .propose(
-            create_table_op("cpu", 1_001),
-            T,
-        )
+        .propose(create_table_op("cpu", 1_001), T)
         .expect("建表");
 
     let mut now = 2_000u64;
@@ -384,25 +383,16 @@ fn full_cluster_restart_keeps_state_byte_identical() {
     let leader = cluster.wait_leader(T).expect("三节点应选出 leader");
 
     cluster
-        .propose(
-            create_schema_op("analytics", 1_000),
-            T,
-        )
+        .propose(create_schema_op("analytics", 1_000), T)
         .expect("建 schema");
     cluster
-        .propose(
-            create_table_op("cpu", 1_001),
-            T,
-        )
+        .propose(create_table_op("cpu", 1_001), T)
         .expect("建表");
     let mut now = 2_000u64;
     for b in ["r1", "r2", "r3", "r4"] {
         now += 1;
         cluster
-            .propose(
-                commit_op("public.cpu", b, 1, now),
-                T,
-            )
+            .propose(commit_op("public.cpu", b, 1, now), T)
             .expect("写入");
     }
     wait_all_equal(&cluster, T);
@@ -446,10 +436,7 @@ fn full_cluster_restart_keeps_state_byte_identical() {
     // 重启后必须**还能服务**：再写一笔，三个节点继续收敛
     now += 1;
     cluster
-        .propose(
-            commit_op("public.cpu", "after_restart", 1, now),
-            T,
-        )
+        .propose(commit_op("public.cpu", "after_restart", 1, now), T)
         .expect("重启后应能继续提交");
     wait_all_equal(&cluster, T);
 }

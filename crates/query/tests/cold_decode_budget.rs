@@ -36,9 +36,7 @@ fn schema() -> Arc<Schema> {
 }
 
 fn batch() -> RecordBatch {
-    let v: ArrayRef = Arc::new(Int64Array::from(
-        (0..ROWS as i64).collect::<Vec<i64>>(),
-    ));
+    let v: ArrayRef = Arc::new(Int64Array::from((0..ROWS as i64).collect::<Vec<i64>>()));
     // 高基数十六进制串（近似 UUID）：**故意不好压**，让 `file_size` 接近解码大小
     let mut st = 0x2545F4914F6CDD1Du64;
     let s: ArrayRef = Arc::new(StringArray::from(
@@ -179,7 +177,10 @@ async fn a_small_budget_fails_loudly_and_names_the_limit() {
         .expect_err("预算不足必须失败（不能静默少行）")
         .to_string();
     assert!(err.contains("冷读解码预算"), "{err}");
-    assert!(err.contains("cold_read_budget_mb"), "错误里要给出改哪个键：{err}");
+    assert!(
+        err.contains("cold_read_budget_mb"),
+        "错误里要给出改哪个键：{err}"
+    );
 }
 
 /// **累计**语义：预算够第一个文件、不够第二个 ⇒ 在第二个文件处失败（而不是把两个都读完）。
@@ -194,6 +195,10 @@ async fn the_budget_is_cumulative_across_files() {
     // 预算 = 第一个文件 + 一半第二个文件 ⇒ 第一个读得下、第二个读不下
     let budget = s1 + s2 / 2;
     let q = engine(store.clone(), &catalog, budget).await;
-    let err = q.sql(SUM).await.expect_err("第二个文件必须被挡住").to_string();
+    let err = q
+        .sql(SUM)
+        .await
+        .expect_err("第二个文件必须被挡住")
+        .to_string();
     assert!(err.contains("冷读解码预算"), "{err}");
 }

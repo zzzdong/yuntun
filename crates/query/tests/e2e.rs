@@ -9,8 +9,8 @@ use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use yuntun_catalog::MemoryCatalog;
 use yuntun_ingest::{Ingestor, IngestorConfig};
-use yuntun_model::ops::CreateTableRequest;
 use yuntun_model::IngestBatch;
+use yuntun_model::ops::CreateTableRequest;
 use yuntun_query::QueryEngine;
 use yuntun_store::create_store;
 

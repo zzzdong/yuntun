@@ -15,12 +15,12 @@
 use crate::config::WalConfig;
 use crate::recovery::{self, Recovery};
 use crate::segment::{
-    atomic_write_current, fsync_dir, list_segments, parse_segment_file_name, read_current,
-    SegmentWriter,
+    SegmentWriter, atomic_write_current, fsync_dir, list_segments, parse_segment_file_name,
+    read_current,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 use yuntun_model::error::{LakeError, WalError};
 use yuntun_model::wal_record::Record;
@@ -229,11 +229,7 @@ fn open_active_segment(
             let seq = parse_segment_file_name(&name)
                 .ok_or_else(|| LakeError::Wal(WalError::CorruptedCurrent(name.clone())))?;
             let p = shard_dir.join(&name);
-            if p.exists() {
-                Some((seq, p))
-            } else {
-                None
-            }
+            if p.exists() { Some((seq, p)) } else { None }
         }
         None => None,
     }
@@ -438,7 +434,12 @@ mod tests {
     async fn open_repairs_torn_tail_so_new_appends_are_readable() {
         let dir = tmpdir("repair");
         let cfg = WalConfig::for_dir(&dir);
-        let seg = || crate::segment::list_segments(&cfg.shard_dir(0)).unwrap().remove(0).1;
+        let seg = || {
+            crate::segment::list_segments(&cfg.shard_dir(0))
+                .unwrap()
+                .remove(0)
+                .1
+        };
         let (len7, len8);
         {
             let wal = WalWriter::open(cfg.clone(), 0).await.unwrap();
@@ -478,7 +479,9 @@ mod tests {
             "新记录必须可被读到 —— 修复前它落在撕裂垃圾之后，永远读不到"
         );
         assert!(
-            !recovery::recover(&cfg, 0, false).unwrap().torn_write_detected,
+            !recovery::recover(&cfg, 0, false)
+                .unwrap()
+                .torn_write_detected,
             "修复后不应再报告撕裂（边界已与文件末尾一致）"
         );
     }
@@ -491,7 +494,9 @@ mod tests {
         let mut handles = Vec::new();
         for i in 0..8u64 {
             let w = wal.clone();
-            handles.push(tokio::spawn(async move { w.append(rec(i)).await.unwrap().seq }));
+            handles.push(tokio::spawn(
+                async move { w.append(rec(i)).await.unwrap().seq },
+            ));
         }
         let mut seqs = Vec::new();
         for h in handles {

@@ -107,7 +107,7 @@ async fn query_reads_hot_data_through_remote_shard_reader() {
         })
         .await
         .unwrap();
-        cache.set_hot_shards("standalone", reader);
+    cache.set_hot_shards("standalone", reader);
     cache.refresh(&catalog).await.unwrap();
 
     let store = yuntun_store::create_store(&yuntun_store::StoreConfig::Memory).unwrap();
@@ -168,7 +168,7 @@ async fn hot_data_from_every_registered_instance_is_read() {
         })
         .await
         .unwrap();
-        cache.set_hot_shards(
+    cache.set_hot_shards(
         "inst-a",
         Arc::new(RemoteShard::new(Arc::new(CannedFetch { entries: a }))),
     );
@@ -182,7 +182,7 @@ async fn hot_data_from_every_registered_instance_is_read() {
         })
         .await
         .unwrap();
-        cache.set_hot_shards(
+    cache.set_hot_shards(
         "inst-b",
         Arc::new(RemoteShard::new(Arc::new(CannedFetch { entries: b }))),
     );

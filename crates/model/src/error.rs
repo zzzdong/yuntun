@@ -102,7 +102,9 @@ pub enum SnapshotError {
         needed: usize,
         remaining: usize,
     },
-    #[error("snapshot chunk at offset {offset} CRC mismatch: stored {expected:#010x} computed {actual:#010x}")]
+    #[error(
+        "snapshot chunk at offset {offset} CRC mismatch: stored {expected:#010x} computed {actual:#010x}"
+    )]
     ChunkCrcMismatch {
         offset: usize,
         expected: u32,

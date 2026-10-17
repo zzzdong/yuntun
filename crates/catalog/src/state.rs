@@ -25,27 +25,27 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::PurgeOutcome;
 use arrow::datatypes::SchemaRef;
+use yuntun_model::dv::DeletionEntry;
 use yuntun_model::error::LakeError;
 use yuntun_model::meta::{
     DatanodeMember, FileManifest, FileStatus, IdempotencyRecord, LeaseEntry, LeaseGrant,
     SchemaVersion, TableMeta,
 };
 use yuntun_model::ops::{
-    qualified_name, split_qualified, validate_schema_name, validate_table_name, CatalogVersion,
-    CommitFilesRequest, CommitFilesResponse, CreateTableRequest, EvolveSchemaRequest,
-    EvolveSchemaResponse, ManifestDelta, DEFAULT_SCHEMA,
+    CatalogVersion, CommitFilesRequest, CommitFilesResponse, CreateTableRequest, DEFAULT_SCHEMA,
+    EvolveSchemaRequest, EvolveSchemaResponse, ManifestDelta, qualified_name, split_qualified,
+    validate_schema_name, validate_table_name,
 };
-use crate::PurgeOutcome;
-use yuntun_model::dv::DeletionEntry;
 use yuntun_model::schema::apply_change;
 
 use crate::normalize_table;
 use yuntun_model::error::SnapshotError;
 use yuntun_model::snapshot::{
-    CatalogStateSnapshot, SnapshotDeletionEntry, SnapshotFileEntry, SnapshotIdempotencyEntry,
-    SnapshotInFlightEntry, SnapshotPurgeEntry, SnapshotSchemaEntry, SnapshotTableEntry,
-    SnapshotTableVerEntry, SNAPSHOT_FORMAT_VERSION,
+    CatalogStateSnapshot, SNAPSHOT_FORMAT_VERSION, SnapshotDeletionEntry, SnapshotFileEntry,
+    SnapshotIdempotencyEntry, SnapshotInFlightEntry, SnapshotPurgeEntry, SnapshotSchemaEntry,
+    SnapshotTableEntry, SnapshotTableVerEntry,
 };
 
 /// Catalog 的全部可变状态。
@@ -290,8 +290,7 @@ impl CatalogState {
     fn bump_manifest_ver(&mut self, table: &str) -> u64 {
         self.manifest_ver += 1;
         let v = self.manifest_ver;
-        self.table_manifest_ver
-            .insert(normalize_table(table), v);
+        self.table_manifest_ver.insert(normalize_table(table), v);
         v
     }
 
@@ -392,7 +391,8 @@ impl CatalogState {
 
     /// 当前的任务目录（按键排序 ⇒ 多节点的遍历顺序一致）。
     pub fn list_tasks(&self) -> Vec<yuntun_model::task::CompactionTask> {
-        let mut out: Vec<yuntun_model::task::CompactionTask> = self.tasks.values().cloned().collect();
+        let mut out: Vec<yuntun_model::task::CompactionTask> =
+            self.tasks.values().cloned().collect();
         out.sort_by_key(|a| a.key());
         out
     }
@@ -1001,10 +1001,8 @@ impl CatalogState {
 
         // `§172`（台账 `D-29`）：UPDATE **既加新文件、又改 DV** ⇒ 两侧都可能让任务出现/消失，
         // 所以两边都要重算。在"消费掉两个 Vec"之前先把受影响的分片收集出来。
-        let touched_shards: std::collections::BTreeSet<String> = fresh_files
-            .iter()
-            .map(|f| f.shard.clone())
-            .collect();
+        let touched_shards: std::collections::BTreeSet<String> =
+            fresh_files.iter().map(|f| f.shard.clone()).collect();
         let touched_paths: Vec<String> = fresh_dvs.iter().map(|e| e.file_path.clone()).collect();
 
         for mut f in fresh_files {
@@ -1310,9 +1308,7 @@ impl CatalogState {
     ///
     /// 幂等：同一 `batch_id` 重复登记保留首次时刻（重试/恢复不该无限续命）。
     pub fn record_in_flight(&mut self, batch_id: &str, now_ms: u64) {
-        self.in_flight
-            .entry(batch_id.to_string())
-            .or_insert(now_ms);
+        self.in_flight.entry(batch_id.to_string()).or_insert(now_ms);
     }
 
     /// **撤销在途登记**（`commit_files` 成功时调用；失败重试时会重新登记）。
@@ -1508,7 +1504,10 @@ impl CatalogState {
                 .clone()
                 .ok_or_else(|| SnapshotError::InvalidState(format!("幂等键 {} 缺记录", e.key)))?;
             if idempotency.insert(e.key.clone(), v).is_some() {
-                return Err(SnapshotError::InvalidState(format!("幂等键 {} 重复", e.key)));
+                return Err(SnapshotError::InvalidState(format!(
+                    "幂等键 {} 重复",
+                    e.key
+                )));
             }
         }
         let mut datanodes: BTreeMap<String, DatanodeMember> = BTreeMap::new();
@@ -1750,11 +1749,7 @@ impl CatalogState {
             );
         }
         for (k, r) in &self.idempotency {
-            let _ = writeln!(
-                s,
-                "idem {k} batch={} at={}",
-                r.batch_id, r.committed_at
-            );
+            let _ = writeln!(s, "idem {k} batch={} at={}", r.batch_id, r.committed_at);
         }
         for (t, v) in &self.table_manifest_ver {
             let _ = writeln!(s, "tmv {t} {v}");
@@ -1841,8 +1836,13 @@ mod tests {
             st.commit_files(commit_req("public.mem", "b2", &["k2"]), 1_004)
                 .unwrap();
             st.drop_shard("public.cpu", "s0", 0);
-            st.commit_compaction(&["b2".to_string()], vec![merged_file("public.mem", "m1", 1)], 0, "")
-                .unwrap();
+            st.commit_compaction(
+                &["b2".to_string()],
+                vec![merged_file("public.mem", "m1", 1)],
+                0,
+                "",
+            )
+            .unwrap();
             st.sweep_expired_idempotency(24 * 3600, 1_010);
             st
         };
@@ -1987,7 +1987,6 @@ mod tests {
         assert_eq!(st.sweep_expired_idempotency(24 * 3600, 100 + 25 * 3600), 1);
     }
 }
-
 
 #[cfg(test)]
 mod snapshot_tests {
@@ -2181,13 +2180,19 @@ mod snapshot_tests {
         let mut s2 = CatalogState::new();
         s2.acquire_lease("compaction", "a", 1_000, 1_000);
         s2.acquire_lease("compaction", "b", 2_000, 30_000); // 接管 ⇒ epoch 2
-        assert!(!s2.renew_lease("compaction", "a", 1, 2_500, 30_000), "旧持有者不得续租");
+        assert!(
+            !s2.renew_lease("compaction", "a", 1, 2_500, 30_000),
+            "旧持有者不得续租"
+        );
         assert!(s2.renew_lease("compaction", "b", 2, 2_500, 30_000));
 
         // 已过期 ⇒ 不得续租（必须重新 acquire，可能被别人抢先）
         let mut s3 = CatalogState::new();
         s3.acquire_lease("compaction", "a", 1_000, 10_000);
-        assert!(!s3.renew_lease("compaction", "a", 1, 11_000, 10_000), "过期即失效");
+        assert!(
+            !s3.renew_lease("compaction", "a", 1, 11_000, 10_000),
+            "过期即失效"
+        );
     }
 
     #[test]
@@ -2245,30 +2250,20 @@ mod snapshot_tests {
             ..Default::default()
         };
         // 无租约记录 ⇒ 不设栅栏（进程内直连形态、既有用例照常）
-        assert!(s
-            .commit_compaction(&[], vec![mf("m1")], 0, "")
-            .is_ok());
+        assert!(s.commit_compaction(&[], vec![mf("m1")], 0, "").is_ok());
 
         // 租约代次 1：携带 1 可提交，携带 0（没有租约的旧代码）被拒
         s.acquire_lease("compaction", "a", 1_000, 1_000);
-        assert!(s
-            .commit_compaction(&[], vec![mf("m2")], 1, "")
-            .is_ok());
-        let e = s
-            .commit_compaction(&[], vec![mf("m3")], 0, "")
-            .unwrap_err();
+        assert!(s.commit_compaction(&[], vec![mf("m2")], 1, "").is_ok());
+        let e = s.commit_compaction(&[], vec![mf("m3")], 0, "").unwrap_err();
         assert!(e.to_string().contains("fenced"), "{e}");
 
         // **被接管（代次 2）⇒ 旧持有者（1）的在途提交必须被拒** —— 这就是栅栏的全部意义
         s.acquire_lease("compaction", "b", 5_000, 1_000);
-        let e = s
-            .commit_compaction(&[], vec![mf("m4")], 1, "")
-            .unwrap_err();
+        let e = s.commit_compaction(&[], vec![mf("m4")], 1, "").unwrap_err();
         assert!(e.to_string().contains("fenced"), "{e}");
         // 新持有者（2）照常提交
-        assert!(s
-            .commit_compaction(&[], vec![mf("m5")], 2, "")
-            .is_ok());
+        assert!(s.commit_compaction(&[], vec![mf("m5")], 2, "").is_ok());
     }
 
     /// 这是专防"加字段忘了加进快照"的回归测试 —— 那种漏法不会让任何测试变红，
@@ -2345,8 +2340,7 @@ mod snapshot_tests {
         s.manifest_ver += 1;
         cases.push(("manifest_ver", s));
         let mut s = rich_state();
-        s.table_manifest_ver
-            .insert("public.cpu".into(), 9_999);
+        s.table_manifest_ver.insert("public.cpu".into(), 9_999);
         cases.push(("table_manifest_ver", s));
 
         for (name, st) in cases {
@@ -2410,7 +2404,8 @@ mod snapshot_tests {
         assert_eq!(s.purge_count(), 1);
 
         assert!(
-            s.list_visible_files("public.cpu", out.snapshot, None).is_empty(),
+            s.list_visible_files("public.cpu", out.snapshot, None)
+                .is_empty(),
             "清除之后，新快照看不到任何文件"
         );
         assert_eq!(
@@ -2430,7 +2425,9 @@ mod snapshot_tests {
     #[test]
     fn purge_revokes_hanging_deletions_at_the_same_snapshot() {
         let mut s = rich_state();
-        let file = s.list_visible_files("public.cpu", u64::MAX, None)[0].file_path.clone();
+        let file = s.list_visible_files("public.cpu", u64::MAX, None)[0]
+            .file_path
+            .clone();
         let rows = s.list_visible_files("public.cpu", u64::MAX, None)[0].row_count;
         let mut dv = dv_entry("dv-1", "public.cpu", &file);
         dv.card = 3;
@@ -2438,7 +2435,11 @@ mod snapshot_tests {
 
         let out = s.purge_table_files("public.cpu", "purge-1", 0).unwrap();
         assert_eq!(out.revoked, 1, "悬挂的 DV 在同一次操作里被撤销");
-        assert_eq!(out.rows, rows - 3, "受影响行数扣掉被 DV 藏起来的行（口径与行级删一致）");
+        assert_eq!(
+            out.rows,
+            rows - 3,
+            "受影响行数扣掉被 DV 藏起来的行（口径与行级删一致）"
+        );
         assert!(
             s.list_deletions("public.cpu", out.snapshot).is_empty(),
             "撤销之后不再生效"
@@ -2481,7 +2482,10 @@ mod snapshot_tests {
         // 换一个 id ⇒ 是一次新的清除（用户再执行一次 `DELETE FROM t` 就该是这个语义）
         let fresh = s.purge_table_files("public.cpu", "p2", 0).unwrap();
         assert_eq!(fresh.files, 1);
-        assert!(s.list_visible_files("public.cpu", u64::MAX, None).is_empty());
+        assert!(
+            s.list_visible_files("public.cpu", u64::MAX, None)
+                .is_empty()
+        );
         assert_eq!(s.purge_count(), 2);
     }
 
@@ -2510,10 +2514,13 @@ mod snapshot_tests {
         let before = s.snapshot_version;
         let sv_before = s.schema_ver;
         let committed = s
-            .apply_deletions(vec![
-                dv_entry("dv-1", "public.cpu", "f1.parquet"),
-                dv_entry("dv-2", "public.cpu", "f2.parquet"),
-            ], 0)
+            .apply_deletions(
+                vec![
+                    dv_entry("dv-1", "public.cpu", "f1.parquet"),
+                    dv_entry("dv-2", "public.cpu", "f2.parquet"),
+                ],
+                0,
+            )
             .unwrap();
         assert!(committed > before, "apply 必须分配新的快照号");
         assert_eq!(
@@ -2528,7 +2535,11 @@ mod snapshot_tests {
             "旧快照不许看到新删除（否则快照隔离不成立）"
         );
         assert_eq!(s.list_deletions("public.cpu", committed).len(), 2);
-        assert_eq!(s.list_deletions("public.cpu", u64::MAX).len(), 2, "长期有效");
+        assert_eq!(
+            s.list_deletions("public.cpu", u64::MAX).len(),
+            2,
+            "长期有效"
+        );
         // 别的表看不见（按表过滤）
         assert!(s.list_deletions("public.other", u64::MAX).is_empty());
         // 一次 DELETE 的两份 DV 共用同一个 applied_at（单快照原子）
@@ -2549,7 +2560,10 @@ mod snapshot_tests {
         // 撤销（compaction 消费）：置 revoked_at，旧快照仍"当时看得见"
         let at = s.snapshot_version + 1;
         assert_eq!(s.revoke_deletions_for_file("f1.parquet", at, 0), 1);
-        assert!(s.list_deletions("public.cpu", at).len() == 1, "撤销后不再生效");
+        assert!(
+            s.list_deletions("public.cpu", at).len() == 1,
+            "撤销后不再生效"
+        );
         assert!(
             s.list_deletions("public.cpu", at - 1).len() == 2,
             "撤销**之前**的快照仍应看到它（历史可回答）"
@@ -2614,7 +2628,11 @@ mod snapshot_tests {
             .apply_update(vec![dv], vec![new_file], "upd-1", 9_501)
             .unwrap();
         assert_eq!(again, snap, "重放同一份 UPDATE 是空操作");
-        assert_eq!(s.list_deletions("public.cpu", snap).len(), 1, "不会插出第二份 DV");
+        assert_eq!(
+            s.list_deletions("public.cpu", snap).len(),
+            1,
+            "不会插出第二份 DV"
+        );
     }
 
     /// `UPDATE` 的归属校验与空 op：跨表的"删 + 插"是另一个特性，不许悄悄支持。
@@ -2652,23 +2670,33 @@ mod snapshot_tests {
     fn one_delete_record_can_cover_several_files() {
         let mut s = rich_state();
         let snap = s
-            .apply_deletions(vec![
-                dv_entry("dv-batch", "public.cpu", "f1.parquet"),
-                dv_entry("dv-batch", "public.cpu", "f2.parquet"),
-            ], 0)
+            .apply_deletions(
+                vec![
+                    dv_entry("dv-batch", "public.cpu", "f1.parquet"),
+                    dv_entry("dv-batch", "public.cpu", "f2.parquet"),
+                ],
+                0,
+            )
             .unwrap();
         let live = s.list_deletions("public.cpu", snap);
-        assert_eq!(live.len(), 2, "同一个 dv_id 下两个文件都要留（键是「删除 × 文件」）");
+        assert_eq!(
+            live.len(),
+            2,
+            "同一个 dv_id 下两个文件都要留（键是「删除 × 文件」）"
+        );
         assert_eq!(
             live.iter().filter(|d| d.file_path == "f1.parquet").count(),
             1
         );
         // 幂等仍按 (dv_id, file_path)：重放同一条记录不写两份
         let again = s
-            .apply_deletions(vec![
-                dv_entry("dv-batch", "public.cpu", "f1.parquet"),
-                dv_entry("dv-batch", "public.cpu", "f2.parquet"),
-            ], 0)
+            .apply_deletions(
+                vec![
+                    dv_entry("dv-batch", "public.cpu", "f1.parquet"),
+                    dv_entry("dv-batch", "public.cpu", "f2.parquet"),
+                ],
+                0,
+            )
             .unwrap();
         assert_eq!(again, s.snapshot_version, "完全重复 ⇒ 不推快照号");
         assert_eq!(s.all_deletions().len(), 2);
@@ -2680,7 +2708,10 @@ mod snapshot_tests {
         let mut s = rich_state();
         let mut empty_card = dv_entry("dv-0", "public.cpu", "f1.parquet");
         empty_card.card = 0;
-        assert!(s.apply_deletions(vec![empty_card], 0).is_err(), "card=0 不该进目录");
+        assert!(
+            s.apply_deletions(vec![empty_card], 0).is_err(),
+            "card=0 不该进目录"
+        );
         let mut no_id = dv_entry("", "public.cpu", "f1.parquet");
         no_id.dv_id = String::new();
         assert!(s.apply_deletions(vec![no_id], 0).is_err(), "缺 dv_id");
@@ -2853,7 +2884,11 @@ mod snapshot_tests {
             .unwrap();
         assert_eq!(s.list_tasks().len(), 1);
 
-        assert_eq!(s.drop_shard("public.cpu", "s0", 3_000), 2, "两个文件都被下线");
+        assert_eq!(
+            s.drop_shard("public.cpu", "s0", 3_000),
+            2,
+            "两个文件都被下线"
+        );
         assert!(s.list_tasks().is_empty(), "{:?}", s.list_tasks());
     }
 

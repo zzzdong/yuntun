@@ -33,9 +33,9 @@ use arrow::datatypes::SchemaRef;
 use datafusion::prelude::{Expr, SessionContext, col, lit};
 use yuntun_model::agg::{AggQuery, AggStates};
 use yuntun_model::dv::DeletionEntry;
-use yuntun_model::predicate::{CmpOp, Literal, Predicate};
 use yuntun_model::error::LakeError;
 use yuntun_model::meta::FileManifest;
+use yuntun_model::predicate::{CmpOp, Literal, Predicate};
 
 use crate::cache::CatalogSnapshot;
 use crate::partial::{PartialPolicy, PartialSink};

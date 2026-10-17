@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 use yuntun_catalog::CatalogOps;
 use yuntun_chunk::chunk::{ChunkId, ChunkKey, TableLiveness};
 use yuntun_chunk::{ChunkStore, ChunkStoreConfig, SealPolicy};
@@ -27,11 +28,10 @@ use yuntun_model::error::LakeError;
 use yuntun_model::wal_record::{DataPayload, Record};
 use yuntun_store::ShardId;
 use yuntun_wal::writer::WalWriter;
-use uuid::Uuid;
 
 use crate::accumulator::now_ms;
-use crate::flush::{flush_chunk_with_id, recommit_into_catalog, FlushDeps, LiveBatchTracker};
-use crate::schema_cache::{resolve_schema_version, SchemaCache};
+use crate::flush::{FlushDeps, LiveBatchTracker, flush_chunk_with_id, recommit_into_catalog};
+use crate::schema_cache::{SchemaCache, resolve_schema_version};
 use crate::source::{IngestBatch, IngestSource, Receipt};
 
 /// Ingestor 配置（详细设计 §11 `[ingest]` + 架构 §5.2/§5.3/§5.4 + §2 阈值）。
@@ -901,7 +901,11 @@ impl Ingestor {
                     let schema = batches[0].schema();
                     let input = yuntun_chunk::store::ChunkFlushInput {
                         id: None, // 恢复路径：不对应任何在世的 chunk
-                        shard: ShardId::new(table.clone(), st.shard.clone(), st.time_window.clone()),
+                        shard: ShardId::new(
+                            table.clone(),
+                            st.shard.clone(),
+                            st.time_window.clone(),
+                        ),
                         epoch: epoch_now,
                         schema_version: if st.schema_version > 0 {
                             st.schema_version
@@ -1078,7 +1082,10 @@ mod tests {
         assert!(c.claims("public.t", "s0", "w1", 1, 19));
         assert!(!c.claims("public.t", "s0", "w1", 1, 20), "右界为开");
         assert!(!c.claims("public.t", "s1", "w1", 1, 10), "别的组不算已覆盖");
-        assert!(!c.claims("public.t", "s0", "w1", 2, 10), "别的世代不算已覆盖");
+        assert!(
+            !c.claims("public.t", "s0", "w1", 2, 10),
+            "别的世代不算已覆盖"
+        );
     }
 
     #[test]

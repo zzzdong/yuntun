@@ -66,7 +66,9 @@ impl LeaseSet {
         purposes.dedup();
         let mut held: Vec<(String, u64)> = Vec::with_capacity(purposes.len());
         for purpose in &purposes {
-            let grant = catalog.acquire_lease(purpose, holder, now_ms, ttl_ms).await?;
+            let grant = catalog
+                .acquire_lease(purpose, holder, now_ms, ttl_ms)
+                .await?;
             if !grant.granted {
                 // **全或无**：把已经拿到的放掉再报错 —— 留着一半会让"重试"越试越糟
                 for (p, epoch) in held.iter().rev() {
@@ -104,7 +106,11 @@ impl LeaseSet {
     /// 归还全部（best-effort，**逆序**）：还失败也只影响"接手方要不要等 TTL"。
     pub async fn release(self) {
         for (purpose, epoch) in self.purposes.iter().zip(self.epochs.iter()).rev() {
-            if let Err(e) = self.catalog.release_lease(purpose, &self.holder, *epoch).await {
+            if let Err(e) = self
+                .catalog
+                .release_lease(purpose, &self.holder, *epoch)
+                .await
+            {
                 tracing::warn!(purpose = %purpose, error = %e, "归还 DML 租约失败（等 TTL 自动过期）");
             }
         }
@@ -127,16 +133,19 @@ mod tests {
     #[tokio::test]
     async fn different_shards_of_the_same_table_do_not_block_each_other() {
         let catalog: Arc<dyn CatalogOps> = Arc::new(crate::MemoryCatalog::new());
-        catalog.create_table(yuntun_model::ops::CreateTableRequest {
-            name: "t".into(),
-            namespace: yuntun_model::ops::DEFAULT_SCHEMA.into(),
-            schema: Arc::new(arrow::datatypes::Schema::new(vec![
-                arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Int64, true),
-            ])),
-            partition_cols: vec![],
-            default_format: "parquet".into(),
-            ingest_config: yuntun_model::meta::IngestConfig::standard(),
-        }).await.unwrap();
+        catalog
+            .create_table(yuntun_model::ops::CreateTableRequest {
+                name: "t".into(),
+                namespace: yuntun_model::ops::DEFAULT_SCHEMA.into(),
+                schema: Arc::new(arrow::datatypes::Schema::new(vec![
+                    arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Int64, true),
+                ])),
+                partition_cols: vec![],
+                default_format: "parquet".into(),
+                ingest_config: yuntun_model::meta::IngestConfig::standard(),
+            })
+            .await
+            .unwrap();
         let a = LeaseSet::acquire(catalog.clone(), "public.t", &s(&["s0"]), "a", 30_000, NOW)
             .await
             .unwrap();
@@ -148,7 +157,10 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(e.contains(&purpose("public.t", "s0")), "要点名是哪把锁：{e}");
+        assert!(
+            e.contains(&purpose("public.t", "s0")),
+            "要点名是哪把锁：{e}"
+        );
         assert!(e.contains("重试"), "短操作：要让调用方知道重试即可：{e}");
         b.release().await;
         a.release().await;
@@ -164,20 +176,30 @@ mod tests {
     #[tokio::test]
     async fn a_blocked_shard_fails_the_whole_set_without_leaking_leases() {
         let catalog: Arc<dyn CatalogOps> = Arc::new(crate::MemoryCatalog::new());
-        catalog.create_table(yuntun_model::ops::CreateTableRequest {
-            name: "t".into(),
-            namespace: yuntun_model::ops::DEFAULT_SCHEMA.into(),
-            schema: Arc::new(arrow::datatypes::Schema::new(vec![
-                arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Int64, true),
-            ])),
-            partition_cols: vec![],
-            default_format: "parquet".into(),
-            ingest_config: yuntun_model::meta::IngestConfig::standard(),
-        }).await.unwrap();
-        // 别人拿着 s1
-        let other = LeaseSet::acquire(catalog.clone(), "public.t", &s(&["s1"]), "other", 30_000, NOW)
+        catalog
+            .create_table(yuntun_model::ops::CreateTableRequest {
+                name: "t".into(),
+                namespace: yuntun_model::ops::DEFAULT_SCHEMA.into(),
+                schema: Arc::new(arrow::datatypes::Schema::new(vec![
+                    arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Int64, true),
+                ])),
+                partition_cols: vec![],
+                default_format: "parquet".into(),
+                ingest_config: yuntun_model::meta::IngestConfig::standard(),
+            })
             .await
             .unwrap();
+        // 别人拿着 s1
+        let other = LeaseSet::acquire(
+            catalog.clone(),
+            "public.t",
+            &s(&["s1"]),
+            "other",
+            30_000,
+            NOW,
+        )
+        .await
+        .unwrap();
         // 我要 s0+s1+s2（排序后是 s0, s1, s2）：s0 会先拿到，s1 失败 ⇒ 必须把 s0 放掉
         let e = LeaseSet::acquire(
             catalog.clone(),
@@ -192,17 +214,31 @@ mod tests {
         .to_string();
         assert!(e.contains(&purpose("public.t", "s1")), "{e}");
         // s0 必须**没被漏在我手里**：别人现在能拿到它
-        LeaseSet::acquire(catalog.clone(), "public.t", &s(&["s0"]), "second", 30_000, NOW)
-            .await
-            .expect("失败的集合获取不许留下半把锁（漏了它，重试就会永远失败）")
-            .release()
-            .await;
+        LeaseSet::acquire(
+            catalog.clone(),
+            "public.t",
+            &s(&["s0"]),
+            "second",
+            30_000,
+            NOW,
+        )
+        .await
+        .expect("失败的集合获取不许留下半把锁（漏了它，重试就会永远失败）")
+        .release()
+        .await;
         // s2 同样没被漏
-        LeaseSet::acquire(catalog.clone(), "public.t", &s(&["s2"]), "third", 30_000, NOW)
-            .await
-            .expect("s2 也不许被漏")
-            .release()
-            .await;
+        LeaseSet::acquire(
+            catalog.clone(),
+            "public.t",
+            &s(&["s2"]),
+            "third",
+            30_000,
+            NOW,
+        )
+        .await
+        .expect("s2 也不许被漏")
+        .release()
+        .await;
         other.release().await;
     }
 
@@ -210,16 +246,19 @@ mod tests {
     #[tokio::test]
     async fn purposes_are_sorted_and_deduped() {
         let catalog: Arc<dyn CatalogOps> = Arc::new(crate::MemoryCatalog::new());
-        catalog.create_table(yuntun_model::ops::CreateTableRequest {
-            name: "t".into(),
-            namespace: yuntun_model::ops::DEFAULT_SCHEMA.into(),
-            schema: Arc::new(arrow::datatypes::Schema::new(vec![
-                arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Int64, true),
-            ])),
-            partition_cols: vec![],
-            default_format: "parquet".into(),
-            ingest_config: yuntun_model::meta::IngestConfig::standard(),
-        }).await.unwrap();
+        catalog
+            .create_table(yuntun_model::ops::CreateTableRequest {
+                name: "t".into(),
+                namespace: yuntun_model::ops::DEFAULT_SCHEMA.into(),
+                schema: Arc::new(arrow::datatypes::Schema::new(vec![
+                    arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Int64, true),
+                ])),
+                partition_cols: vec![],
+                default_format: "parquet".into(),
+                ingest_config: yuntun_model::meta::IngestConfig::standard(),
+            })
+            .await
+            .unwrap();
         let set = LeaseSet::acquire(
             catalog.clone(),
             "public.t",

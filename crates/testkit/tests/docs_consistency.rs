@@ -173,7 +173,9 @@ fn check_log_index(root: &Path, name: &str) {
     if let Some(d) = date
         && !head.contains(&d)
     {
-        panic!("`docs/{name}` 头部索引的日期不是最后一节的日期\n→ 头部应写 `…§{max}，{d}…`，实际是：{head}");
+        panic!(
+            "`docs/{name}` 头部索引的日期不是最后一节的日期\n→ 头部应写 `…§{max}，{d}…`，实际是：{head}"
+        );
     }
 }
 
@@ -342,7 +344,12 @@ fn docs_top_level_set_is_the_documented_one() {
     check_doc_set(&root.join("docs/dev"), &DEV_DOCS, "docs/dev/");
 
     // 归档必须还在（新文档里的 §号与台账靠它解释）。
-    for need in ["operation-log.md", "closeout.md", "architecture.md", "design.md"] {
+    for need in [
+        "operation-log.md",
+        "closeout.md",
+        "architecture.md",
+        "design.md",
+    ] {
         let p = root.join("docs/archive").join(need);
         assert!(
             p.is_file(),
@@ -411,7 +418,10 @@ fn proto_migration_table_is_honest() {
             ops.push(name.to_string());
         }
     }
-    assert!(!ops.is_empty(), "没从 `oneof op` 里解析出任何 op —— 格式变了？");
+    assert!(
+        !ops.is_empty(),
+        "没从 `oneof op` 里解析出任何 op —— 格式变了？"
+    );
 
     let missing: Vec<&String> = ops
         .iter()
@@ -607,7 +617,10 @@ fn wall_clock_assertions_need_a_reviewed_waiver() {
 
     let mut offenders: Vec<String> = Vec::new();
     for f in &files {
-        if me.as_ref().is_some_and(|m| std::fs::canonicalize(f).ok().as_ref() == Some(m)) {
+        if me
+            .as_ref()
+            .is_some_and(|m| std::fs::canonicalize(f).ok().as_ref() == Some(m))
+        {
             continue; // 本文件自己（见上面的说明）
         }
         let text = read(f);

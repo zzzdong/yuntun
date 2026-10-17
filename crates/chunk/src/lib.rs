@@ -40,8 +40,8 @@ pub mod store;
 
 pub use budget::{MemoryLedger, MemoryPartition, Pressure, PressureThresholds};
 pub use chunk::{
-    batch_memory_bytes, Chunk, ChunkData, ChunkId, ChunkKey, ChunkState, PartitionKey, SpillHandle,
-    TableLiveness,
+    Chunk, ChunkData, ChunkId, ChunkKey, ChunkState, PartitionKey, SpillHandle, TableLiveness,
+    batch_memory_bytes,
 };
 pub use spill::SpillMeta;
 pub use stats::{ColumnStat, ColumnStats, StatValue};

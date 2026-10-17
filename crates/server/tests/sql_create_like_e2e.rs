@@ -25,10 +25,7 @@ use yuntun_server::Lakehouse;
 
 // ---------------------------------------------------------------- 夹具
 
-async fn exec(
-    client: &mut FlightServiceClient<tonic::transport::Channel>,
-    sql: &str,
-) -> i64 {
+async fn exec(client: &mut FlightServiceClient<tonic::transport::Channel>, sql: &str) -> i64 {
     let first = FlightData {
         flight_descriptor: Some(FlightDescriptor {
             r#type: 2,
@@ -182,7 +179,11 @@ async fn create_table_like_copies_schema_without_data() {
     let mut client = serve(&lakehouse, shutdown.clone()).await;
 
     // 源表：三种类型 + 一个 NOT NULL（可空性必须带过去）
-    exec(&mut client, "CREATE TABLE src (a INT NOT NULL, b TEXT, c DOUBLE)").await;
+    exec(
+        &mut client,
+        "CREATE TABLE src (a INT NOT NULL, b TEXT, c DOUBLE)",
+    )
+    .await;
     assert_eq!(
         exec(&mut client, "INSERT INTO src VALUES (1, 'x', 2.5)").await,
         1
@@ -194,8 +195,14 @@ async fn create_table_like_copies_schema_without_data() {
     // ① schema 逐字段相同（含 NOT NULL）
     let src_schema = table_schema(&lakehouse, "public.src").await;
     let dst_schema = table_schema(&lakehouse, "public.dst").await;
-    assert_eq!(dst_schema, src_schema, "LIKE 必须逐字段拷贝 schema（含可空性）");
-    assert!(!dst_schema[0].2, "NOT NULL 必须带过去（否则写入侧校验在新表上失效）");
+    assert_eq!(
+        dst_schema, src_schema,
+        "LIKE 必须逐字段拷贝 schema（含可空性）"
+    );
+    assert!(
+        !dst_schema[0].2,
+        "NOT NULL 必须带过去（否则写入侧校验在新表上失效）"
+    );
 
     // ② 新表是空的（拷 schema 不拷数据）
     let rows = query(&mut client, "SELECT count(*) AS c FROM dst").await;

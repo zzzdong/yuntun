@@ -389,7 +389,7 @@ fn encode_vortex(batch: &arrow::record_batch::RecordBatch) -> Result<Vec<u8>, La
 fn decode_vortex(bytes: &[u8]) -> Result<Vec<arrow::record_batch::RecordBatch>, LakeError> {
     use arrow::array::StructArray;
     use futures::TryStreamExt;
-    use vortex::array::{array_session, VortexSessionExecute};
+    use vortex::array::{VortexSessionExecute, array_session};
     use vortex::arrow::ArrowSessionExt;
     use vortex::buffer::ByteBuffer;
     use vortex::editions::{enable_default_editions, register_default_editions};
@@ -544,7 +544,14 @@ mod vortex_tests {
         let out = decode_batch(&bytes, DataFormat::Vortex).expect("vortex 解码应当成功");
         let got = concat_batches(&out[0].schema(), &out).expect("拼回");
         assert_eq!(got.num_rows(), 3);
-        eprintln!("DECODED SCHEMA: {:?}", got.schema().fields().iter().map(|f| (f.name(), f.data_type())).collect::<Vec<_>>());
+        eprintln!(
+            "DECODED SCHEMA: {:?}",
+            got.schema()
+                .fields()
+                .iter()
+                .map(|f| (f.name(), f.data_type()))
+                .collect::<Vec<_>>()
+        );
         // 读回的 b 列：按目标类型 cast 后逐值相同（物理类型可以是 BinaryView 等）
         let col = arrow::compute::cast(got.column(1), &DataType::Binary)
             .unwrap_or_else(|e| panic!("Binary 列 cast 失败：{e}"));
@@ -566,10 +573,20 @@ mod vortex_tests {
             ("递增整数（偏袒 Parquet 的 delta）", batch(1_000)),
             ("高基数随机串（偏袒字典/FSST）", random_strings_batch(1_000)),
         ] {
-            let v = encode_batch(&b, DataFormat::Vortex).expect("vortex 编码").len();
-            let p = encode_batch(&b, DataFormat::Parquet).expect("parquet 编码").len();
-            println!("{label}: vortex={v}B parquet={p}B ratio={:.2}", v as f64 / p as f64);
-            assert!(v > 0 && p > 0, "两种格式都得真写出东西：vortex={v} parquet={p}");
+            let v = encode_batch(&b, DataFormat::Vortex)
+                .expect("vortex 编码")
+                .len();
+            let p = encode_batch(&b, DataFormat::Parquet)
+                .expect("parquet 编码")
+                .len();
+            println!(
+                "{label}: vortex={v}B parquet={p}B ratio={:.2}",
+                v as f64 / p as f64
+            );
+            assert!(
+                v > 0 && p > 0,
+                "两种格式都得真写出东西：vortex={v} parquet={p}"
+            );
             // 两种形状下都要**读得回来**（体积之外，可用性同样要看）
             let back = decode_batch(
                 &encode_batch(&b, DataFormat::Vortex).expect("vortex 编码"),
@@ -585,7 +602,9 @@ mod vortex_tests {
         // 用**确定性**的伪随机（LCG）：用例必须可复现，不能靠 `rand`
         let mut state = 0x2545_F491_4F6C_DD1Du64;
         let mut next = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             state >> 33
         };
         let ids: Vec<String> = (0..rows)
@@ -633,15 +652,25 @@ mod tests {
     #[test]
     fn dv_paths_are_anchored_to_their_data_file() {
         let dv = "yuntun/public/t/dt=w/shard=s0/dv/b7.parquet/dv-1.bin";
-        assert_eq!(dv_anchor_batch_id(dv).as_deref(), Some("b7"), "锚定数据文件的 batch_id");
+        assert_eq!(
+            dv_anchor_batch_id(dv).as_deref(),
+            Some("b7"),
+            "锚定数据文件的 batch_id"
+        );
         assert_eq!(
             extract_batch_id(dv).as_deref(),
             Some("dv-1"),
             "`extract_batch_id` 拿到的是 dv_id —— 所以它**不能**用来给 DV 对账"
         );
         // 非 DV 路径：不冒充锚定
-        assert_eq!(dv_anchor_batch_id("yuntun/public/t/dt=w/shard=s0/b7.parquet"), None);
-        assert_eq!(dv_anchor_batch_id("yuntun/public/t/dt=w/shard=s0/b7.idx"), None);
+        assert_eq!(
+            dv_anchor_batch_id("yuntun/public/t/dt=w/shard=s0/b7.parquet"),
+            None
+        );
+        assert_eq!(
+            dv_anchor_batch_id("yuntun/public/t/dt=w/shard=s0/b7.idx"),
+            None
+        );
         // 形状不对（`dv/` 后面没有数据文件名那一层）⇒ 保守返回 None
         assert_eq!(dv_anchor_batch_id("yuntun/public/t/dv/"), None);
         assert_eq!(dv_anchor_batch_id("yuntun/public/t/dv/x"), None);
@@ -675,14 +704,16 @@ mod tests {
         let rows = MAX_ROWS_PER_ROW_GROUP * 3 + 1234; // 跨 3 个完整组 + 一个尾巴
         let batch = arrow::record_batch::RecordBatch::try_new(
             schema,
-            vec![SArc::new(Int64Array::from((0..rows as i64).collect::<Vec<_>>()))],
+            vec![SArc::new(Int64Array::from(
+                (0..rows as i64).collect::<Vec<_>>(),
+            ))],
         )
         .unwrap();
 
         let bytes = encode_parquet(&batch).unwrap();
         use parquet::file::reader::{FileReader, SerializedFileReader};
-        let reader =
-            SerializedFileReader::new(bytes::Bytes::copy_from_slice(&bytes)).expect("parquet footer");
+        let reader = SerializedFileReader::new(bytes::Bytes::copy_from_slice(&bytes))
+            .expect("parquet footer");
         let groups = reader.metadata().num_row_groups();
         let expected = rows.div_ceil(MAX_ROWS_PER_ROW_GROUP);
         assert_eq!(
@@ -738,7 +769,10 @@ mod tests {
         let disk = yuntun_store::DiskShard::new(store.clone());
         assert_eq!(
             disk.prefix(&yuntun_store::ShardId::new("sales.orders", "s0", "w")),
-            layered.rsplit_once('/').map(|(d, _)| format!("{d}/")).unwrap()
+            layered
+                .rsplit_once('/')
+                .map(|(d, _)| format!("{d}/"))
+                .unwrap()
         );
 
         let batches = read_batch(&store, &path, DataFormat::Parquet)
@@ -794,7 +828,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(path.ends_with(".vortex"), "产物扩展名必须是 .vortex：{path}");
+        assert!(
+            path.ends_with(".vortex"),
+            "产物扩展名必须是 .vortex：{path}"
+        );
         assert_eq!(
             DataFormat::from_path(&path),
             DataFormat::Vortex,
@@ -802,9 +839,7 @@ mod tests {
         );
         assert!(size > 0);
         assert_eq!(rows, 3);
-        let batches = read_batch(&store, &path, DataFormat::Vortex)
-            .await
-            .unwrap();
+        let batches = read_batch(&store, &path, DataFormat::Vortex).await.unwrap();
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 3, "vortex 往返行数必须一致");
     }

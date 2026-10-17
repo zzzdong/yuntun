@@ -49,9 +49,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use object_store::ObjectStore;
-use yuntun_model::wal_record::Record;
 use tokio_util::sync::CancellationToken;
 use yuntun_model::error::LakeError;
+use yuntun_model::wal_record::Record;
 
 /// WAL 归档配置（`§125`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,10 +127,7 @@ fn seq_of(file_name: &str) -> Option<u64> {
 /// 为什么只看这两类记录：它们是**带数据的**那两类（`Data` 是批次本体、`BatchPending` 是它的
 /// 账目），而且都带 `table`。`BatchS3Written/Committed/Abort` 只带 `batch_id`（判不出表），
 /// 它们很小、且丢了也能被 `Pending` 的恢复通路重做 ⇒ 不进判定。
-pub fn segment_is_archived(
-    path: &Path,
-    durable: &std::collections::HashSet<String>,
-) -> bool {
+pub fn segment_is_archived(path: &Path, durable: &std::collections::HashSet<String>) -> bool {
     let Ok((_header, records, _torn)) = yuntun_wal::segment::load_segment(path) else {
         return true; // 读不了 ⇒ 保守归档
     };
@@ -249,11 +246,7 @@ pub async fn durable_tables(
     let tables = catalog.list_tables().await?;
     Ok(tables
         .into_iter()
-        .filter(|t| {
-            t.ingest_config
-                .as_ref()
-                .is_some_and(|c| c.durability == 1)
-        })
+        .filter(|t| t.ingest_config.as_ref().is_some_and(|c| c.durability == 1))
         // 与文档一致：**全限定名**（WAL 记录里的 `table` 就是它）；`TableMeta.name` 是裸名 ⇒
         // 拿它去比对会永远不命中（`§167` 与合并那处同一个坑）。
         .map(|t| t.qualified_name())
@@ -392,11 +385,8 @@ mod tests {
     async fn segment_is_archived_follows_the_durable_tables() {
         let (seg_durable, _d1) = write_segment("dur", vec![data("durable_t")]).await;
         let (seg_effort, _d2) = write_segment("eff", vec![data("best_effort_t")]).await;
-        let (seg_mixed, _d3) = write_segment(
-            "mix",
-            vec![data("best_effort_t"), data("durable_t")],
-        )
-        .await;
+        let (seg_mixed, _d3) =
+            write_segment("mix", vec![data("best_effort_t"), data("durable_t")]).await;
         let (seg_pending, _d4) = write_segment("pend", vec![pending("durable_t", "b1")]).await;
         let durable = set(&["durable_t"]);
 

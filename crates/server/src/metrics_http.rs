@@ -55,8 +55,10 @@ const READ_TIMEOUT: Duration = Duration::from_secs(2);
 pub async fn spawn_metrics(
     lakehouse: &Lakehouse,
     cfg: &crate::config::MetricsSection,
-) -> Result<Option<(SocketAddr, tokio::task::JoinHandle<()>)>, Box<dyn std::error::Error + Send + Sync>>
-{
+) -> Result<
+    Option<(SocketAddr, tokio::task::JoinHandle<()>)>,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     if !cfg.enabled {
         tracing::info!("metrics http disabled by config ([metrics].enabled = false)");
         return Ok(None);
@@ -138,9 +140,7 @@ async fn handle(mut stream: TcpStream, m: &LakehouseMetrics) -> std::io::Result<
             )
             .await
         }
-        _ => {
-            respond(&mut stream, 405, "text/plain", "only GET is supported\n").await
-        }
+        _ => respond(&mut stream, 405, "text/plain", "only GET is supported\n").await,
     }
 }
 
@@ -424,7 +424,10 @@ mod tests {
                 checked += 1;
             }
         }
-        assert!(checked >= 37, "字段数不对（{checked}）—— 判据本身要跟着字段增长");
+        assert!(
+            checked >= 37,
+            "字段数不对（{checked}）—— 判据本身要跟着字段增长"
+        );
     }
 
     /// **带标签的任务/租约行**（`§172`，G.4）：这是"有哪些活、谁在做"在 Prometheus 侧的全部内容。
@@ -445,12 +448,16 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("yuntun_compaction_task_age_seconds{table=\"public.dist\",shard=\"s0\"} 27"),
+            text.contains(
+                "yuntun_compaction_task_age_seconds{table=\"public.dist\",shard=\"s0\"} 27"
+            ),
             "{text}"
         );
         // 未知年龄：`*_unknown=1`，且**不许**出现该标签组合的 age_seconds
         assert!(
-            text.contains("yuntun_compaction_task_age_unknown{table=\"pub\\\"lic\",shard=\"s1\"} 1"),
+            text.contains(
+                "yuntun_compaction_task_age_unknown{table=\"pub\\\"lic\",shard=\"s1\"} 1"
+            ),
             "标签值要转义、未知年龄要如实报：{text}"
         );
         assert!(
@@ -482,7 +489,10 @@ mod tests {
         assert!(text.contains("yuntun_wal_backlog_records 13"), "{text}");
         assert!(text.contains("yuntun_chunk_pressure_code 1"), "{text}");
         // 数组/字符串不装数值；null 的 query.limit_bytes 报 0（available）
-        assert!(text.contains("yuntun_query_limit_bytes_available 0"), "{text}");
+        assert!(
+            text.contains("yuntun_query_limit_bytes_available 0"),
+            "{text}"
+        );
         assert!(
             text.contains("yuntun_query_reserved_bytes 22"),
             "有值的那一项要出数值：{text}"

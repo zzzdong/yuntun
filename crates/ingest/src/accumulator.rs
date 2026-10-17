@@ -77,7 +77,10 @@ mod tests {
         let ts = 1_788_166_527_000i64;
         let (w, s) = window_of(Some(ts), 0);
         assert_eq!(w % crate::timeutil::MINUTE_MS, 0, "窗口起点必须是整分钟");
-        assert!(ts >= w && ts < w + crate::timeutil::MINUTE_MS, "事件时间必须落在窗口内");
+        assert!(
+            ts >= w && ts < w + crate::timeutil::MINUTE_MS,
+            "事件时间必须落在窗口内"
+        );
         assert_eq!(s.len(), 16, "窗口标识形如 YYYY-MM-DDTHH:MM: {s}");
         assert_eq!(&s[10..11], "T");
 

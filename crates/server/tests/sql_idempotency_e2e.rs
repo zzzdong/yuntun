@@ -22,8 +22,8 @@ use futures::StreamExt;
 use prost::Message;
 use tokio_util::sync::CancellationToken;
 use yuntun_model::ops::CreateTableRequest;
-use yuntun_server::flight::command_bytes;
 use yuntun_server::Lakehouse;
+use yuntun_server::flight::command_bytes;
 
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -44,10 +44,7 @@ fn batch(ts: i64) -> RecordBatch {
 }
 
 /// 简易轨执行 SQL（ticket = SQL 文本），排空结果流。
-async fn run_sql_do_get(
-    client: &mut FlightServiceClient<tonic::transport::Channel>,
-    sql: &str,
-) {
+async fn run_sql_do_get(client: &mut FlightServiceClient<tonic::transport::Channel>, sql: &str) {
     let mut stream = client
         .do_get(Ticket {
             ticket: sql.as_bytes().to_vec().into(),
@@ -94,8 +91,8 @@ async fn put_prepared(
     handle: Vec<u8>,
     ts: i64,
 ) -> i64 {
-    let mut msgs = arrow_flight::utils::batches_to_flight_data(schema().as_ref(), vec![batch(ts)])
-        .unwrap();
+    let mut msgs =
+        arrow_flight::utils::batches_to_flight_data(schema().as_ref(), vec![batch(ts)]).unwrap();
     let data = msgs.remove(1); // 不带 app_metadata：键只能来自 prepared 上的键或服务端生成
     let first = FlightData {
         flight_descriptor: Some(FlightDescriptor {

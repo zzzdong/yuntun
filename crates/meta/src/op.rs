@@ -14,15 +14,15 @@
 
 use std::sync::Arc;
 
-use yuntun_catalog::CatalogState;
 use arrow::datatypes::{DataType, Field, Schema};
+use yuntun_catalog::CatalogState;
 use yuntun_model::meta::{
     ColumnStatLite, DatanodeMember, FileManifest, IdempotencyRecord, IngestConfig, StatisticsLite,
     TableMeta,
 };
 use yuntun_model::ops::EvolveSchemaRequest;
-use yuntun_model::schema::SchemaChange;
 use yuntun_model::ops::{CommitFilesRequest, CreateTableRequest};
+use yuntun_model::schema::SchemaChange;
 
 // `encode_to_vec` / `decode`：prost 的 trait 方法（匿名导入，避免与 pb 别名混淆）
 use prost::Message as _;
@@ -138,9 +138,15 @@ pub enum StateOp {
         now_ms: u64,
     },
     /// **在途批次登记**（T14.3）：上传对象存储之前的声明，让孤儿 GC 看得见。
-    RecordInFlight { batch_id: String, now_ms: u64 },
+    RecordInFlight {
+        batch_id: String,
+        now_ms: u64,
+    },
     /// **在途登记的超时清扫**（T14.3）：与摘除同形 —— 触发者是巡检，结果进 raft。
-    SweepInFlight { ttl_ms: u64, now_ms: u64 },
+    SweepInFlight {
+        ttl_ms: u64,
+        now_ms: u64,
+    },
 }
 
 // `CreateTableRequest` 里有 `SchemaRef`（`Arc<Schema>`）—— `Arc` 未使用会告警
@@ -383,9 +389,8 @@ pub fn create_table_from_proto(c: &pb::CreateTableOp) -> Result<CreateTableReque
         IngestConfig::standard()
     } else {
         use prost::Message as _;
-        IngestConfig::decode(c.ingest_config.as_slice()).map_err(|e| {
-            MetaError::BadRequest(format!("ingest_config 解码失败：{e}"))
-        })?
+        IngestConfig::decode(c.ingest_config.as_slice())
+            .map_err(|e| MetaError::BadRequest(format!("ingest_config 解码失败：{e}")))?
     };
     let schema = yuntun_model::meta::deserialize_schema(&c.arrow_schema_ipc)
         .map_err(|e| MetaError::BadRequest(format!("arrow schema 解码失败：{e}")))?;
@@ -413,7 +418,9 @@ pub fn create_table_to_proto(r: &CreateTableRequest) -> pb::CreateTableOp {
 }
 
 /// `CommitFilesRequestMsg` → `CommitFilesRequest`（**逐字段**，漏字段在编译期就会被发现）。
-pub fn commit_request_from_proto(m: &pb::CommitFilesRequestMsg) -> Result<CommitFilesRequest, MetaError> {
+pub fn commit_request_from_proto(
+    m: &pb::CommitFilesRequestMsg,
+) -> Result<CommitFilesRequest, MetaError> {
     Ok(CommitFilesRequest {
         table: m.table.clone(),
         batch_id: m.batch_id.clone(),
@@ -626,12 +633,13 @@ pub fn table_meta_from_proto(m: &pb::TableMeta) -> Result<TableMeta, MetaError> 
             m.name, m.namespace
         )));
     }
-    let ingest_config = match &m.ingest_config {
-        Some(bytes) => Some(IngestConfig::decode(bytes.as_slice()).map_err(|e| {
-            MetaError::BadRequest(format!("TableMeta.ingest_config 解不开：{e}"))
-        })?),
-        None => None,
-    };
+    let ingest_config =
+        match &m.ingest_config {
+            Some(bytes) => Some(IngestConfig::decode(bytes.as_slice()).map_err(|e| {
+                MetaError::BadRequest(format!("TableMeta.ingest_config 解不开：{e}"))
+            })?),
+            None => None,
+        };
     Ok(TableMeta {
         name: name.to_string(),
         current_schema_version: m.current_schema_version,
@@ -688,9 +696,9 @@ pub fn schema_change_to_proto(c: &SchemaChange) -> pb::SchemaChangeMsg {
                 column: column.clone(),
                 to_type_ipc: type_to_ipc(to),
             }),
-            SchemaChange::DropColumn { column } => {
-                Kind::DropColumn(pb::DropColumnMsg { column: column.clone() })
-            }
+            SchemaChange::DropColumn { column } => Kind::DropColumn(pb::DropColumnMsg {
+                column: column.clone(),
+            }),
         }),
     }
 }
@@ -778,9 +786,7 @@ pub fn apply(state: &mut CatalogState, op: &StateOp) -> Result<ApplyOutcome, Met
             if state.schema_exists(name) {
                 return Ok(ApplyOutcome::hit());
             }
-            state
-                .create_schema(name)
-                .map_err(MetaError::from_lake)?;
+            state.create_schema(name).map_err(MetaError::from_lake)?;
             Ok(ApplyOutcome::one())
         }
         StateOp::CreateTable { request, .. } => {
@@ -975,7 +981,12 @@ pub fn apply(state: &mut CatalogState, op: &StateOp) -> Result<ApplyOutcome, Met
         } => {
             // 栅栏拒绝 = op **失败**（要让客户端看见"你被接管了"，而不是静默丢弃）
             state
-                .commit_compaction(old_batch_ids, new_files.clone(), *lease_epoch, lease_purpose)
+                .commit_compaction(
+                    old_batch_ids,
+                    new_files.clone(),
+                    *lease_epoch,
+                    lease_purpose,
+                )
                 .map_err(MetaError::from_lake)?;
             // affected = 本次写入的新文件数（调用方按它算"合并产出"）
             Ok(ApplyOutcome::new(true, new_files.len() as u64))
@@ -1211,8 +1222,14 @@ mod tests {
         };
 
         let p = table_meta_to_proto(&m);
-        assert_eq!(p.name, "analytics.cpu", "线上必须是全限定名（缓存键靠它唯一）");
-        assert_eq!(p.namespace, "analytics", "冗余副本要填归一化后的值（供解码侧交叉校验）");
+        assert_eq!(
+            p.name, "analytics.cpu",
+            "线上必须是全限定名（缓存键靠它唯一）"
+        );
+        assert_eq!(
+            p.namespace, "analytics",
+            "冗余副本要填归一化后的值（供解码侧交叉校验）"
+        );
 
         let back = table_meta_from_proto(&p).expect("round-trip");
         assert_eq!(back.name, m.name);
@@ -1223,7 +1240,10 @@ mod tests {
         assert_eq!(back.arrow_schema, m.arrow_schema);
         assert_eq!(back.created_at, m.created_at);
         assert_eq!(back.table_template, m.table_template);
-        assert_eq!(back.ingest_config, m.ingest_config, "ingest_config 必须无损");
+        assert_eq!(
+            back.ingest_config, m.ingest_config,
+            "ingest_config 必须无损"
+        );
 
         // ② `None` 不能被"补成"默认配置（optional 的存在性就是为这个）
         m.ingest_config = None;
@@ -1247,7 +1267,6 @@ mod tests {
         let e = table_meta_from_proto(&bad).expect_err("不一致必须拒绝");
         assert!(format!("{e}").contains("不一致"), "{e}");
     }
-
 
     /// `SchemaChange` 三个变体的镜像必须**逐字段无损**。
     ///
@@ -1280,7 +1299,8 @@ mod tests {
         assert!(format!("{e}").contains("kind"), "{e}");
 
         // ② add_column 的载荷不是「恰好 1 个字段」（0 字段）
-        let empty_schema: std::sync::Arc<Schema> = std::sync::Arc::new(Schema::new(Vec::<Field>::new()));
+        let empty_schema: std::sync::Arc<Schema> =
+            std::sync::Arc::new(Schema::new(Vec::<Field>::new()));
         let empty = yuntun_model::meta::serialize_schema(&empty_schema);
         let e = schema_change_from_proto(&pb::SchemaChangeMsg {
             kind: Some(pb::schema_change_msg::Kind::AddColumnFieldIpc(empty)),
@@ -1297,15 +1317,16 @@ mod tests {
         // ① evolve_schema：OCC 版本必须带过去（丢了就退化成"永远成功"）
         let req = EvolveSchemaRequest {
             table: "public.cpu".into(),
-            change: SchemaChange::DropColumn {
-                column: "x".into(),
-            },
+            change: SchemaChange::DropColumn { column: "x".into() },
             expected_version: 7,
         };
         let back = evolve_schema_from_proto(&evolve_schema_to_proto(&req)).unwrap();
         assert_eq!(back.table, req.table);
         assert_eq!(back.change, req.change);
-        assert_eq!(back.expected_version, 7, "OCC 版本丢了 → DDL 变成无条件覆盖");
+        assert_eq!(
+            back.expected_version, 7,
+            "OCC 版本丢了 → DDL 变成无条件覆盖"
+        );
 
         // ② idempotency：**空 batch_id 有语义**（已认领、批次未落盘），不能被"补默认值"
         let rec = IdempotencyRecord {
@@ -1313,7 +1334,10 @@ mod tests {
             batch_id: String::new(),
             committed_at: 1_700_000_000,
         };
-        assert_eq!(idempotency_record_from_proto(&idempotency_record_to_proto(&rec)), rec);
+        assert_eq!(
+            idempotency_record_from_proto(&idempotency_record_to_proto(&rec)),
+            rec
+        );
 
         // ③ 五个新分支都要能被 `decode_op` 解出来，且带上 op 的时间（纪律 1）
         let decode = |kind: pb::op::Kind, what: &str| {
@@ -1326,7 +1350,10 @@ mod tests {
             d
         };
         assert!(matches!(
-            decode(pb::op::Kind::DropSchema(pb::DropSchemaOp { name: "a".into() }), "drop_schema"),
+            decode(
+                pb::op::Kind::DropSchema(pb::DropSchemaOp { name: "a".into() }),
+                "drop_schema"
+            ),
             StateOp::DropSchema { .. }
         ));
         assert!(matches!(
@@ -1378,12 +1405,13 @@ mod tests {
         // ④ 缺 `record` 的幂等 op 必须报错（不能当空操作 —— 那等于让客户端"认领成功"）
         let e = decode_op(&pb::Op {
             now_ms: now,
-            kind: Some(pb::op::Kind::Idempotency(pb::IdempotencyOp { record: None })),
+            kind: Some(pb::op::Kind::Idempotency(pb::IdempotencyOp {
+                record: None,
+            })),
         })
         .unwrap_err();
         assert!(format!("{e}").contains("record"), "{e}");
     }
-
 
     /// 新 op 的**幂等语义**：重复执行 → `accepted=false`（**不是**错误）。
     ///
@@ -1450,24 +1478,28 @@ mod tests {
         .unwrap();
         assert!(!f.accepted, "删不存在的 schema 必须幂等（false 而非错误）");
         sm.create_schema("tmp").unwrap();
-        assert!(apply(
-            &mut sm,
-            &StateOp::DropSchema {
-                name: "tmp".into(),
-                now_ms: now
-            }
-        )
-        .unwrap()
-        .accepted);
-        assert!(!apply(
-            &mut sm,
-            &StateOp::DropSchema {
-                name: "tmp".into(),
-                now_ms: now
-            }
-        )
-        .unwrap()
-        .accepted);
+        assert!(
+            apply(
+                &mut sm,
+                &StateOp::DropSchema {
+                    name: "tmp".into(),
+                    now_ms: now
+                }
+            )
+            .unwrap()
+            .accepted
+        );
+        assert!(
+            !apply(
+                &mut sm,
+                &StateOp::DropSchema {
+                    name: "tmp".into(),
+                    now_ms: now
+                }
+            )
+            .unwrap()
+            .accepted
+        );
     }
 
     /// T12.3：数据节点注册 —— 名录进状态机，且**重复注册不得推进版本**。

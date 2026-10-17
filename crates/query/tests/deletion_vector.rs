@@ -43,7 +43,8 @@ fn schema() -> arrow::datatypes::SchemaRef {
 
 fn batch(offset: i64, n: i64, step: i64) -> arrow::record_batch::RecordBatch {
     let ts: Vec<i64> = (0..n).map(|i| offset + i * step).collect();
-    arrow::record_batch::RecordBatch::try_new(schema(), vec![Arc::new(Int64Array::from(ts))]).unwrap()
+    arrow::record_batch::RecordBatch::try_new(schema(), vec![Arc::new(Int64Array::from(ts))])
+        .unwrap()
 }
 
 /// 手写一个小 parquet（行序 == 我们写入的顺序 ⇒ 行号可预测）。
@@ -96,11 +97,9 @@ async fn fixture() -> Fixture {
         .unwrap();
 
     // A 的索引（F.4）：证明"带 DV 的文件不再取索引"这条互斥纪律
-    let idx = yuntun_model::index::IndexFile::build(
-        &batch(0, A_ROWS, 2),
-        &["event_time".to_string()],
-    )
-    .unwrap();
+    let idx =
+        yuntun_model::index::IndexFile::build(&batch(0, A_ROWS, 2), &["event_time".to_string()])
+            .unwrap();
     let idx_path = yuntun_format::index_path(&a_path);
     yuntun_store::put_bytes(&*store, &idx_path, idx.to_bytes())
         .await
@@ -109,7 +108,13 @@ async fn fixture() -> Fixture {
     // ⚠️ **一个批次一个文件**（`files` 以 batch_id 为键；一次传两个会被状态机拒绝，
     //    见 `§147` 顺带补的护栏）。真实世界里这也是常态：一次 flush 一个文件。
     for (batch, path, bytes, rows, idx) in [
-        ("b-a", &a_path, &a_bytes, a_rows as u64, Some((idx_path.clone(), idx.to_bytes()))),
+        (
+            "b-a",
+            &a_path,
+            &a_bytes,
+            a_rows as u64,
+            Some((idx_path.clone(), idx.to_bytes())),
+        ),
         ("b-b", &b_path, &b_bytes, b_rows as u64, None),
     ] {
         let (index_path, index_bytes) = match idx {
@@ -176,11 +181,7 @@ impl Fixture {
 
     /// 查询 → 升序的 `event_time` 列表（`num_rows()` 也一并返回，供"行数对得上"用）。
     async fn query(&self, sql: &str) -> Result<Vec<i64>, String> {
-        let batches = self
-            .engine
-            .sql(sql)
-            .await
-            .map_err(|e| e.to_string())?;
+        let batches = self.engine.sql(sql).await.map_err(|e| e.to_string())?;
         let mut out: Vec<i64> = Vec::new();
         for b in &batches {
             let col = b
@@ -205,7 +206,10 @@ fn all_rows() -> Vec<i64> {
 async fn deleted_rows_disappear_and_the_rest_stay() {
     let f = fixture().await;
     assert_eq!(
-        f.query(&format!("SELECT event_time FROM {TABLE}")).await.unwrap().len(),
+        f.query(&format!("SELECT event_time FROM {TABLE}"))
+            .await
+            .unwrap()
+            .len(),
         20,
         "前提：没有删除时两个文件都读得到"
     );
@@ -214,9 +218,15 @@ async fn deleted_rows_disappear_and_the_rest_stay() {
     f.delete("dv-a", &f.a_path, &[0, 2, 4]).await;
     f.cache.refresh(&f.catalog).await.unwrap();
 
-    let got = f.query(&format!("SELECT event_time FROM {TABLE}")).await.unwrap();
+    let got = f
+        .query(&format!("SELECT event_time FROM {TABLE}"))
+        .await
+        .unwrap();
     assert_eq!(got.len(), 17, "删 3 行 ⇒ 少 3 行（少了是错，多了也是错）");
-    assert!(!got.contains(&0) && !got.contains(&4) && !got.contains(&8), "被删的行必须查不到");
+    assert!(
+        !got.contains(&0) && !got.contains(&4) && !got.contains(&8),
+        "被删的行必须查不到"
+    );
     // 没被删的一行不少 —— 这一条才是"剪错"那类失败的拦网
     let mut expect = all_rows();
     expect.retain(|v| ![0, 4, 8].contains(v));
@@ -224,7 +234,9 @@ async fn deleted_rows_disappear_and_the_rest_stay() {
 
     // 谓词查询也不受影响（DV 在文件级剪枝之后、扫描之前生效）
     let got = f
-        .query(&format!("SELECT event_time FROM {TABLE} WHERE event_time < 10"))
+        .query(&format!(
+            "SELECT event_time FROM {TABLE} WHERE event_time < 10"
+        ))
         .await
         .unwrap();
     assert_eq!(got, vec![2, 6], "A 里 < 10 的 0/4/8 已删；B 全是 100+");
@@ -236,23 +248,38 @@ async fn multiple_deletions_on_one_file_stack() {
     let f = fixture().await;
     f.delete("dv-a1", &f.a_path, &[0]).await;
     f.cache.refresh(&f.catalog).await.unwrap();
-    assert!(!f.query(&format!("SELECT event_time FROM {TABLE}")).await.unwrap().contains(&0));
+    assert!(
+        !f.query(&format!("SELECT event_time FROM {TABLE}"))
+            .await
+            .unwrap()
+            .contains(&0)
+    );
 
     f.delete("dv-a2", &f.a_path, &[2, 3]).await;
     f.cache.refresh(&f.catalog).await.unwrap();
-    let got = f.query(&format!("SELECT event_time FROM {TABLE}")).await.unwrap();
+    let got = f
+        .query(&format!("SELECT event_time FROM {TABLE}"))
+        .await
+        .unwrap();
     let mut expect = all_rows();
     expect.retain(|v| ![0, 4, 6].contains(v));
-    assert_eq!(got, expect, "先后两次删除必须**叠加**（第二份不许把第一份盖掉）");
+    assert_eq!(
+        got, expect,
+        "先后两次删除必须**叠加**（第二份不许把第一份盖掉）"
+    );
 }
 
 /// 只影响被锚定的文件：B 没有 DV ⇒ 一行不少（混有无 DV 文件的正确性）。
 #[tokio::test]
 async fn only_the_anchored_file_is_affected() {
     let f = fixture().await;
-    f.delete("dv-a", &f.a_path, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]).await; // A 全删
+    f.delete("dv-a", &f.a_path, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+        .await; // A 全删
     f.cache.refresh(&f.catalog).await.unwrap();
-    let got = f.query(&format!("SELECT event_time FROM {TABLE}")).await.unwrap();
+    let got = f
+        .query(&format!("SELECT event_time FROM {TABLE}"))
+        .await
+        .unwrap();
     assert_eq!(
         got,
         (0..B_ROWS).map(|i| 100 + i).collect::<Vec<_>>(),
@@ -264,7 +291,10 @@ async fn only_the_anchored_file_is_affected() {
         .await;
     f.cache.refresh(&f.catalog).await.unwrap();
     assert!(
-        f.query(&format!("SELECT event_time FROM {TABLE}")).await.unwrap().is_empty(),
+        f.query(&format!("SELECT event_time FROM {TABLE}"))
+            .await
+            .unwrap()
+            .is_empty(),
         "整文件删光 ⇒ 该文件贡献 0 行（既不是报错，也不是全留）"
     );
 }
@@ -275,19 +305,35 @@ async fn stale_reader_keeps_the_old_view() {
     let f = fixture().await;
     // 这一份快照是"删除之前的世界"
     let stale = f.cache.snapshot();
-    assert!(f.cache.snapshot().get(&format!("public.{TABLE}")).unwrap().deletions.is_empty());
+    assert!(
+        f.cache
+            .snapshot()
+            .get(&format!("public.{TABLE}"))
+            .unwrap()
+            .deletions
+            .is_empty()
+    );
 
     f.delete("dv-a", &f.a_path, &[0, 1]).await;
     // ⚠️ **故意不刷新**：正是"删除之后的查询"与"删除之前就规划好的查询"的分界
-    let old = f.query(&format!("SELECT event_time FROM {TABLE}")).await.unwrap();
-    assert_eq!(old, all_rows(), "删除提交前的读者必须仍看到被删的行（快照隔离）");
+    let old = f
+        .query(&format!("SELECT event_time FROM {TABLE}"))
+        .await
+        .unwrap();
+    assert_eq!(
+        old,
+        all_rows(),
+        "删除提交前的读者必须仍看到被删的行（快照隔离）"
+    );
 
     // 刷新之后（新快照）才看得到删除
     f.cache.refresh(&f.catalog).await.unwrap();
     let mut expect = all_rows();
     expect.retain(|v| ![0, 2].contains(v));
     assert_eq!(
-        f.query(&format!("SELECT event_time FROM {TABLE}")).await.unwrap(),
+        f.query(&format!("SELECT event_time FROM {TABLE}"))
+            .await
+            .unwrap(),
         expect
     );
     assert!(
@@ -303,9 +349,13 @@ async fn broken_deletion_vector_fails_the_query_loudly() {
     let f = fixture().await;
     f.delete("dv-a", &f.a_path, &[0]).await;
     let dp = dv_object_path(&f.a_path, "dv-a");
-    yuntun_store::put_bytes(&*f.store, &dp, b"YTDV\x01\x02\x00\x00\x00\xff\xff\xff\xffXX".to_vec())
-        .await
-        .unwrap();
+    yuntun_store::put_bytes(
+        &*f.store,
+        &dp,
+        b"YTDV\x01\x02\x00\x00\x00\xff\xff\xff\xffXX".to_vec(),
+    )
+    .await
+    .unwrap();
     f.cache.refresh(&f.catalog).await.unwrap();
     let e = f
         .query(&format!("SELECT event_time FROM {TABLE}"))

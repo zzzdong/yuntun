@@ -73,9 +73,9 @@ use yuntun_catalog::{CatalogOps, MemoryCatalog};
 #[cfg(test)]
 use yuntun_ingest::{Ingestor, IngestorConfig};
 #[cfg(test)]
-use yuntun_model::ops::CreateTableRequest;
-#[cfg(test)]
 use yuntun_model::IngestBatch;
+#[cfg(test)]
+use yuntun_model::ops::CreateTableRequest;
 #[cfg(test)]
 use yuntun_query::QueryEngine;
 // 供 `tracker.non_terminal()` 的方法解析（trait 实现已在 ingest 侧）
@@ -170,7 +170,15 @@ async fn build_full(
     max_flush_delay_secs: u64,
     wal_cfg: yuntun_wal::WalConfig,
 ) -> Setup {
-    build_full_with_wal(wal_dir, store_root, tables, 1, max_flush_delay_secs, wal_cfg).await
+    build_full_with_wal(
+        wal_dir,
+        store_root,
+        tables,
+        1,
+        max_flush_delay_secs,
+        wal_cfg,
+    )
+    .await
 }
 
 /// 同 [`build`]，但可指定"seal → flush 宽限期"。
@@ -233,7 +241,9 @@ async fn build_full_with_wal(
         root: store_root.to_string_lossy().to_string(),
     })
     .unwrap();
-    let wal = yuntun_wal::writer::WalWriter::open(wal_cfg, 0).await.unwrap();
+    let wal = yuntun_wal::writer::WalWriter::open(wal_cfg, 0)
+        .await
+        .unwrap();
     let cfg = IngestorConfig {
         rows_threshold,
         time_threshold_secs: 0,
@@ -380,30 +390,29 @@ async fn crash_recovery_no_data_loss() {
                     .collect::<Vec<_>>()
             );
             // WAL 原始记录：看 BatchPending 携带的区间是否与 Data 的真实位置一致
-            let dump: Vec<String> = yuntun_wal::reader::WalReader::new(
-                cur.ingestor.wal.shard_dir(),
-            )
-            .scan_from(0)
-            .unwrap()
-            .iter()
-            .map(|(s, r)| {
-                use yuntun_model::wal_record::Record as R;
-                let b = |id: &str| id[..6.min(id.len())].to_string();
-                match r {
-                    R::Data(p) => format!("{s}:Data({})", p.table),
-                    R::BatchPending(p) => format!(
-                        "{s}:Pending({} {}..{})",
-                        b(&p.batch_id),
-                        p.wal_seq_start,
-                        p.wal_seq_end
-                    ),
-                    R::BatchS3Written(p) => format!("{s}:S3W({})", b(&p.batch_id)),
-                    R::BatchCommitted(p) => format!("{s}:Commit({})", b(&p.batch_id)),
-                    R::BatchAbort(p) => format!("{s}:Abort({})", b(&p.batch_id)),
-                    _ => format!("{s}:other"),
-                }
-            })
-            .collect();
+            let dump: Vec<String> =
+                yuntun_wal::reader::WalReader::new(cur.ingestor.wal.shard_dir())
+                    .scan_from(0)
+                    .unwrap()
+                    .iter()
+                    .map(|(s, r)| {
+                        use yuntun_model::wal_record::Record as R;
+                        let b = |id: &str| id[..6.min(id.len())].to_string();
+                        match r {
+                            R::Data(p) => format!("{s}:Data({})", p.table),
+                            R::BatchPending(p) => format!(
+                                "{s}:Pending({} {}..{})",
+                                b(&p.batch_id),
+                                p.wal_seq_start,
+                                p.wal_seq_end
+                            ),
+                            R::BatchS3Written(p) => format!("{s}:S3W({})", b(&p.batch_id)),
+                            R::BatchCommitted(p) => format!("{s}:Commit({})", b(&p.batch_id)),
+                            R::BatchAbort(p) => format!("{s}:Abort({})", b(&p.batch_id)),
+                            _ => format!("{s}:other"),
+                        }
+                    })
+                    .collect();
             eprintln!("[诊断] WAL: {dump:?}");
             // 恢复后的批次状态：batch_id 全量 + 区间 + 组键（定位区间为何重复/漏覆盖）
             let rec = cur.ingestor.wal.full_recovery().unwrap();
@@ -862,11 +871,7 @@ async fn explain_text(setup: &Setup, sql: &str) -> String {
         .refresh(&(setup.catalog.clone() as Arc<dyn CatalogOps>))
         .await
         .unwrap();
-    let batches = setup
-        .engine
-        .sql(&format!("EXPLAIN {sql}"))
-        .await
-        .unwrap();
+    let batches = setup.engine.sql(&format!("EXPLAIN {sql}")).await.unwrap();
     let mut out = String::new();
     for b in &batches {
         if let Some(col) = b
@@ -929,7 +934,8 @@ fn write_unsynced_data_record(
     });
     // 独立的 segment 文件：不干扰 WalWriter 自己的追加偏移
     let seg_seq = 900_000 + first_seq;
-    let mut w = yuntun_wal::segment::SegmentWriter::create(shard_dir, seg_seq, 0, first_seq).unwrap();
+    let mut w =
+        yuntun_wal::segment::SegmentWriter::create(shard_dir, seg_seq, 0, first_seq).unwrap();
     w.append(&rec).unwrap();
     // ⚠️ 刻意**不** `sync_all()`：这正是被测边界
     first_seq
@@ -949,7 +955,6 @@ fn newest_segment(shard_dir: &std::path::Path) -> std::path::PathBuf {
         })
         .expect("至少应有一个 segment")
 }
-
 
 // ---------------------------------------------------------------- 目录语义场景
 
@@ -998,7 +1003,11 @@ async fn idempotency_survives_compaction() {
 
     // 等落盘：rows_threshold=1 → 每批独立 chunk → 3 个文件
     let files = wait_visible_files(&setup, "public.idem", "s0", 3).await;
-    assert_eq!(files.len(), 3, "三个批次应产出三个文件（后续 compaction 才有意义）");
+    assert_eq!(
+        files.len(),
+        3,
+        "三个批次应产出三个文件（后续 compaction 才有意义）"
+    );
 
     // ② 重试（compaction 之前）：入口预筛命中 —— 不写 WAL、不加行
     let dup = ingest("idem-k0", 999).await;
@@ -1254,7 +1263,10 @@ async fn commit_to_mark_window_must_not_double_count() {
 
     // ① 启动攒批 → 等 chunk 被吸收并 seal → 停掉（此刻还不会 flush）
     let acc_shutdown = CancellationToken::new();
-    let acc = setup.ingestor.clone().spawn_accumulator(acc_shutdown.clone());
+    let acc = setup
+        .ingestor
+        .clone()
+        .spawn_accumulator(acc_shutdown.clone());
     assert_eq!(ingest_into(&setup, "cw", "s0", 42).await, 3);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while chunks.stats().chunks == 0 {
@@ -1278,10 +1290,8 @@ async fn commit_to_mark_window_must_not_double_count() {
     use yuntun_store::ShardReader;
     let shards = chunks.shards_of("public.cw").await.unwrap();
     assert_eq!(shards.len(), 1, "应只有一个热分片: {shards:?}");
-    let key = yuntun_chunk::chunk::ChunkKey::new(
-        shards[0].clone(),
-        chunks.liveness("public.cw").epoch,
-    );
+    let key =
+        yuntun_chunk::chunk::ChunkKey::new(shards[0].clone(), chunks.liveness("public.cw").epoch);
     let ids = chunks.chunk_ids_of(&key);
     assert_eq!(ids.len(), 1, "应只有一个 chunk: {ids:?}");
     let input = chunks.flush_input(ids[0]).unwrap().unwrap();
@@ -1393,11 +1403,7 @@ fn power_loss_hook(
 
 /// 并发写若干批，返回 (已 ack 行数, 失败次数)。
 #[cfg(test)]
-async fn concurrent_ingest(
-    setup: &Setup,
-    table: &str,
-    n: usize,
-) -> (u64, usize) {
+async fn concurrent_ingest(setup: &Setup, table: &str, n: usize) -> (u64, usize) {
     let mut handles = Vec::new();
     for i in 0..n {
         let ing = setup.ingestor.clone();
@@ -1477,14 +1483,7 @@ async fn kill_before_fsync_keeps_acked_data_and_drops_unacked() {
     let mut wcfg = yuntun_wal::WalConfig::for_dir(&wal_dir);
     wcfg.group_commit_max_batch = 1; // 每条记录自成一批 → 一次 append 一次 fsync，点位可数
     wcfg.fsync_hook = Some(hook);
-    let setup = build_full(
-        &wal_dir,
-        &store_root,
-        &[("k8", schema(), false)],
-        0,
-        wcfg,
-    )
-    .await;
+    let setup = build_full(&wal_dir, &store_root, &[("k8", schema(), false)], 0, wcfg).await;
     let shard_dir = setup.ingestor.wal.shard_dir();
 
     let (acked, failed) = concurrent_ingest(&setup, "k8", 6).await;
@@ -1516,7 +1515,10 @@ async fn kill_before_fsync_keeps_acked_data_and_drops_unacked() {
     assert_data_seq_prefix(&shard_dir, 2);
     // 重建后的系统必须仍可写入（注入点在重启后已卸掉）
     let more = ingest_into(&setup, "k8", "s1", 2000).await;
-    assert_eq!(wait_visible_rows(&setup, "public.k8", "s1", more).await, more);
+    assert_eq!(
+        wait_visible_rows(&setup, "public.k8", "s1", more).await,
+        more
+    );
     shutdown.cancel();
 }
 
@@ -1535,18 +1537,14 @@ async fn kill_after_fsync_keeps_fsynced_data_without_ack() {
     let mut wcfg = yuntun_wal::WalConfig::for_dir(&wal_dir);
     wcfg.group_commit_max_batch = 1;
     wcfg.fsync_hook = Some(hook);
-    let setup = build_full(
-        &wal_dir,
-        &store_root,
-        &[("k8", schema(), false)],
-        0,
-        wcfg,
-    )
-    .await;
+    let setup = build_full(&wal_dir, &store_root, &[("k8", schema(), false)], 0, wcfg).await;
     let shard_dir = setup.ingestor.wal.shard_dir();
 
     let (acked, failed) = concurrent_ingest(&setup, "k8", 6).await;
-    assert!(failed > 0, "被 kill 的那一次写入必须没有 ack（客户端会重试）");
+    assert!(
+        failed > 0,
+        "被 kill 的那一次写入必须没有 ack（客户端会重试）"
+    );
     assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 3);
     assert_eq!(acked, 6, "前两批应已 ack；第 3 批已 fsync 但未 ack");
     drop(setup);
@@ -1649,13 +1647,18 @@ async fn batch_timeout_releases_segment_after_object_store_failure() {
 
     // ② 前置：flush 必须真的卡成非终态（否则夹具失效，用例会变成空测试）
     let tracker = setup.ingestor.tracker.clone();
-    wait_until("flush 未产生非终态批次（S3 失败路径没跑到）", || {
-        let nt = tracker.non_terminal();
-        (!nt.is_empty()).then_some(nt)
-    })
+    wait_until(
+        "flush 未产生非终态批次（S3 失败路径没跑到）",
+        || {
+            let nt = tracker.non_terminal();
+            (!nt.is_empty()).then_some(nt)
+        },
+    )
     .await;
 
-    let before = yuntun_wal::segment::list_segments(&shard_dir).unwrap().len();
+    let before = yuntun_wal::segment::list_segments(&shard_dir)
+        .unwrap()
+        .len();
     assert!(
         before >= 2,
         "需要轮转出多个 segment 才能验证释放（实测 {before} 个，检查 segment_max_size）"
@@ -1678,10 +1681,15 @@ async fn batch_timeout_releases_segment_after_object_store_failure() {
     .await;
 
     // ⑤ segment 回收：所有批次终态 → 非活跃 segment 可删（再等几轮监控 tick 执行清理）
-    wait_until("非活跃 segment 未被回收（磁盘会只增不减）", || {
-        let n = yuntun_wal::segment::list_segments(&shard_dir).unwrap().len();
-        (n == 1).then_some(n)
-    })
+    wait_until(
+        "非活跃 segment 未被回收（磁盘会只增不减）",
+        || {
+            let n = yuntun_wal::segment::list_segments(&shard_dir)
+                .unwrap()
+                .len();
+            (n == 1).then_some(n)
+        },
+    )
     .await;
 
     shutdown.cancel();
@@ -1763,7 +1771,9 @@ async fn disk_watermark_aborts_oldest_batch_then_releases_segments() {
     })
     .await;
     wait_until("非活跃 segment 未被回收", || {
-        let n = yuntun_wal::segment::list_segments(&shard_dir).unwrap().len();
+        let n = yuntun_wal::segment::list_segments(&shard_dir)
+            .unwrap()
+            .len();
         (n == 1).then_some(n)
     })
     .await;
@@ -1777,7 +1787,11 @@ async fn disk_watermark_aborts_oldest_batch_then_releases_segments() {
     // 判据仍是事件（WAL 恢复也全终态），不是墙钟。
     wait_until("WAL 侧仍有非终态批次", || {
         let rec = setup.ingestor.wal.full_recovery().unwrap();
-        rec.states.states.values().all(|s| s.is_terminal()).then_some(())
+        rec.states
+            .states
+            .values()
+            .all(|s| s.is_terminal())
+            .then_some(())
     })
     .await;
     // 终态后复核一次完整状态（顺带把"全部终态"这个事实钉在断言里）
@@ -1965,7 +1979,8 @@ async fn accumulator_never_reads_beyond_synced_seq() {
     // 正常数据走**热数据读侧**可见（宽限期内还没落盘）—— 证明"没读到幽灵"不是"什么都没读到"
     let got = count_rows_parts(&setup.catalog, &setup.engine, "public.sq").await;
     assert_eq!(
-        got, acked,
+        got,
+        acked,
         "攒批线程读到了未 fsync 的数据（多出 {} 行）—— synced_seq 边界失守",
         got as i64 - acked as i64
     );
@@ -2034,8 +2049,16 @@ async fn schema_evolution_keeps_predicate_pushed_down() {
                             arrow::datatypes::DataType::Int64,
                             false,
                         ),
-                        arrow::datatypes::Field::new("user", arrow::datatypes::DataType::Utf8, true),
-                        arrow::datatypes::Field::new("extra", arrow::datatypes::DataType::Utf8, true),
+                        arrow::datatypes::Field::new(
+                            "user",
+                            arrow::datatypes::DataType::Utf8,
+                            true,
+                        ),
+                        arrow::datatypes::Field::new(
+                            "extra",
+                            arrow::datatypes::DataType::Utf8,
+                            true,
+                        ),
                     ])),
                     vec![
                         Arc::new(Int64Array::from(vec![200 + i; 3])),
@@ -2232,7 +2255,13 @@ async fn orphan_cleanup_spares_known_and_inflight_files() {
         ingest_into(&setup, "orph", "s0", 300 + i).await;
     }
     assert_eq!(wait_visible_rows(&setup, "public.orph", "s0", 6).await, 6);
-    let known: Vec<String> = setup.catalog.known_batch_ids().await.unwrap().into_iter().collect();
+    let known: Vec<String> = setup
+        .catalog
+        .known_batch_ids()
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
     assert_eq!(known.len(), 2, "应有两个已提交批次: {known:?}");
 
     let store = yuntun_store::create_store(&yuntun_store::StoreConfig::Local {
@@ -2268,7 +2297,9 @@ async fn orphan_cleanup_spares_known_and_inflight_files() {
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
-        let objs = yuntun_format::list_objects(&store, "yuntun/").await.unwrap();
+        let objs = yuntun_format::list_objects(&store, "yuntun/")
+            .await
+            .unwrap();
         if !objs.iter().any(|(p, _)| p == &orphan_path) {
             break;
         }
@@ -2278,7 +2309,9 @@ async fn orphan_cleanup_spares_known_and_inflight_files() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let objs = yuntun_format::list_objects(&store, "yuntun/").await.unwrap();
+    let objs = yuntun_format::list_objects(&store, "yuntun/")
+        .await
+        .unwrap();
     for id in &known {
         assert!(
             objs.iter().any(|(p, _)| p.contains(id.as_str())),
@@ -2313,7 +2346,9 @@ async fn orphan_cleanup_spares_known_and_inflight_files() {
     );
     // 跑足够多轮（>> interval），静置期内的文件必须原封不动
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let objs = yuntun_format::list_objects(&store, "yuntun/").await.unwrap();
+    let objs = yuntun_format::list_objects(&store, "yuntun/")
+        .await
+        .unwrap();
     assert!(
         objs.iter().any(|(p, _)| p == &inflight_path),
         "静置期内的在途文件被删除 —— 多写者下即丢数据（T14.3）"
@@ -2413,7 +2448,9 @@ async fn orphan_cleanup_reclaims_unreferenced_deletion_vectors() {
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
-        let objs = yuntun_format::list_objects(&store, "yuntun/").await.unwrap();
+        let objs = yuntun_format::list_objects(&store, "yuntun/")
+            .await
+            .unwrap();
         let has = |p: &str| objs.iter().any(|(x, _)| x == p);
         if !has(&ghost_path) && !has(&gone_path) {
             break;
@@ -2426,7 +2463,9 @@ async fn orphan_cleanup_reclaims_unreferenced_deletion_vectors() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let objs = yuntun_format::list_objects(&store, "yuntun/").await.unwrap();
+    let objs = yuntun_format::list_objects(&store, "yuntun/")
+        .await
+        .unwrap();
     assert!(
         objs.iter().any(|(p, _)| p == &live_path),
         "**活着的 DV 被当成孤儿删掉了** —— 它标记的行会复活；剩余对象: {objs:?}"
@@ -2443,7 +2482,9 @@ async fn orphan_cleanup_reclaims_unreferenced_deletion_vectors() {
         .await
         .unwrap();
     assert_eq!(
-        yuntun_model::dv::DvBitmap::from_bytes(&bytes).unwrap().card(),
+        yuntun_model::dv::DvBitmap::from_bytes(&bytes)
+            .unwrap()
+            .card(),
         1,
         "被保护不等于可以先损坏：位图必须逐字节还是原来那份"
     );
@@ -2525,7 +2566,11 @@ async fn commit_registers_every_key_of_a_multi_key_chunk() {
     let _acc = setup.ingestor.clone().spawn_accumulator(shutdown.clone());
 
     let files = wait_visible_files(&setup, "public.mk", "s0", 1).await;
-    assert_eq!(files.len(), 1, "两条批次必须落在同一个 chunk（否则本用例没测到键集合）");
+    assert_eq!(
+        files.len(),
+        1,
+        "两条批次必须落在同一个 chunk（否则本用例没测到键集合）"
+    );
     assert_eq!(files[0].row_count, 123, "该文件应含两个批次的全部行");
 
     // ③ 权威断言：**两个键都在 Catalog 里**（提交层按键集合登记）

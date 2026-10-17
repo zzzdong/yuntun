@@ -1,8 +1,8 @@
 //! 会话上下文（协议适配层持有并传入，裁决 S-4：引擎无状态）。
 
 use sqlparser::ast::Statement;
-use sqlparser::dialect::{Dialect as SqlDialectTrait, GenericDialect, MySqlDialect};
 use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::dialect::{Dialect as SqlDialectTrait, GenericDialect, MySqlDialect};
 
 /// SQL 方言（决定 sqlparser 解析行为；MySQL wire → MySql，Flight → Generic）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

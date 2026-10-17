@@ -11,9 +11,9 @@ use arrow::array::{
 };
 use arrow::compute::kernels::aggregate;
 use arrow::datatypes::{
-    DataType, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, TimeUnit,
+    DataType, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type, TimeUnit,
     TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
-    TimestampSecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    TimestampSecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 use arrow::record_batch::RecordBatch;
 
@@ -142,10 +142,7 @@ pub fn cmp_values(a: &StatValue, b: &StatValue) -> Option<std::cmp::Ordering> {
 macro_rules! prim_min_max {
     ($arr:expr, $ty:ty, $wrap:expr) => {{
         match $arr.as_any().downcast_ref::<PrimitiveArray<$ty>>() {
-            Some(a) => (
-                aggregate::min(a).map($wrap),
-                aggregate::max(a).map($wrap),
-            ),
+            Some(a) => (aggregate::min(a).map($wrap), aggregate::max(a).map($wrap)),
             None => (None, None),
         }
     }};
@@ -259,14 +256,8 @@ mod tests {
         )
         .unwrap();
         let s = ColumnStats::from_batch(&b);
-        assert_eq!(
-            s.get("s").unwrap().min,
-            Some(StatValue::Str("a".into()))
-        );
-        assert_eq!(
-            s.get("s").unwrap().max,
-            Some(StatValue::Str("c".into()))
-        );
+        assert_eq!(s.get("s").unwrap().min, Some(StatValue::Str("a".into())));
+        assert_eq!(s.get("s").unwrap().max, Some(StatValue::Str("c".into())));
     }
 
     #[test]

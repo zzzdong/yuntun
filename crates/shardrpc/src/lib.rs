@@ -44,12 +44,14 @@ use tokio::net::TcpListener;
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
-use yuntun_model::error::LakeError;
-use yuntun_proto::shard as pb;
 use yuntun_model::agg::AggQuery;
 use yuntun_model::dv::DeletionEntry;
+use yuntun_model::error::LakeError;
 use yuntun_model::meta::FileManifest;
-use yuntun_store::{ColdReadRequest, ColdReader, ShardAggs, ShardFetch, ShardId, ShardRead, ShardReader};
+use yuntun_proto::shard as pb;
+use yuntun_store::{
+    ColdReadRequest, ColdReader, ShardAggs, ShardFetch, ShardId, ShardRead, ShardReader,
+};
 
 // ---------------------------------------------------------------- 批次编解码
 
@@ -742,14 +744,11 @@ fn agg_spec_to_msg(s: &yuntun_model::agg::AggSpec) -> pb::AggSpecMsg {
 
 /// 请求方向：**不懂的 kind 直接报错**（协议里加了新聚合而本节点不认识时，
 /// 静默忽略会变成"少算一个聚合"——那是最坏的一种成功）。
-fn agg_specs_from_msg(
-    msgs: &[pb::AggSpecMsg],
-) -> Result<Vec<yuntun_model::agg::AggSpec>, Status> {
+fn agg_specs_from_msg(msgs: &[pb::AggSpecMsg]) -> Result<Vec<yuntun_model::agg::AggSpec>, Status> {
     let mut out = Vec::with_capacity(msgs.len());
     for m in msgs {
-        let kind = yuntun_model::agg::AggKind::from_u32(m.kind).ok_or_else(|| {
-            Status::invalid_argument(format!("不认识的聚合种类：{}", m.kind))
-        })?;
+        let kind = yuntun_model::agg::AggKind::from_u32(m.kind)
+            .ok_or_else(|| Status::invalid_argument(format!("不认识的聚合种类：{}", m.kind)))?;
         if kind.needs_column() && m.column.is_empty() {
             return Err(Status::invalid_argument(format!("{kind:?} 缺列名")));
         }
@@ -775,7 +774,11 @@ fn partial_to_msg(p: &yuntun_model::agg::PartialAgg) -> pb::PartialAggMsg {
             msg.sum = s.unwrap_or(0);
         }
         PartialAgg::Min(s) | PartialAgg::Max(s) => {
-            msg.kind = if matches!(p, PartialAgg::Min(_)) { 2 } else { 3 };
+            msg.kind = if matches!(p, PartialAgg::Min(_)) {
+                2
+            } else {
+                3
+            };
             msg.has_scalar = s.is_some();
             if let Some(v) = s {
                 match v {
@@ -813,7 +816,7 @@ fn partial_from_msg(m: &pb::PartialAggMsg) -> Result<yuntun_model::agg::PartialA
         other => {
             return Err(LakeError::Other(format!(
                 "远端返回了不认识的聚合部分状态：kind={other}"
-            )))
+            )));
         }
     })
 }
@@ -872,7 +875,7 @@ fn predicate_from_msg(
                 other => {
                     return Err(Status::invalid_argument(format!(
                         "不认识的谓词字面量：{other}"
-                    )))
+                    )));
                 }
             };
             if m.column.is_empty() {
@@ -913,7 +916,7 @@ fn predicate_from_msg(
         other => {
             return Err(Status::invalid_argument(format!(
                 "不认识的谓词种类：{other}"
-            )))
+            )));
         }
     }))
 }
@@ -973,9 +976,7 @@ fn scalar_to_msg(v: &yuntun_model::agg::KeyPart) -> pb::ScalarMsg {
     m
 }
 
-fn scalar_from_msg(
-    m: &pb::ScalarMsg,
-) -> Result<yuntun_model::agg::KeyPart, LakeError> {
+fn scalar_from_msg(m: &pb::ScalarMsg) -> Result<yuntun_model::agg::KeyPart, LakeError> {
     if !m.has_value {
         return Ok(None);
     }

@@ -25,10 +25,10 @@ use std::sync::Arc;
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use yuntun_catalog::{CatalogOps, MemoryCatalog};
-use yuntun_ingest::wal_archive::{archive_once, restore, ArchiveConfig};
+use yuntun_ingest::wal_archive::{ArchiveConfig, archive_once, restore};
 use yuntun_ingest::{Ingestor, IngestorConfig};
-use yuntun_model::wal_record::{ddl_op, BatchPendingPayload, DataPayload, DdlPayload, Record};
 use yuntun_model::meta::serialize_schema;
+use yuntun_model::wal_record::{BatchPendingPayload, DataPayload, DdlPayload, Record, ddl_op};
 
 const T: &str = "public.durable";
 
@@ -142,9 +142,16 @@ async fn durable_batch_becomes_visible_after_total_disk_loss() {
 
     // 归档一轮（机制：可注入间隔；生产里是后台循环）
     let mut uploaded = std::collections::HashMap::new();
-    let up = archive_once(&archive_cfg(), &wal_dir, 0, store.as_ref(), &mut uploaded, None)
-        .await
-        .expect("归档");
+    let up = archive_once(
+        &archive_cfg(),
+        &wal_dir,
+        0,
+        store.as_ref(),
+        &mut uploaded,
+        None,
+    )
+    .await
+    .expect("归档");
     assert!(up >= 1, "归档应当传了 {up} 个段");
 
     // **整盘丢失**：私有目录整个删掉
@@ -177,8 +184,7 @@ async fn without_archive_the_acked_batch_is_gone() {
     // 对照组：**不归档**，直接丢盘
     std::fs::remove_dir_all(&wal_dir).expect("删掉私有目录：模拟整盘丢失");
 
-    let (redone, _) =
-        recover_after_total_disk_loss(&wal_dir, &store, catalog.clone(), false).await;
+    let (redone, _) = recover_after_total_disk_loss(&wal_dir, &store, catalog.clone(), false).await;
     assert_eq!(
         redone, 0,
         "**没归档** ⇒ 恢复通路找不到任何东西（{redone}）—— 这就是 `best_effort` 承认的那句话；\

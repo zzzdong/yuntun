@@ -67,8 +67,14 @@ async fn observed(c: &Arc<dyn CatalogOps>, old_snapshot: u64) -> Observed {
         tables,
         version: (v.schema_ver, v.manifest_ver),
         snapshot: c.current_snapshot().await,
-        visible_now: ids(c.list_visible_files("public.cpu", u64::MAX, None).await.unwrap()),
-        visible_old: ids(c.list_visible_files("public.cpu", old_snapshot, None).await.unwrap()),
+        visible_now: ids(c
+            .list_visible_files("public.cpu", u64::MAX, None)
+            .await
+            .unwrap()),
+        visible_old: ids(c
+            .list_visible_files("public.cpu", old_snapshot, None)
+            .await
+            .unwrap()),
         deletions_now: dvs(c, u64::MAX).await,
         deletions_old: dvs(c, old_snapshot).await,
         tasks: {
@@ -114,9 +120,7 @@ fn schema(fields: &[&str]) -> arrow::datatypes::SchemaRef {
     Arc::new(arrow::datatypes::Schema::new(
         fields
             .iter()
-            .map(|f| {
-                arrow::datatypes::Field::new(*f, arrow::datatypes::DataType::Int64, true)
-            })
+            .map(|f| arrow::datatypes::Field::new(*f, arrow::datatypes::DataType::Int64, true))
             .collect::<Vec<_>>(),
     ))
 }
@@ -157,8 +161,14 @@ async fn remote_and_memory_catalogs_agree_on_the_same_ops() {
     let memory: Arc<dyn CatalogOps> = Arc::new(MemoryCatalog::new());
 
     // ---- ① 建 schema ----
-    remote.create_schema("analytics").await.expect("远端建 schema");
-    memory.create_schema("analytics").await.expect("本地建 schema");
+    remote
+        .create_schema("analytics")
+        .await
+        .expect("远端建 schema");
+    memory
+        .create_schema("analytics")
+        .await
+        .expect("本地建 schema");
     agree!("create_schema", remote, memory, 0);
 
     // ---- ② 建两张表（跨 schema：这条抓的是"全限定名"处理）----
@@ -176,7 +186,11 @@ async fn remote_and_memory_catalogs_agree_on_the_same_ops() {
         };
         let rt = remote.create_table(req.clone()).await.expect("远端建表");
         let mt = memory.create_table(req).await.expect("本地建表");
-        assert_eq!(rt.qualified_name(), mt.qualified_name(), "建表返回的表身份不一致");
+        assert_eq!(
+            rt.qualified_name(),
+            mt.qualified_name(),
+            "建表返回的表身份不一致"
+        );
     }
     agree!("create_table x2", remote, memory, 0);
 
@@ -215,7 +229,10 @@ async fn remote_and_memory_catalogs_agree_on_the_same_ops() {
         },
         expected_version: 1,
     };
-    let rr = remote.evolve_schema(evolve.clone()).await.expect("远端演进");
+    let rr = remote
+        .evolve_schema(evolve.clone())
+        .await
+        .expect("远端演进");
     let mr = memory.evolve_schema(evolve).await.expect("本地演进");
     assert_eq!(rr.version, mr.version, "演进后的版本号不一致");
     assert_eq!(
@@ -228,12 +245,13 @@ async fn remote_and_memory_catalogs_agree_on_the_same_ops() {
     // ---- ⑤ OCC 冲突：拿过期的 expected_version 再演进一次 ----
     let stale = EvolveSchemaRequest {
         table: "public.cpu".into(),
-        change: yuntun_model::schema::SchemaChange::DropColumn {
-            column: "n".into(),
-        },
+        change: yuntun_model::schema::SchemaChange::DropColumn { column: "n".into() },
         expected_version: 1, // 已经是 2 了
     };
-    let re = remote.evolve_schema(stale.clone()).await.expect_err("远端应报冲突");
+    let re = remote
+        .evolve_schema(stale.clone())
+        .await
+        .expect_err("远端应报冲突");
     let me = memory.evolve_schema(stale).await.expect_err("本地应报冲突");
     assert!(
         matches!(re, LakeError::SchemaChanged { .. }),
@@ -241,15 +259,25 @@ async fn remote_and_memory_catalogs_agree_on_the_same_ops() {
     );
     match (&re, &me) {
         (
-            LakeError::SchemaChanged { actual_version: a, .. },
-            LakeError::SchemaChanged { actual_version: b, .. },
+            LakeError::SchemaChanged {
+                actual_version: a, ..
+            },
+            LakeError::SchemaChanged {
+                actual_version: b, ..
+            },
         ) => assert_eq!(a, b, "冲突里的实际版本必须一致"),
         _ => panic!("两个实现的冲突错误形状不一致：{re:?} vs {me:?}"),
     }
 
     // ---- ⑥ 删分片 → b1 变墓碑 ----
-    let rd = remote.drop_shard("public.cpu", "s0").await.expect("远端删分片");
-    let md = memory.drop_shard("public.cpu", "s0").await.expect("本地删分片");
+    let rd = remote
+        .drop_shard("public.cpu", "s0")
+        .await
+        .expect("远端删分片");
+    let md = memory
+        .drop_shard("public.cpu", "s0")
+        .await
+        .expect("本地删分片");
     assert_eq!(
         rd, md,
         "删分片的**精确条数**也必须一致（`affected` 随提交过线；远端的 1/0 那套已废弃）"
@@ -296,7 +324,10 @@ async fn remote_and_memory_catalogs_agree_on_the_same_ops() {
     agree!("apply_update", remote, memory, old_snapshot);
 
     for (name, c, snap) in [("远端", &remote, rsnap), ("本地", &memory, msnap)] {
-        let files = c.list_visible_files("public.cpu", snap, None).await.unwrap();
+        let files = c
+            .list_visible_files("public.cpu", snap, None)
+            .await
+            .unwrap();
         let nf = files
             .iter()
             .find(|f| f.batch_id == "b-upd")
@@ -319,7 +350,10 @@ async fn remote_and_memory_catalogs_agree_on_the_same_ops() {
             "{name}：旧快照不许看到新行"
         );
         assert!(
-            c.list_deletions("public.cpu", snap - 1).await.unwrap().is_empty(),
+            c.list_deletions("public.cpu", snap - 1)
+                .await
+                .unwrap()
+                .is_empty(),
             "{name}：旧快照不许看到删除（否则就是「删了没插」）"
         );
         // 重放同一份 op（幂等）：空操作，不推版本
@@ -331,8 +365,14 @@ async fn remote_and_memory_catalogs_agree_on_the_same_ops() {
     }
 
     // ---- ⑦ 删表 ----
-    remote.drop_table("analytics.metrics").await.expect("远端删表");
-    memory.drop_table("analytics.metrics").await.expect("本地删表");
+    remote
+        .drop_table("analytics.metrics")
+        .await
+        .expect("远端删表");
+    memory
+        .drop_table("analytics.metrics")
+        .await
+        .expect("本地删表");
     agree!("drop_table", remote, memory, old_snapshot);
 
     // ---- ⑧ 错误保真：重复建表 / 删不存在的表 / 删 public ----
@@ -359,8 +399,14 @@ async fn remote_and_memory_catalogs_agree_on_the_same_ops() {
         matches!(re, LakeError::TableNotFound(_)),
         "远端必须还原 TableNotFound：{re:?}"
     );
-    let re = remote.drop_schema("public").await.expect_err("public 不可删");
-    let me = memory.drop_schema("public").await.expect_err("public 不可删");
+    let re = remote
+        .drop_schema("public")
+        .await
+        .expect_err("public 不可删");
+    let me = memory
+        .drop_schema("public")
+        .await
+        .expect_err("public 不可删");
     assert_eq!(
         std::mem::discriminant(&re),
         std::mem::discriminant(&me),
@@ -454,16 +500,17 @@ async fn list_tables_identity_is_directly_usable_for_file_queries() {
 
     let remote: Arc<dyn CatalogOps> =
         Arc::new(RemoteCatalog::connect(vec![addr.to_string()]).expect("连接 metanode"));
-    remote.create_table(CreateTableRequest {
-        name: "cpu".into(),
-        namespace: "public".into(),
-        schema: schema(&["ts", "v"]),
-        partition_cols: vec![],
-        default_format: "parquet".into(),
-        ingest_config: yuntun_model::meta::IngestConfig::standard(),
-    })
-    .await
-    .expect("建表");
+    remote
+        .create_table(CreateTableRequest {
+            name: "cpu".into(),
+            namespace: "public".into(),
+            schema: schema(&["ts", "v"]),
+            partition_cols: vec![],
+            default_format: "parquet".into(),
+            ingest_config: yuntun_model::meta::IngestConfig::standard(),
+        })
+        .await
+        .expect("建表");
     remote
         .commit_files(commit("public.cpu", "b1", "k-b1", "s0"))
         .await
@@ -540,7 +587,12 @@ async fn task_directory_is_derived_on_both_catalog_forms() {
     let mt = memory.list_tasks().await.expect("本地任务目录");
     let fmt = |v: &[yuntun_model::task::CompactionTask]| -> Vec<String> {
         v.iter()
-            .map(|t| format!("{}:{} files={} reason={}", t.table, t.shard, t.files, t.reason))
+            .map(|t| {
+                format!(
+                    "{}:{} files={} reason={}",
+                    t.table, t.shard, t.files, t.reason
+                )
+            })
             .collect()
     };
     assert_eq!(
@@ -593,11 +645,7 @@ async fn remote_task_directory_follows_purge() {
             .expect("提交文件");
     }
     let before = remote.list_tasks().await.expect("远端任务目录");
-    assert_eq!(
-        before.len(),
-        1,
-        "两个文件 ⇒ 应当有一条待办：{before:?}"
-    );
+    assert_eq!(before.len(), 1, "两个文件 ⇒ 应当有一条待办：{before:?}");
 
     // 整表清除：此刻可见文件全部下线（**走 raft**：`PurgeFiles` op）
     let out = remote

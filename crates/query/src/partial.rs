@@ -210,15 +210,20 @@ mod tests {
         let sink = PartialSink::new(PartialPolicy::Allow);
         assert!(!sink.read().is_partial());
 
-        sink.record(src("public.t", "inst-a")).expect("allow 不报错");
-        sink.record(src("public.t", "inst-b")).expect("allow 不报错");
+        sink.record(src("public.t", "inst-a"))
+            .expect("allow 不报错");
+        sink.record(src("public.t", "inst-b"))
+            .expect("allow 不报错");
 
         let r = sink.read();
         assert!(r.is_partial());
         assert_eq!(r.missing().len(), 2);
         // 摘要要点出"谁"与"为什么"——否则标记等于没标
         let d = r.describe();
-        assert!(d.contains("inst-a") && d.contains("connection refused"), "{d}");
+        assert!(
+            d.contains("inst-a") && d.contains("connection refused"),
+            "{d}"
+        );
         assert!(d.contains("部分"), "{d}");
     }
 
@@ -243,7 +248,10 @@ mod tests {
     #[test]
     fn policy_parse_is_explicit() {
         assert_eq!(PartialPolicy::parse("allow"), Some(PartialPolicy::Allow));
-        assert_eq!(PartialPolicy::parse(" Reject "), Some(PartialPolicy::Reject));
+        assert_eq!(
+            PartialPolicy::parse(" Reject "),
+            Some(PartialPolicy::Reject)
+        );
         // 未知值**不静默取默认**：免得配置写错却以为生效了
         assert_eq!(PartialPolicy::parse("alloww"), None);
         assert_eq!(PartialPolicy::default(), PartialPolicy::Allow);

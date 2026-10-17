@@ -86,7 +86,10 @@ async fn select_is_untouched_by_the_router() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn garbage_sql_fails_readably() {
     let e = engine();
-    let err = e.sql("NOT SQL AT ALL ;;;").await.expect_err("垃圾 SQL 必须报错");
+    let err = e
+        .sql("NOT SQL AT ALL ;;;")
+        .await
+        .expect_err("垃圾 SQL 必须报错");
     let msg = format!("{err}");
     assert!(
         msg.contains("SQL 解析失败"),

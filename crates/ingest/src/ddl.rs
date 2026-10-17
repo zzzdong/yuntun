@@ -13,10 +13,10 @@
 use std::sync::Arc;
 
 use yuntun_catalog::CatalogOps;
-use yuntun_model::meta::{deserialize_schema, IngestConfig};
+use yuntun_model::meta::{IngestConfig, deserialize_schema};
 use yuntun_model::ops::{CreateTableRequest, EvolveSchemaRequest};
-use yuntun_model::schema::{classify, SchemaChange, SchemaCompatibility};
-use yuntun_model::wal_record::{ddl_op, Record};
+use yuntun_model::schema::{SchemaChange, SchemaCompatibility, classify};
+use yuntun_model::wal_record::{Record, ddl_op};
 use yuntun_wal::writer::WalWriter;
 
 pub async fn replay_wal_ddl(
@@ -140,9 +140,9 @@ async fn converge_schema(
             }
             SchemaCompatibility::NeedsEvolve(c) => c,
             SchemaCompatibility::Incompatible(reason) => {
-                return Err(yuntun_model::error::LakeError::InvalidSchemaChange(format!(
-                    "WAL DDL 重放：{table} 无法收敛到目标 schema（{reason}）"
-                )))
+                return Err(yuntun_model::error::LakeError::InvalidSchemaChange(
+                    format!("WAL DDL 重放：{table} 无法收敛到目标 schema（{reason}）"),
+                ));
             }
         };
         match catalog

@@ -20,7 +20,7 @@
 
 use arrow::datatypes::Schema;
 use datafusion::logical_expr::{Expr, Operator};
-use yuntun_model::meta::{decode_bound, StatBound, StatisticsLite};
+use yuntun_model::meta::{StatBound, StatisticsLite, decode_bound};
 
 /// 一条能从过滤器里读出来的**单列约束**。
 ///
@@ -111,12 +111,13 @@ pub(crate) fn scalar_matches_column(kind: ScalarKind, dt: &arrow::datatypes::Dat
     use arrow::datatypes::{DataType as D, TimeUnit};
     matches!(
         (kind, dt),
-        (ScalarKind::Int | ScalarKind::UInt, D::Int8 | D::Int16 | D::Int32 | D::Int64)
-            | (
-                ScalarKind::Int | ScalarKind::UInt,
-                D::UInt8 | D::UInt16 | D::UInt32 | D::UInt64
-            )
-            | (ScalarKind::Float, D::Float32 | D::Float64)
+        (
+            ScalarKind::Int | ScalarKind::UInt,
+            D::Int8 | D::Int16 | D::Int32 | D::Int64
+        ) | (
+            ScalarKind::Int | ScalarKind::UInt,
+            D::UInt8 | D::UInt16 | D::UInt32 | D::UInt64
+        ) | (ScalarKind::Float, D::Float32 | D::Float64)
             | (
                 ScalarKind::Bytes,
                 D::Utf8 | D::LargeUtf8 | D::Binary | D::LargeBinary
@@ -141,8 +142,8 @@ fn flip(op: Operator) -> Operator {
 
 /// 字面量 → `(StatBound, 类型族)`（不认识的类型 ⇒ `None` ⇒ 不做判断）。
 fn literal_bound(v: &datafusion::scalar::ScalarValue) -> Option<(StatBound, ScalarKind)> {
-    use datafusion::scalar::ScalarValue as S;
     use ScalarKind as K;
+    use datafusion::scalar::ScalarValue as S;
     // ⚠️ `ScalarValue` 的数值变体带 `Option`（NULL 的可表示性）—— 这里只认**有值**的
     Some(match v {
         S::Int8(Some(x)) => (StatBound::I(*x as i64), K::Int),
@@ -266,7 +267,10 @@ fn violates(lo: &StatBound, hi: &StatBound, op: Operator, value: &StatBound) -> 
     use std::cmp::Ordering;
     match op {
         // col > value：整个区间都 <= value ⇒ 无解
-        Operator::Gt => matches!(hi.partial_cmp(value), Some(Ordering::Less | Ordering::Equal)),
+        Operator::Gt => matches!(
+            hi.partial_cmp(value),
+            Some(Ordering::Less | Ordering::Equal)
+        ),
         // col >= value：整个区间都 < value ⇒ 无解
         Operator::GtEq => matches!(hi.partial_cmp(value), Some(Ordering::Less)),
         // col < value：整个区间都 >= value ⇒ 无解
@@ -277,10 +281,10 @@ fn violates(lo: &StatBound, hi: &StatBound, op: Operator, value: &StatBound) -> 
         // col <= value：整个区间都 > value ⇒ 无解
         Operator::LtEq => matches!(lo.partial_cmp(value), Some(Ordering::Greater)),
         // col = value：value 落在区间外 ⇒ 无解
-        Operator::Eq => matches!(
-            value.partial_cmp(lo),
-            Some(Ordering::Less)
-        ) || matches!(hi.partial_cmp(value), Some(Ordering::Less)),
+        Operator::Eq => {
+            matches!(value.partial_cmp(lo), Some(Ordering::Less))
+                || matches!(hi.partial_cmp(value), Some(Ordering::Less))
+        }
         // col != value：**只有**区间退化成这一点（min == max == value）时才无解
         Operator::NotEq => {
             matches!(lo.partial_cmp(value), Some(Ordering::Equal))
@@ -294,10 +298,14 @@ fn violates(lo: &StatBound, hi: &StatBound, op: Operator, value: &StatBound) -> 
 mod tests {
     use super::*;
     use arrow::datatypes::DataType;
-    use yuntun_model::meta::{encode_bound, ColumnStatLite};
+    use yuntun_model::meta::{ColumnStatLite, encode_bound};
 
     fn schema_i64() -> Schema {
-        Schema::new(vec![arrow::datatypes::Field::new("a", DataType::Int64, true)])
+        Schema::new(vec![arrow::datatypes::Field::new(
+            "a",
+            DataType::Int64,
+            true,
+        )])
     }
 
     fn stats(lo: i64, hi: i64, nulls: u64) -> StatisticsLite {
@@ -355,7 +363,10 @@ mod tests {
     fn overlapping_ranges_are_kept() {
         // ⚠️ 严格比较的"差一位"就在这里： 而文件上界**正好**是 5 ⇒ **无解**（该剪）。
         // 本用例第一版把这条写成了"保留"，是**测试错**（剪枝器是对的）—— 单测的价值就在这。
-        assert!(pruned(1, 5, Operator::Gt, 5), "严格 > ：上界等于字面量 ⇒ 无解");
+        assert!(
+            pruned(1, 5, Operator::Gt, 5),
+            "严格 > ：上界等于字面量 ⇒ 无解"
+        );
         assert!(!pruned(1, 5, Operator::Gt, 4), "上界 5 > 4 ⇒ 可能命中");
         assert!(pruned(1, 5, Operator::GtEq, 6));
         assert!(!pruned(1, 5, Operator::Lt, 5));
@@ -367,7 +378,10 @@ mod tests {
     /// `!=` 只在区间退化成一点且等于该值时才能剪 —— 这是最容易写错的一条。
     #[test]
     fn not_eq_only_prunes_a_degenerate_range() {
-        assert!(pruned(7, 7, Operator::NotEq, 7), "min==max==7 ⇒ 全是 7 ⇒ 无解");
+        assert!(
+            pruned(7, 7, Operator::NotEq, 7),
+            "min==max==7 ⇒ 全是 7 ⇒ 无解"
+        );
         assert!(!pruned(7, 8, Operator::NotEq, 7), "区间里还有 8 ⇒ 可能有解");
     }
 

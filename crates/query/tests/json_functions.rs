@@ -49,7 +49,11 @@ async fn json_functions_on_utf8_column() {
         .await
         .unwrap();
     let col = batches[0].column(0);
-    assert!(matches!(col.data_type(), DataType::Union(_, _)), "{:?}", col.data_type());
+    assert!(
+        matches!(col.data_type(), DataType::Union(_, _)),
+        "{:?}",
+        col.data_type()
+    );
     let u = col.as_any().downcast_ref::<UnionArray>().unwrap();
     let child = u.child(u.type_id(0));
     assert_eq!(
@@ -109,7 +113,10 @@ async fn scalar_int(ctx: &mut SessionContext, sql: &str) -> Option<i64> {
         return None;
     }
     // 命中时 json_get_int 返回 UInt64（miss 可能是 Int64/Null 列），两者都接受
-    if let Some(a) = col.as_any().downcast_ref::<datafusion::arrow::array::UInt64Array>() {
+    if let Some(a) = col
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+    {
         return Some(a.value(0) as i64);
     }
     Some(

@@ -18,7 +18,7 @@ use yuntun_model::dv::{DeletionEntry, DvBitmap};
 use yuntun_model::error::LakeError;
 use yuntun_model::meta::FileManifest;
 use yuntun_model::ops::CreateTableRequest;
-use yuntun_query::{QueryEngine, LocalCatalog, cold, placement};
+use yuntun_query::{LocalCatalog, QueryEngine, cold, placement};
 use yuntun_store::{StoreConfig, create_store};
 
 const TABLE: &str = "public.cold";
@@ -159,11 +159,16 @@ impl Fx {
 
 /// 从引擎的**一行一组**结果里读出 `(键, count)` 对（升序）。
 async fn grouped_pairs(engine: &QueryEngine, sql: &str) -> Vec<(i64, i64)> {
-    let out = engine.sql(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let out = engine
+        .sql(sql)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
     let b = &out[0];
     let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
     let c = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
-    let mut got: Vec<(i64, i64)> = (0..b.num_rows()).map(|i| (k.value(i), c.value(i))).collect();
+    let mut got: Vec<(i64, i64)> = (0..b.num_rows())
+        .map(|i| (k.value(i), c.value(i)))
+        .collect();
     got.sort();
     got
 }
@@ -190,9 +195,23 @@ async fn cold_fold_matches_the_coordinators_own_query() {
     let AggStates::Plain(p) = &states else {
         panic!("应当是不分组结果");
     };
-    let out = fx.engine.sql("SELECT count(*) AS c, sum(v) AS s FROM cold").await.unwrap();
-    let c = out[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
-    let s = out[0].column(1).as_any().downcast_ref::<Int64Array>().unwrap().value(0);
+    let out = fx
+        .engine
+        .sql("SELECT count(*) AS c, sum(v) AS s FROM cold")
+        .await
+        .unwrap();
+    let c = out[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    let s = out[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
     assert_eq!(
         (p[0].clone(), p[1].clone()),
         (PartialAgg::Count(c as u64), PartialAgg::SumInt(Some(s))),
@@ -247,9 +266,18 @@ async fn cold_fold_honours_the_deletion_vectors() {
     assert_eq!(a[0], PartialAgg::Count(5), "删后：少一行（DV 生效）");
     assert_eq!(a[1], PartialAgg::SumInt(Some(64)), "66 - 2");
     // 与协调者自己的查询对拍（它读同一条路径）
-    let out = fx.engine.sql("SELECT count(*) AS c, sum(v) AS s FROM cold").await.unwrap();
+    let out = fx
+        .engine
+        .sql("SELECT count(*) AS c, sum(v) AS s FROM cold")
+        .await
+        .unwrap();
     assert_eq!(
-        out[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap().value(0),
+        out[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
         5
     );
 }
@@ -282,10 +310,20 @@ async fn cold_fold_grouped_matches_the_coordinator() {
                 PartialAgg::Min(Some(AggScalar::Int(i))) => i,
                 _ => panic!("整数极值"),
             };
-            (key, match x.states[0] { PartialAgg::Count(c) => c, _ => panic!() }, min)
+            (
+                key,
+                match x.states[0] {
+                    PartialAgg::Count(c) => c,
+                    _ => panic!(),
+                },
+                min,
+            )
         })
         .collect();
-    assert_eq!(got, vec![(1, 1, 1), (3, 1, 3), (10, 1, 10), (20, 1, 20), (30, 1, 30)]);
+    assert_eq!(
+        got,
+        vec![(1, 1, 1), (3, 1, 3), (10, 1, 10), (20, 1, 20), (30, 1, 30)]
+    );
 
     // 对拍：协调者自己的分组查询（DV 也生效）
     assert_eq!(
@@ -326,7 +364,11 @@ async fn cold_fold_applies_predicate_and_grouping_together() {
         assert_eq!(grp.states[0], PartialAgg::Count(1));
     }
     assert_eq!(
-        grouped_pairs(&fx.engine, "SELECT v, count(*) FROM cold WHERE v > 5 GROUP BY v").await,
+        grouped_pairs(
+            &fx.engine,
+            "SELECT v, count(*) FROM cold WHERE v > 5 GROUP BY v"
+        )
+        .await,
         vec![(10, 1), (20, 1), (30, 1)],
         "与协调者自己的查询一致"
     );
@@ -364,7 +406,11 @@ async fn assigned_cold_folds_add_up_to_the_whole() {
             .unwrap();
         merged = yuntun_model::agg::merge_states(&merged, &part).unwrap();
     }
-    assert_eq!(merged, AggStates::Plain(whole), "各份折叠后合并 == 整份折叠");
+    assert_eq!(
+        merged,
+        AggStates::Plain(whole),
+        "各份折叠后合并 == 整份折叠"
+    );
 }
 
 fn whole_empty(q: &AggQuery) -> AggStates {

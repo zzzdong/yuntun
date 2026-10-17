@@ -9,9 +9,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use yuntun_catalog::{CatalogOps, MemoryCatalog};
 use yuntun_ingest::{Ingestor, IngestorConfig};
 use yuntun_model::meta::serialize_schema;
-use yuntun_model::wal_record::{
-    ddl_op, BatchPendingPayload, DataPayload, DdlPayload, Record,
-};
+use yuntun_model::wal_record::{BatchPendingPayload, DataPayload, DdlPayload, Record, ddl_op};
 
 #[tokio::test]
 async fn pending_batch_of_dropped_table_is_aborted_not_committed() {
@@ -34,9 +32,11 @@ async fn pending_batch_of_dropped_table_is_aborted_not_committed() {
 
     // 手工构造 WAL：Ddl(CREATE t) → Data(t) → BatchPending(覆盖该 Data) → Ddl(DROP t)
     let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
-    let batch =
-        arrow::record_batch::RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![7]))])
-            .unwrap();
+    let batch = arrow::record_batch::RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![7]))],
+    )
+    .unwrap();
     let mut ipc = Vec::new();
     {
         let mut w = arrow::ipc::writer::StreamWriter::try_new(&mut ipc, &schema).unwrap();

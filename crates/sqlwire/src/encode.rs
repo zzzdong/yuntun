@@ -36,9 +36,7 @@ pub fn columns_of(schema: &SchemaRef) -> Vec<Column> {
 /// 的文本声明对应：同源映射，此处产出协议常量）。
 pub fn arrow_to_mysql_type(dt: &DataType) -> ColumnType {
     match dt {
-        DataType::Boolean
-        | DataType::Int8
-        | DataType::UInt8 => ColumnType::MYSQL_TYPE_TINY,
+        DataType::Boolean | DataType::Int8 | DataType::UInt8 => ColumnType::MYSQL_TYPE_TINY,
         DataType::Int16 | DataType::UInt16 => ColumnType::MYSQL_TYPE_SHORT,
         DataType::Int32 | DataType::UInt32 => ColumnType::MYSQL_TYPE_LONG,
         DataType::Int64 | DataType::UInt64 => ColumnType::MYSQL_TYPE_LONGLONG,
@@ -159,14 +157,16 @@ pub async fn write_row<W: tokio::io::AsyncWrite + Send + Unpin>(
                 // `{变体名=}` 包装，直接展示对客户端不友好）
                 let u = col.as_any().downcast_ref::<UnionArray>().unwrap();
                 let child = u.child(u.type_id(row));
-                let s = arrow::util::display::array_value_to_string(child.as_ref(), u.value_offset(row))
-                    .unwrap_or_default();
+                let s = arrow::util::display::array_value_to_string(
+                    child.as_ref(),
+                    u.value_offset(row),
+                )
+                .unwrap_or_default();
                 rw.write_col(s)?;
             }
             // 兜底：Display 转字符串（与 SHOW COLUMNS 的 text 回退一致）
             _ => {
-                let s = arrow::util::display::array_value_to_string(col, row)
-                    .unwrap_or_default();
+                let s = arrow::util::display::array_value_to_string(col, row).unwrap_or_default();
                 rw.write_col(s)?;
             }
         }
@@ -175,11 +175,7 @@ pub async fn write_row<W: tokio::io::AsyncWrite + Send + Unpin>(
     Ok(())
 }
 
-fn format_timestamp_array(
-    col: &dyn Array,
-    unit: &TimeUnit,
-    row: usize,
-) -> String {
+fn format_timestamp_array(col: &dyn Array, unit: &TimeUnit, row: usize) -> String {
     match unit {
         TimeUnit::Second => {
             let a = col
@@ -194,7 +190,10 @@ fn format_timestamp_array(
                 .downcast_ref::<TimestampMillisecondArray>()
                 .expect("timestamp millisecond array");
             let v = a.value(row);
-            format_ts(v.div_euclid(1_000_000), (v.rem_euclid(1_000_000) * 1000) as u32)
+            format_ts(
+                v.div_euclid(1_000_000),
+                (v.rem_euclid(1_000_000) * 1000) as u32,
+            )
         }
         TimeUnit::Microsecond => {
             let a = col

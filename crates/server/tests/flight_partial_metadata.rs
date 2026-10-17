@@ -30,8 +30,8 @@ use yuntun_chunk::{ChunkKey, ChunkStore, ChunkStoreConfig, MemoryLedger, SealPol
 use yuntun_model::error::LakeError;
 use yuntun_model::ops::CreateTableRequest;
 use yuntun_query::{LocalCatalog, PartialPolicy, QueryEngine};
-use yuntun_server::{flight::command_bytes, FlightServer};
-use yuntun_store::{create_store, ShardId, ShardRead, ShardReader, ShardTier, StoreConfig};
+use yuntun_server::{FlightServer, flight::command_bytes};
+use yuntun_store::{ShardId, ShardRead, ShardReader, ShardTier, StoreConfig, create_store};
 
 const TABLE: &str = "public.partialwire";
 const SHARD: &str = "default";
@@ -98,7 +98,14 @@ fn instance(dir: &yuntun_testkit::TestDir, instance_id: &str) -> Arc<ChunkStore>
 
 fn write(store: &ChunkStore, vals: &[i64]) {
     store
-        .append(ChunkKey::new(shard_id(), 0), 1, schema(), 0, vec![batch(vals)], 0)
+        .append(
+            ChunkKey::new(shard_id(), 0),
+            1,
+            schema(),
+            0,
+            vec![batch(vals)],
+            0,
+        )
         .unwrap();
 }
 
@@ -183,11 +190,7 @@ async fn collect_flight_data(
         transaction_id: None,
     };
     let desc = FlightDescriptor::new_cmd(command_bytes(&cmd));
-    let info = client
-        .get_flight_info(desc)
-        .await
-        .unwrap()
-        .into_inner();
+    let info = client.get_flight_info(desc).await.unwrap().into_inner();
     let ticket = info.endpoint[0].ticket.clone().unwrap();
     let mut stream = client.do_get(ticket).await.unwrap().into_inner();
     let mut datas = Vec::new();
@@ -245,10 +248,7 @@ async fn partial_result_is_visible_in_flight_metadata() {
         meta.contains("inst-b") && meta.contains("public.partialwire"),
         "缺失来源必须点名（哪张表、哪个实例）：{meta}"
     );
-    assert!(
-        meta.contains("connection refused"),
-        "原因要能排障：{meta}"
-    );
+    assert!(meta.contains("connection refused"), "原因要能排障：{meta}");
 
     shutdown.cancel();
     let _ = server.await;

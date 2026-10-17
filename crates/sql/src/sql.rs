@@ -13,18 +13,18 @@ use std::sync::Arc;
 
 use arrow::array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int16Array, Int32Array, Int64Array, Int8Array, ListArray, MapArray, StringArray,
-    StructArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    Int8Array, Int16Array, Int32Array, Int64Array, ListArray, MapArray, StringArray, StructArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use arrow_cast::cast;
 use sqlparser::ast::{
-    AlterColumnOperation, AlterTable, AlterTableOperation, ArrayElemTypeDef, ColumnDef, CreateTable,
-    DataType as SqlDataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName,
-    Statement,
+    AlterColumnOperation, AlterTable, AlterTableOperation, ArrayElemTypeDef, ColumnDef,
+    CreateTable, DataType as SqlDataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
+    ObjectName, Statement,
 };
 use sqlparser::ast::{ExactNumberInfo, TimezoneInfo, Value, ValueWithSpan};
 use sqlparser::dialect::{Dialect as SqlDialect, GenericDialect};
@@ -194,7 +194,10 @@ pub const OPT_PARTITION_BY: &str = "partition_by";
 ///
 /// 为什么拒绝而不是静默忽略：写错列名而"建表成功"⇒ 剪枝永远不生效且不报错，
 /// 正是本项目最忌的形态（静默劣化）。
-fn partition_cols_from_options(ct: &CreateTable, schema: &SchemaRef) -> Result<Vec<String>, LakeError> {
+fn partition_cols_from_options(
+    ct: &CreateTable,
+    schema: &SchemaRef,
+) -> Result<Vec<String>, LakeError> {
     let opts = match &ct.table_options {
         sqlparser::ast::CreateTableOptions::With(v) => v,
         _ => return Ok(Vec::new()),
@@ -208,7 +211,7 @@ fn partition_cols_from_options(ct: &CreateTable, schema: &SchemaRef) -> Result<V
             other => {
                 return Err(LakeError::Other(format!(
                     "CREATE TABLE ... WITH (...) 只接受 `{OPT_PARTITION_BY} = '列名'`，实际：{other}"
-                )))
+                )));
             }
         };
         let key = key.value.to_ascii_lowercase();
@@ -231,7 +234,7 @@ fn partition_cols_from_options(ct: &CreateTable, schema: &SchemaRef) -> Result<V
             other => {
                 return Err(LakeError::Other(format!(
                     "WITH ({OPT_PARTITION_BY} = ...) 的值应为列名（'ts' 或 ts），实际：{other}"
-                )))
+                )));
             }
         };
         if value.is_empty() {
@@ -377,7 +380,7 @@ pub fn map_column_type(dt: &SqlDataType) -> Result<DataType, LakeError> {
             other => {
                 return Err(LakeError::Other(format!(
                     "timestamp with timezone ({other}) is not supported in CREATE TABLE"
-                )))
+                )));
             }
         },
         SqlDataType::Datetime(_) => DataType::Timestamp(TimeUnit::Nanosecond, None),
@@ -391,7 +394,7 @@ pub fn map_column_type(dt: &SqlDataType) -> Result<DataType, LakeError> {
                 ArrayElemTypeDef::None => {
                     return Err(LakeError::Other(
                         "ARRAY requires an element type, e.g. ARRAY<INT>".into(),
-                    ))
+                    ));
                 }
             };
             DataType::List(Arc::new(Field::new(LIST_ITEM_FIELD_NAME, inner, true)))
@@ -407,7 +410,10 @@ pub fn map_column_type(dt: &SqlDataType) -> Result<DataType, LakeError> {
                     "unsupported column type in CREATE TABLE: {name}({modifiers:?})"
                 )));
             }
-            let probe = format!("CREATE TABLE __t (m Map({}, {}))", modifiers[0], modifiers[1]);
+            let probe = format!(
+                "CREATE TABLE __t (m Map({}, {}))",
+                modifiers[0], modifiers[1]
+            );
             let Statement::CreateTable(ct) = parse_single(&probe)? else {
                 return Err(LakeError::Other("internal: map re-parse failed".into()));
             };
@@ -419,7 +425,7 @@ pub fn map_column_type(dt: &SqlDataType) -> Result<DataType, LakeError> {
         other => {
             return Err(LakeError::Other(format!(
                 "unsupported column type in CREATE TABLE: {other}"
-            )))
+            )));
         }
     };
     Ok(t)
@@ -762,7 +768,7 @@ pub fn build_values_batch(
                     Err(_) => {
                         return Err(LakeError::Other(format!(
                             "unknown column in INSERT: {name}"
-                        )))
+                        )));
                     }
                 }
             }
@@ -810,7 +816,11 @@ pub fn build_values_batch(
 }
 
 /// 按列类型把字面量流转换为 Arrow 数组（范围检查内联完成）。
-fn build_column(field: &Field, n: usize, get: &dyn Fn(usize) -> Literal) -> Result<ArrayRef, LakeError> {
+fn build_column(
+    field: &Field,
+    n: usize,
+    get: &dyn Fn(usize) -> Literal,
+) -> Result<ArrayRef, LakeError> {
     use Literal as L;
 
     macro_rules! int_col {
@@ -962,7 +972,7 @@ fn build_column(field: &Field, n: usize, get: &dyn Fn(usize) -> Literal) -> Resu
                     return Err(LakeError::Other(format!(
                         "column {}: invalid MAP entries type: {other}",
                         field.name()
-                    )))
+                    )));
                 }
             };
             let (key_field, value_field) = match (entry_fields.first(), entry_fields.get(1)) {
@@ -971,7 +981,7 @@ fn build_column(field: &Field, n: usize, get: &dyn Fn(usize) -> Literal) -> Resu
                     return Err(LakeError::Other(format!(
                         "column {}: MAP entries must have key/value fields",
                         field.name()
-                    )))
+                    )));
                 }
             };
             let mut offsets: Vec<i32> = Vec::with_capacity(n + 1);
@@ -1020,14 +1030,12 @@ fn build_column(field: &Field, n: usize, get: &dyn Fn(usize) -> Literal) -> Resu
                     L::Str(s) => v.push(Some(s)),
                     // 二进制字面量进文本列：MySQL 允许（按 UTF-8 解释）；
                     // 非 UTF-8 字节明确拒绝（Arrow Utf8 装不下，静默替换 = 改数据）
-                    L::Bytes(b) => v.push(Some(
-                        String::from_utf8(b).map_err(|_| {
-                            LakeError::Other(format!(
-                                "binary literal is not valid UTF-8 for text column {}",
-                                field.name()
-                            ))
-                        })?,
-                    )),
+                    L::Bytes(b) => v.push(Some(String::from_utf8(b).map_err(|_| {
+                        LakeError::Other(format!(
+                            "binary literal is not valid UTF-8 for text column {}",
+                            field.name()
+                        ))
+                    })?)),
                     other => return Err(bad_lit(&other, field)),
                 }
             }
@@ -1103,7 +1111,7 @@ fn build_column(field: &Field, n: usize, get: &dyn Fn(usize) -> Literal) -> Resu
             return Err(LakeError::Other(format!(
                 "column {}: unsupported type for INSERT VALUES: {other}",
                 field.name()
-            )))
+            )));
         }
     };
     Ok(arr)
@@ -1559,7 +1567,11 @@ mod tests {
             .as_any()
             .downcast_ref::<arrow::array::BinaryArray>()
             .unwrap();
-        assert_eq!(b.value(0), &[0xDE, 0xAD, 0xBE, 0xEF], "hex 字面量必须是 4 个原始字节");
+        assert_eq!(
+            b.value(0),
+            &[0xDE, 0xAD, 0xBE, 0xEF],
+            "hex 字面量必须是 4 个原始字节"
+        );
         // 文本列：二进制字面量按 UTF-8 解释（MySQL 允许）
         let s = batch
             .column(1)
@@ -1570,12 +1582,17 @@ mod tests {
 
         // 非法 hex：奇数长 / 非 hex 字符 ⇒ 明确错误
         let bad = parse("INSERT INTO t VALUES (x'ABC', 'x')");
-        let Statement::Insert(ins) = &bad else { panic!() };
+        let Statement::Insert(ins) = &bad else {
+            panic!()
+        };
         let SetExpr::Values(vals) = ins.source.as_ref().unwrap().body.as_ref() else {
             panic!()
         };
         let rows: Vec<Vec<Expr>> = vals.rows.iter().map(|r| r.content.clone()).collect();
-        assert!(build_values_batch(&t, None, &rows).is_err(), "奇数长 hex 必须拒绝");
+        assert!(
+            build_values_batch(&t, None, &rows).is_err(),
+            "奇数长 hex 必须拒绝"
+        );
     }
 
     /// **`D-33` 的判据**：无符号整数家族可建表（README §2.1 写着"含无符号"）。
@@ -1638,12 +1655,7 @@ mod tests {
         assert!(matches!(p.change, SchemaChange::AddColumn { .. }));
 
         let p = parse_alter_table(&alter_of("ALTER TABLE t DROP COLUMN c")).unwrap();
-        assert_eq!(
-            p.change,
-            SchemaChange::DropColumn {
-                column: "c".into()
-            }
-        );
+        assert_eq!(p.change, SchemaChange::DropColumn { column: "c".into() });
         assert!(!p.idempotent);
 
         let p = parse_alter_table(&alter_of("ALTER TABLE t DROP COLUMN IF EXISTS c")).unwrap();
@@ -1670,7 +1682,8 @@ mod tests {
         }
 
         // 拒绝的**理由**要对得上（不然用户看到的又是一句"不支持"）
-        let e = parse_alter_table(&alter_of("ALTER TABLE t ALTER COLUMN c TYPE VARCHAR")).unwrap_err();
+        let e =
+            parse_alter_table(&alter_of("ALTER TABLE t ALTER COLUMN c TYPE VARCHAR")).unwrap_err();
         assert!(e.to_string().contains("破坏性"), "{e}");
         let e = parse_alter_table(&alter_of("ALTER TABLE t RENAME COLUMN c TO d")).unwrap_err();
         assert!(e.to_string().contains("载体"), "{e}");
@@ -2038,10 +2051,12 @@ mod tests {
             Statement::CreateTable(ct) => ct,
             other => panic!("{other:?}"),
         };
-        assert!(parse_create_table(&ct5)
-            .unwrap_err()
-            .to_string()
-            .contains("sort_by"));
+        assert!(
+            parse_create_table(&ct5)
+                .unwrap_err()
+                .to_string()
+                .contains("sort_by")
+        );
     }
 
     /// **`§189/U2`**：方言回退 —— MySQL 语法里没有 `ADD COLUMN IF NOT EXISTS`
@@ -2051,13 +2066,19 @@ mod tests {
         use sqlparser::dialect::MySqlDialect;
         // MySQL 方言自己**不认**这条（严格解析应当失败）
         assert!(
-            parse_single_strict(&MySqlDialect {}, "ALTER TABLE t ADD COLUMN IF NOT EXISTS b INT")
-                .is_err(),
+            parse_single_strict(
+                &MySqlDialect {},
+                "ALTER TABLE t ADD COLUMN IF NOT EXISTS b INT"
+            )
+            .is_err(),
             "MySqlDialect 本就不支持该语法（回退机制的前提）"
         );
         // 走 `parse_single_with` ⇒ 回退到 Generic ⇒ 成功，且 `if_not_exists` 为真
-        let st = parse_single_with(&MySqlDialect {}, "ALTER TABLE t ADD COLUMN IF NOT EXISTS b INT")
-            .expect("回退后应当解析成功");
+        let st = parse_single_with(
+            &MySqlDialect {},
+            "ALTER TABLE t ADD COLUMN IF NOT EXISTS b INT",
+        )
+        .expect("回退后应当解析成功");
         let Statement::AlterTable(alter) = &st else {
             panic!("应当是 AlterTable：{st:?}")
         };

@@ -126,11 +126,8 @@ pub async fn run(
                 }
             }
             AdminAction::Promote(node_id) => {
-                match tokio::time::timeout(
-                    timeout,
-                    client.promote(pb::PromoteRequest { node_id }),
-                )
-                .await
+                match tokio::time::timeout(timeout, client.promote(pb::PromoteRequest { node_id }))
+                    .await
                 {
                     Ok(x) => x.map(|r| {
                         let s = r.into_inner();

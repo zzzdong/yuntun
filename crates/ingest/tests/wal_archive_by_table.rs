@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use object_store::ObjectStore;
-use yuntun_ingest::wal_archive::{archive_once, restore, ArchiveConfig};
+use yuntun_ingest::wal_archive::{ArchiveConfig, archive_once, restore};
 use yuntun_model::wal_record::{DataPayload, Record};
 use yuntun_wal::{WalConfig, WalReader, WalWriter};
 
@@ -94,7 +94,9 @@ async fn replayed_by_table(
         .await
         .expect("从归档拉回");
     let reader = WalReader::new(wal_dir.join("shard=0"));
-    let recs = reader.scan_from(0).expect("拉回的字节必须能被既有读取面解析");
+    let recs = reader
+        .scan_from(0)
+        .expect("拉回的字节必须能被既有读取面解析");
     let mut out: HashMap<String, usize> = HashMap::new();
     for (_, r) in recs {
         if let Record::Data(p) = r {
@@ -112,8 +114,8 @@ async fn best_effort_only_segments_are_not_archived() {
         vec![data("best_effort_t", 0), data("best_effort_t", 1)],
     )
     .await;
-    let archive: Arc<dyn ObjectStore> = yuntun_store::create_store(&yuntun_store::StoreConfig::Memory)
-        .unwrap();
+    let archive: Arc<dyn ObjectStore> =
+        yuntun_store::create_store(&yuntun_store::StoreConfig::Memory).unwrap();
     let durable = durable_set(&["durable_t"]);
 
     let mut uploaded = HashMap::new();
@@ -135,9 +137,16 @@ async fn best_effort_only_segments_are_not_archived() {
 
     // 对照：同一份数据在**全归档**口径下会传（证明"0"来自过滤，不是来自别的毛病）
     let mut uploaded2 = HashMap::new();
-    let n2 = archive_once(&cfg(), dir.path(), 0, archive.as_ref(), &mut uploaded2, None)
-        .await
-        .expect("全归档一轮");
+    let n2 = archive_once(
+        &cfg(),
+        dir.path(),
+        0,
+        archive.as_ref(),
+        &mut uploaded2,
+        None,
+    )
+    .await
+    .expect("全归档一轮");
     assert_eq!(n2, 1, "对照：不按表过滤时同一个段会上传");
 }
 
@@ -155,8 +164,8 @@ async fn durable_tables_pull_the_whole_segment_in() {
         ],
     )
     .await;
-    let archive: Arc<dyn ObjectStore> = yuntun_store::create_store(&yuntun_store::StoreConfig::Memory)
-        .unwrap();
+    let archive: Arc<dyn ObjectStore> =
+        yuntun_store::create_store(&yuntun_store::StoreConfig::Memory).unwrap();
     let durable = durable_set(&["durable_t"]);
 
     let mut uploaded = HashMap::new();
@@ -170,7 +179,10 @@ async fn durable_tables_pull_the_whole_segment_in() {
     )
     .await
     .expect("归档一轮");
-    assert_eq!(n, 1, "段里有 durable 表的数据 ⇒ 必须上传（不能丢数据的那一半）");
+    assert_eq!(
+        n, 1,
+        "段里有 durable 表的数据 ⇒ 必须上传（不能丢数据的那一半）"
+    );
 
     // 整盘丢失之后：从归档拉回，逐条读得回来
     let after = TempDir::new("arch-mixed-after");

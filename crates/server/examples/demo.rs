@@ -246,7 +246,9 @@ scan_interval_ms = 50
         .await,
     );
 
-    println!("\n[6] 全链路贯通（全部经由 gRPC）：DoPut 写入 → WAL(组提交 fsync) → 攒批(Jitter) → Parquet → Meta(快照隔离) → DoGet SQL 查询 ✓");
+    println!(
+        "\n[6] 全链路贯通（全部经由 gRPC）：DoPut 写入 → WAL(组提交 fsync) → 攒批(Jitter) → Parquet → Meta(快照隔离) → DoGet SQL 查询 ✓"
+    );
 
     // ---- ⑥b SQL 前置解析分流（S1.6/S1.7）：CREATE / INSERT / SHOW 经 do_get ticket ----
     println!("\n=== SQL 前置解析分流（plan §4.3：只有 SELECT 让 DataFusion 处理）===");

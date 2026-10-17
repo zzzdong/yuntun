@@ -15,7 +15,7 @@
 
 use std::time::Duration;
 
-use yuntun_meta::{cli, MetaNode, MetaOptions};
+use yuntun_meta::{MetaNode, MetaOptions, cli};
 
 fn main() {
     // clap 统一处理 `--help`/`--version`（退 0）与用法错（退 2）；语义错也归"用法错"。
@@ -164,9 +164,7 @@ async fn join_cluster(
     let mut tried: Vec<String> = Vec::new();
     for addr in addrs.split(',').map(str::trim).filter(|a| !a.is_empty()) {
         let ep = format!("http://{addr}");
-        let Ok(mut client) =
-            yuntun_proto::meta::meta_client::MetaClient::connect(ep).await
-        else {
+        let Ok(mut client) = yuntun_proto::meta::meta_client::MetaClient::connect(ep).await else {
             tried.push(format!("{addr}: 连不上"));
             continue;
         };

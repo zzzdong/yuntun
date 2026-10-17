@@ -349,10 +349,7 @@ impl QueryRegistry {
 
     /// `SHOW STATUS` 的数据源。
     pub fn status(&self) -> StatusSnapshot {
-        let sessions = self
-            .sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let running = sessions
             .values()
             .filter(|s| s.running_guard().is_some())
@@ -398,12 +395,7 @@ impl QueryRegistry {
         })
     }
 
-    fn insert_session(
-        &self,
-        id: u64,
-        host: impl Into<String>,
-        ephemeral: bool,
-    ) -> Arc<Session> {
+    fn insert_session(&self, id: u64, host: impl Into<String>, ephemeral: bool) -> Arc<Session> {
         let session = Arc::new(Session {
             id,
             host: host.into(),
@@ -416,10 +408,7 @@ impl QueryRegistry {
             ephemeral,
         });
         let live = {
-            let mut map = self
-                .sessions
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut map = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             map.insert(id, Arc::clone(&session));
             map.values().filter(|s| !s.ephemeral).count() as u64
         };

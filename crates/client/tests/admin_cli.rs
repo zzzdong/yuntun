@@ -20,9 +20,7 @@ use yuntun_client::admin::{self, AdminAction, is_retryable};
 /// ⚠️ **必须把 `MetaNode` 还回去**：驱动线程跟着它的邮箱活着，丢了它 = 驱动线程退出
 /// （现象是 `Status` 还答得出来 —— 它读的是快照 —— 而 `Promote` 报"命令通道断开"。
 /// 本用例第一次就是踩在这上面）。
-async fn serve_single_node(
-    dir: &std::path::Path,
-) -> (std::net::SocketAddr, yuntun_meta::MetaNode) {
+async fn serve_single_node(dir: &std::path::Path) -> (std::net::SocketAddr, yuntun_meta::MetaNode) {
     let node = yuntun_meta::MetaNode::open_with(
         dir,
         1,
@@ -48,15 +46,21 @@ async fn serve_single_node(
     loop {
         // 两件事都要等：① 诊断快照已刷过一轮（成员表非空）；② **已经选出 leader** ——
         // 前者来自盘上的 conf state（比选举早得多），只等它会让 `Promote` 撞上"还没选出来"。
-        if let Ok((ms, _)) =
-            admin::run(AdminAction::Members, std::slice::from_ref(&contact), Duration::from_secs(2))
-                .await
+        if let Ok((ms, _)) = admin::run(
+            AdminAction::Members,
+            std::slice::from_ref(&contact),
+            Duration::from_secs(2),
+        )
+        .await
             && !ms.voters.is_empty()
             && ms.leader_id.is_some_and(|l| l != 0)
         {
             return (addr, node);
         }
-        assert!(std::time::Instant::now() < deadline, "10s 内服务没起来（或成员表一直空）");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "10s 内服务没起来（或成员表一直空）"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -77,9 +81,13 @@ async fn contacts_are_tried_in_order_and_real_rejections_are_not_hidden() {
     assert!(ms.learners.is_empty(), "{ms}");
 
     // ---- ② 真拒绝原样上抛：提升一个**不在成员表里**的 id ----
-    let err = admin::run(AdminAction::Promote(9), &[real.to_string()], Duration::from_secs(5))
-        .await
-        .expect_err("提升不在册的节点必须失败");
+    let err = admin::run(
+        AdminAction::Promote(9),
+        &[real.to_string()],
+        Duration::from_secs(5),
+    )
+    .await
+    .expect_err("提升不在册的节点必须失败");
     assert!(
         err.contains("不在成员表"),
         "必须**把服务端的判据原样带出来**（而不是'没有任何接触点受理'）：{err}"
@@ -90,9 +98,13 @@ async fn contacts_are_tried_in_order_and_real_rejections_are_not_hidden() {
     );
 
     // ---- ③ 幂等：移除一个本来就不在册的 id ⇒ 成功（那就是移除的目的）----
-    let (ms, _) = admin::run(AdminAction::Remove(9), &[real.to_string()], Duration::from_secs(5))
-        .await
-        .expect("移除不在册的 id 是幂等成功");
+    let (ms, _) = admin::run(
+        AdminAction::Remove(9),
+        &[real.to_string()],
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("移除不在册的 id 是幂等成功");
     assert_eq!(ms.voters, vec![1], "幂等操作不该改动成员表：{ms}");
 }
 

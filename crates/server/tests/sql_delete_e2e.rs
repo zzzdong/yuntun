@@ -83,10 +83,7 @@ async fn refresh_cache(lakehouse: &Lakehouse) {
 }
 
 /// `v` 列升序的整数值（查询都带 `ORDER BY`）。
-async fn col_v(
-    client: &mut FlightServiceClient<tonic::transport::Channel>,
-    sql: &str,
-) -> Vec<i64> {
+async fn col_v(client: &mut FlightServiceClient<tonic::transport::Channel>, sql: &str) -> Vec<i64> {
     let batches = collect_do_get(client, sql).await;
     let mut out = Vec::new();
     for b in &batches {
@@ -155,7 +152,10 @@ scan_interval_ms = 20
 /// ⚠️ 实测：**同一进程内**重新打开同一个 meta 目录会一直 `FjallError: Locked`
 /// （`MetaNode::drop` 之后锁也没释放，重试 5 秒无效 —— `§151.3`）。
 /// 所以本用例**不做**"同进程重启"；这个助手留着是为了"起第一次"时的时序抖动。
-async fn build_embedded(cfg: &yuntun_server::Config, shutdown: CancellationToken) -> Arc<Lakehouse> {
+async fn build_embedded(
+    cfg: &yuntun_server::Config,
+    shutdown: CancellationToken,
+) -> Arc<Lakehouse> {
     // ⚠️ 这里**曾经**有一段"看到 `Locked` 就重试 5 秒"的兜底 —— `§159` 之后删掉了：
     // 那个 `Locked` 不是"锁还没放"的抖动，而是**装配层真的没停 metanode 的 gRPC 服务任务**
     // （任务持有 `NodeHandle` ⇒ 持有 fjall 的目录锁，进程内永不释放）。现在任务随 `shutdown`
@@ -272,14 +272,21 @@ async fn delete_removes_only_the_matching_rows() {
         10
     );
     assert_eq!(
-        col_v_until(&mut client, "SELECT v FROM t ORDER BY v", &(1..=10).collect::<Vec<i64>>())
-            .await,
+        col_v_until(
+            &mut client,
+            "SELECT v FROM t ORDER BY v",
+            &(1..=10).collect::<Vec<i64>>()
+        )
+        .await,
         (1..=10).collect::<Vec<i64>>(),
         "前提：写入的 10 行都查得到"
     );
 
     // ① 删除命中 3 行
-    assert_eq!(execute_update(&mut client, "DELETE FROM t WHERE v <= 3").await, 3);
+    assert_eq!(
+        execute_update(&mut client, "DELETE FROM t WHERE v <= 3").await,
+        3
+    );
     assert_eq!(
         col_v(&mut client, "SELECT v FROM t ORDER BY v").await,
         (4..=10).collect::<Vec<i64>>(),
@@ -295,7 +302,11 @@ async fn delete_removes_only_the_matching_rows() {
         (4..=8).collect::<Vec<i64>>(),
         "两次删除必须**叠加**（第二次不许把第一次盖掉）"
     );
-    assert_eq!(deleted_card(&lakehouse, "public.t").await, 5, "目录里的 DV 覆盖 5 行");
+    assert_eq!(
+        deleted_card(&lakehouse, "public.t").await,
+        5,
+        "目录里的 DV 覆盖 5 行"
+    );
 
     // 谓词没命中任何行 ⇒ 受影响 0，且**不留痕迹**（不推快照号）
     let snap_before = lakehouse.catalog.current_snapshot().await;
@@ -352,7 +363,10 @@ async fn delete_of_just_inserted_rows_flushes_first() {
         "前提：惰性配置下数据应当还在 chunk 里"
     );
 
-    assert_eq!(execute_update(&mut client, "DELETE FROM t WHERE v = 2").await, 1);
+    assert_eq!(
+        execute_update(&mut client, "DELETE FROM t WHERE v = 2").await,
+        1
+    );
     assert_eq!(
         col_v(&mut client, "SELECT v FROM t ORDER BY v").await,
         vec![1, 3],
@@ -407,8 +421,14 @@ async fn delete_survives_restart_in_memory_meta_mode() {
             execute_update(&mut client, "INSERT INTO t VALUES (1),(2),(3),(4)").await,
             4
         );
-        assert_eq!(execute_update(&mut client, "DELETE FROM t WHERE v IN (2, 4)").await, 2);
-        assert_eq!(col_v(&mut client, "SELECT v FROM t ORDER BY v").await, vec![1, 3]);
+        assert_eq!(
+            execute_update(&mut client, "DELETE FROM t WHERE v IN (2, 4)").await,
+            2
+        );
+        assert_eq!(
+            col_v(&mut client, "SELECT v FROM t ORDER BY v").await,
+            vec![1, 3]
+        );
         shutdown.cancel();
         // 给后台任务一点时间退出（WAL 已 fsync，删除已提交）
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -429,7 +449,10 @@ async fn delete_survives_restart_in_memory_meta_mode() {
         vec![1, 3],
         "重启之后：表在、数据在、**删除仍然生效**（WAL 重放收敛回来）"
     );
-    assert!(deleted_card(&lakehouse, "public.t").await > 0, "目录里重建了 DV");
+    assert!(
+        deleted_card(&lakehouse, "public.t").await > 0,
+        "目录里重建了 DV"
+    );
     shutdown.cancel();
 }
 
@@ -464,8 +487,8 @@ async fn delete_refusals_are_explicit() {
     // 注意：**无 `WHERE` 的全表删已经支持**（`F.3f`：设计 §7 的文件级下线，见
     // `sql_purge_e2e.rs`）—— 所以它不在下面这张"拒绝清单"里。
     for sql in [
-        "DELETE t FROM t WHERE v = 1",          // 多表
-        "DELETE FROM t USING s WHERE t.v = 1",  // USING
+        "DELETE t FROM t WHERE v = 1",         // 多表
+        "DELETE FROM t USING s WHERE t.v = 1", // USING
     ] {
         let msg = match lakehouse.sql.execute(sql, &mut session).await {
             Err(e) => e.to_string(),
@@ -500,11 +523,19 @@ async fn delete_refusals_are_explicit() {
         .list_visible_files("public.t", snap, None)
         .await
         .unwrap();
-    let file = files.first().expect("前提：表里得有已提交文件（上面刚 flush 过）").clone();
+    let file = files
+        .first()
+        .expect("前提：表里得有已提交文件（上面刚 flush 过）")
+        .clone();
     let dml_purpose = yuntun_model::meta::dml_shard_lease_purpose("public.t", &file.shard);
     let held = lakehouse
         .catalog
-        .acquire_lease(&dml_purpose, "someone-else", yuntun_ingest::now_ms(), 30_000)
+        .acquire_lease(
+            &dml_purpose,
+            "someone-else",
+            yuntun_ingest::now_ms(),
+            30_000,
+        )
         .await
         .unwrap();
     assert!(held.granted, "前提：这把租约现在被占着");
@@ -512,10 +543,18 @@ async fn delete_refusals_are_explicit() {
     let other_purpose = yuntun_model::meta::dml_shard_lease_purpose("public.t", "s-other");
     let other = lakehouse
         .catalog
-        .acquire_lease(&other_purpose, "someone-else", yuntun_ingest::now_ms(), 30_000)
+        .acquire_lease(
+            &other_purpose,
+            "someone-else",
+            yuntun_ingest::now_ms(),
+            30_000,
+        )
         .await
         .unwrap();
-    assert!(other.granted, "另一个分片的锁必须还能拿到（否则就是表级互斥）");
+    assert!(
+        other.granted,
+        "另一个分片的锁必须还能拿到（否则就是表级互斥）"
+    );
     let msg = match lakehouse
         .sql
         .execute("DELETE FROM t WHERE v = 1", &mut session)
@@ -593,11 +632,13 @@ async fn delete_works_in_the_default_embedded_assembly() {
             2,
             "默认形态下删除必须成功（不再是「尚未接线」）"
         );
-        assert_eq!(col_v(&mut client, "SELECT v FROM t ORDER BY v").await, vec![1, 3]);
+        assert_eq!(
+            col_v(&mut client, "SELECT v FROM t ORDER BY v").await,
+            vec![1, 3]
+        );
         // 目录里真的有了（内部事实：不是只有查询缓存知道）
         assert_eq!(deleted_card(&lakehouse, "public.t").await, 2);
         shutdown.cancel();
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
-
 }

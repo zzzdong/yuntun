@@ -23,5 +23,5 @@ pub mod writer;
 
 pub use config::WalConfig;
 pub use reader::WalReader;
-pub use recovery::{recover, Recovery, SegmentInfo};
+pub use recovery::{Recovery, SegmentInfo, recover};
 pub use writer::{WalAck, WalWriter};

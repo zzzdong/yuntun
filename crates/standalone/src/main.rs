@@ -20,7 +20,11 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 并额外支持 `-V`）；`--help` 由 clap 从本结构的 doc 注释生成 —— 手写的那套
 /// "unknown arg + usage" 只在拼错时给一行含糊提示，clap 会指出**是哪个参数**。
 #[derive(clap::Parser, Debug)]
-#[command(name = "yuntun", version, about = "yuntun 单机进程（阶段 1；原 bins/all-in-one）")]
+#[command(
+    name = "yuntun",
+    version,
+    about = "yuntun 单机进程（阶段 1；原 bins/all-in-one）"
+)]
 struct Args {
     /// 配置文件（TOML）；省略则用默认配置（本地 ./data + 内存 catalog）
     #[arg(long)]
@@ -89,8 +93,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // 只处理 SIGINT 会让进程在"直接死"与"优雅关闭"之间**选前者** ——
             // WAL 不封口、后台任务不 join、WAL/spill 目录租约不释放
             // （下一次启动还要等锁）。两条信号共用同一份收尾流程。
-            let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("install SIGTERM handler");
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("install SIGTERM handler");
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("SIGINT received, shutting down gracefully");

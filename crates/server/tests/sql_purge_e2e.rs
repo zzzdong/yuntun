@@ -75,10 +75,7 @@ async fn execute_update_sql(
         .record_count
 }
 
-async fn col_v(
-    client: &mut FlightServiceClient<tonic::transport::Channel>,
-    sql: &str,
-) -> Vec<i64> {
+async fn col_v(client: &mut FlightServiceClient<tonic::transport::Channel>, sql: &str) -> Vec<i64> {
     let batches = collect_do_get(client, sql).await;
     let mut out = Vec::new();
     for b in &batches {
@@ -240,7 +237,9 @@ async fn purge_deletes_the_whole_table_and_never_eats_later_writes() {
         let after = lakehouse.catalog.current_snapshot().await;
         assert_eq!(after, before_purge + 1, "一次整表清除只推**一个**快照号");
         assert!(
-            col_v(&mut client, "SELECT v FROM t ORDER BY v").await.is_empty(),
+            col_v(&mut client, "SELECT v FROM t ORDER BY v")
+                .await
+                .is_empty(),
             "清除之后一行都查不到"
         );
 
@@ -316,10 +315,8 @@ async fn purge_deletes_the_whole_table_and_never_eats_later_writes() {
 
         // ⑥ 只读装配 + 不存在的表：都是**可读的拒绝**
         let mut session = SessionCtx::default();
-        let ro = yuntun_sql::SqlEngine::new_readonly(
-            lakehouse.query.clone(),
-            lakehouse.catalog.clone(),
-        );
+        let ro =
+            yuntun_sql::SqlEngine::new_readonly(lakehouse.query.clone(), lakehouse.catalog.clone());
         match ro.execute("DELETE FROM t", &mut session).await {
             Err(yuntun_sql::SqlError::ReadOnly) => {}
             Err(other) => panic!("只读形态应当报 ReadOnly，实际：{other}"),
@@ -338,7 +335,9 @@ async fn purge_deletes_the_whole_table_and_never_eats_later_writes() {
             "拒绝要说清是哪张表：{msg}"
         );
         assert!(
-            col_v(&mut client, "SELECT v FROM t ORDER BY v").await.is_empty(),
+            col_v(&mut client, "SELECT v FROM t ORDER BY v")
+                .await
+                .is_empty(),
             "前提：重启之前表是空的"
         );
         shutdown.cancel();
@@ -356,7 +355,9 @@ async fn purge_deletes_the_whole_table_and_never_eats_later_writes() {
     let mut client = serve(&lakehouse, shutdown.clone()).await;
     // （重启后的第一次查询**不需要**显式刷缓存：读路径自己会保鲜，`§163`）
     assert!(
-        col_v(&mut client, "SELECT v FROM t ORDER BY v").await.is_empty(),
+        col_v(&mut client, "SELECT v FROM t ORDER BY v")
+            .await
+            .is_empty(),
         "**重启之后表仍然是空的**（整表清除只改目录 ⇒ 必须靠 WAL 重放，见 `PurgePayload` 的文档）"
     );
     // 而且重启之后表还能用

@@ -214,7 +214,11 @@ fn commit_files_is_field_for_field_lossless() {
         schema_ver: 2,
     };
     let back = roundtrip(&req);
-    assert_eq!(back.op.as_ref().unwrap().now_ms, 1_700_000_000_000, "时间戳必须随 op 传播（约定 1）");
+    assert_eq!(
+        back.op.as_ref().unwrap().now_ms,
+        1_700_000_000_000,
+        "时间戳必须随 op 传播（约定 1）"
+    );
     let decoded = match back.op.unwrap().kind.unwrap() {
         op::Kind::CommitFiles(c) => from_msg(c.request.as_ref().expect("request 必须存在")),
         other => panic!("op 类型变了：{other:?}"),
@@ -232,15 +236,27 @@ fn commit_files_is_field_for_field_lossless() {
         "幂等键集合丢了"
     );
     assert_eq!(decoded.shard, original.shard, "shard 丢了");
-    assert_eq!(decoded.time_window, original.time_window, "time_window 丢了");
-    assert_eq!(decoded.schema_version, original.schema_version, "schema_version 丢了");
+    assert_eq!(
+        decoded.time_window, original.time_window,
+        "time_window 丢了"
+    );
+    assert_eq!(
+        decoded.schema_version, original.schema_version,
+        "schema_version 丢了"
+    );
     assert_eq!(decoded.row_count, original.row_count, "row_count 丢了");
     assert_eq!(decoded.files.len(), original.files.len(), "文件数变了");
     for (i, (got, want)) in decoded.files.iter().zip(original.files.iter()).enumerate() {
         assert_eq!(got.file_path, want.file_path, "files[{i}].file_path");
         assert_eq!(got.batch_id, want.batch_id, "files[{i}].batch_id");
-        assert_eq!(got.client_request_id, want.client_request_id, "files[{i}].client_request_id");
-        assert_eq!(got.schema_version, want.schema_version, "files[{i}].schema_version");
+        assert_eq!(
+            got.client_request_id, want.client_request_id,
+            "files[{i}].client_request_id"
+        );
+        assert_eq!(
+            got.schema_version, want.schema_version,
+            "files[{i}].schema_version"
+        );
         assert_eq!(got.status, want.status, "files[{i}].status");
         assert_eq!(got.valid_from, want.valid_from, "files[{i}].valid_from");
         assert_eq!(got.deleted_at, want.deleted_at, "files[{i}].deleted_at");
@@ -249,22 +265,47 @@ fn commit_files_is_field_for_field_lossless() {
         assert_eq!(got.table, want.table, "files[{i}].table");
         assert_eq!(got.shard, want.shard, "files[{i}].shard");
         assert_eq!(got.time_window, want.time_window, "files[{i}].time_window");
-        assert_eq!(got.partition_key, want.partition_key, "files[{i}].partition_key");
-        assert_eq!(got.source_instance, want.source_instance, "files[{i}].source_instance");
-        assert_eq!(got.sealed_at_ms, want.sealed_at_ms, "files[{i}].sealed_at_ms");
-        assert_eq!(got.committed_at_ms, want.committed_at_ms, "files[{i}].committed_at_ms");
+        assert_eq!(
+            got.partition_key, want.partition_key,
+            "files[{i}].partition_key"
+        );
+        assert_eq!(
+            got.source_instance, want.source_instance,
+            "files[{i}].source_instance"
+        );
+        assert_eq!(
+            got.sealed_at_ms, want.sealed_at_ms,
+            "files[{i}].sealed_at_ms"
+        );
+        assert_eq!(
+            got.committed_at_ms, want.committed_at_ms,
+            "files[{i}].committed_at_ms"
+        );
         // 后加的可观测性字段（T8 / 封口原因）最容易被漏 —— 单独点名
-        assert_eq!(got.seal_reason, want.seal_reason, "files[{i}].seal_reason 丢了");
-        assert_eq!(got.seal_pressure, want.seal_pressure, "files[{i}].seal_pressure 丢了");
+        assert_eq!(
+            got.seal_reason, want.seal_reason,
+            "files[{i}].seal_reason 丢了"
+        );
+        assert_eq!(
+            got.seal_pressure, want.seal_pressure,
+            "files[{i}].seal_pressure 丢了"
+        );
         match (&got.stats, &want.stats) {
             (None, None) => {}
             (Some(g), Some(w)) => {
-                assert_eq!(g.columns.len(), w.columns.len(), "files[{i}].stats.columns 数变了");
+                assert_eq!(
+                    g.columns.len(),
+                    w.columns.len(),
+                    "files[{i}].stats.columns 数变了"
+                );
                 for (j, (gc, wc)) in g.columns.iter().zip(w.columns.iter()).enumerate() {
                     assert_eq!(gc.name, wc.name, "files[{i}].stats[{j}].name");
                     assert_eq!(gc.min, wc.min, "files[{i}].stats[{j}].min");
                     assert_eq!(gc.max, wc.max, "files[{i}].stats[{j}].max");
-                    assert_eq!(gc.null_count, wc.null_count, "files[{i}].stats[{j}].null_count");
+                    assert_eq!(
+                        gc.null_count, wc.null_count,
+                        "files[{i}].stats[{j}].null_count"
+                    );
                 }
             }
             (a, b) => panic!("files[{i}].stats 有无不一致：{a:?} vs {b:?}"),
@@ -424,7 +465,7 @@ fn status_response_exposes_all_operational_fields() {
         first_index: 21,
         last_index: 30,
         version: yuntun_proto::PROTO_VERSION.into(),
-                leases: vec![
+        leases: vec![
             // `§172`：租约的运维视图（含 `granted_at_ms` —— 运维要回答"这件事做了多久"）
             LeaseView {
                 purpose: "compaction:public.dist:s0".into(),
@@ -453,7 +494,7 @@ fn status_response_exposes_all_operational_fields() {
             reason: 1,
             since_ms: 1700000000000,
         }],
-        };
+    };
     let back = roundtrip(&s);
     assert_eq!(back, s);
     // 快照健康度的三个量必须都在（缺任一个都无法判断"该发快照了吗"）

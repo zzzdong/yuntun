@@ -24,9 +24,9 @@ use yuntun_model::agg::{AggQuery, AggStates, PartialAgg};
 use yuntun_model::error::LakeError;
 use yuntun_model::ops::CreateTableRequest;
 use yuntun_query::{LocalCatalog, QueryEngine};
-use yuntun_store::{ColdReader,
-    RemoteShard, ShardAggs, ShardFetch, ShardId, ShardRead, ShardReader, ShardTier, create_store,
-    StoreConfig,
+use yuntun_store::{
+    ColdReader, RemoteShard, ShardAggs, ShardFetch, ShardId, ShardRead, ShardReader, ShardTier,
+    StoreConfig, create_store,
 };
 
 const TABLE: &str = "public.agg";
@@ -235,7 +235,6 @@ impl ShardReader for CountingReader {
     }
 }
 
-
 /// 部分状态在网上的**定长表示**有多大（真实实现是几十字节的 proto）。
 ///
 /// 分组时是"每组的标量" ⇒ 组越多越大，但**仍然不是行**（这正是这一刀要测的那件事）。
@@ -320,10 +319,8 @@ impl ShardFetch for WireFetch {
             // `§176`/`§177`：谓词与分组**都**在**数据旁边**生效（与真实服务端同一条代码路径）
             let states = yuntun_model::agg::fold_query(&query, &read.batches)?;
             // 上网的字节 = 部分状态那点标量（真实实现是几十字节的 proto）
-            self.agg_bytes.fetch_add(
-                agg_bytes_of(&states),
-                Ordering::SeqCst,
-            );
+            self.agg_bytes
+                .fetch_add(agg_bytes_of(&states), Ordering::SeqCst);
             Ok(ShardAggs {
                 states,
                 flushed_watermark: read.flushed_watermark,
@@ -498,7 +495,10 @@ async fn pushed_down_aggregates_match_the_row_path_bit_for_bit() {
         ("SELECT count(*) FROM agg WHERE 3 <= v", true),
         // `§177`：**分组**也能下推（每组的标量过网，不是行）
         ("SELECT v, count(*) FROM agg GROUP BY v", true),
-        ("SELECT v, count(*), sum(v), min(v) FROM agg GROUP BY v", true),
+        (
+            "SELECT v, count(*), sum(v), min(v) FROM agg GROUP BY v",
+            true,
+        ),
         // 字符串分组键（看板里最常见的"按主机/租户分组"）
         ("SELECT s, count(*) FROM agg GROUP BY s", true),
         // 多列键 + "键在前、聚合在后"
@@ -517,7 +517,10 @@ async fn pushed_down_aggregates_match_the_row_path_bit_for_bit() {
         ("SELECT count(*), v FROM agg GROUP BY v", false),
         ("SELECT v + 1, count(*) FROM agg GROUP BY v + 1", false),
         ("SELECT v, count(*) FROM agg GROUP BY v ORDER BY v", false),
-        ("SELECT v, count(*) FROM agg GROUP BY v HAVING count(*) > 1", false),
+        (
+            "SELECT v, count(*) FROM agg GROUP BY v HAVING count(*) > 1",
+            false,
+        ),
         ("SELECT avg(v) FROM agg", false),
         ("SELECT count(*) + 1 FROM agg", false),
     ];
@@ -562,7 +565,12 @@ async fn pushed_down_pull_moves_scalars_not_rows() {
     let wire = WireFetch::new(instance(&dir, "inst-r", &rows));
     let source: Arc<dyn ShardReader> = Arc::new(RemoteShard::new(wire.clone()));
 
-    let subject = engine(store.clone(), catalog.clone(), vec![("inst-r", source.clone())]).await;
+    let subject = engine(
+        store.clone(),
+        catalog.clone(),
+        vec![("inst-r", source.clone())],
+    )
+    .await;
     let reference = engine(store.clone(), catalog.clone(), vec![("inst-r", source)])
         .await
         .with_agg_pushdown(false);
@@ -574,8 +582,14 @@ async fn pushed_down_pull_moves_scalars_not_rows() {
 
     let agg = wire.agg_bytes.load(Ordering::SeqCst);
     let rows_bytes = wire.row_bytes.load(Ordering::SeqCst);
-    assert!(agg > 0, "聚合路径必须真的过了一次响应（否则这个对比是假的）");
-    assert!(rows_bytes > 0, "行路径必须真的传过字节（否则这个对比是假的）");
+    assert!(
+        agg > 0,
+        "聚合路径必须真的过了一次响应（否则这个对比是假的）"
+    );
+    assert!(
+        rows_bytes > 0,
+        "行路径必须真的传过字节（否则这个对比是假的）"
+    );
     eprintln!(
         "【§173 实测】无谓词：行 {rows_bytes} 字节 vs 聚合 {agg} 字节（{:.0}×）",
         rows_bytes as f64 / agg.max(1) as f64
@@ -674,15 +688,11 @@ async fn stale_sources_never_leak_into_a_pushed_down_answer() {
         CountingReader::new(instance(&dir, "inst-ok", &[Some(1), Some(2)]));
     let stale: Arc<dyn ShardReader> = Arc::new(AlwaysStale);
 
-    let e = engine(
-        store,
-        catalog,
-        vec![("inst-ok", ok), ("inst-stale", stale)],
-    )
-    .await
-    .sql_partial("SELECT count(*) FROM agg")
-    .await
-    .expect_err("STALE 必须失败（刷新重试上限后照样失败）");
+    let e = engine(store, catalog, vec![("inst-ok", ok), ("inst-stale", stale)])
+        .await
+        .sql_partial("SELECT count(*) FROM agg")
+        .await
+        .expect_err("STALE 必须失败（刷新重试上限后照样失败）");
     let msg = e.to_string();
     assert!(
         msg.contains("stale") && msg.contains("inst-stale"),
@@ -775,9 +785,7 @@ impl ShardReader for FoldingReader {
         known: u64,
         exclude: &[String],
     ) -> Result<ShardRead, LakeError> {
-        self.inner
-            .read_table_excluding(table, known, exclude)
-            .await
+        self.inner.read_table_excluding(table, known, exclude).await
     }
     async fn watermark(&self, known: u64) -> Result<ShardRead, LakeError> {
         self.inner.watermark(known).await
@@ -789,7 +797,9 @@ impl ShardReader for FoldingReader {
         exclude: &[String],
         query: &AggQuery,
     ) -> Result<ShardAggs, LakeError> {
-        self.inner.read_table_aggs(table, known, exclude, query).await
+        self.inner
+            .read_table_aggs(table, known, exclude, query)
+            .await
     }
     fn as_cold(&self) -> Option<Arc<dyn ColdReader>> {
         self.cold.clone()
@@ -855,7 +865,10 @@ async fn cold_files_are_shared_out_and_the_answer_is_unchanged() {
         "SELECT v, count(*) FROM agg GROUP BY v",
     ] {
         let before: usize = [cold_a.calls(), cold_b.calls()].into_iter().sum();
-        let got = engine.sql(sql).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let got = engine
+            .sql(sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
         let want = reference
             .sql(sql)
             .await
@@ -899,13 +912,19 @@ async fn a_node_that_cannot_fold_falls_back_to_local_reading() {
     )
     .await;
 
-    let got = engine.sql("SELECT count(*), sum(v) FROM agg").await.unwrap();
+    let got = engine
+        .sql("SELECT count(*), sum(v) FROM agg")
+        .await
+        .unwrap();
     let want = reference
         .sql("SELECT count(*), sum(v) FROM agg")
         .await
         .unwrap();
     assert_eq!(rows_of(&got), rows_of(&want), "回退本地读后答案必须不变");
-    assert!(cold_a.calls() > 0, "回退路径要真的调用过远端（否则没验到回退）");
+    assert!(
+        cold_a.calls() > 0,
+        "回退路径要真的调用过远端（否则没验到回退）"
+    );
     // 回退不是降级：**不**该出现 partial 标记（那份数据本地就能读到）
     let out = engine
         .sql_partial("SELECT count(*), sum(v) FROM agg")
@@ -945,7 +964,10 @@ async fn nodes_without_cold_folding_do_not_change_the_answer() {
     )
     .await;
 
-    let got = engine.sql("SELECT count(*), sum(v) FROM agg").await.unwrap();
+    let got = engine
+        .sql("SELECT count(*), sum(v) FROM agg")
+        .await
+        .unwrap();
     let want = reference
         .sql("SELECT count(*), sum(v) FROM agg")
         .await

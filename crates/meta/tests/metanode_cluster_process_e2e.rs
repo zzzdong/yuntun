@@ -266,7 +266,10 @@ fn start_cluster_of(root: &Path, ids: &[u64]) -> Cluster {
         let mut procs: HashMap<u64, Proc> = HashMap::new();
         for id in ids {
             let dir = run.join(format!("node{id}"));
-            procs.insert(*id, start_with_voters(*id, &dir, addrs[id], &addrs, ids, true));
+            procs.insert(
+                *id,
+                start_with_voters(*id, &dir, addrs[id], &addrs, ids, true),
+            );
         }
         let mut ok = true;
         for id in ids {
@@ -543,7 +546,8 @@ fn three_real_processes_elect_replicate_and_survive_leader_kill_and_restart() {
         );
         // 最硬的一条：幂等记录**只存在于状态机**里，而状态机是靠"重放已提交日志"重建的。
         // 命中（accepted=false）= 换主前那份提交在新 leader 上确实还在，不是"日志里在、状态机里没有"。
-        let replay = propose_following_leader(&live, &survivors, commit_op("b1", "key-b1", 1_002)).await;
+        let replay =
+            propose_following_leader(&live, &survivors, commit_op("b1", "key-b1", 1_002)).await;
         assert!(
             !replay.accepted,
             "换主后重放旧的幂等键必须命中（accepted=false）—— 否则说明已提交数据丢了"
@@ -579,8 +583,9 @@ fn three_real_processes_elect_replicate_and_survive_leader_kill_and_restart() {
     // ---- ⑦ 它从盘恢复并追平：三个进程再次收敛到同一条日志 ----
     let clients_all = rt.block_on(async { connect_all(&cluster.addrs, &IDS).await });
     // 重启的节点要先经过一轮选举/追日志；这里等**三个**都 applied==last 且 last_index 相同
-    let after_restart =
-        rt.block_on(async { wait_converged(&clients_all, &IDS, "重启后三进程再收敛").await });
+    let after_restart = rt.block_on(async {
+        wait_converged(&clients_all, &IDS, "重启后三进程再收敛").await
+    });
     for id in IDS {
         assert_eq!(
             after_restart[&id].0, after_restart[&id].1,
@@ -698,7 +703,10 @@ fn a_fourth_process_joins_a_running_cluster_and_catches_up() {
 
     let clients = rt.block_on(connect_all(&cluster.addrs, &IDS));
     let leader = rt.block_on(wait_some_leader(&clients, &IDS));
-    eprintln!("  集群 leader = {leader}，地址 {:?}", cluster.addrs[&leader]);
+    eprintln!(
+        "  集群 leader = {leader}，地址 {:?}",
+        cluster.addrs[&leader]
+    );
 
     // ---- ① 先写几条：让新节点"有东西可追" ----
     for k in 0..3u64 {
@@ -710,7 +718,10 @@ fn a_fourth_process_joins_a_running_cluster_and_catches_up() {
         assert!(r.accepted, "预备写入 k={k} 应当被接受");
     }
     let st0 = rt.block_on(status(&clients[&leader], leader));
-    eprintln!("  加入前：leader commit={} last={}", st0.commit_index, st0.last_index);
+    eprintln!(
+        "  加入前：leader commit={} last={}",
+        st0.commit_index, st0.last_index
+    );
 
     // ---- ② 起第 4 个进程（**空目录 + 不给 --init**，只给 --join 与 --advertise）----
     let addr4 = free_ports(1)[0];
@@ -800,9 +811,10 @@ fn a_fourth_process_joins_a_running_cluster_and_catches_up() {
     for id in IDS {
         let dir = cluster.run.join(format!("node{id}"));
         // 重启：**不带 `--init`**（目录里有数据，闸门会拒绝），`--peer` 仍是原来那三个
-        cluster
-            .procs
-            .insert(id, start(id, &dir, cluster.addrs[&id], &cluster.addrs, false));
+        cluster.procs.insert(
+            id,
+            start(id, &dir, cluster.addrs[&id], &cluster.addrs, false),
+        );
     }
     for id in IDS {
         assert!(
@@ -845,7 +857,6 @@ fn a_fourth_process_joins_a_running_cluster_and_catches_up() {
         std::thread::sleep(Duration::from_millis(200));
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // 成员变更的第二半：把 learner **提升为 voter**（`§120`）
@@ -895,7 +906,10 @@ fn promoting_a_learner_makes_it_count_for_the_quorum() {
         let s4 = rt.block_on(status(&c4, 4));
         let sl = rt.block_on(status(&clients[&leader0], leader0));
         if sl.commit_index > 0 && s4.applied_index >= sl.commit_index {
-            eprintln!("  ① 节点 4 已追平：applied={}（集群 commit={}）", s4.applied_index, sl.commit_index);
+            eprintln!(
+                "  ① 节点 4 已追平：applied={}（集群 commit={}）",
+                s4.applied_index, sl.commit_index
+            );
             break;
         }
         assert!(
@@ -931,7 +945,11 @@ fn promoting_a_learner_makes_it_count_for_the_quorum() {
             .expect("提升应当成功（§120）")
             .into_inner()
     });
-    assert_eq!(resp.voter_ids, vec![1, 2, 3, 4], "提升后成员表必须含 4：{resp:?}");
+    assert_eq!(
+        resp.voter_ids,
+        vec![1, 2, 3, 4],
+        "提升后成员表必须含 4：{resp:?}"
+    );
     assert!(
         resp.learner_ids.is_empty(),
         "它已经不再是 learner：{:?}",
@@ -970,7 +988,9 @@ fn promoting_a_learner_makes_it_count_for_the_quorum() {
         res.is_err(),
         "4 个 voter 只活 2 个（{{1,3}}）⇒ 不到 quorum，**不该**被接受：{res:?}"
     );
-    eprintln!("  ④ 提升后：同一批存活 voter {{1,3}} 已不构成多数派 ⇒ 写入**停住**（4s 内未被接受）");
+    eprintln!(
+        "  ④ 提升后：同一批存活 voter {{1,3}} 已不构成多数派 ⇒ 写入**停住**（4s 内未被接受）"
+    );
 }
 
 // ---------------------------------------------------------------------------

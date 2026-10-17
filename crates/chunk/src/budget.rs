@@ -12,8 +12,8 @@
 //! 分区在本 crate 只体现为**两个独立账本**；query 侧由 `yuntun-query` 把 query 账本接成
 //! DataFusion 的内存池，从而在物理计划层真正生效（两边不共享任何计数器）。
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// 背压水位（架构 §2.7 背压阶梯）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,7 +93,11 @@ impl MemoryLedger {
         })
     }
 
-    pub fn with_thresholds(name: &'static str, limit: usize, thresholds: PressureThresholds) -> Arc<Self> {
+    pub fn with_thresholds(
+        name: &'static str,
+        limit: usize,
+        thresholds: PressureThresholds,
+    ) -> Arc<Self> {
         Arc::new(Self {
             name,
             limit,
@@ -121,11 +125,7 @@ impl MemoryLedger {
     /// 水位比例 `[0, +inf)`；`limit == 0` 视为已满（0 字节预算 = 禁止驻留）。
     pub fn ratio(&self) -> f64 {
         if self.limit == 0 {
-            if self.used() == 0 {
-                0.0
-            } else {
-                f64::INFINITY
-            }
+            if self.used() == 0 { 0.0 } else { f64::INFINITY }
         } else {
             self.used() as f64 / self.limit as f64
         }
@@ -178,11 +178,7 @@ pub struct MemoryPartition {
 impl MemoryPartition {
     /// `chunk_bytes` / `query_bytes` 相互独立，互不借用。
     pub fn new(chunk_bytes: usize, query_bytes: usize) -> Self {
-        Self::with_thresholds(
-            chunk_bytes,
-            query_bytes,
-            PressureThresholds::default(),
-        )
+        Self::with_thresholds(chunk_bytes, query_bytes, PressureThresholds::default())
     }
 
     pub fn with_thresholds(
@@ -266,7 +262,10 @@ mod tests {
         assert_eq!(p.query().pressure(), Pressure::Reject);
         assert_eq!(p.chunk().used(), 0);
         assert_eq!(p.chunk().pressure(), Pressure::Normal);
-        assert!(p.chunk().try_reserve(100), "chunk 区必须保底，不被 query 抢占");
+        assert!(
+            p.chunk().try_reserve(100),
+            "chunk 区必须保底，不被 query 抢占"
+        );
     }
 
     /// **硬分区**（架构 §2.8，plan `T6.14`）：chunk 区触顶**与** query 区无关，反之亦然。
@@ -279,7 +278,10 @@ mod tests {
 
         // ① chunk 区塞到限额：再要一个字节必须**被拒**，且被拒的那次**不计入**用量
         assert!(p.chunk().try_reserve(100), "限额内的申请应当成功");
-        assert!(!p.chunk().try_reserve(1), "超出限额必须**被拒**（不是静默超限）");
+        assert!(
+            !p.chunk().try_reserve(1),
+            "超出限额必须**被拒**（不是静默超限）"
+        );
         assert_eq!(p.chunk().used(), 100, "被拒的申请不得计入用量");
         assert!(
             p.chunk().pressure().rejects_writes(),

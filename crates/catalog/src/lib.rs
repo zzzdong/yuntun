@@ -14,12 +14,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use yuntun_model::dv::DeletionEntry;
 use yuntun_model::error::LakeError;
 use yuntun_model::meta::{
-    DatanodeMember, LeaseGrant, FileManifest, IdempotencyRecord, TableMeta,
-    compute_stats_lite,
+    DatanodeMember, FileManifest, IdempotencyRecord, LeaseGrant, TableMeta, compute_stats_lite,
 };
 use yuntun_model::ops::{
-    qualified_name, split_qualified, CatalogVersion, CommitFilesRequest, CommitFilesResponse,
-    CreateTableRequest, EvolveSchemaRequest, EvolveSchemaResponse, ManifestDelta,
+    CatalogVersion, CommitFilesRequest, CommitFilesResponse, CreateTableRequest,
+    EvolveSchemaRequest, EvolveSchemaResponse, ManifestDelta, qualified_name, split_qualified,
 };
 use yuntun_model::schema::SchemaChangeKind;
 
@@ -78,7 +77,7 @@ pub trait CatalogOps: Send + Sync {
     // ---- 文件 ----
     /// 提交文件清单（幂等，按 batch_id / client_request_id 去重）
     async fn commit_files(&self, req: CommitFilesRequest)
-        -> Result<CommitFilesResponse, LakeError>;
+    -> Result<CommitFilesResponse, LakeError>;
 
     /// 查询某表在某快照下的可见文件（Manifest 驱动，C7）
     async fn list_visible_files(
@@ -118,11 +117,8 @@ pub trait CatalogOps: Send + Sync {
     /// **撤销**锚定在某文件上的 DV（compaction 把那些行物理重写掉之后调用），返回条数。
     ///
     /// 置 `revoked_at` 而不是删行：删了就无法回答"某个历史快照当时看到什么"。
-    async fn revoke_deletions_for_file(
-        &self,
-        file_path: &str,
-        at: u64,
-    ) -> Result<usize, LakeError>;
+    async fn revoke_deletions_for_file(&self, file_path: &str, at: u64)
+    -> Result<usize, LakeError>;
 
     /// **目录里被事件引用**的删除向量对象路径（GC 的"被引用"集合，`F.3d-4` / `§156`）。
     ///
@@ -432,7 +428,10 @@ impl CatalogOps for MemoryCatalog {
 
     async fn apply_deletions(&self, entries: Vec<DeletionEntry>) -> Result<u64, LakeError> {
         // 时钟在宿主取（同 `apply_update`）：状态机不读钟（纪律 1）
-        self.state.write().unwrap().apply_deletions(entries, now_ms())
+        self.state
+            .write()
+            .unwrap()
+            .apply_deletions(entries, now_ms())
     }
 
     async fn list_deletions(
@@ -601,7 +600,11 @@ impl CatalogOps for MemoryCatalog {
     }
 
     async fn manifest_delta(&self, since_manifest_ver: u64) -> Result<ManifestDelta, LakeError> {
-        Ok(self.state.read().unwrap().manifest_delta(since_manifest_ver))
+        Ok(self
+            .state
+            .read()
+            .unwrap()
+            .manifest_delta(since_manifest_ver))
     }
 
     // ---------------------------------------------------------- compaction / 运维
@@ -613,10 +616,12 @@ impl CatalogOps for MemoryCatalog {
         lease_epoch: u64,
         lease_purpose: &str,
     ) -> Result<u64, LakeError> {
-        self.state
-            .write()
-            .unwrap()
-            .commit_compaction(old_batch_ids, new_files, lease_epoch, lease_purpose)
+        self.state.write().unwrap().commit_compaction(
+            old_batch_ids,
+            new_files,
+            lease_epoch,
+            lease_purpose,
+        )
     }
 
     async fn known_batch_ids(&self) -> Result<Vec<String>, LakeError> {
@@ -668,11 +673,11 @@ pub fn change_kind_value(kind: SchemaChangeKind) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yuntun_model::ops::DEFAULT_SCHEMA;
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
     use yuntun_model::ops::CreateTableRequest;
-    use yuntun_model::schema::{classify, SchemaChange, SchemaCompatibility};
+    use yuntun_model::ops::DEFAULT_SCHEMA;
+    use yuntun_model::schema::{SchemaChange, SchemaCompatibility, classify};
 
     fn schema(fields: &[(&str, DataType)]) -> SchemaRef {
         let fs: Vec<Field> = fields
@@ -788,7 +793,10 @@ mod tests {
         c.drop_table("audit").await.unwrap();
         let after = c.version().await;
         assert!(after.schema_ver > before.schema_ver, "删表推 schema_ver");
-        assert!(after.manifest_ver > before.manifest_ver, "删表推 manifest_ver");
+        assert!(
+            after.manifest_ver > before.manifest_ver,
+            "删表推 manifest_ver"
+        );
 
         let d = c.manifest_delta(before.manifest_ver).await.unwrap();
         assert!(
@@ -990,8 +998,8 @@ mod tests {
         assert_eq!(resp.version, 2);
 
         // 窄化被 apply_change 拒绝
-        assert!(c
-            .evolve_schema(EvolveSchemaRequest {
+        assert!(
+            c.evolve_schema(EvolveSchemaRequest {
                 table: "audit".into(),
                 change: SchemaChange::WidenType {
                     column: "ts".into(),
@@ -1000,7 +1008,8 @@ mod tests {
                 expected_version: 2,
             })
             .await
-            .is_err());
+            .is_err()
+        );
     }
 
     // T3.1/T3.4：快照可见性过滤
@@ -1438,7 +1447,10 @@ mod multi_writer_retry {
             .commit_files(req("b-b", "key-b", "inst-b", "p/b.parquet"))
             .await
             .unwrap();
-        assert!(r1.accepted && r2.accepted, "两个不同的键各写各的，都该被接受");
+        assert!(
+            r1.accepted && r2.accepted,
+            "两个不同的键各写各的，都该被接受"
+        );
 
         let files = c
             .list_visible_files(TABLE, c.current_snapshot().await, None)

@@ -30,8 +30,8 @@
 //! ⇒ 这条用例既能证明修复有效，也把"为什么必须这么修"写成了可执行的形式。
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tonic::{Request, Response, Status};
 use yuntun_catalog::CatalogOps;

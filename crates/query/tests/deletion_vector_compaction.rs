@@ -57,7 +57,9 @@ impl Fx {
     async fn rows(&self) -> Vec<i64> {
         let batches = self
             .engine
-            .sql(&format!("SELECT event_time FROM {TABLE} ORDER BY event_time"))
+            .sql(&format!(
+                "SELECT event_time FROM {TABLE} ORDER BY event_time"
+            ))
             .await
             .unwrap();
         let mut out = Vec::new();
@@ -172,10 +174,11 @@ async fn compaction_consumes_the_deletion_vector_and_keeps_the_row_set_exact() {
         lease_holder: "comp-test".into(),
     });
     let snap = f.catalog.current_snapshot().await;
-    let new_snap = yuntun_compaction::compact_shard(&compactor, &format!("public.{TABLE}"), "s0", snap, 0)
-        .await
-        .unwrap()
-        .expect("两个文件 + min_files=1 ⇒ 必须合并");
+    let new_snap =
+        yuntun_compaction::compact_shard(&compactor, &format!("public.{TABLE}"), "s0", snap, 0)
+            .await
+            .unwrap()
+            .expect("两个文件 + min_files=1 ⇒ 必须合并");
 
     // 产物：行数 = 5 + 5 − 2（被删的两行**没有**被写进新文件）
     f.cache.refresh(&f.catalog).await.unwrap();
@@ -232,16 +235,11 @@ async fn compaction_handles_a_fully_deleted_file() {
         lease_holder: "comp-test".into(),
     });
     let snap = f.catalog.current_snapshot().await;
-    let new_snap = yuntun_compaction::compact_shard(
-        &compactor,
-        &format!("public.{TABLE}"),
-        "s0",
-        snap,
-        0,
-    )
-    .await
-    .unwrap()
-    .expect("必须合并");
+    let new_snap =
+        yuntun_compaction::compact_shard(&compactor, &format!("public.{TABLE}"), "s0", snap, 0)
+            .await
+            .unwrap()
+            .expect("必须合并");
 
     f.cache.refresh(&f.catalog).await.unwrap();
     let files = f

@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{Array, Int64Array};
-use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::Ticket;
+use arrow_flight::flight_service_client::FlightServiceClient;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use yuntun_server::Lakehouse;
@@ -266,7 +266,10 @@ async fn multi_schema_create_isolate_and_recover() {
         })
         .collect();
     assert!(names.contains(&"recover".to_string()), "{names:?}");
-    assert!(!names.contains(&"sales".to_string()), "DROP 语义保持: {names:?}");
+    assert!(
+        !names.contains(&"sales".to_string()),
+        "DROP 语义保持: {names:?}"
+    );
     let err = run_sql_err(&mut client, "SELECT count(*) FROM recover.nope").await;
     assert_eq!(err.code(), tonic::Code::NotFound, "{err:?}");
     // 重放后的表可查（schema 存在 → 解析成功 → 0 行）

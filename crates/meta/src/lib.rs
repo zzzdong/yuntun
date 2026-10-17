@@ -47,9 +47,9 @@ pub mod transport;
 pub use cli::Args;
 pub use error::{MetaError, MetaNodeError};
 pub use fjall_storage::FjallStorage;
-pub use op::{apply, decode_op, StateOp};
+pub use op::{StateOp, apply, decode_op};
 pub use remote_catalog::RemoteCatalog;
-pub use service::{serve, MetaService};
+pub use service::{MetaService, serve};
 pub use storage::MetaStorage;
 pub use transport::{
     GrpcTransport, MpscTransport, NoTransport, PeerTransport, TransportStats, TransportStatsView,
@@ -61,15 +61,15 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use raft::StateRole;
 use raft::eraftpb::{Entry, EntryType, Message, Snapshot};
 use raft::prelude::*;
-use raft::StateRole;
 // `ConfChange::merge_from_bytes` 来自 protobuf trait（raft-rs 0.7 默认 protobuf 编解码）
 use protobuf::Message as PbMessage;
 
+use prost::Message as _;
 use yuntun_catalog::CatalogState;
 use yuntun_model::meta::{FileManifest, TableMeta};
-use prost::Message as _;
 
 /// 三节点的固定成员表（PoC 用常量；生产由 `--init` / `Join` 决定）。
 pub const PEERS: [u64; 3] = [1, 2, 3];
@@ -142,9 +142,7 @@ enum Command {
         reply: SyncSender<Result<(), MetaError>>,
     },
     /// 当前成员表快照（[`MembersView`]）。
-    Members {
-        reply: SyncSender<MembersView>,
-    },
+    Members { reply: SyncSender<MembersView> },
     /// 停止该节点（模拟崩溃：线程退出、消息不再收发）。
     Stop,
 }
@@ -358,7 +356,10 @@ impl NodeHandle {
     pub fn promote(&self, id: u64, timeout: Duration) -> Result<(), MetaError> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.cmd_tx
-            .send(Command::Promote { id, reply: reply_tx })
+            .send(Command::Promote {
+                id,
+                reply: reply_tx,
+            })
             .map_err(|e| MetaError::Storage(format!("命令通道断开：{e}")))?;
         match reply_rx.recv_timeout(timeout) {
             Ok(r) => r,
@@ -373,7 +374,10 @@ impl NodeHandle {
     pub fn remove(&self, id: u64, timeout: Duration) -> Result<(), MetaError> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.cmd_tx
-            .send(Command::Remove { id, reply: reply_tx })
+            .send(Command::Remove {
+                id,
+                reply: reply_tx,
+            })
             .map_err(|e| MetaError::Storage(format!("命令通道断开：{e}")))?;
         match reply_rx.recv_timeout(timeout) {
             Ok(r) => r,
@@ -515,7 +519,11 @@ impl NodeHandle {
                     .collect(),
                 idempotency_keys: keys,
                 // `§169`：任务目录 —— 与 files/deletions **同一次响应**下发（它是这两者派生的）
-                tasks: st.list_tasks().iter().map(crate::op::task_to_proto).collect(),
+                tasks: st
+                    .list_tasks()
+                    .iter()
+                    .map(crate::op::task_to_proto)
+                    .collect(),
             }),
             full_reload: full,
         }
@@ -680,7 +688,12 @@ impl Cluster {
     pub fn wait_leader(&self, timeout: Duration) -> Option<u64> {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            if let Some(id) = self.nodes.iter().find(|(_, n)| n.is_leader()).map(|(id, _)| *id) {
+            if let Some(id) = self
+                .nodes
+                .iter()
+                .find(|(_, n)| n.is_leader())
+                .map(|(id, _)| *id)
+            {
                 return Some(id);
             }
             thread::sleep(Duration::from_millis(10));
@@ -926,14 +939,8 @@ pub fn spawn_liveness_sweep(
                         std::time::Duration::from_secs(5),
                     );
                 }
-                let roster: Vec<String> = hb
-                    .sm
-                    .lock()
-                    .unwrap()
-                    .datanodes()
-                    .keys()
-                    .cloned()
-                    .collect();
+                let roster: Vec<String> =
+                    hb.sm.lock().unwrap().datanodes().keys().cloned().collect();
                 for id in roster {
                     let stale = {
                         let mut st = hb.status.lock().unwrap();
@@ -960,7 +967,9 @@ pub fn spawn_liveness_sweep(
                             tracing::warn!(instance = %id, "datanode evicted: heartbeat timeout");
                         }
                         // **不**在失败时清存活记录：下一轮还会看到它仍超时，于是重试
-                        Err(e) => tracing::warn!(instance = %id, error = %e, "摘除提议失败，下轮重试"),
+                        Err(e) => {
+                            tracing::warn!(instance = %id, error = %e, "摘除提议失败，下轮重试")
+                        }
                     }
                 }
             })
@@ -1117,7 +1126,18 @@ impl MetaNode {
             raft_inbox: inbox_tx,
         };
         let thread = spawn_node(
-            id, rx, transport, sm, storage, role, applied, debug, status, cmd_rx, members_init, opts,
+            id,
+            rx,
+            transport,
+            sm,
+            storage,
+            role,
+            applied,
+            debug,
+            status,
+            cmd_rx,
+            members_init,
+            opts,
         );
         Ok(Self {
             id,
@@ -1274,7 +1294,11 @@ fn spawn_node(
             loop {
                 match cmd_rx.try_recv() {
                     Ok(Command::Stop) => break 'node,
-                    Ok(Command::AddLearner { id: nid, addr, reply }) => {
+                    Ok(Command::AddLearner {
+                        id: nid,
+                        addr,
+                        reply,
+                    }) => {
                         if raw.raft.state == StateRole::Leader {
                             let cc = raft::eraftpb::ConfChange {
                                 change_type: raft::eraftpb::ConfChangeType::AddLearnerNode,
@@ -1336,9 +1360,9 @@ fn spawn_node(
                             match raw.propose(vec![], op.encode_to_vec()) {
                                 Ok(()) => pending.push_back(reply),
                                 Err(e) => {
-                                    let _ = reply.send(Err(MetaError::Storage(
-                                        format!("raft propose 失败：{e}"),
-                                    )));
+                                    let _ = reply.send(Err(MetaError::Storage(format!(
+                                        "raft propose 失败：{e}"
+                                    ))));
                                 }
                             }
                         } else {
@@ -1369,10 +1393,7 @@ fn spawn_node(
                     .map(|(id, pr)| {
                         format!(
                             "peer{id}(next={},matched={},state={:?},active={})",
-                            pr.next_idx,
-                            pr.matched,
-                            pr.state,
-                            pr.recent_active
+                            pr.next_idx, pr.matched, pr.state, pr.recent_active
                         )
                     })
                     .collect();
@@ -1696,9 +1717,7 @@ fn apply_committed(
     sm: &Arc<Mutex<CatalogState>>,
     storage: &FjallStorage,
     applied: &Arc<Mutex<u64>>,
-    pending: &mut VecDeque<
-        SyncSender<Result<yuntun_proto::meta::ProposeResponse, MetaError>>,
-    >,
+    pending: &mut VecDeque<SyncSender<Result<yuntun_proto::meta::ProposeResponse, MetaError>>>,
     transport: &Arc<dyn PeerTransport>,
     members: &mut HashMap<u64, String>,
 ) {

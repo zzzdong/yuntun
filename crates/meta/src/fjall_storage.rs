@@ -233,7 +233,10 @@ impl FjallStorage {
             })?;
             Arc::new(Mutex::new(st))
         };
-        let storage = Self { sm: sm.clone(), ..storage };
+        let storage = Self {
+            sm: sm.clone(),
+            ..storage
+        };
         // 状态机在哪，`applied` 就该在哪（派生量按权威链重置，见 `reset_applied`）。
         // 快照 index = 0 时重置为 0 → raft 会从日志第 1 条重放 ✓ 正是重建所需。
         storage.reset_applied(idx)?;
@@ -502,7 +505,10 @@ impl Storage for FjallStorage {
         // 而空 append 会让 follower 误以为"没事"（`§106`/`§107` 的停摆就卡在这里）。
         self.trace(
             "entries",
-            format!("[{low},{high}) first={first} last={last} → {} 条", out.len()),
+            format!(
+                "[{low},{high}) first={first} last={last} → {} 条",
+                out.len()
+            ),
         );
         Ok(out)
     }
@@ -583,7 +589,9 @@ fn artifact_key(idx: u64) -> Vec<u8> {
 }
 
 fn read_u64(ks: &Keyspace, key: &[u8]) -> fjall::Result<Option<u64>> {
-    let Some(v) = ks.get(key)? else { return Ok(None) };
+    let Some(v) = ks.get(key)? else {
+        return Ok(None);
+    };
     if v.len() != 8 {
         return Ok(None);
     }
@@ -597,15 +605,12 @@ fn write_u64(ks: &Keyspace, key: &[u8], v: u64) -> fjall::Result<()> {
 }
 
 fn read_msg<T: PbMessage>(ks: &Keyspace, key: &[u8]) -> fjall::Result<Option<T>> {
-    Ok(ks
-        .get(key)?
-        .and_then(|v| T::parse_from_bytes(&v).ok()))
+    Ok(ks.get(key)?.and_then(|v| T::parse_from_bytes(&v).ok()))
 }
 
 fn write_msg<T: PbMessage>(ks: &Keyspace, key: &[u8], msg: &T) -> fjall::Result<()> {
     ks.insert(key, msg.write_to_bytes().unwrap())
 }
-
 
 /// 成员地址表的**内部**编码（`§119`）：每行 `id\t地址`。
 ///

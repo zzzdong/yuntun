@@ -22,7 +22,7 @@ use yuntun_query::{LocalCatalog, QueryEngine};
 use yuntun_sql::registry::QueryRegistry;
 use yuntun_sql::session::SessionCtx;
 use yuntun_sql::{SqlEngine, SqlError, SqlResult};
-use yuntun_store::{create_store, StoreConfig};
+use yuntun_store::{StoreConfig, create_store};
 
 fn engine() -> SqlEngine {
     let catalog: Arc<dyn CatalogOps> = Arc::new(MemoryCatalog::new());
@@ -37,7 +37,10 @@ fn engine() -> SqlEngine {
 
 /// 从结果集里按列名取一行（`SHOW PROCESSLIST` 的列顺序是 MySQL 契约，不能靠猜）。
 fn rows_of(out: SqlResult) -> (Vec<String>, Vec<arrow::record_batch::RecordBatch>) {
-    let SqlResult::Rows { schema, batches, .. } = out else {
+    let SqlResult::Rows {
+        schema, batches, ..
+    } = out
+    else {
         panic!("应当是结果集");
     };
     let names = schema.fields().iter().map(|f| f.name().clone()).collect();
@@ -115,7 +118,10 @@ async fn processlist_has_mysql_columns_and_shows_queries_and_sleepers() {
 
     // ③ 查询结束后同一条连接变成 Sleep（Id 不变 —— 客户端拿它继续 KILL）
     drop(running);
-    let out = engine.execute("SHOW PROCESSLIST", &mut session).await.unwrap();
+    let out = engine
+        .execute("SHOW PROCESSLIST", &mut session)
+        .await
+        .unwrap();
     let (_, batches) = rows_of(out);
     let batch = &batches[0];
     let mut slept = false;
@@ -144,9 +150,16 @@ async fn a_registered_connection_keeps_its_id_across_queries() {
     let mut session = SessionCtx::mysql();
     session.conn_id = Some(id);
     for _ in 0..2 {
-        engine.execute("SHOW DATABASES", &mut session).await.unwrap();
+        engine
+            .execute("SHOW DATABASES", &mut session)
+            .await
+            .unwrap();
         let rows = registry.snapshot();
-        assert_eq!(rows.len(), 1, "只应有一条连接（不能每次查询都新建临时会话）");
+        assert_eq!(
+            rows.len(),
+            1,
+            "只应有一条连接（不能每次查询都新建临时会话）"
+        );
         assert_eq!(rows[0].id, id, "Id 必须跨查询稳定");
         assert_eq!(rows[0].host, "10.0.0.9:3306");
         assert_eq!(rows[0].user, "bob");
@@ -176,10 +189,7 @@ async fn kill_query_cancels_only_the_target_and_rejects_unknown_ids() {
     assert!(!oq.is_cancelled(), "别的查询**不能**被误杀");
 
     // ② 未知 Id ⇒ 1094 语义（不静默成功）
-    match engine
-        .execute("KILL QUERY 424242", &mut session)
-        .await
-    {
+    match engine.execute("KILL QUERY 424242", &mut session).await {
         Err(SqlError::UnknownThread(id)) => assert_eq!(id, 424242),
         Err(e) => panic!("期望 UnknownThread，实际错误 {e}"),
         Ok(_) => panic!("期望 UnknownThread，实际执行成功"),

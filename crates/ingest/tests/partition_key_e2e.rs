@@ -24,8 +24,8 @@ use arrow::array::{Int64Array, TimestampNanosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use yuntun_catalog::{CatalogOps, MemoryCatalog};
 use yuntun_ingest::{Ingestor, IngestorConfig};
-use yuntun_model::ops::CreateTableRequest;
 use yuntun_model::IngestBatch;
+use yuntun_model::ops::CreateTableRequest;
 
 /// 事件时间列叫 `ts`（**不是** `event_time`），类型 `Timestamp(ns)` —— SQL `TIMESTAMP`
 /// 建出来就是这一档，正是老实现"认不出来"的那一档。
@@ -57,11 +57,7 @@ fn eager_config(wal_dir: &std::path::Path) -> IngestorConfig {
     }
 }
 
-async fn create(
-    catalog: &Arc<dyn CatalogOps>,
-    name: &str,
-    partition_cols: Vec<String>,
-) {
+async fn create(catalog: &Arc<dyn CatalogOps>, name: &str, partition_cols: Vec<String>) {
     catalog
         .create_table(CreateTableRequest {
             name: name.into(),
@@ -104,10 +100,7 @@ async fn files_of(
     table: &str,
 ) -> Vec<yuntun_model::meta::FileManifest> {
     let snap = catalog.current_snapshot().await;
-    catalog
-        .list_visible_files(table, snap, None)
-        .await
-        .unwrap()
+    catalog.list_visible_files(table, snap, None).await.unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

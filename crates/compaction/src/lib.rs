@@ -317,7 +317,9 @@ async fn compact_shard_inner(
     // 产物格式（`§164`）：**输入格式一致就沿用**（合并不该顺手做"格式迁移" ——
     // 那会静默改变既有部署的存储形态与体积）；输入混合时才回退到 `compactor.format`。
     let out_format = {
-        let mut it = files.iter().map(|f| yuntun_format::DataFormat::from_path(&f.file_path));
+        let mut it = files
+            .iter()
+            .map(|f| yuntun_format::DataFormat::from_path(&f.file_path));
         let first = it.next().unwrap_or(compactor.format);
         if it.all(|f| f == first) {
             first
@@ -457,9 +459,8 @@ fn apply_deletions(
     row_count: u64,
     file_path: &str,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, LakeError> {
-    dv.keep_ranges(row_count).map_err(|e| {
-        LakeError::Other(format!("{e}（文件 {file_path}）"))
-    })?;
+    dv.keep_ranges(row_count)
+        .map_err(|e| LakeError::Other(format!("{e}（文件 {file_path}）")))?;
     let mut out = Vec::with_capacity(batches.len());
     let mut offset: u64 = 0;
     for b in batches {
@@ -473,8 +474,9 @@ fn apply_deletions(
             out.push(b);
         } else {
             out.push(
-                arrow::compute::filter_record_batch(&b, &keep)
-                    .map_err(|e| LakeError::Other(format!("应用删除向量失败（{file_path}）：{e}")))?,
+                arrow::compute::filter_record_batch(&b, &keep).map_err(|e| {
+                    LakeError::Other(format!("应用删除向量失败（{file_path}）：{e}"))
+                })?,
             );
         }
         offset += n;
@@ -952,8 +954,7 @@ mod tests {
         let mut want = vec![dv_gone.clone(), dv_orphan.clone()];
         want.sort();
         assert_eq!(
-            orphans,
-            want,
+            orphans, want,
             "① 锚定文件活着 **且** 目录认它 ⇒ 保护（dv-1）；\
              ② 锚定文件活着但**没人引用** ⇒ 孤儿（dv-ghost：对象写了、apply 没落地）；\
              ③ 锚定文件没了 ⇒ 孤儿（dv-2，引用不救它）"
@@ -992,7 +993,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc as SArc;
     use yuntun_catalog::MemoryCatalog;
-    use yuntun_format::{write_batch, DataFormat};
+    use yuntun_format::{DataFormat, write_batch};
     use yuntun_model::ops::CommitFilesRequest;
     use yuntun_model::ops::CreateTableRequest;
 
@@ -1049,8 +1050,8 @@ mod tests {
         let mut first_seen = std::collections::HashMap::new();
         let mut last: Option<(Vec<String>, Vec<String>)> = None;
         for _ in 0..MAX_ROUNDS {
-            let _ = orphan_cleanup_round(store, catalog, prefix, Duration::ZERO, &mut first_seen)
-                .await;
+            let _ =
+                orphan_cleanup_round(store, catalog, prefix, Duration::ZERO, &mut first_seen).await;
             let objects: Vec<String> = list_s3_files(store, prefix)
                 .await
                 .unwrap()
@@ -1350,8 +1351,8 @@ mod tests {
         let mut left: Vec<String> = Vec::new();
         let mut settled = false;
         for _ in 0..32 {
-            let _ =
-                orphan_cleanup_round(&store, &cat, "yuntun/", Duration::ZERO, &mut first_seen).await;
+            let _ = orphan_cleanup_round(&store, &cat, "yuntun/", Duration::ZERO, &mut first_seen)
+                .await;
             left = list_s3_files(&store, "yuntun/")
                 .await
                 .unwrap()
@@ -1694,16 +1695,20 @@ mod tests {
         )
         .await
         .unwrap();
-        catalog.record_in_flight("inflight-batch", now_ms()).await.unwrap();
+        catalog
+            .record_in_flight("inflight-batch", now_ms())
+            .await
+            .unwrap();
 
         // `§171`：**按轮驱动**孤儿对账，不再 `spawn` 后台循环 + `sleep(300ms)` 赌它跑过 ——
         // 那种写法在机器被占满时会**假通过**（GC 一轮都没扫到，于是"真孤儿应被回收"无从谈起）。
         // 一轮就够：grace = ZERO ⇒ **不靠时间假设**，只靠"在途可见"。
         let cat: Arc<dyn CatalogOps> = catalog.clone();
         let mut first_seen = std::collections::HashMap::new();
-        let removed = orphan_cleanup_round(&store, &cat, "yuntun/", Duration::ZERO, &mut first_seen)
-            .await
-            .expect("一轮对账（对账基准拿得到）");
+        let removed =
+            orphan_cleanup_round(&store, &cat, "yuntun/", Duration::ZERO, &mut first_seen)
+                .await
+                .expect("一轮对账（对账基准拿得到）");
         assert!(
             removed >= 1,
             "这一轮至少要回收那个纯孤儿（否则这条用例是空转）：removed={removed}"
@@ -1742,10 +1747,11 @@ mod tests {
         };
 
         // 持有代次 1 ⇒ 提交通过
-        assert!(cat
-            .commit_compaction(&[], vec![mf("m1")], 1, "")
-            .await
-            .is_ok());
+        assert!(
+            cat.commit_compaction(&[], vec![mf("m1")], 1, "")
+                .await
+                .is_ok()
+        );
 
         // 租约过期、被别人接管 ⇒ 代次 2
         let g2 = cat
@@ -1762,7 +1768,11 @@ mod tests {
         assert!(e.to_string().contains("fenced"), "{e}");
 
         // 新持有者的提交照常
-        assert!(cat.commit_compaction(&[], vec![mf("m3")], 2, "").await.is_ok());
+        assert!(
+            cat.commit_compaction(&[], vec![mf("m3")], 2, "")
+                .await
+                .is_ok()
+        );
     }
 
     fn compactor(catalog: Arc<dyn CatalogOps>) -> Compactor {
@@ -1866,7 +1876,10 @@ mod tests {
             .unwrap();
         assert!(mine.granted);
         assert!(
-            compact_shard(&c, "t", "s0", snap, 0).await.unwrap().is_none(),
+            compact_shard(&c, "t", "s0", snap, 0)
+                .await
+                .unwrap()
+                .is_none(),
             "本分片被 DML 占着 ⇒ 必须跳过（硬干会让已删的行复活）"
         );
         assert_eq!(s0_files(catalog.clone()).await, 3, "跳过时不许动任何文件");
@@ -1891,7 +1904,10 @@ mod tests {
             .unwrap();
         assert!(other.granted);
         assert!(
-            compact_shard(&c, "t", "s0", snap, 0).await.unwrap().is_some(),
+            compact_shard(&c, "t", "s0", snap, 0)
+                .await
+                .unwrap()
+                .is_some(),
             "**别的分片**的锁不许挡住本分片的合并（那正是表级互斥的毛病）"
         );
         assert_eq!(
@@ -1967,7 +1983,10 @@ mod tests {
         );
 
         // 执行合并
-        let new_snap = compact_shard(&c, "t", "s0", snap, 0).await.unwrap().unwrap();
+        let new_snap = compact_shard(&c, "t", "s0", snap, 0)
+            .await
+            .unwrap()
+            .unwrap();
 
         // 旧快照仍见 3 个（快照隔离）；新快照只见 1 个合并文件
         assert_eq!(
@@ -1995,7 +2014,12 @@ mod tests {
         let c = compactor(catalog.clone());
         let snap = catalog.current_snapshot().await;
         // 无文件 → None
-        assert!(compact_shard(&c, "t", "s0", snap, 0).await.unwrap().is_none());
+        assert!(
+            compact_shard(&c, "t", "s0", snap, 0)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

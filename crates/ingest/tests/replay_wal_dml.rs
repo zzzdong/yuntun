@@ -15,7 +15,7 @@ use std::sync::Arc;
 use yuntun_catalog::{CatalogOps, MemoryCatalog};
 use yuntun_model::dv::DvBitmap;
 use yuntun_model::wal_record::{
-    DeletePayload, DdlPayload, FileDeletion, NewFilePayload, PurgePayload, Record, UpdatePayload,
+    DdlPayload, DeletePayload, FileDeletion, NewFilePayload, PurgePayload, Record, UpdatePayload,
     ddl_op,
 };
 use yuntun_wal::writer::WalWriter;
@@ -71,7 +71,11 @@ async fn replay_rebuilds_deletions_from_the_wal_alone() {
     wal.append(Record::Delete(DeletePayload {
         table: TABLE.into(),
         dv_id: "dv-stale".into(),
-        deletions: vec![deletion("yuntun/public/t/dt=w/shard=s0/old.parquet", "b-old", &[1])],
+        deletions: vec![deletion(
+            "yuntun/public/t/dt=w/shard=s0/old.parquet",
+            "b-old",
+            &[1],
+        )],
         schema_epoch: 99,
     }))
     .await
@@ -94,7 +98,10 @@ async fn replay_rebuilds_deletions_from_the_wal_alone() {
     let mut live = catalog.list_deletions(TABLE, snap).await.unwrap();
     live.sort_by(|a, b| a.file_path.cmp(&b.file_path));
     assert_eq!(live.len(), 2);
-    assert!(live.iter().all(|d| d.dv_id == "dv-1"), "同一 dv_id 覆盖两个文件");
+    assert!(
+        live.iter().all(|d| d.dv_id == "dv-1"),
+        "同一 dv_id 覆盖两个文件"
+    );
     assert_eq!(live[0].card, 2, "card 来自位图（a 文件删 2 行）");
     assert_eq!(live[0].batch_id, "b-a", "对账键：dv → file_path → batch_id");
     assert_eq!(
@@ -104,18 +111,23 @@ async fn replay_rebuilds_deletions_from_the_wal_alone() {
     );
     assert_eq!(live[1].card, 1);
     assert!(
-        live.iter().all(|d| d.applied_at == snap && d.revoked_at == 0),
+        live.iter()
+            .all(|d| d.applied_at == snap && d.revoked_at == 0),
         "同一条记录的全部条目共用同一个快照号（单快照原子），且都生效中"
     );
     // 旧世代那条**没有**留下任何痕迹
     assert!(
-        live.iter().all(|d| d.dv_id != "dv-stale" && !d.file_path.ends_with("old.parquet")),
+        live.iter()
+            .all(|d| d.dv_id != "dv-stale" && !d.file_path.ends_with("old.parquet")),
         "旧世代的删除不得挂到新表上"
     );
 
     // 重放**幂等**：再来一遍不写两份、也不推快照号
     let again = yuntun_ingest::replay_wal_dml(&catalog, &wal).await.unwrap();
-    assert_eq!(again.entries, 2, "重放照旧「重建」（目录侧按 (dv_id,file) 去重）");
+    assert_eq!(
+        again.entries, 2,
+        "重放照旧「重建」（目录侧按 (dv_id,file) 去重）"
+    );
     assert_eq!(catalog.current_snapshot().await, snap, "重复重放不推快照号");
     assert_eq!(catalog.list_deletions(TABLE, snap).await.unwrap().len(), 2);
 }
@@ -150,7 +162,11 @@ async fn replay_rebuilds_an_update_atomically() {
     wal.append(Record::Update(UpdatePayload {
         table: TABLE.into(),
         upd_id: "upd-1".into(),
-        deletions: vec![deletion("yuntun/public/t/dt=w/shard=s0/a.parquet", "b-a", &[0, 2])],
+        deletions: vec![deletion(
+            "yuntun/public/t/dt=w/shard=s0/a.parquet",
+            "b-a",
+            &[0, 2],
+        )],
         new_files: vec![NewFilePayload {
             file_path: "yuntun/public/t/dt=w/shard=s0/upd-1.parquet".into(),
             batch_id: "b-upd".into(),
@@ -181,7 +197,10 @@ async fn replay_rebuilds_an_update_atomically() {
         .expect("新行文件必须在重放后可见");
     assert_eq!(nf.valid_from, snap, "新文件与删除向量必须同号");
     assert_eq!(nf.row_count, 2);
-    assert_eq!(nf.shard, "s0", "产物继承源文件的 shard（按分片读的语义不变）");
+    assert_eq!(
+        nf.shard, "s0",
+        "产物继承源文件的 shard（按分片读的语义不变）"
+    );
     let live = catalog.list_deletions(TABLE, snap).await.unwrap();
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].dv_id, "upd-1");
@@ -214,10 +233,18 @@ async fn replay_rebuilds_an_update_atomically() {
     // 重放**幂等**：再来一遍不推版本、不写第二份
     let again = yuntun_ingest::replay_wal_dml(&catalog, &wal).await.unwrap();
     assert_eq!(again.applied, 1, "重放照旧重建");
-    assert_eq!(catalog.current_snapshot().await, snap, "完全重复 ⇒ 不推快照号");
+    assert_eq!(
+        catalog.current_snapshot().await,
+        snap,
+        "完全重复 ⇒ 不推快照号"
+    );
     assert_eq!(catalog.list_deletions(TABLE, snap).await.unwrap().len(), 1);
     assert_eq!(
-        catalog.list_visible_files(TABLE, snap, None).await.unwrap().len(),
+        catalog
+            .list_visible_files(TABLE, snap, None)
+            .await
+            .unwrap()
+            .len(),
         1,
         "不会插出第二个文件"
     );
@@ -249,7 +276,11 @@ async fn replay_skips_an_update_from_another_epoch() {
     wal.append(Record::Update(UpdatePayload {
         table: TABLE.into(),
         upd_id: "upd-stale".into(),
-        deletions: vec![deletion("yuntun/public/t/dt=w/shard=s0/old.parquet", "b-old", &[1])],
+        deletions: vec![deletion(
+            "yuntun/public/t/dt=w/shard=s0/old.parquet",
+            "b-old",
+            &[1],
+        )],
         new_files: vec![NewFilePayload {
             file_path: "yuntun/public/t/dt=w/shard=s0/old-upd.parquet".into(),
             batch_id: "b-old-upd".into(),
@@ -270,7 +301,13 @@ async fn replay_skips_an_update_from_another_epoch() {
     assert_eq!(stats.applied, 0);
     assert_eq!(stats.skipped, 1);
     let snap = catalog.current_snapshot().await;
-    assert!(catalog.list_deletions(TABLE, snap).await.unwrap().is_empty());
+    assert!(
+        catalog
+            .list_deletions(TABLE, snap)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert!(
         catalog
             .list_visible_files(TABLE, snap, None)
@@ -349,7 +386,11 @@ async fn replay_applies_a_purge_and_never_eats_later_data() {
     assert_eq!(stats.purged, 1, "这条 purge 属于当前世代 ⇒ 重放");
     let snap = catalog.current_snapshot().await;
     assert!(
-        catalog.list_visible_files(TABLE, snap, None).await.unwrap().is_empty(),
+        catalog
+            .list_visible_files(TABLE, snap, None)
+            .await
+            .unwrap()
+            .is_empty(),
         "重放之后表里没有可见文件（否则重启后整表复活）"
     );
 
@@ -358,7 +399,10 @@ async fn replay_applies_a_purge_and_never_eats_later_data() {
     let again = yuntun_ingest::replay_wal_dml(&catalog, &wal).await.unwrap();
     assert_eq!(again.purged, 1, "记录照旧被处理（幂等在状态机里）");
     let snap2 = catalog.current_snapshot().await;
-    let files = catalog.list_visible_files(TABLE, snap2, None).await.unwrap();
+    let files = catalog
+        .list_visible_files(TABLE, snap2, None)
+        .await
+        .unwrap();
     assert_eq!(
         files.len(),
         1,
@@ -406,7 +450,11 @@ async fn replay_skips_a_purge_from_another_epoch() {
     assert_eq!(stats.skipped, 1);
     let snap = catalog.current_snapshot().await;
     assert_eq!(
-        catalog.list_visible_files(TABLE, snap, None).await.unwrap().len(),
+        catalog
+            .list_visible_files(TABLE, snap, None)
+            .await
+            .unwrap()
+            .len(),
         1,
         "旧世代的整表清除不许动新表的数据"
     );

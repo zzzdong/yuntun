@@ -3,9 +3,9 @@
 //! 类型转换复用 INSERT VALUES 的 Literal 中间表示与范围检查。
 
 use sqlparser::ast::Expr;
+use sqlparser::ast::Statement;
 use sqlparser::ast::Value;
 use sqlparser::ast::visit_expressions_mut;
-use sqlparser::ast::Statement;
 use sqlparser::ast::{DataType as SqlDataType, TimezoneInfo, TypedString, ValueWithSpan};
 use std::ops::ControlFlow;
 use yuntun_model::error::LakeError;
@@ -120,10 +120,7 @@ fn param_to_expr(p: &SqlValue) -> Expr {
             SqlDataType::Timestamp(None, TimezoneInfo::None),
             format_ts_ns(*ns),
         ),
-        SqlValue::Date(days) => typed(
-            SqlDataType::Date,
-            format_date_days(*days),
-        ),
+        SqlValue::Date(days) => typed(SqlDataType::Date, format_date_days(*days)),
     }
 }
 
@@ -205,10 +202,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(count_placeholders(&mut stmt), 0);
-        assert_eq!(
-            stmt.to_string(),
-            "INSERT INTO t VALUES (7, 'a''b', NULL)"
-        );
+        assert_eq!(stmt.to_string(), "INSERT INTO t VALUES (7, 'a''b', NULL)");
     }
 
     #[test]

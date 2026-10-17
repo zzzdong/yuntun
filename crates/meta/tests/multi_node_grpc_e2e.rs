@@ -22,10 +22,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use prost::Message as _;
+use yuntun_meta::NodeHandle;
 use yuntun_meta::{MetaNode, MetaOptions};
 use yuntun_proto::meta as pb;
 use yuntun_proto::meta::meta_client::MetaClient;
-use yuntun_meta::NodeHandle;
 
 const IDS: [u64; 3] = [1, 2, 3];
 
@@ -246,10 +246,7 @@ async fn propose_following_leader(
 }
 
 /// 等 `ids` 里的节点**都**追平（`applied == last`），返回它们的 `last_index`。
-async fn wait_converged(
-    clients: &HashMap<u64, Client>,
-    ids: &[u64],
-) -> HashMap<u64, u64> {
+async fn wait_converged(clients: &HashMap<u64, Client>, ids: &[u64]) -> HashMap<u64, u64> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let mut last = HashMap::new();
@@ -291,7 +288,15 @@ async fn three_nodes_replicate_over_grpc_and_survive_leader_loss() {
     let addrs: HashMap<u64, SocketAddr> = IDS
         .iter()
         .zip(&listeners)
-        .map(|(id, l)| (*id, l.as_ref().expect("已 bind").local_addr().expect("local_addr")))
+        .map(|(id, l)| {
+            (
+                *id,
+                l.as_ref()
+                    .expect("已 bind")
+                    .local_addr()
+                    .expect("local_addr"),
+            )
+        })
         .collect();
 
     // ---- ② 起三个节点（peer 表 = 别的两个节点）+ 三个 gRPC 服务 ----
@@ -322,9 +327,14 @@ async fn three_nodes_replicate_over_grpc_and_survive_leader_loss() {
     let leader = wait_settled_leader(&clients, &IDS).await;
 
     // ---- ④ 写：3 个 op 经过**网络复制**到多数派 ----
-    let r_schema = propose_following_leader(&clients, &IDS, create_schema_op("analytics", 1_000)).await;
+    let r_schema =
+        propose_following_leader(&clients, &IDS, create_schema_op("analytics", 1_000)).await;
     assert!(r_schema.accepted);
-    assert!(propose_following_leader(&clients, &IDS, create_table_op("cpu", 1_001)).await.accepted);
+    assert!(
+        propose_following_leader(&clients, &IDS, create_table_op("cpu", 1_001))
+            .await
+            .accepted
+    );
     let r_commit = propose_following_leader(&clients, &IDS, commit_op("b1", "key-b1", 1_002)).await;
     assert!(r_commit.accepted);
     let manifest_ver = r_commit.manifest_ver;
@@ -371,14 +381,19 @@ async fn three_nodes_replicate_over_grpc_and_survive_leader_loss() {
     wait_leader_agreement(&live_clients, &survivors, new_leader).await;
 
     // ---- ⑨ 换主后仍能写（M3 的"写入不中断"）----
-    let r_new = propose_following_leader(&live_clients, &survivors, commit_op("b2", "key-b2", 2_000)).await;
+    let r_new =
+        propose_following_leader(&live_clients, &survivors, commit_op("b2", "key-b2", 2_000)).await;
     assert!(r_new.accepted, "换主后必须还能写入");
-    assert!(r_new.manifest_ver > manifest_ver, "新提交必须推进 manifest_ver");
+    assert!(
+        r_new.manifest_ver > manifest_ver,
+        "新提交必须推进 manifest_ver"
+    );
 
     // ---- ⑩ 换主前**已提交**的数据不丢：同幂等键重放必须命中 ----
     // 这条最硬：幂等记录只存在于**状态机**里，而状态机是靠"重放已提交日志"重建的。
     // 命中 = 换主前的提交在新 leader 上确实还在（不是"日志里在、状态机里没有"）。
-    let replay = propose_following_leader(&live_clients, &survivors, commit_op("b1", "key-b1", 1_002)).await;
+    let replay =
+        propose_following_leader(&live_clients, &survivors, commit_op("b1", "key-b1", 1_002)).await;
     assert!(
         !replay.accepted,
         "换主后重放旧的幂等键必须命中（accepted=false）—— 否则说明已提交数据丢了"
@@ -636,7 +651,15 @@ async fn partitioned_leader_cannot_commit_and_heals_without_loss() {
     let addrs: HashMap<u64, SocketAddr> = IDS
         .iter()
         .zip(&listeners)
-        .map(|(id, l)| (*id, l.as_ref().expect("已 bind").local_addr().expect("local_addr")))
+        .map(|(id, l)| {
+            (
+                *id,
+                l.as_ref()
+                    .expect("已 bind")
+                    .local_addr()
+                    .expect("local_addr"),
+            )
+        })
         .collect();
 
     // ---- ② 六条链路；各节点的 peer 表指向**链路**而不是对端 ----
@@ -711,7 +734,10 @@ async fn partitioned_leader_cannot_commit_and_heals_without_loss() {
     assert_ne!(new_leader, leader, "被隔离的节点拉不到票，不可能当选");
     wait_leader_agreement(&live, &survivors, new_leader).await;
     let r2 = propose_following_leader(&live, &survivors, commit_op("b2", "key-b2", 2_000)).await;
-    assert!(r2.accepted, "多数派（2/3）必须能提交 —— 少数派失联不该让集群停写");
+    assert!(
+        r2.accepted,
+        "多数派（2/3）必须能提交 —— 少数派失联不该让集群停写"
+    );
     assert!(
         r2.manifest_ver > ver_before,
         "多数派的提交必须推进版本号（{ver_before} → {}）",
@@ -732,7 +758,13 @@ async fn partitioned_leader_cannot_commit_and_heals_without_loss() {
     loop {
         let failed: u64 = nodes
             .iter()
-            .map(|n| n.node.as_ref().expect("节点还活着").transport_stats().failed)
+            .map(|n| {
+                n.node
+                    .as_ref()
+                    .expect("节点还活着")
+                    .transport_stats()
+                    .failed
+            })
             .sum();
         let refused = links.refused_total();
         if failed > 0 && refused > 0 {
@@ -768,7 +800,8 @@ async fn partitioned_leader_cannot_commit_and_heals_without_loss() {
     );
 
     // ---- ⑪ 分区期间多数派的提交：**不丢**（在被隔离者身上也能重放命中）----
-    let replay_b2 = propose_following_leader(&clients, &IDS, commit_op("b2", "key-b2", 2_000)).await;
+    let replay_b2 =
+        propose_following_leader(&clients, &IDS, commit_op("b2", "key-b2", 2_000)).await;
     assert!(
         !replay_b2.accepted,
         "分区期间多数派提交的记录丢了 —— 这正是「愈合后少数派把多数派的成果顶掉」的失败模样"
@@ -783,7 +816,8 @@ async fn partitioned_leader_cannot_commit_and_heals_without_loss() {
     );
 
     // ---- ⑬ 分区**之前**那条也还在 ----
-    let replay_b1 = propose_following_leader(&clients, &IDS, commit_op("b1", "key-b1", 1_002)).await;
+    let replay_b1 =
+        propose_following_leader(&clients, &IDS, commit_op("b1", "key-b1", 1_002)).await;
     assert!(!replay_b1.accepted, "分区前提交的记录跨过换主 + 分区丢了");
 
     // 收尾：停掉三个节点（`Drop` 会停）
@@ -952,7 +986,11 @@ async fn compaction_with_lagging_follower_should_keep_committing() {
     wait_converged(&clients, &IDS).await;
 
     // 隔离一个 follower（不是 leader）
-    let victim = IDS.iter().copied().find(|i| *i != leader).expect("有 follower");
+    let victim = IDS
+        .iter()
+        .copied()
+        .find(|i| *i != leader)
+        .expect("有 follower");
     links.isolate(victim);
     let majority: Vec<u64> = IDS.iter().copied().filter(|i| *i != victim).collect();
     let live: HashMap<u64, Client> = majority
@@ -1002,7 +1040,6 @@ async fn compaction_with_lagging_follower_should_keep_committing() {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // 成员变更（`§118`）：在线加一个 learner
 // ---------------------------------------------------------------------------
@@ -1037,7 +1074,12 @@ async fn adding_a_learner_is_replicated_with_its_address() {
     let addrs: HashMap<u64, SocketAddr> = IDS
         .iter()
         .zip(&listeners)
-        .map(|(id, l)| (*id, l.as_ref().expect("已 bind").local_addr().expect("addr")))
+        .map(|(id, l)| {
+            (
+                *id,
+                l.as_ref().expect("已 bind").local_addr().expect("addr"),
+            )
+        })
         .collect();
 
     // ---- ② 起三个节点 ----

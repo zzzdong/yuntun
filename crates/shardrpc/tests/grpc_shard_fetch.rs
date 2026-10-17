@@ -20,9 +20,7 @@ use arrow::record_batch::RecordBatch;
 use tokio::net::TcpListener;
 
 use yuntun_catalog::{CatalogOps, MemoryCatalog};
-use yuntun_chunk::{
-    ChunkId, ChunkKey, ChunkStore, ChunkStoreConfig, MemoryLedger, SealPolicy,
-};
+use yuntun_chunk::{ChunkId, ChunkKey, ChunkStore, ChunkStoreConfig, MemoryLedger, SealPolicy};
 use yuntun_model::ops::CreateTableRequest;
 use yuntun_query::{LocalCatalog, QueryEngine};
 use yuntun_shardrpc::GrpcShardFetch;
@@ -260,9 +258,7 @@ fn plain_of(states: &yuntun_model::agg::AggStates) -> Vec<yuntun_model::agg::Par
     }
 }
 
-fn groups_of(
-    states: &yuntun_model::agg::AggStates,
-) -> Vec<yuntun_model::agg::GroupStates> {
+fn groups_of(states: &yuntun_model::agg::AggStates) -> Vec<yuntun_model::agg::GroupStates> {
     match states {
         yuntun_model::agg::AggStates::Grouped(g) => g.clone(),
         other => panic!("期望分组结果，实际：{other:?}"),
@@ -364,7 +360,12 @@ async fn aggregate_pull_survives_the_wire() {
     let empty_addr = serve(empty_local).await;
     let empty_remote = remote_reader(&empty_addr).await;
     let got = empty_remote
-        .read_table_aggs(TABLE, 0, &[], &yuntun_model::agg::AggQuery::plain(specs.clone()))
+        .read_table_aggs(
+            TABLE,
+            0,
+            &[],
+            &yuntun_model::agg::AggQuery::plain(specs.clone()),
+        )
         .await
         .expect("空来源也要能答");
     let g = plain_of(&got.states);
@@ -401,7 +402,10 @@ async fn grouped_aggregate_pull_survives_the_wire() {
         .read_table_aggs(TABLE, 0, &[], &q)
         .await
         .expect("进程内分组聚合拉取");
-    assert_eq!(over_wire.states, in_process.states, "过网与进程内必须逐位相同");
+    assert_eq!(
+        over_wire.states, in_process.states,
+        "过网与进程内必须逐位相同"
+    );
 
     let groups = groups_of(&over_wire.states);
     let got: Vec<_> = groups
@@ -444,9 +448,6 @@ async fn grouped_aggregate_pull_survives_the_wire() {
     let fg = groups_of(&filtered.states);
     assert_eq!(
         fg.iter().map(|g| g.key.clone()).collect::<Vec<_>>(),
-        vec![
-            vec![Some(AggScalar::Int(2))],
-            vec![Some(AggScalar::Int(3))]
-        ]
+        vec![vec![Some(AggScalar::Int(2))], vec![Some(AggScalar::Int(3))]]
     );
 }

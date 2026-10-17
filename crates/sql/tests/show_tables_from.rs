@@ -15,8 +15,8 @@ use arrow::array::Array as _;
 use yuntun_catalog::{CatalogOps, MemoryCatalog};
 use yuntun_model::ops::CreateTableRequest;
 use yuntun_query::{LocalCatalog, QueryEngine};
-use yuntun_sql::session::SessionCtx;
 use yuntun_sql::SqlEngine;
+use yuntun_sql::session::SessionCtx;
 use yuntun_store::{StoreConfig, create_store};
 
 async fn mk_table(catalog: &Arc<MemoryCatalog>, ns: &str, name: &str) {
@@ -51,7 +51,12 @@ async fn first_column(engine: &SqlEngine, sql: &str, session: &mut SessionCtx) -
             .column(0)
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .unwrap_or_else(|| panic!("第一列应是 Utf8，实际 {:?}", b.schema().field(0).data_type()));
+            .unwrap_or_else(|| {
+                panic!(
+                    "第一列应是 Utf8，实际 {:?}",
+                    b.schema().field(0).data_type()
+                )
+            });
         for i in 0..col.len() {
             names.push(col.value(i).to_string());
         }
@@ -127,11 +132,18 @@ async fn show_tables_from_filters_by_the_qualified_schema() {
         .execute("SHOW FULL TABLES FROM sales", &mut mysql_session)
         .await
         .expect("execute");
-    let yuntun_sql::SqlResult::Rows { schema, batches, .. } = out else {
+    let yuntun_sql::SqlResult::Rows {
+        schema, batches, ..
+    } = out
+    else {
         panic!("应返回结果集")
     };
     assert_eq!(
-        schema.fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
+        schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect::<Vec<_>>(),
         vec!["Tables_in_sales", "Table_type"],
     );
     assert_eq!(batches[0].num_rows(), 2, "sales 两张表");
@@ -152,11 +164,18 @@ async fn show_tables_from_filters_by_the_qualified_schema() {
         .execute("SHOW TABLES FROM sales", &mut generic_session)
         .await
         .expect("execute");
-    let yuntun_sql::SqlResult::Rows { schema, batches, .. } = out else {
+    let yuntun_sql::SqlResult::Rows {
+        schema, batches, ..
+    } = out
+    else {
         panic!("应返回结果集")
     };
     assert_eq!(
-        schema.fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
+        schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect::<Vec<_>>(),
         vec!["table_catalog", "table_schema", "table_name"],
     );
     let schemas = batches[0]
@@ -165,7 +184,11 @@ async fn show_tables_from_filters_by_the_qualified_schema() {
         .downcast_ref::<arrow::array::StringArray>()
         .unwrap();
     for i in 0..schemas.len() {
-        assert_eq!(schemas.value(i), "sales", "Generic 轨的 table_schema 必须是限定库");
+        assert_eq!(
+            schemas.value(i),
+            "sales",
+            "Generic 轨的 table_schema 必须是限定库"
+        );
     }
     // ⑨ 无限定 → 会话 schema（public 的表）：第三列是表名
     let out = engine
@@ -180,6 +203,8 @@ async fn show_tables_from_filters_by_the_qualified_schema() {
         .as_any()
         .downcast_ref::<arrow::array::StringArray>()
         .unwrap();
-    let names: Vec<&str> = (0..table_names.len()).map(|i| table_names.value(i)).collect();
+    let names: Vec<&str> = (0..table_names.len())
+        .map(|i| table_names.value(i))
+        .collect();
     assert_eq!(names, vec!["cpu"], "无限定 → 会话 schema（public）的表");
 }

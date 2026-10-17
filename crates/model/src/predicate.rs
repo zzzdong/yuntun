@@ -93,7 +93,9 @@ impl Predicate {
                     Err(_) => Ok(BooleanArray::from(vec![!*negated; batch.num_rows()])),
                     Ok(idx) => {
                         let col = batch.column(idx);
-                        let m = BooleanArray::from((0..col.len()).map(|i| col.is_null(i)).collect::<Vec<_>>());
+                        let m = BooleanArray::from(
+                            (0..col.len()).map(|i| col.is_null(i)).collect::<Vec<_>>(),
+                        );
                         Ok(if *negated { not(&m) } else { m })
                     }
                 }
@@ -208,9 +210,12 @@ fn cmp_ord(ord: std::cmp::Ordering, op: CmpOp) -> bool {
 pub fn filter_batch(batch: &RecordBatch, p: &Predicate) -> Result<RecordBatch, LakeError> {
     let m = p.mask(batch)?;
     let col: arrow::array::ArrayRef = Arc::new(m);
-    arrow::compute::filter_record_batch(batch, col.as_any().downcast_ref::<BooleanArray>().ok_or_else(
-        || LakeError::Other("谓词掩码类型异常".into()),
-    )?)
+    arrow::compute::filter_record_batch(
+        batch,
+        col.as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| LakeError::Other("谓词掩码类型异常".into()))?,
+    )
     .map_err(|e| LakeError::Other(format!("谓词过滤失败：{e}")))
 }
 
@@ -270,7 +275,11 @@ mod tests {
         let and = Predicate::And(vec![gt0.clone(), lt3.clone()]);
         assert_eq!(and.count_matching(&b).unwrap(), 1, "只有 1 同时满足");
         let or = Predicate::Or(vec![gt0, lt3]);
-        assert_eq!(or.count_matching(&b).unwrap(), 2, "NULL 行两边都不真 ⇒ 不放行");
+        assert_eq!(
+            or.count_matching(&b).unwrap(),
+            2,
+            "NULL 行两边都不真 ⇒ 不放行"
+        );
     }
 
     /// `IS NULL` 与 `IS NOT NULL` 必须是**互补**的。
@@ -343,7 +352,11 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, true)]));
         let b = RecordBatch::try_new(
             schema,
-            vec![Arc::new(StringArray::from(vec![Some("abc"), Some("abd"), None]))],
+            vec![Arc::new(StringArray::from(vec![
+                Some("abc"),
+                Some("abd"),
+                None,
+            ]))],
         )
         .unwrap();
         let p = Predicate::Cmp {

@@ -74,11 +74,7 @@ async fn col_v(lakehouse: &Lakehouse, session: &mut SessionCtx, sql: &str) -> Ve
 
 /// 同 `col_v`，但**失败返回 `None`**：轮询时"缓存里还没有这张表"是正常中间态
 /// （写路径会主动刷；冷缓存的兜底是读路径的按需保鲜，见 `§163`）。
-async fn col_v_opt(
-    lakehouse: &Lakehouse,
-    session: &mut SessionCtx,
-    sql: &str,
-) -> Option<Vec<i64>> {
+async fn col_v_opt(lakehouse: &Lakehouse, session: &mut SessionCtx, sql: &str) -> Option<Vec<i64>> {
     match lakehouse.sql.execute(sql, session).await {
         Ok(SqlResult::Rows { batches, .. }) => {
             let mut out = Vec::new();
@@ -149,7 +145,12 @@ async fn embedded_mode_persists_dml_across_an_in_process_restart() {
             .unwrap();
         let bg = lakehouse.spawn_background(&cfg);
 
-        run(&lakehouse, &mut session, "CREATE TABLE t (v BIGINT NOT NULL)").await;
+        run(
+            &lakehouse,
+            &mut session,
+            "CREATE TABLE t (v BIGINT NOT NULL)",
+        )
+        .await;
         assert_eq!(
             run(
                 &lakehouse,
@@ -160,7 +161,13 @@ async fn embedded_mode_persists_dml_across_an_in_process_restart() {
             4
         );
         assert_eq!(
-            col_v_until(&lakehouse, &mut session, "SELECT v FROM t ORDER BY v", &[1, 2, 3, 4]).await,
+            col_v_until(
+                &lakehouse,
+                &mut session,
+                "SELECT v FROM t ORDER BY v",
+                &[1, 2, 3, 4]
+            )
+            .await,
             vec![1, 2, 3, 4]
         );
         assert_eq!(
@@ -227,7 +234,13 @@ async fn embedded_mode_persists_dml_across_an_in_process_restart() {
         1
     );
     assert_eq!(
-        col_v_until(&lakehouse, &mut session, "SELECT v FROM t ORDER BY v", &[1, 3, 5]).await,
+        col_v_until(
+            &lakehouse,
+            &mut session,
+            "SELECT v FROM t ORDER BY v",
+            &[1, 3, 5]
+        )
+        .await,
         vec![1, 3, 5],
         "新实例继续写入，且已删的行（2/4）不会因为重启而回来"
     );

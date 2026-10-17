@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 use yuntun_server::Lakehouse;
-use yuntun_sql::session::SessionCtx;
 use yuntun_sql::SqlResult;
+use yuntun_sql::session::SessionCtx;
 
 fn config(base: &str) -> yuntun_server::Config {
     yuntun_server::Config::from_toml(&format!(
@@ -80,12 +80,18 @@ async fn metrics_expose_memory_backlog_pressure_and_catalog_versions() {
     // ① 写入侧水位：WAL 已 fsync，且积压已被攒批线程吸收干净
     assert!(m.wal.synced_seq >= 1, "写入应已 fsync: {m:?}");
     assert_eq!(m.wal.backlog_records, 0, "吸收完成后不应有积压: {m:?}");
-    assert!(m.wal.absorbed_seq > m.wal.synced_seq, "吸收位置应越过 synced: {m:?}");
+    assert!(
+        m.wal.absorbed_seq > m.wal.synced_seq,
+        "吸收位置应越过 synced: {m:?}"
+    );
     assert!(m.wal.dir_bytes > 0, "WAL 目录应有字节占用");
 
     // ② chunk 内存水位：可见性承诺优先，未落盘数据必须驻留
     assert!(m.chunk.budget_bytes == 16 * 1024 * 1024, "预算来自配置");
-    assert!(m.chunk.chunks >= 1, "应有 chunk（max_flush_delay 很长，不落盘）");
+    assert!(
+        m.chunk.chunks >= 1,
+        "应有 chunk（max_flush_delay 很长，不落盘）"
+    );
     assert!(m.chunk.resident_bytes > 0, "内存账本应非零");
     assert!(
         m.chunk.pressure_ratio >= 0.0 && m.chunk.pressure_ratio < 1.0,

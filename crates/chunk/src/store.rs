@@ -39,9 +39,7 @@ use yuntun_model::wal_record::ddl_op;
 use yuntun_store::{ShardId, ShardRead, ShardReader, ShardTier};
 
 use crate::budget::{MemoryLedger, Pressure};
-use crate::chunk::{
-    batches_memory_bytes, Chunk, ChunkId, ChunkKey, ChunkState, TableLiveness,
-};
+use crate::chunk::{Chunk, ChunkId, ChunkKey, ChunkState, TableLiveness, batches_memory_bytes};
 
 /// seal / spill / flush 策略（架构 §2.2 / §5.2 / §5.3 / ADR-10）。
 ///
@@ -863,9 +861,7 @@ impl ChunkStore {
                     drop_ids.push(c.id);
                     continue;
                 }
-                let caught_up = c
-                    .committed_snapshot
-                    .is_some_and(|s| cached_snapshot >= s);
+                let caught_up = c.committed_snapshot.is_some_and(|s| cached_snapshot >= s);
                 if caught_up && c.state == ChunkState::Flushed {
                     // 放弃副本 ⇒ 这条数据从此只能从 manifest 冷读。把它计入水位：
                     // 还在拿旧 manifest 的读者需要知道"你可能会少这批数据"（§4.5 的窗口）。
@@ -1110,7 +1106,8 @@ impl ShardReader for ChunkStore {
         table: &str,
         known_manifest_ver: u64,
     ) -> Result<ShardRead, LakeError> {
-        self.read_table_excluding(table, known_manifest_ver, &[]).await
+        self.read_table_excluding(table, known_manifest_ver, &[])
+            .await
     }
 
     // **读侧栅栏**（`§28.1`）：整表读也带 `exclude`。
@@ -1164,10 +1161,7 @@ mod tests {
     }
 
     fn key() -> ChunkKey {
-        ChunkKey::new(
-            ShardId::new("public.t", "default", "2026-09-15T10:00"),
-            0,
-        )
+        ChunkKey::new(ShardId::new("public.t", "default", "2026-09-15T10:00"), 0)
     }
 
     struct Fixture {
@@ -1276,7 +1270,11 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert_eq!(f.store.chunk_ids_of(&key()).len(), 1, "同窗口不得裂成多个 chunk");
+        assert_eq!(
+            f.store.chunk_ids_of(&key()).len(),
+            1,
+            "同窗口不得裂成多个 chunk"
+        );
 
         // "创建后 5s"已过，但窗口未关闭 → 不得 seal
         assert!(
@@ -1303,16 +1301,13 @@ mod tests {
 
         let due = {
             let inner = f.store.inner.lock().unwrap();
-            f.store.flush_due_at(inner.chunks.get(&out.chunk_id).unwrap())
+            f.store
+                .flush_due_at(inner.chunks.get(&out.chunk_id).unwrap())
         };
         assert_eq!(due, now + 30_000, "到期时间 = seal_time + max_flush_delay");
 
         // 到期前一轮不 flush，到期即 flush
-        assert!(!f
-            .store
-            .plan_flush(due - 1)
-            .flush
-            .contains(&out.chunk_id));
+        assert!(!f.store.plan_flush(due - 1).flush.contains(&out.chunk_id));
         assert!(f.store.plan_flush(due).flush.contains(&out.chunk_id));
     }
 
@@ -1390,7 +1385,10 @@ mod tests {
         assert!(f.store.reclaim(7) > 0, "回收应释放驻留字节");
         assert!(f.store.is_empty(), "缓存追上后 chunk 应被回收");
         assert_eq!(f.store.ledger().used(), 0);
-        assert!(f.store.plan_flush(1_000_000).flush.is_empty(), "已回收不得再 flush");
+        assert!(
+            f.store.plan_flush(1_000_000).flush.is_empty(),
+            "已回收不得再 flush"
+        );
     }
 
     #[test]
@@ -1447,7 +1445,11 @@ mod tests {
         // 用 3.5 个批次预算把水位推进 Hard 区间
         let unit = batches_memory_bytes(&[batch(vec![1])]);
         assert!(unit > 0, "账本口径必须有非零占用");
-        let f = fixture("chunk-pressure", tight_policy(usize::MAX), unit * 3 + unit / 2);
+        let f = fixture(
+            "chunk-pressure",
+            tight_policy(usize::MAX),
+            unit * 3 + unit / 2,
+        );
 
         for i in 0..3u64 {
             f.store
@@ -1523,9 +1525,16 @@ mod tests {
             .append(key(), 1, schema(), 0, vec![batch(vec![1, 2, 3, 4])], 1_000)
             .unwrap();
         let id = out2.chunk_id;
-        assert!(matches!(tight.store.pressure(), Pressure::Soft | Pressure::Hard));
+        assert!(matches!(
+            tight.store.pressure(),
+            Pressure::Soft | Pressure::Hard
+        ));
         let p = tight.store.plan_flush(1_001);
-        assert_eq!(p.flush, vec![id], "水位 ≥ Soft 时相位让位，已 sealed 的必须立即 flush");
+        assert_eq!(
+            p.flush,
+            vec![id],
+            "水位 ≥ Soft 时相位让位，已 sealed 的必须立即 flush"
+        );
         assert_eq!(p.phase_yielded, 1);
         assert_eq!(
             tight.store.stats().phase_yielded_flushes,
@@ -1552,7 +1561,11 @@ mod tests {
             .unwrap();
         let sealed = out.sealed.expect("行数阈值应触发 seal");
         assert_eq!(sealed.1, SealReason::Rows);
-        let input = f.store.flush_input(sealed.0).unwrap().expect("已 sealed 可取");
+        let input = f
+            .store
+            .flush_input(sealed.0)
+            .unwrap()
+            .expect("已 sealed 可取");
         assert_eq!(input.seal_reason, Some(SealReason::Rows));
         assert_eq!(input.pressure_at_seal, Some(Pressure::Normal));
 
@@ -1591,10 +1604,15 @@ mod tests {
         f.store
             .append(key(), 1, schema(), 0, vec![batch(vec![1, 2])], 1_000)
             .unwrap();
-        assert!(matches!(f.store.pressure(), Pressure::Hard | Pressure::Reject));
+        assert!(matches!(
+            f.store.pressure(),
+            Pressure::Hard | Pressure::Reject
+        ));
         let actions = f.store.enforce_pressure(1_001);
         assert!(
-            actions.iter().any(|a| matches!(a, PressureAction::ForcedSeal(_))),
+            actions
+                .iter()
+                .any(|a| matches!(a, PressureAction::ForcedSeal(_))),
             "Hard 档应强制 seal open chunk"
         );
         let input = f.store.flush_input(ChunkId(1)).unwrap().unwrap();
@@ -1691,16 +1709,17 @@ mod tests {
 
         // 本地副本被回收（缓存推进到 6）⇒ 这条数据从此只能从 manifest 冷读
         assert!(f.store.reclaim(6) >= 1, "应回收那个已 commit 的 chunk");
-        assert_eq!(f.store.flushed_watermark(), 5, "水位 = 已放弃副本的最高版本");
+        assert_eq!(
+            f.store.flushed_watermark(),
+            5,
+            "水位 = 已放弃副本的最高版本"
+        );
 
         // 同一读者（仍在快照 4）再来读：热数据已不在本地，它的 manifest（4）里也没有
         // valid_from=5 的文件 ⇒ **两头都没有**。契约要求报 STALE，而不是回一个"空"。
         let behind = futures::executor::block_on(reader.read_table("public.t", 4)).unwrap();
         assert_eq!(behind.rows(), 0, "本地副本已放弃");
-        assert!(
-            behind.stale,
-            "必须报 STALE —— 否则读者会把这批数据静默丢掉"
-        );
+        assert!(behind.stale, "必须报 STALE —— 否则读者会把这批数据静默丢掉");
         assert_eq!(behind.flushed_watermark, 5);
 
         // 刷新到水位之后恢复正常（不再 STALE，也不再依赖本地副本）
@@ -1752,6 +1771,10 @@ mod tests {
             .flatten()
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
-        assert_eq!(left, vec!["keep.txt".to_string()], "只清 spill 副本，不动别的文件");
+        assert_eq!(
+            left,
+            vec!["keep.txt".to_string()],
+            "只清 spill 副本，不动别的文件"
+        );
     }
 }

@@ -181,9 +181,9 @@ impl TokenInterceptor {
         match token {
             None => Ok(Self { header: None }),
             Some(t) => {
-                let header = format!("Bearer {t}").parse::<MetadataValue<Ascii>>().map_err(|e| {
-                    ClientError::Other(format!("invalid Flight auth token: {e}"))
-                })?;
+                let header = format!("Bearer {t}")
+                    .parse::<MetadataValue<Ascii>>()
+                    .map_err(|e| ClientError::Other(format!("invalid Flight auth token: {e}")))?;
                 Ok(Self {
                     header: Some(header),
                 })
@@ -431,8 +431,13 @@ impl Client {
     }
 
     /// 便捷写入：默认 shard，服务端生成幂等键。
-    pub async fn insert(&self, table: &str, batches: Vec<RecordBatch>) -> Result<Vec<InsertReceipt>> {
-        self.insert_batches(table, DEFAULT_SHARD, batches, None).await
+    pub async fn insert(
+        &self,
+        table: &str,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Vec<InsertReceipt>> {
+        self.insert_batches(table, DEFAULT_SHARD, batches, None)
+            .await
     }
 }
 
@@ -490,8 +495,7 @@ mod tests {
         // ④ 真降级：detail + 缺失来源都要能读懂并点名
         let meta = r#"{"partial":true,"detail":"缺 1 个来源","missing":[
                  {"instance":"inst-b","table":"public.t","reason":"connection refused"}]}"#;
-        let p = partial_from_app_metadata(meta.as_bytes())
-            .expect("标记了 partial 就必须认出来");
+        let p = partial_from_app_metadata(meta.as_bytes()).expect("标记了 partial 就必须认出来");
         assert_eq!(p.detail, "缺 1 个来源");
         assert_eq!(p.missing, vec!["inst-b @ public.t: connection refused"]);
         assert!(p.to_string().contains("inst-b"), "{p}");

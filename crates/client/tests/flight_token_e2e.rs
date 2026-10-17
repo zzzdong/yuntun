@@ -89,7 +89,11 @@ async fn ready(addr: &str) -> Client {
 fn assert_unauthenticated(e: ClientError) {
     match e {
         ClientError::Rpc(status) => {
-            assert_eq!(status.code(), tonic::Code::Unauthenticated, "实际：{status}");
+            assert_eq!(
+                status.code(),
+                tonic::Code::Unauthenticated,
+                "实际：{status}"
+            );
         }
         other => panic!("期望 Unauthenticated，实际：{other}"),
     }
@@ -102,12 +106,19 @@ async fn sdk_sends_the_token_on_every_rpc() {
 
     // ① 对令牌 ⇒ 真答回 SQL（不只 `get_flight_info` 通了：`query` 会走 `do_get`，
     // 两个 RPC 都必须带上头 —— `§190.3` 的第二个坑）
-    let batches = client.query("SHOW DATABASES").await.expect("对令牌必须放行");
+    let batches = client
+        .query("SHOW DATABASES")
+        .await
+        .expect("对令牌必须放行");
     assert!(!batches.is_empty(), "应当答回至少一行");
 
     // ② 缺令牌
     let anon = Client::connect(&addr).await.unwrap();
-    assert_unauthenticated(anon.query("SHOW DATABASES").await.expect_err("缺令牌必须被拒"));
+    assert_unauthenticated(
+        anon.query("SHOW DATABASES")
+            .await
+            .expect_err("缺令牌必须被拒"),
+    );
 
     // ③ 错令牌
     let wrong = Client::connect_with_token(&addr, Some("definitely-wrong"))

@@ -255,14 +255,16 @@ mod tests {
     #[test]
     fn apply_widen_narrowing_rejected() {
         let s = test_schema(&[("v", DT::Int64)]);
-        assert!(apply_change(
-            &s,
-            &SchemaChange::WidenType {
-                column: "v".into(),
-                to: DT::Int32,
-            },
-        )
-        .is_err());
+        assert!(
+            apply_change(
+                &s,
+                &SchemaChange::WidenType {
+                    column: "v".into(),
+                    to: DT::Int32,
+                },
+            )
+            .is_err()
+        );
     }
 
     #[test]

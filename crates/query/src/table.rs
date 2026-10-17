@@ -53,28 +53,28 @@ use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::datasource::object_store::ObjectStoreUrl;
 
-use datafusion::logical_expr::Expr;
-use datafusion::logical_expr::TableProviderFilterPushDown;
-use datafusion::physical_plan::limit::GlobalLimitExec;
-use datafusion::physical_plan::union::UnionExec;
-use datafusion::physical_plan::ExecutionPlan;
-use datafusion_datasource::file::FileSource;
-use datafusion_datasource::file_groups::FileGroup;
 use crate::index::group_access_plan;
 use crate::prune::prune_visible_files;
+use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::TableProviderFilterPushDown;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::limit::GlobalLimitExec;
+use datafusion::physical_plan::union::UnionExec;
+use datafusion_datasource::PartitionedFile;
+use datafusion_datasource::file::FileSource;
+use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::source::DataSourceExec;
-use datafusion_datasource::PartitionedFile;
 use datafusion_datasource_parquet::source::ParquetSource;
 use datafusion_datasource_parquet::{ParquetAccessPlan, ParquetRowSelection};
 // 整体行选择（DV 的载体）：DF 明说这是给"**外部索引**"用的扩展点，
 // 它会用 parquet footer 把它拆成**逐行组**的访问计划（`delta-dml-design §5.2` 的 M2 提前实现了）
+use crate::cache::HotShards;
+use crate::partial::{MissingSource, PartialSink};
 use datafusion::parquet::arrow::arrow_reader::RowSelection;
 use std::collections::HashMap;
 use std::sync::Arc;
-use crate::cache::HotShards;
-use crate::partial::{MissingSource, PartialSink};
 use std::time::Duration;
 use yuntun_model::dv::DvBitmap;
 use yuntun_model::meta::FileManifest;
@@ -125,8 +125,6 @@ enum SourceOutcome {
     Missing(String),
     Stale(HotReadStale),
 }
-
-
 
 /// 一张 yuntun 表的 DataFusion 视图（**绑定在某个不可变 Catalog 快照上**）。
 /// vortex 文件的扩展名（与 `yuntun_format::DataFormat::Vortex::ext()` 同一份事实；
@@ -186,15 +184,14 @@ impl YuntunTableProvider {
         dvs: &HashMap<String, DvBitmap>,
     ) -> Result<Vec<arrow::record_batch::RecordBatch>, datafusion::error::DataFusionError> {
         // 读字节走 store 层那个公共便捷函数（与别处同一条路，不在这里另写一份 `get`）
-        let bytes =
-            yuntun_store::get_bytes(self.store.as_ref(), &f.file_path)
-                .await
-                .map_err(|e| {
-                    datafusion::error::DataFusionError::Execution(format!(
-                        "vortex 读取（文件 {}）：{e}",
-                        f.file_path
-                    ))
-                })?;
+        let bytes = yuntun_store::get_bytes(self.store.as_ref(), &f.file_path)
+            .await
+            .map_err(|e| {
+                datafusion::error::DataFusionError::Execution(format!(
+                    "vortex 读取（文件 {}）：{e}",
+                    f.file_path
+                ))
+            })?;
         let decoded = yuntun_format::decode_batch(&bytes, yuntun_format::DataFormat::Vortex)
             .map_err(|e| {
                 datafusion::error::DataFusionError::Execution(format!(
@@ -205,14 +202,14 @@ impl YuntunTableProvider {
 
         let mut batches = Vec::with_capacity(decoded.len());
         for b in decoded {
-            batches.push(yuntun_model::arrow_util::align_batch(&b, &self.schema).map_err(
-                |e| {
+            batches.push(
+                yuntun_model::arrow_util::align_batch(&b, &self.schema).map_err(|e| {
                     datafusion::error::DataFusionError::Execution(format!(
                         "vortex 对齐（文件 {}）：{e}",
                         f.file_path
                     ))
-                },
-            )?);
+                })?,
+            );
         }
 
         let Some(dv) = dvs.get(&f.file_path) else {
@@ -239,7 +236,6 @@ impl YuntunTableProvider {
         }
         Ok(out)
     }
-
 
     pub fn new(
         snapshot: Arc<CatalogSnapshot>,
@@ -502,44 +498,43 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
         let plan: Vec<_> = if self.hot_enabled {
             self.hot
                 .iter()
-                .map(|(instance, reader)| {
-                    (instance.clone(), reader.clone(), all_batch_ids.clone())
-                })
+                .map(|(instance, reader)| (instance.clone(), reader.clone(), all_batch_ids.clone()))
                 .collect()
         } else {
             Vec::new()
         };
 
-        let outcomes = futures::future::join_all(plan.into_iter().map(|(instance, reader, exclude)| {
-            let ident = self.ident.clone();
-            let snapshot = self.snapshot.snapshot;
-            async move {
-                let outcome = match tokio::time::timeout_at(
-                    deadline,
-                    reader.read_table_excluding(&ident, snapshot, &exclude),
-                )
-                .await
-                {
-                    // STALE：成员**答上来了**，答的是"我的水位超前于你的 manifest"
-                    // （`architecture-with-chunk §4.5` 的"两头都没有"窗口）⇒ 整次尝试失败，
-                    // 由 `QueryEngine` 刷新后重试（`§61.4` 第 2 条：**绝不能当答案**）。
-                    Ok(Ok(read)) if read.stale => SourceOutcome::Stale(HotReadStale {
-                        instance: instance.clone(),
-                        table: ident,
-                        known_manifest_ver: snapshot,
-                        flushed_watermark: read.flushed_watermark,
-                    }),
-                    Ok(Ok(read)) => SourceOutcome::Read(read.batches),
-                    Ok(Err(e)) => SourceOutcome::Missing(e.to_string()),
-                    Err(_elapsed) => SourceOutcome::Missing(format!(
-                        "超出热读预算（{} ms 内未答复）",
-                        budget.as_millis()
-                    )),
-                };
-                (instance, outcome)
-            }
-        }))
-        .await;
+        let outcomes =
+            futures::future::join_all(plan.into_iter().map(|(instance, reader, exclude)| {
+                let ident = self.ident.clone();
+                let snapshot = self.snapshot.snapshot;
+                async move {
+                    let outcome = match tokio::time::timeout_at(
+                        deadline,
+                        reader.read_table_excluding(&ident, snapshot, &exclude),
+                    )
+                    .await
+                    {
+                        // STALE：成员**答上来了**，答的是"我的水位超前于你的 manifest"
+                        // （`architecture-with-chunk §4.5` 的"两头都没有"窗口）⇒ 整次尝试失败，
+                        // 由 `QueryEngine` 刷新后重试（`§61.4` 第 2 条：**绝不能当答案**）。
+                        Ok(Ok(read)) if read.stale => SourceOutcome::Stale(HotReadStale {
+                            instance: instance.clone(),
+                            table: ident,
+                            known_manifest_ver: snapshot,
+                            flushed_watermark: read.flushed_watermark,
+                        }),
+                        Ok(Ok(read)) => SourceOutcome::Read(read.batches),
+                        Ok(Err(e)) => SourceOutcome::Missing(e.to_string()),
+                        Err(_elapsed) => SourceOutcome::Missing(format!(
+                            "超出热读预算（{} ms 内未答复）",
+                            budget.as_millis()
+                        )),
+                    };
+                    (instance, outcome)
+                }
+            }))
+            .await;
 
         // 装配：**严格按键序**，与"谁先答完"无关（并发只改时间，不改结果）
         for (instance, outcome) in outcomes {
@@ -579,8 +574,8 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
             let exec =
                 MemorySourceConfig::try_new_exec(&[batches], schema.clone(), projection.cloned())
                     .map_err(|e| {
-                        datafusion::error::DataFusionError::Execution(format!("pending plan: {e}"))
-                    })?;
+                    datafusion::error::DataFusionError::Execution(format!("pending plan: {e}"))
+                })?;
             inputs.push(exec);
         }
 
@@ -637,9 +632,8 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
             // 混在一起会让 vortex 文件被当成 parquet 打开 ⇒ 要么报错、要么**静默少数据**。
             // 删除向量两个格式都要（vortex 上不做 = 已删行查得到 = 静默错）⇒ 先取
             let dvs = self.file_deletions(&kept).await?;
-            let (vortex_kept, rest): (Vec<&FileManifest>, Vec<&FileManifest>) = kept
-                .iter()
-                .partition(|f| f.file_path.ends_with(VORTEX_EXT));
+            let (vortex_kept, rest): (Vec<&FileManifest>, Vec<&FileManifest>) =
+                kept.iter().partition(|f| f.file_path.ends_with(VORTEX_EXT));
 
             // --- vortex 支：自解码 + 自应用删除向量 ---
             //
@@ -653,9 +647,7 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
             let mut decoded_bytes: u64 = 0;
             for f in &vortex_kept {
                 if self.cold_read_budget_bytes > 0 {
-                    let remaining = self
-                        .cold_read_budget_bytes
-                        .saturating_sub(decoded_bytes);
+                    let remaining = self.cold_read_budget_bytes.saturating_sub(decoded_bytes);
                     if f.file_size > remaining {
                         return Err(datafusion::error::DataFusionError::Execution(format!(
                             "冷读解码预算超出：文件 {} 的 {} MB 已超过剩余预算 {} MB（本次扫描已解码 {} MB，\
@@ -733,7 +725,9 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
                 })?;
                 let selection =
                     RowSelection::from_consecutive_ranges(ranges.into_iter(), f.row_count as usize);
-                *pf = pf.clone().with_extension(ParquetRowSelection::new(selection));
+                *pf = pf
+                    .clone()
+                    .with_extension(ParquetRowSelection::new(selection));
             }
 
             // 【F.4｜两级剪枝的第二级】文件级已定"读哪些文件"，这里再定"文件里读哪些组"：
@@ -766,7 +760,9 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
                     builder = builder
                         .with_projection_indices(Some(p.clone()))
                         .map_err(|e| {
-                            datafusion::error::DataFusionError::Execution(format!("projection: {e}"))
+                            datafusion::error::DataFusionError::Execution(format!(
+                                "projection: {e}"
+                            ))
                         })?;
                 }
                 inputs.push(DataSourceExec::from_data_source(builder.build()));
@@ -775,11 +771,14 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
 
         // ③ 空表：给一个空的内存执行（保持 schema / 投影语义）
         if inputs.is_empty() {
-            let exec =
-                MemorySourceConfig::try_new_exec(&[Vec::new()], schema.clone(), projection.cloned())
-                    .map_err(|e| {
-                        datafusion::error::DataFusionError::Execution(format!("empty plan: {e}"))
-                    })?;
+            let exec = MemorySourceConfig::try_new_exec(
+                &[Vec::new()],
+                schema.clone(),
+                projection.cloned(),
+            )
+            .map_err(|e| {
+                datafusion::error::DataFusionError::Execution(format!("empty plan: {e}"))
+            })?;
             inputs.push(exec);
         }
 

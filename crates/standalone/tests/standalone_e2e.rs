@@ -70,10 +70,7 @@ enabled = false
         loop {
             line.clear();
             let n = r.read_line(&mut line).expect("读接口行");
-            assert!(
-                n > 0,
-                "还没读到 LISTEN 接口行，进程就退了（stderr 见上）"
-            );
+            assert!(n > 0, "还没读到 LISTEN 接口行，进程就退了（stderr 见上）");
             if let Some(a) = line.trim().strip_prefix("LISTEN ") {
                 return a.to_string();
             }
@@ -158,7 +155,10 @@ async fn standalone_binary_serves_flight_end_to_end() {
 
     let batches = sql(&mut client, "SHOW DATABASES").await;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert!(rows >= 1, "standalone 必须真的答回一条 SQL（SHOW DATABASES）");
+    assert!(
+        rows >= 1,
+        "standalone 必须真的答回一条 SQL（SHOW DATABASES）"
+    );
 
     let _ = child.kill();
     let _ = child.wait();
@@ -198,7 +198,11 @@ async fn standalone_exits_gracefully_on_sigterm_and_releases_its_dirs() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     // ② 退出码 0（优雅收尾后正常返回）
-    assert_eq!(status.code(), Some(0), "SIGTERM 应走优雅关闭（退 0）：{status:?}");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "SIGTERM 应走优雅关闭（退 0）：{status:?}"
+    );
 
     // ③ 同一目录能再起一个实例（WAL/spill/meta 三处租约都放了）
     let (mut child2, addr2) = spawn_yuntun(&dir).await;

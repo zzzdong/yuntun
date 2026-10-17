@@ -234,11 +234,7 @@ impl ChunkSection {
         let soft = to_ratio(self.soft_pct, d.soft);
         let hard = to_ratio(self.hard_pct, d.hard);
         let reject = to_ratio(self.reject_pct, d.reject);
-        yuntun_chunk::PressureThresholds {
-            soft,
-            hard,
-            reject,
-        }
+        yuntun_chunk::PressureThresholds { soft, hard, reject }
     }
 
     pub fn chunk_mem_bytes(&self) -> usize {
@@ -476,7 +472,8 @@ impl Config {
             );
         }
         let max_resident = self.ingest.chunk_max_resident_secs;
-        let normal_deadline = self.ingest.max_flush_delay_secs + self.ingest.flush_phase_spread_secs;
+        let normal_deadline =
+            self.ingest.max_flush_delay_secs + self.ingest.flush_phase_spread_secs;
         if max_resident <= normal_deadline {
             out.push(format!(
                 "[ingest] chunk_max_resident_secs({max_resident}) 必须 > max_flush_delay_secs({}) + \
@@ -553,19 +550,21 @@ impl Config {
     }
 }
 
-
 impl Config {
     /// **WAL 归档配置**（ADR-9 的 `durable` 档，`§125`）：`[wal] archive_prefix` 没给就是 `None`。
     ///
     /// 实例维度取 `[chunk] instance_id` —— WAL 路径本身**没有**实例维度（`shard=0` 固定），
     /// 多节点归档到同一前缀会互相覆盖，所以键里必须带上它。
     pub fn archive_config(&self) -> Option<yuntun_ingest::ArchiveConfig> {
-        self.wal.archive_prefix.as_ref().map(|p| yuntun_ingest::ArchiveConfig {
-            prefix: p.clone(),
-            instance_id: self.chunk.instance_id.clone(),
-            interval: std::time::Duration::from_secs(self.wal.archive_interval_secs.max(1)),
-            all_tables: self.wal.archive_all_tables,
-        })
+        self.wal
+            .archive_prefix
+            .as_ref()
+            .map(|p| yuntun_ingest::ArchiveConfig {
+                prefix: p.clone(),
+                instance_id: self.chunk.instance_id.clone(),
+                interval: std::time::Duration::from_secs(self.wal.archive_interval_secs.max(1)),
+                all_tables: self.wal.archive_all_tables,
+            })
     }
 }
 
@@ -695,7 +694,8 @@ reject_pct = 90
     #[test]
     fn bogus_pressure_pct_falls_back_instead_of_silently_enlarging_budget() {
         // 0 / >100 是配置错误：退化到默认水位，而不是把阈值变成 0（等于永不 spill）
-        let cfg = Config::from_toml("[chunk]\nsoft_pct = 0\nhard_pct = 200\nreject_pct = 0").unwrap();
+        let cfg =
+            Config::from_toml("[chunk]\nsoft_pct = 0\nhard_pct = 200\nreject_pct = 0").unwrap();
         let t = cfg.chunk.pressure_thresholds();
         assert_eq!((t.soft, t.hard, t.reject), (0.60, 0.80, 0.95));
     }
@@ -739,7 +739,8 @@ scan_interval_ms = 50
     fn legacy_flush_jitter_key_is_ignored_not_fatal() {
         // 旧配置里的 flush_jitter_secs 已移除：旧 TOML 仍应可解析（未知字段忽略），
         // 但**不再影响** flush 时刻（改为确定性相位偏移，架构 §5.3）
-        let cfg = Config::from_toml("[ingest]\nrows_threshold = 5\nflush_jitter_secs = 60").unwrap();
+        let cfg =
+            Config::from_toml("[ingest]\nrows_threshold = 5\nflush_jitter_secs = 60").unwrap();
         assert_eq!(cfg.ingest.rows_threshold, 5);
         assert_eq!(cfg.ingest.flush_phase_spread_secs, 30);
     }
@@ -758,7 +759,11 @@ scan_interval_ms = 50
         assert_eq!(cfg.ingest.rows_threshold, 500_000);
         assert_eq!(cfg.ingest.max_flush_delay_secs, 0);
         assert!(cfg.sql.mysql.enabled);
-        assert!(cfg.warnings().is_empty(), "示例配置不得有潜在劣化项: {:?}", cfg.warnings());
+        assert!(
+            cfg.warnings().is_empty(),
+            "示例配置不得有潜在劣化项: {:?}",
+            cfg.warnings()
+        );
     }
 
     #[test]

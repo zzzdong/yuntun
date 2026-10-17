@@ -211,7 +211,10 @@ impl DvBitmap {
         let crc = u32::from_le_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]);
         let payload = &bytes[HEADER_LEN..];
         if payload.len() != len {
-            return Err(bad(format!("载荷长度不符：帧头说 {len}，实际 {}", payload.len())));
+            return Err(bad(format!(
+                "载荷长度不符：帧头说 {len}，实际 {}",
+                payload.len()
+            )));
         }
         let actual = crc32fast::hash(payload);
         if actual != crc {
@@ -236,7 +239,11 @@ mod tests {
     fn empty_dv_keeps_everything() {
         let dv = DvBitmap::new();
         assert!(dv.is_empty());
-        assert_eq!(ranges(&dv, 5), vec![0..5], "没有删除 ⇒ 保留全部（一个连续区间）");
+        assert_eq!(
+            ranges(&dv, 5),
+            vec![0..5],
+            "没有删除 ⇒ 保留全部（一个连续区间）"
+        );
         assert!(ranges(&dv, 0).is_empty(), "零行文件");
     }
 
@@ -328,7 +335,10 @@ mod tests {
         let p = dv_object_path("yuntun/public/t/dt=w/shard=s0/b7.parquet", "dv-1");
         assert_eq!(p, "yuntun/public/t/dt=w/shard=s0/dv/b7.parquet/dv-1.bin");
         assert!(p.contains("/dv/"), "`dv/` 是孤儿清理的显式分流前缀");
-        assert!(p.ends_with("b7.parquet/dv-1.bin"), "锚定完整文件名（含扩展名）");
+        assert!(
+            p.ends_with("b7.parquet/dv-1.bin"),
+            "锚定完整文件名（含扩展名）"
+        );
     }
 
     #[test]
@@ -343,7 +353,10 @@ mod tests {
             card: 3,
             store_path: "p".into(),
         };
-        assert!(!e.active_at(9), "提交前开始的查询看不到这次删除（快照隔离）");
+        assert!(
+            !e.active_at(9),
+            "提交前开始的查询看不到这次删除（快照隔离）"
+        );
         assert!(e.active_at(10));
         assert!(e.active_at(u64::MAX), "revoked_at = 0 ⇒ 一直生效");
         let revoked = DeletionEntry {
@@ -351,6 +364,9 @@ mod tests {
             ..e
         };
         assert!(revoked.active_at(11));
-        assert!(!revoked.active_at(12), "compaction 消费后不再生效（行已被重写掉）");
+        assert!(
+            !revoked.active_at(12),
+            "compaction 消费后不再生效（行已被重写掉）"
+        );
     }
 }

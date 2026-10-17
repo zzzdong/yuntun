@@ -470,7 +470,10 @@ mod tests {
         assert_eq!(back, payload);
         let dv = crate::dv::DvBitmap::from_bytes(&back.deletions[0].bitmap).unwrap();
         assert_eq!(dv.card(), 3, "删除那半（位图）必须原样过线");
-        assert_eq!(back.new_files[0].row_count, 3, "新行那半（清单）也必须原样过线");
+        assert_eq!(
+            back.new_files[0].row_count, 3,
+            "新行那半（清单）也必须原样过线"
+        );
     }
 
     /// `F.3`：DELETE 记录里的位图**过线之后仍解得出**（帧带 CRC，坏一字节就该拒绝）。
@@ -493,7 +496,11 @@ mod tests {
         };
         assert_eq!(back, payload);
         let dv = crate::dv::DvBitmap::from_bytes(&back.deletions[0].bitmap).unwrap();
-        assert_eq!(dv.card(), 3, "位图必须原样过线（重放靠它重建 DeletionEntry）");
+        assert_eq!(
+            dv.card(),
+            3,
+            "位图必须原样过线（重放靠它重建 DeletionEntry）"
+        );
     }
 
     #[test]

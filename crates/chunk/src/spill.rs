@@ -20,9 +20,9 @@ use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
+use arrow::ipc::CompressionType;
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::{IpcWriteOptions, StreamWriter};
-use arrow::ipc::CompressionType;
 use arrow::record_batch::RecordBatch;
 
 use yuntun_model::error::LakeError;
@@ -234,7 +234,10 @@ fn encode_batches(batches: &[RecordBatch]) -> Result<Vec<u8>, LakeError> {
 }
 
 /// Arrow IPC 流解码（压缩标记在流内，无需外部参数）。
-fn decode_batches(payload: &[u8], _schema: &arrow::datatypes::SchemaRef) -> Result<Vec<RecordBatch>, LakeError> {
+fn decode_batches(
+    payload: &[u8],
+    _schema: &arrow::datatypes::SchemaRef,
+) -> Result<Vec<RecordBatch>, LakeError> {
     let reader = StreamReader::try_new(std::io::Cursor::new(payload), None)
         .map_err(|e| LakeError::Other(format!("spill ipc reader: {e}")))?;
     let mut out = Vec::new();

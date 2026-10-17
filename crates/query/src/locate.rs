@@ -138,9 +138,8 @@ pub async fn locate_and_project(
     // 把多批次并成一个，再**按行号排序**：`positions[i]` 与结果第 `i` 行从此一一对应
     // （DataFusion 不保证输出顺序，不显式排序就等于把"哪一行的新值"交给实现细节）
     let schema_with_idx = out[0].schema();
-    let all = arrow::compute::concat_batches(&schema_with_idx, &out).map_err(|e| {
-        DataFusionError::Execution(format!("投影结果合并失败（文件 {path}）：{e}"))
-    })?;
+    let all = arrow::compute::concat_batches(&schema_with_idx, &out)
+        .map_err(|e| DataFusionError::Execution(format!("投影结果合并失败（文件 {path}）：{e}")))?;
     let idx = all
         .column(0)
         .as_any()
@@ -152,12 +151,10 @@ pub async fn locate_and_project(
             ))
         })?
         .clone();
-    let order = arrow::compute::sort_to_indices(&idx, None, None).map_err(|e| {
-        DataFusionError::Execution(format!("投影结果排序失败（文件 {path}）：{e}"))
-    })?;
-    let sorted = arrow::compute::take_record_batch(&all, &order).map_err(|e| {
-        DataFusionError::Execution(format!("投影结果重排失败（文件 {path}）：{e}"))
-    })?;
+    let order = arrow::compute::sort_to_indices(&idx, None, None)
+        .map_err(|e| DataFusionError::Execution(format!("投影结果排序失败（文件 {path}）：{e}")))?;
+    let sorted = arrow::compute::take_record_batch(&all, &order)
+        .map_err(|e| DataFusionError::Execution(format!("投影结果重排失败（文件 {path}）：{e}")))?;
     let positions: Vec<u32> = sorted
         .column(0)
         .as_any()
@@ -168,9 +165,9 @@ pub async fn locate_and_project(
         .collect();
     // 去掉行号列（列序与 schema 都保留调用方给的那套）
     let keep: Vec<usize> = (1..sorted.num_columns()).collect();
-    let batch = sorted.project(&keep).map_err(|e| {
-        DataFusionError::Execution(format!("投影结果取列失败（文件 {path}）：{e}"))
-    })?;
+    let batch = sorted
+        .project(&keep)
+        .map_err(|e| DataFusionError::Execution(format!("投影结果取列失败（文件 {path}）：{e}")))?;
     Ok(ProjectedRows {
         positions,
         rows,
@@ -365,7 +362,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(got.positions, vec![0, 1, 2], "缺列 = NULL ⇒ IS NULL 全都命中");
+        assert_eq!(
+            got.positions,
+            vec![0, 1, 2],
+            "缺列 = NULL ⇒ IS NULL 全都命中"
+        );
 
         // `= 'x'` ⇒ 一行都不命中（NULL 的三值逻辑：比较结果是 NULL，不是真）
         let got = locate_matching_rows(
@@ -434,11 +435,8 @@ mod tests {
     /// **老文件类型更窄**（`Int32` 文件 vs `Int64` 表）⇒ 按提升格 cast 后正常求值。
     #[tokio::test]
     async fn a_narrower_column_is_widened_before_evaluation() {
-        let file_schema = Arc::new(Schema::new(vec![Field::new(
-            "v",
-            DataType::Int32,
-            true,
-        )])) as SchemaRef;
+        let file_schema =
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, true)])) as SchemaRef;
         let (store, path) = write_file_with(
             file_schema,
             vec![Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3]))],
@@ -456,7 +454,11 @@ mod tests {
         .unwrap();
         assert_eq!(got.positions, vec![2], "宽化之后等值比较才有意义");
         let b = got.batch.unwrap();
-        assert_eq!(b.column(0).data_type(), &DataType::Int64, "产物的类型按表 schema");
+        assert_eq!(
+            b.column(0).data_type(),
+            &DataType::Int64,
+            "产物的类型按表 schema"
+        );
     }
 
     #[tokio::test]
@@ -472,7 +474,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(got.rows, 5, "文件行数要报出来（与清单核对用）");
-        assert_eq!(got.positions, vec![2, 3, 4], "命中的是第 2/3/4 行（文件内、0 起）");
+        assert_eq!(
+            got.positions,
+            vec![2, 3, 4],
+            "命中的是第 2/3/4 行（文件内、0 起）"
+        );
     }
 
     /// 没命中 ⇒ 空位置（而不是报错）；这不是"跳过"，是"确实没有"。
@@ -525,7 +531,11 @@ mod tests {
             .downcast_ref::<arrow::array::Int64Array>()
             .unwrap();
         let vals: Vec<i64> = (0..c.len()).map(|i| c.value(i)).collect();
-        assert_eq!(vals, vec![1030, 1040, 1050], "新值 = 原值 + 1000（SET 的效果）");
+        assert_eq!(
+            vals,
+            vec![1030, 1040, 1050],
+            "新值 = 原值 + 1000（SET 的效果）"
+        );
     }
 
     /// **一行都没命中** ⇒ 空结果（而不是 panic）。
@@ -546,7 +556,10 @@ mod tests {
         .await
         .unwrap();
         assert!(got.positions.is_empty());
-        assert!(got.batch.is_none(), "没命中就没有结果批次（调用方据此什么都不做）");
+        assert!(
+            got.batch.is_none(),
+            "没命中就没有结果批次（调用方据此什么都不做）"
+        );
         assert_eq!(got.rows, 3, "文件行数照样要报出来");
     }
 
@@ -602,6 +615,9 @@ mod tests {
         .await
         .unwrap_err()
         .to_string();
-        assert!(e.contains("读不了文件") && e.contains("漏掉"), "要说清后果：{e}");
+        assert!(
+            e.contains("读不了文件") && e.contains("漏掉"),
+            "要说清后果：{e}"
+        );
     }
 }

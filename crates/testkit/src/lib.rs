@@ -59,9 +59,7 @@ pub fn disk_root() -> PathBuf {
         return PathBuf::from(p);
     }
     // crates/testkit → workspace 根
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..");
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
     workspace.join("target").join("test-disk")
 }
 
@@ -72,9 +70,7 @@ pub fn is_tmpfs(path: &Path) -> bool {
     let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
         return false;
     };
-    let target = path
-        .canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf());
+    let target = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let mut best: Option<(usize, bool)> = None;
     for line in mounts.lines() {
         let mut it = line.split_whitespace();

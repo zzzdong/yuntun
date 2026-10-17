@@ -32,7 +32,7 @@ use crate::prune::{self, Constraint};
 use arrow::datatypes::Schema;
 use datafusion::logical_expr::{Expr, Operator};
 use datafusion_datasource_parquet::ParquetAccessPlan;
-use yuntun_model::index::{IndexFile, IndexKey, INDEX_GROUP_ROWS};
+use yuntun_model::index::{INDEX_GROUP_ROWS, IndexFile, IndexKey};
 use yuntun_model::meta::{StatBound, StatisticsLite};
 
 /// 一个候选文件的**行组访问计划**。
@@ -67,7 +67,9 @@ pub(crate) fn group_access_plan(
     let mut skipped = 0usize;
     for g in 0..index.groups.len() {
         let start = g * INDEX_GROUP_ROWS;
-        let group_rows = (row_count as usize).saturating_sub(start).min(INDEX_GROUP_ROWS) as u64;
+        let group_rows = (row_count as usize)
+            .saturating_sub(start)
+            .min(INDEX_GROUP_ROWS) as u64;
         // 组级 zone map：把这一组的列统计喂给**同一套**判定
         let stats = StatisticsLite {
             columns: index.groups[g].columns.clone(),
@@ -77,9 +79,8 @@ pub(crate) fn group_access_plan(
             // 等值路径（zone map 做不到的那半）
             skip = cs.iter().any(|c| {
                 c.op == Operator::Eq
-                    && xor_key(c).is_some_and(|k| {
-                        index.definitely_absent(g, &c.column, &k) == Some(true)
-                    })
+                    && xor_key(c)
+                        .is_some_and(|k| index.definitely_absent(g, &c.column, &k) == Some(true))
             });
         }
         if skip {
@@ -165,7 +166,10 @@ mod tests {
         let f = col("event_time").eq(lit(1i64));
         let plan = group_access_plan(&schema, &idx, b.num_rows() as u64, &[f])
             .expect("应当能剪掉组（否则索引白做）");
-        assert!(!plan.should_scan(0), "组 0 的 zone map 剪不掉，必须由 filter 剪");
+        assert!(
+            !plan.should_scan(0),
+            "组 0 的 zone map 剪不掉，必须由 filter 剪"
+        );
         assert_eq!(plan.len(), 2, "计划长度 = 行组数（DF 的硬要求）");
     }
 
@@ -190,10 +194,20 @@ mod tests {
         // ① 没有过滤：没有依据
         assert!(group_access_plan(&b.schema(), &idx, rows, &[]).is_none());
         // ② OR 形状不认识（`constraints` 放弃它）
-        let f = col("event_time").eq(lit(1i64)).or(col("event_time").eq(lit(3i64)));
+        let f = col("event_time")
+            .eq(lit(1i64))
+            .or(col("event_time").eq(lit(3i64)));
         assert!(group_access_plan(&b.schema(), &idx, rows, &[f]).is_none());
         // ③ 形状对不上（行数改了）
-        assert!(group_access_plan(&b.schema(), &idx, rows + 1, &[col("event_time").eq(lit(1i64))]).is_none());
+        assert!(
+            group_access_plan(
+                &b.schema(),
+                &idx,
+                rows + 1,
+                &[col("event_time").eq(lit(1i64))]
+            )
+            .is_none()
+        );
         // ④ 谓词类型与列不同族（字符串字面量配整型列）⇒ 约束被丢掉
         let f = col("event_time").eq(lit("1"));
         assert!(group_access_plan(&b.schema(), &idx, rows, &[f]).is_none());
@@ -233,17 +247,18 @@ mod tests {
         let rows = b.num_rows() as u64;
 
         // 同刻度（毫秒）且值落在组 0 的"洞"里：`i*1000` 全是 1000 的倍数 ⇒ 1001 不在组 0
-        let f = col("event_time").eq(lit(
-            datafusion::scalar::ScalarValue::TimestampMillisecond(Some(1001), None),
-        ));
-        let plan = group_access_plan(&schema, &idx, rows, &[f])
-            .expect("同刻度的等值谓词应当能剪");
+        let f = col("event_time").eq(lit(datafusion::scalar::ScalarValue::TimestampMillisecond(
+            Some(1001),
+            None,
+        )));
+        let plan = group_access_plan(&schema, &idx, rows, &[f]).expect("同刻度的等值谓词应当能剪");
         assert!(!plan.should_scan(0));
 
         // **不同刻度**（纳秒字面量配毫秒列）：整条约束必须被丢掉（否则数值直接比大小 ⇒ 剪错）
-        let f = col("event_time").eq(lit(
-            datafusion::scalar::ScalarValue::TimestampNanosecond(Some(1), None),
-        ));
+        let f = col("event_time").eq(lit(datafusion::scalar::ScalarValue::TimestampNanosecond(
+            Some(1),
+            None,
+        )));
         assert!(
             group_access_plan(&schema, &idx, rows, &[f]).is_none(),
             "刻度不同的字面量绝不许参与剪枝（`scalar_matches_column` 的护栏）"

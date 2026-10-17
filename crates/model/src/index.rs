@@ -217,9 +217,13 @@ pub fn arrow_key(array: &dyn Array, i: usize) -> Option<IndexKey> {
                 .as_bytes()
                 .to_vec(),
         ),
-        DataType::Binary => {
-            IndexKey::Bytes(array.as_any().downcast_ref::<BinaryArray>()?.value(i).to_vec())
-        }
+        DataType::Binary => IndexKey::Bytes(
+            array
+                .as_any()
+                .downcast_ref::<BinaryArray>()?
+                .value(i)
+                .to_vec(),
+        ),
         DataType::LargeBinary => IndexKey::Bytes(
             array
                 .as_any()
@@ -408,7 +412,13 @@ mod tests {
     fn batch(rows: usize) -> RecordBatch {
         // event_time：**故意不排序**（真实写入形态）：偶数在 0..1000，奇数在 1_000_000..
         let ts: Vec<i64> = (0..rows)
-            .map(|i| if i % 2 == 0 { i as i64 } else { 1_000_000 + i as i64 })
+            .map(|i| {
+                if i % 2 == 0 {
+                    i as i64
+                } else {
+                    1_000_000 + i as i64
+                }
+            })
             .collect();
         let user: Vec<String> = (0..rows).map(|i| format!("u{}", i % 50)).collect();
         let schema = Arc::new(Schema::new(vec![
@@ -461,10 +471,7 @@ mod tests {
             };
             for (col, key) in [
                 ("event_time", IndexKey::Int(ts)),
-                (
-                    "user",
-                    IndexKey::Bytes(format!("u{}", i % 50).into_bytes()),
-                ),
+                ("user", IndexKey::Bytes(format!("u{}", i % 50).into_bytes())),
             ] {
                 assert_ne!(
                     idx.definitely_absent(0, col, &key),
@@ -500,7 +507,10 @@ mod tests {
         // 没有 filter 的列 ⇒ 判不了（`None`，调用方必须当"要读"）
         assert_eq!(idx.definitely_absent(0, "nope", &IndexKey::Int(1)), None);
         // 越界组号 ⇒ 一样判不了
-        assert_eq!(idx.definitely_absent(9, "event_time", &IndexKey::Int(1)), None);
+        assert_eq!(
+            idx.definitely_absent(9, "event_time", &IndexKey::Int(1)),
+            None
+        );
     }
 
     /// 全 null / 不支持类型 ⇒ 不生成 filter（拿不准不剪）。
@@ -519,7 +529,10 @@ mod tests {
         )
         .unwrap();
         let idx = IndexFile::build(&b, &["a".to_string(), "f".to_string()]).unwrap();
-        assert!(idx.groups[0].filters.is_empty(), "全 null 与 float 都不该有 filter");
+        assert!(
+            idx.groups[0].filters.is_empty(),
+            "全 null 与 float 都不该有 filter"
+        );
         assert_eq!(idx.definitely_absent(0, "a", &IndexKey::Int(1)), None);
         assert_eq!(idx.definitely_absent(0, "f", &IndexKey::Int(1)), None);
     }
@@ -568,7 +581,10 @@ mod tests {
 
         // 截断
         assert!(IndexFile::from_bytes(&bytes[..HEADER_LEN - 1]).is_err());
-        assert!(IndexFile::from_bytes(&bytes[..bytes.len() - 1]).is_err(), "载荷长度不符");
+        assert!(
+            IndexFile::from_bytes(&bytes[..bytes.len() - 1]).is_err(),
+            "载荷长度不符"
+        );
         // 魔数
         let mut m = bytes.clone();
         m[0] = b'X';
@@ -597,7 +613,10 @@ mod tests {
         assert_eq!(key_hash(&IndexKey::Bool(true)), 1);
         // FNV-1a 64("") = 偏移基；"a" = 0xaf63dc4c8601ec8c
         assert_eq!(key_hash(&IndexKey::Bytes(vec![])), 0xcbf2_9ce4_8422_2325);
-        assert_eq!(key_hash(&IndexKey::Bytes(b"a".to_vec())), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(
+            key_hash(&IndexKey::Bytes(b"a".to_vec())),
+            0xaf63_dc4c_8601_ec8c
+        );
     }
 
     /// 键编码：null ⇒ `None`（null 不满足任何等值谓词），类型不支持 ⇒ `None`。
@@ -619,7 +638,10 @@ mod tests {
         assert!(!idx.matches_shape(INDEX_GROUP_ROWS as u64), "行数不符");
         assert!(!idx.matches_shape(0), "零行（空文件）不剪");
         idx.group_rows = 1;
-        assert!(!idx.matches_shape(INDEX_GROUP_ROWS as u64 + 1), "组大小不符");
+        assert!(
+            !idx.matches_shape(INDEX_GROUP_ROWS as u64 + 1),
+            "组大小不符"
+        );
     }
 
     /// 结构不完整的 filter 不参与判定（宁可判不了，也不许 panic 在读取路径上）。

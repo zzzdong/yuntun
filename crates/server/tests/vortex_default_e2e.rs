@@ -16,8 +16,8 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use yuntun_server::Lakehouse;
-use yuntun_sql::session::SessionCtx;
 use yuntun_sql::SqlResult;
+use yuntun_sql::session::SessionCtx;
 
 fn config(wal_dir: &str, store_root: &str, default_format: Option<&str>) -> yuntun_server::Config {
     let fmt_line = match default_format {
@@ -107,7 +107,12 @@ async fn walk(default_format: Option<&str>, label: &str) -> Vec<String> {
     let mut session = SessionCtx::default();
 
     run(&lakehouse, &mut session, "CREATE TABLE t (v BIGINT)").await;
-    run(&lakehouse, &mut session, "INSERT INTO t VALUES (1), (2), (3)").await;
+    run(
+        &lakehouse,
+        &mut session,
+        "INSERT INTO t VALUES (1), (2), (3)",
+    )
+    .await;
 
     // 用一条"命中 0 行"的 DELETE 把 flush 逼出来（`DELETE` 先强制 flush 再定位）⇒
     // 这样"产物是什么格式"就是**确定**的，不用等窗口关闭、不用 sleep。
@@ -125,10 +130,19 @@ async fn walk(default_format: Option<&str>, label: &str) -> Vec<String> {
     run(&lakehouse, &mut session, "DELETE FROM t WHERE v = 2").await;
     let mut v = run(&lakehouse, &mut session, "SELECT v FROM t ORDER BY v").await;
     v.sort();
-    assert_eq!(v, vec![1, 3], "{label}：删掉的行必须查不到（DV 在该格式上生效）");
+    assert_eq!(
+        v,
+        vec![1, 3],
+        "{label}：删掉的行必须查不到（DV 在该格式上生效）"
+    );
 
     // ③ 更新生效（新行写成**同一个格式**的文件，再被读回来）
-    run(&lakehouse, &mut session, "UPDATE t SET v = v + 100 WHERE v = 1").await;
+    run(
+        &lakehouse,
+        &mut session,
+        "UPDATE t SET v = v + 100 WHERE v = 1",
+    )
+    .await;
     let mut v = run(&lakehouse, &mut session, "SELECT v FROM t ORDER BY v").await;
     v.sort();
     assert_eq!(v, vec![3, 101], "{label}：UPDATE 的新值必须读得到");
@@ -162,7 +176,9 @@ fn config_warns_when_vortex_is_configured_but_not_compiled() {
     let warnings = cfg.warnings();
     // 本二进制**编进了** vortex（默认特性）⇒ 这条自检不该响
     assert!(
-        !warnings.iter().any(|w| w.contains("没有") && w.contains("vortex")),
+        !warnings
+            .iter()
+            .any(|w| w.contains("没有") && w.contains("vortex")),
         "编进 vortex 时不该告警：{warnings:?}"
     );
 }

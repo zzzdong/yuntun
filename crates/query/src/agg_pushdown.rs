@@ -35,8 +35,8 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use yuntun_model::agg::{AggKind, AggScalar, AggSpec, KeyPart, PartialAgg};
-use yuntun_model::predicate::{CmpOp, Literal, Predicate};
 use yuntun_model::error::LakeError;
+use yuntun_model::predicate::{CmpOp, Literal, Predicate};
 
 use crate::cache::CatalogSnapshot;
 
@@ -89,7 +89,11 @@ pub fn detect(sql: &str, default_schema: &str, snapshot: &CatalogSnapshot) -> Op
             for e in exprs {
                 let col = column_of(e)?;
                 if !matches!(
-                    cached.schema.field_with_name(&col).ok().map(|f| f.data_type()),
+                    cached
+                        .schema
+                        .field_with_name(&col)
+                        .ok()
+                        .map(|f| f.data_type()),
                     Some(DataType::Int64 | DataType::Utf8)
                 ) {
                     return None;
@@ -252,11 +256,7 @@ fn literal_of(expr: &Expr) -> Option<Literal> {
 }
 
 /// 列必须存在，且类型与字面量**同族**（否则不下推）。
-fn type_ok(
-    schema: &arrow::datatypes::Schema,
-    column: &str,
-    lit: &Literal,
-) -> bool {
+fn type_ok(schema: &arrow::datatypes::Schema, column: &str, lit: &Literal) -> bool {
     let Ok(field) = schema.field_with_name(column) else {
         return false;
     };
@@ -277,10 +277,7 @@ fn single_table(select: &Select) -> Option<(String, String)> {
     }
     match &factor.relation {
         TableFactor::Table {
-            name,
-            alias,
-            args,
-            ..
+            name, alias, args, ..
         } => {
             if alias.is_some() || args.is_some() {
                 return None; // 别名 / 表函数：不碰
@@ -397,7 +394,11 @@ fn spec_of_item(item: &SelectItem, schema: &arrow::datatypes::Schema) -> Option<
         }
         "min" | "max" => {
             let col = single_column_arg(args)?;
-            let kind = if name == "min" { AggKind::Min } else { AggKind::Max };
+            let kind = if name == "min" {
+                AggKind::Min
+            } else {
+                AggKind::Max
+            };
             check_column(schema, &col, kind)?;
             Some(AggSpec::new(kind, col))
         }
@@ -421,11 +422,7 @@ fn single_column_arg(args: &[FunctionArg]) -> Option<String> {
 }
 
 /// 列必须存在，且类型在**这一刀的下推边界**内（见 `yuntun_model::agg` 的模块文档）。
-fn check_column(
-    schema: &arrow::datatypes::Schema,
-    column: &str,
-    kind: AggKind,
-) -> Option<()> {
+fn check_column(schema: &arrow::datatypes::Schema, column: &str, kind: AggKind) -> Option<()> {
     let dt = schema.field_with_name(column).ok()?.data_type();
     let ok = match kind {
         AggKind::CountStar | AggKind::Count => true,
@@ -586,9 +583,9 @@ pub fn merge_grouped_into_cold(
                     .collect()
             });
             for (i, p) in g.states.iter().enumerate() {
-                let cur = states.get(i).ok_or_else(|| {
-                    LakeError::Other("热来源的状态个数与请求不符".into())
-                })?;
+                let cur = states
+                    .get(i)
+                    .ok_or_else(|| LakeError::Other("热来源的状态个数与请求不符".into()))?;
                 states[i] = yuntun_model::agg::merge(cur, p)?;
             }
         }
@@ -619,10 +616,7 @@ fn cold_key_at(col: &arrow::array::ArrayRef, row: usize) -> Result<KeyPart, Lake
     )))
 }
 
-fn key_array_of(
-    want: &DataType,
-    vals: &[KeyPart],
-) -> Result<arrow::array::ArrayRef, LakeError> {
+fn key_array_of(want: &DataType, vals: &[KeyPart]) -> Result<arrow::array::ArrayRef, LakeError> {
     match want {
         DataType::Int64 => {
             let mut out = Vec::with_capacity(vals.len());
@@ -631,7 +625,7 @@ fn key_array_of(
                     None => None,
                     Some(AggScalar::Int(i)) => Some(*i),
                     Some(AggScalar::Text(_)) => {
-                        return Err(LakeError::Other("分组键是字符串，但列是 Int64".into()))
+                        return Err(LakeError::Other("分组键是字符串，但列是 Int64".into()));
                     }
                 });
             }
@@ -644,15 +638,13 @@ fn key_array_of(
                     None => None,
                     Some(AggScalar::Text(t)) => Some(t.clone()),
                     Some(AggScalar::Int(_)) => {
-                        return Err(LakeError::Other("分组键是整数，但列是 Utf8".into()))
+                        return Err(LakeError::Other("分组键是整数，但列是 Utf8".into()));
                     }
                 });
             }
             Ok(std::sync::Arc::new(StringArray::from(out)))
         }
-        other => Err(LakeError::Other(format!(
-            "分组键列的类型不支持：{other:?}"
-        ))),
+        other => Err(LakeError::Other(format!("分组键列的类型不支持：{other:?}"))),
     }
 }
 
@@ -727,7 +719,9 @@ fn array_of_many(
                     Some(AggScalar::Int(i)) => Some(*i),
                     None => None,
                     Some(AggScalar::Text(_)) => {
-                        return Err(LakeError::Other("min/max 合并出了字符串，但列是 Int64".into()))
+                        return Err(LakeError::Other(
+                            "min/max 合并出了字符串，但列是 Int64".into(),
+                        ));
                     }
                 },
                 None,
@@ -738,7 +732,7 @@ fn array_of_many(
                     Some(AggScalar::Text(t)) => Some(t.clone()),
                     None => None,
                     Some(AggScalar::Int(_)) => {
-                        return Err(LakeError::Other("min/max 合并出了整数，但列是 Utf8".into()))
+                        return Err(LakeError::Other("min/max 合并出了整数，但列是 Utf8".into()));
                     }
                 },
             ),
@@ -746,7 +740,7 @@ fn array_of_many(
                 return Err(LakeError::Other(format!(
                     "聚合下推结果类型与冷结果不一致：合并出 {:?}，冷结果列是 {want:?}",
                     got.kind()
-                )))
+                )));
             }
         };
         saw_text |= tv.is_some();
@@ -758,7 +752,9 @@ fn array_of_many(
     } else if matches!(want, DataType::UInt64) {
         // `count` 在 DataFusion 里是 UInt64 还是 Int64 由它决定，我们照着写
         std::sync::Arc::new(UInt64Array::from(
-            ints.into_iter().map(|v| v.unwrap_or(0) as u64).collect::<Vec<_>>(),
+            ints.into_iter()
+                .map(|v| v.unwrap_or(0) as u64)
+                .collect::<Vec<_>>(),
         ))
     } else {
         std::sync::Arc::new(Int64Array::from(ints))
@@ -766,10 +762,7 @@ fn array_of_many(
 }
 
 /// 不分组时用：一个聚合列只有**一个**值。
-fn array_of(
-    merged: PartialAgg,
-    want: &DataType,
-) -> Result<arrow::array::ArrayRef, LakeError> {
+fn array_of(merged: PartialAgg, want: &DataType) -> Result<arrow::array::ArrayRef, LakeError> {
     array_of_many(std::slice::from_ref(&merged), want)
 }
 
@@ -791,10 +784,7 @@ mod tests {
     fn the_narrow_shape_is_recognized() {
         let snap = snapshot_with(DataType::Int64);
         for (sql, want) in [
-            (
-                "SELECT count(*) FROM cpu",
-                vec![AggSpec::count_star()],
-            ),
+            ("SELECT count(*) FROM cpu", vec![AggSpec::count_star()]),
             (
                 "SELECT count(v), sum(v), min(v), max(v) FROM cpu",
                 vec![
@@ -808,10 +798,7 @@ mod tests {
                 "SELECT max(s) FROM public.cpu",
                 vec![AggSpec::new(AggKind::Max, "s")],
             ),
-            (
-                "SELECT count(*) AS c FROM cpu",
-                vec![AggSpec::count_star()],
-            ),
+            ("SELECT count(*) AS c FROM cpu", vec![AggSpec::count_star()]),
         ] {
             let got = detect(sql, "public", &snap).unwrap_or_else(|| panic!("{sql} 应当可下推"));
             assert_eq!(got.table, "public.cpu", "{sql}");
@@ -940,10 +927,7 @@ mod tests {
             // 普通 SQL 之外的东西
             "CREATE TABLE t (a INT)",
         ] {
-            assert!(
-                detect(sql, "public", &snap).is_none(),
-                "{sql} 不该被下推"
-            );
+            assert!(detect(sql, "public", &snap).is_none(), "{sql} 不该被下推");
         }
     }
 
@@ -986,8 +970,14 @@ mod tests {
         let specs = vec![AggSpec::count_star(), AggSpec::new(AggKind::SumInt, "v")];
         let cold_batch = cold(vec![PartialAgg::Count(10), PartialAgg::SumInt(Some(100))]);
         let hot = vec![
-            yuntun_model::agg::AggStates::Plain(vec![PartialAgg::Count(3), PartialAgg::SumInt(Some(7))]),
-            yuntun_model::agg::AggStates::Plain(vec![PartialAgg::Count(0), PartialAgg::SumInt(None)]),
+            yuntun_model::agg::AggStates::Plain(vec![
+                PartialAgg::Count(3),
+                PartialAgg::SumInt(Some(7)),
+            ]),
+            yuntun_model::agg::AggStates::Plain(vec![
+                PartialAgg::Count(0),
+                PartialAgg::SumInt(None),
+            ]),
         ];
         let got = merge_into_cold(&cold_batch, &specs, &hot).unwrap();
         assert_eq!(got.num_rows(), 1);
@@ -1005,7 +995,9 @@ mod tests {
         let with_hot = merge_into_cold(
             &cold_null,
             &specs,
-            &[yuntun_model::agg::AggStates::Plain(vec![PartialAgg::SumInt(Some(5))])],
+            &[yuntun_model::agg::AggStates::Plain(vec![
+                PartialAgg::SumInt(Some(5)),
+            ])],
         )
         .unwrap();
         assert_eq!(
@@ -1017,14 +1009,18 @@ mod tests {
                 .value(0),
             5
         );
-        let all_null =
-            merge_into_cold(
-                &cold_null,
-                &specs,
-                &[yuntun_model::agg::AggStates::Plain(vec![PartialAgg::SumInt(None)])],
-            )
-                .unwrap();
-        assert!(all_null.column(0).is_null(0), "全 NULL ⇒ 仍然是 NULL（不是 0）");
+        let all_null = merge_into_cold(
+            &cold_null,
+            &specs,
+            &[yuntun_model::agg::AggStates::Plain(vec![
+                PartialAgg::SumInt(None),
+            ])],
+        )
+        .unwrap();
+        assert!(
+            all_null.column(0).is_null(0),
+            "全 NULL ⇒ 仍然是 NULL（不是 0）"
+        );
     }
 
     /// 形状不成立（列数不符）时**响亮失败**，不许悄悄返回一个少了一列的批次。
@@ -1094,7 +1090,11 @@ mod tests {
             vec![(None, 2), (Some(1), 13), (Some(9), 4)],
             "NULL 组不受影响、v=1 累加、v=9 是新组"
         );
-        assert_eq!(got.schema(), cold_batch.schema(), "schema 必须沿用 DataFusion 的");
+        assert_eq!(
+            got.schema(),
+            cold_batch.schema(),
+            "schema 必须沿用 DataFusion 的"
+        );
     }
 
     /// 分组形状不符（一边分组一边不分组）⇒ **响亮失败**（少一个组看起来也像正常答案）。
@@ -1109,7 +1109,9 @@ mod tests {
         let e = merge_grouped_into_cold(
             &cold_batch,
             &q,
-            &[yuntun_model::agg::AggStates::Plain(vec![PartialAgg::Count(1)])],
+            &[yuntun_model::agg::AggStates::Plain(vec![
+                PartialAgg::Count(1),
+            ])],
         )
         .unwrap_err();
         assert!(e.to_string().contains("不是分组结果"), "{e}");

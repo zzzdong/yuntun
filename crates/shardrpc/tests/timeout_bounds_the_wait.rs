@@ -99,13 +99,19 @@ async fn a_hung_node_fails_within_the_bound_and_says_it_timed_out() {
     let id = ShardId::new("public.t", "default", "2026-09-23T10:00");
 
     let t0 = Instant::now();
-    let e = fetch.fetch_shards("public.t").await.expect_err("假死 ⇒ 必须失败");
+    let e = fetch
+        .fetch_shards("public.t")
+        .await
+        .expect_err("假死 ⇒ 必须失败");
     let d = t0.elapsed();
     assert!(
         d >= Duration::from_millis(200),
         "应当**等满**超时才放弃（而不是立刻误判）：{d:?}"
     );
-    assert!(d < Duration::from_secs(3), "必须**有界**，不能一直等：{d:?}");
+    assert!(
+        d < Duration::from_secs(3),
+        "必须**有界**，不能一直等：{d:?}"
+    );
     assert!(
         e.to_string().contains("超时"),
         "错误要能区分『没响应』与『拒绝连接』：{e}"
@@ -116,10 +122,7 @@ async fn a_hung_node_fails_within_the_bound_and_says_it_timed_out() {
         .await
         .expect_err("假死 ⇒ 必须失败");
     assert!(e.to_string().contains("超时"), "{e}");
-    let e = fetch
-        .fetch_watermark(0)
-        .await
-        .expect_err("假死 ⇒ 必须失败");
+    let e = fetch.fetch_watermark(0).await.expect_err("假死 ⇒ 必须失败");
     assert!(e.to_string().contains("超时"), "{e}");
 }
 
@@ -131,7 +134,10 @@ async fn a_healthy_node_is_not_misjudged() {
         .await
         .unwrap();
 
-    let shards = fetch.fetch_shards("public.t").await.expect("健康节点应当成功");
+    let shards = fetch
+        .fetch_shards("public.t")
+        .await
+        .expect("健康节点应当成功");
     assert!(shards.is_empty());
     let wm = fetch.fetch_watermark(7).await.expect("水位应当成功");
     assert_eq!(wm.flushed_watermark, 0);

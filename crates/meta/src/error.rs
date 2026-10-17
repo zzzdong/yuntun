@@ -113,13 +113,17 @@ impl From<MetaError> for tonic::Status {
                 "no-quorum",
                 String::new(),
             ),
-            MetaError::OccConflict { actual_version } => with_kind(with_hint(
-                tonic::Status::failed_precondition(format!(
-                    "schema version changed (actual {actual_version})"
-                )),
-                "actual-version",
-                actual_version.to_string(),
-            ), "occ-conflict", String::new()),
+            MetaError::OccConflict { actual_version } => with_kind(
+                with_hint(
+                    tonic::Status::failed_precondition(format!(
+                        "schema version changed (actual {actual_version})"
+                    )),
+                    "actual-version",
+                    actual_version.to_string(),
+                ),
+                "occ-conflict",
+                String::new(),
+            ),
             MetaError::BadRequest(m) => tonic::Status::invalid_argument(m),
             MetaError::Storage(m) => tonic::Status::internal(m),
             MetaError::Lake(e) => match e {
@@ -207,7 +211,10 @@ pub enum MetaNodeError {
     /// 传输层起不来（地址非法 / 不在 tokio 运行时上下文里）。
     Transport(String),
     /// 盘上的成员表与本次配置不一致。
-    MembershipMismatch { stored: Vec<u64>, requested: Vec<u64> },
+    MembershipMismatch {
+        stored: Vec<u64>,
+        requested: Vec<u64>,
+    },
 }
 
 impl std::fmt::Display for MetaNodeError {

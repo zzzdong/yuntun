@@ -26,16 +26,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use async_trait::async_trait;
 use yuntun_catalog::{CatalogOps, MemoryCatalog};
 use yuntun_chunk::{ChunkKey, ChunkStore, ChunkStoreConfig, MemoryLedger, SealPolicy};
 use yuntun_model::error::LakeError;
 use yuntun_model::ops::CreateTableRequest;
 use yuntun_query::{LocalCatalog, PartialPolicy, QueryEngine};
-use yuntun_store::{create_store, ShardId, ShardRead, ShardReader, ShardTier, StoreConfig};
+use yuntun_store::{ShardId, ShardRead, ShardReader, ShardTier, StoreConfig, create_store};
 
 /// 全限定表名：必须与 `ChunkKey.shard.table` 一致，否则热读按表名过滤会扑空
 const TABLE: &str = "public.partial";
@@ -220,7 +220,14 @@ fn instance(dir: &yuntun_testkit::TestDir, instance_id: &str) -> Arc<ChunkStore>
 
 fn write(store: &ChunkStore, vals: &[i64]) {
     store
-        .append(ChunkKey::new(shard_id(), 0), 1, schema(), 0, vec![batch(vals)], 0)
+        .append(
+            ChunkKey::new(shard_id(), 0),
+            1,
+            schema(),
+            0,
+            vec![batch(vals)],
+            0,
+        )
         .unwrap();
 }
 
@@ -313,7 +320,11 @@ async fn unreachable_source_degrades_to_a_marked_partial_result() {
         .expect("默认策略下应当**降级**，而不是整体失败");
 
     // 可用部分照常给出
-    assert_eq!(values(&out.batches), vec![1, 2, 3], "健康来源的数据必须完整返回");
+    assert_eq!(
+        values(&out.batches),
+        vec![1, 2, 3],
+        "健康来源的数据必须完整返回"
+    );
     // 但**必须**标记为部分，并点名缺了谁、为什么
     assert!(out.is_partial(), "缺了来源却没标记 = 静默少数据");
     let missing = out.partial.missing();
@@ -354,7 +365,10 @@ async fn reject_policy_fails_loudly_and_names_the_missing_source() {
         .expect_err("reject 策略下必须失败");
     let msg = e.to_string();
     assert!(msg.contains("inst-b"), "错误要点名缺失来源：{msg}");
-    assert!(msg.contains("拒绝部分结果"), "错误要说清是为什么失败：{msg}");
+    assert!(
+        msg.contains("拒绝部分结果"),
+        "错误要说清是为什么失败：{msg}"
+    );
 }
 
 // ---------------------------------------------------------------- ③ 不许误标
@@ -380,7 +394,11 @@ async fn complete_reads_are_not_marked_partial() {
 
     let out = engine.sql_partial(QUERY).await.expect("两个来源都健康");
     assert_eq!(values(&out.batches), vec![1, 2, 3, 4]);
-    assert!(!out.is_partial(), "完整结果被标成部分：{}", out.partial.describe());
+    assert!(
+        !out.is_partial(),
+        "完整结果被标成部分：{}",
+        out.partial.describe()
+    );
 }
 
 // ---------------------------------------------------------------- ④ 护栏：STALE 不降级
@@ -407,7 +425,10 @@ async fn stale_is_retried_then_fails_loudly_never_downgraded_to_partial() {
         .await
         .expect_err("永久 STALE ⇒ 必须失败，不能返回不完整结果");
     let msg = e.to_string();
-    assert!(msg.contains("STALE"), "错误要说清是 STALE（可重试信号）：{msg}");
+    assert!(
+        msg.contains("STALE"),
+        "错误要说清是 STALE（可重试信号）：{msg}"
+    );
     assert!(
         msg.contains("不返回不完整结果"),
         "STALE 追不上时的语义是**失败**，不是部分结果：{msg}"
@@ -480,10 +501,7 @@ async fn budget_above_which_sources_degrade_to_partial() {
 
     let engine = engine_with_budget(
         PartialPolicy::Allow,
-        vec![
-            ("inst-a", slow(vec![1])),
-            ("inst-b", slow(vec![2])),
-        ],
+        vec![("inst-a", slow(vec![1])), ("inst-b", slow(vec![2]))],
         Duration::from_millis(150),
     )
     .await;

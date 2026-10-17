@@ -111,7 +111,13 @@ async fn cli_round_trips_ddl_insert_query_against_a_real_server() {
     let (addr, shutdown, server, _lakehouse) = start_server().await;
 
     // ① DDL：无结果集语句打印 OK
-    let out = cli_ok(&addr, &["query", "CREATE TABLE cpu (ts BIGINT, host TEXT, usage DOUBLE)"]);
+    let out = cli_ok(
+        &addr,
+        &[
+            "query",
+            "CREATE TABLE cpu (ts BIGINT, host TEXT, usage DOUBLE)",
+        ],
+    );
     assert!(out.contains("OK"), "DDL 应打印 OK：{out}");
 
     // ② CSV 导入（回执行数 = 实际写入行数）
@@ -122,10 +128,7 @@ async fn cli_round_trips_ddl_insert_query_against_a_real_server() {
         "ts,host,usage\n1,web-01,0.5\n2,web-01,0.7\n3,web-02,0.9\n",
     )
     .unwrap();
-    let out = cli_ok(
-        &addr,
-        &["insert", "-t", "cpu", "-f", csv.to_str().unwrap()],
-    );
+    let out = cli_ok(&addr, &["insert", "-t", "cpu", "-f", csv.to_str().unwrap()]);
     assert!(out.contains("inserted 3 rows"), "回执应报 3 行：{out}");
 
     // ③ 聚合查询（读己之写：轮询到可见，上界 = 1 个 scan 周期 + 余量）
@@ -152,12 +155,20 @@ async fn cli_round_trips_ddl_insert_query_against_a_real_server() {
 
     // ④ table 格式（默认）：管道符号表格
     let out = cli_ok(&addr, &["query", "SELECT count(*) AS c FROM cpu"]);
-    assert!(out.contains('|') && out.contains('3'), "table 输出应含 3 行计数：{out}");
+    assert!(
+        out.contains('|') && out.contains('3'),
+        "table 输出应含 3 行计数：{out}"
+    );
 
     // ⑤ json 格式：行式 JSON
     let out = cli_ok(
         &addr,
-        &["query", "SELECT host FROM cpu ORDER BY ts LIMIT 1", "--format", "json"],
+        &[
+            "query",
+            "SELECT host FROM cpu ORDER BY ts LIMIT 1",
+            "--format",
+            "json",
+        ],
     );
     assert!(out.contains("web-01"), "json 输出应含 host：{out}");
 

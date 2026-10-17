@@ -79,10 +79,7 @@ async fn refresh_cache(lakehouse: &Lakehouse) {
         .unwrap();
 }
 
-async fn col_v(
-    client: &mut FlightServiceClient<tonic::transport::Channel>,
-    sql: &str,
-) -> Vec<i64> {
+async fn col_v(client: &mut FlightServiceClient<tonic::transport::Channel>, sql: &str) -> Vec<i64> {
     let batches = collect_do_get(client, sql).await;
     let mut out = Vec::new();
     for b in &batches {
@@ -267,7 +264,10 @@ async fn update_rewrites_the_matching_rows_and_nothing_else() {
         .unwrap();
     assert_eq!(dvs.len(), 1, "被命中的源文件 ⇒ 一份删除向量");
     assert_eq!(dvs[0].card, 3);
-    assert_eq!(dvs[0].applied_at, after, "删除向量与产物**同号** ⇒ 原子可见");
+    assert_eq!(
+        dvs[0].applied_at, after,
+        "删除向量与产物**同号** ⇒ 原子可见"
+    );
 
     // 旧快照看到的是**旧世界**（两半都不可见）
     let old_files = lakehouse
@@ -417,9 +417,7 @@ async fn update_survives_restart_in_memory_meta_mode() {
         .await
         .unwrap();
     assert!(
-        files
-            .iter()
-            .any(|f| f.valid_from == dvs[0].applied_at),
+        files.iter().any(|f| f.valid_from == dvs[0].applied_at),
         "重放之后两半仍然同号（原子可见不许在重放路径上退化）"
     );
     shutdown.cancel();
@@ -444,19 +442,23 @@ async fn update_refusals_are_explicit() {
 
     let mut session = SessionCtx::default();
     // 只读装配：UPDATE 必须给**可读拒绝**
-    let ro = yuntun_sql::SqlEngine::new_readonly(lakehouse.query.clone(), lakehouse.catalog.clone());
-    match ro.execute("UPDATE t SET v = 1 WHERE v = 1", &mut session).await {
+    let ro =
+        yuntun_sql::SqlEngine::new_readonly(lakehouse.query.clone(), lakehouse.catalog.clone());
+    match ro
+        .execute("UPDATE t SET v = 1 WHERE v = 1", &mut session)
+        .await
+    {
         Err(yuntun_sql::SqlError::ReadOnly) => {}
         Err(other) => panic!("只读形态应当报 ReadOnly，实际：{other}"),
         Ok(_) => panic!("只读形态下的 UPDATE 不许成功"),
     }
 
     for sql in [
-        "UPDATE t SET v = 1",                        // 无 WHERE：等于整表重写
-        "UPDATE t SET v = 1 FROM s WHERE t.v = 1",   // FROM
-        "UPDATE t SET v = no_such = 1 WHERE v = 1",  // 表达式里引用不存在的列
-        "UPDATE t SET v = 1, v = 2 WHERE v = 1",     // 同一列两次
-        "UPDATE t SET v = 1 WHERE v = 1 RETURNING v",// RETURNING
+        "UPDATE t SET v = 1",                         // 无 WHERE：等于整表重写
+        "UPDATE t SET v = 1 FROM s WHERE t.v = 1",    // FROM
+        "UPDATE t SET v = no_such = 1 WHERE v = 1",   // 表达式里引用不存在的列
+        "UPDATE t SET v = 1, v = 2 WHERE v = 1",      // 同一列两次
+        "UPDATE t SET v = 1 WHERE v = 1 RETURNING v", // RETURNING
     ] {
         let msg = match lakehouse.sql.execute(sql, &mut session).await {
             Err(e) => e.to_string(),

@@ -11,6 +11,8 @@
 //! **边界**：无 listener、无 wire 格式、无连接概念——会话（方言 / prepared
 //! 语句表）由协议适配层持有，以 [`SessionCtx`] 显式传入（裁决 S-2/S-4）。
 
+/// `F.3`：DML（`DELETE`）的前端 —— 定位 → 写位图 → WAL → 目录 → 刷缓存。
+pub(crate) mod dml;
 pub mod idempotency;
 pub mod params;
 /// `U4`（`§191`）：`SHOW PROCESSLIST` / `KILL` 的数据源 —— 会话表 + 协作式取消。
@@ -18,13 +20,12 @@ pub mod registry;
 pub mod session;
 pub mod shim;
 pub mod sql;
-/// `F.3`：DML（`DELETE`）的前端 —— 定位 → 写位图 → WAL → 目录 → 刷缓存。
-pub(crate) mod dml;
 
 use std::sync::Arc;
 
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+pub use params::SqlValue;
 use session::{SessionCtx, SqlDialect};
 use yuntun_catalog::CatalogOps;
 use yuntun_ingest::Ingestor;
@@ -32,8 +33,7 @@ use yuntun_model::error::LakeError;
 use yuntun_model::meta::serialize_schema;
 use yuntun_model::ops::{CreateTableRequest, EvolveSchemaRequest};
 use yuntun_model::schema::SchemaChange;
-use yuntun_model::wal_record::{ddl_op, DdlPayload};
-pub use params::SqlValue;
+use yuntun_model::wal_record::{DdlPayload, ddl_op};
 use yuntun_query::{PartialRead, PartialSink, QueryEngine};
 
 /// SQL 执行错误（协议适配层负责映射到各自的回执：
@@ -299,7 +299,11 @@ impl SqlEngine {
 
     /// 一次性执行（简单协议：MySQL COM_QUERY 文本 / PG simple Query /
     /// Flight 简易轨与 StatementUpdate）。
-    pub async fn execute(&self, sql: &str, session: &mut SessionCtx) -> Result<SqlResult, SqlError> {
+    pub async fn execute(
+        &self,
+        sql: &str,
+        session: &mut SessionCtx,
+    ) -> Result<SqlResult, SqlError> {
         // S1.8：幂等键透传（SQL 注释 `/* idempotency_key=... */`）
         let key = idempotency::extract(sql);
         self.execute_with_key(sql, session, key).await
@@ -335,7 +339,10 @@ impl SqlEngine {
 
     /// schema 清单（`SHOW DATABASES` / FlightSQL `GetDbSchemas`）。
     pub async fn list_schemas(&self) -> Result<Vec<String>, SqlError> {
-        self.catalog.list_schemas().await.map_err(SqlError::from_lake)
+        self.catalog
+            .list_schemas()
+            .await
+            .map_err(SqlError::from_lake)
     }
 
     /// schema 是否存在（`USE db` / handshake 校验）。
@@ -383,7 +390,11 @@ impl SqlEngine {
 
     /// 某 schema 下的表名（裸名，已排序）——`SHOW TABLES`。
     pub async fn list_tables_in(&self, schema: &str) -> Result<Vec<String>, SqlError> {
-        let all = self.catalog.list_tables().await.map_err(SqlError::from_lake)?;
+        let all = self
+            .catalog
+            .list_tables()
+            .await
+            .map_err(SqlError::from_lake)?;
         let mut names: Vec<String> = all
             .into_iter()
             .filter(|t| t.schema_name() == schema)
@@ -457,7 +468,11 @@ impl SqlEngine {
     }
 
     /// 预编译：方言感知解析 + 占位符计数 + 列 schema（尽力而为）。
-    pub async fn prepare(&self, sql: &str, session: &SessionCtx) -> Result<PreparedStatement, SqlError> {
+    pub async fn prepare(
+        &self,
+        sql: &str,
+        session: &SessionCtx,
+    ) -> Result<PreparedStatement, SqlError> {
         let mut stmt = sql::parse_single_with(session.dialect.parser_dialect(), sql)
             .map_err(|e| SqlError::Parse(e.to_string()))?;
         let param_count = params::count_placeholders(&mut stmt);
@@ -486,7 +501,11 @@ impl SqlEngine {
 
     /// 元数据 API：全部表的**全限定标识**（跨 schema；调试/内部用）。
     pub async fn list_tables(&self) -> Result<Vec<String>, SqlError> {
-        let tables = self.catalog.list_tables().await.map_err(SqlError::from_lake)?;
+        let tables = self
+            .catalog
+            .list_tables()
+            .await
+            .map_err(SqlError::from_lake)?;
         let mut names: Vec<String> = tables.into_iter().map(|t| t.qualified_name()).collect();
         names.sort();
         Ok(names)
@@ -496,7 +515,12 @@ impl SqlEngine {
     ///
     /// `name` 为全限定标识 `schema.table`（[`sql::resolve_table_ref`] 解析而来）。
     pub async fn describe_table(&self, name: &str) -> Result<Option<TableDesc>, SqlError> {
-        let Some(meta) = self.catalog.get_table(name).await.map_err(SqlError::from_lake)? else {
+        let Some(meta) = self
+            .catalog
+            .get_table(name)
+            .await
+            .map_err(SqlError::from_lake)?
+        else {
             return Ok(None);
         };
         let schema = meta.schema().map_err(SqlError::from_lake)?;
@@ -518,7 +542,8 @@ impl SqlEngine {
 
     /// 逻辑计划 schema（S1.5 一致性语义：空结果集也返回查询 schema，默认 schema）。
     pub async fn schema_of(&self, sql: &str) -> Option<SchemaRef> {
-        self.schema_of_in(sql, yuntun_model::ops::DEFAULT_SCHEMA).await
+        self.schema_of_in(sql, yuntun_model::ops::DEFAULT_SCHEMA)
+            .await
     }
 
     /// 逻辑计划 schema（指定会话 schema：非限定表名按该 schema 解析）。
@@ -649,7 +674,8 @@ impl SqlEngine {
                         "TRUNCATE 的分区 / CASCADE / IDENTITY / ON CLUSTER 选项未支持".into(),
                     ));
                 }
-                self.execute_truncate(&tr.table_names[0].name, session).await
+                self.execute_truncate(&tr.table_names[0].name, session)
+                    .await
             }
             // `F.3e-2`：`UPDATE t SET … WHERE …` —— 删 + 插**一个 op**（原子可见，见 `dml` 模块文档）
             Statement::Update(update) => self.execute_update(&update, session).await,
@@ -752,7 +778,7 @@ impl SqlEngine {
                     _ => {
                         return Err(SqlError::Unsupported(
                             "INSERT target must be a plain table name".into(),
-                        ))
+                        ));
                     }
                 };
                 if table.is_empty() {
@@ -812,9 +838,8 @@ impl SqlEngine {
                             .sql_with_schema(&select_sql, session.schema())
                             .await
                             .map_err(query_error)?;
-                        let (batches, n) =
-                            sql::cast_batches_to_table(&schema, &src_batches)
-                                .map_err(SqlError::from_lake)?;
+                        let (batches, n) = sql::cast_batches_to_table(&schema, &src_batches)
+                            .map_err(SqlError::from_lake)?;
                         if n > 0 {
                             self.ingest_batches(&table, batches, stmt_key).await?;
                         }
@@ -932,9 +957,7 @@ impl SqlEngine {
                     SchemaChange::AddColumn { field } => {
                         schema.field_with_name(field.name()).is_ok()
                     }
-                    SchemaChange::DropColumn { column } => {
-                        schema.field_with_name(column).is_err()
-                    }
+                    SchemaChange::DropColumn { column } => schema.field_with_name(column).is_err(),
                     // 非列级变更由 `parse_alter_table` 挡在门外，这里取保守值
                     _ => false,
                 };
@@ -1042,7 +1065,7 @@ impl SqlEngine {
                     other => {
                         return Err(SqlError::Unsupported(format!(
                             "DROP {other} is not supported (only TABLE / DATABASE)"
-                        )))
+                        )));
                     }
                 }
                 Ok(RawOutcome::Affected(0))
@@ -1087,7 +1110,11 @@ fn query_error(e: impl std::fmt::Display) -> SqlError {
     // 形如 `table 'yuntun.public.foo' not found` → 取引号内限定名
     let table = msg
         .find('\'')
-        .and_then(|s| msg[s + 1..].find('\'').map(|e| msg[s + 1..s + 1 + e].to_string()))
+        .and_then(|s| {
+            msg[s + 1..]
+                .find('\'')
+                .map(|e| msg[s + 1..s + 1 + e].to_string())
+        })
         .unwrap_or(msg);
     SqlError::NotFound(table)
 }
@@ -1144,10 +1171,16 @@ mod tests {
     fn query_error_classifies_missing_table() {
         // DataFusion 规划错误（字符串形态）→ NotFound（协议层映射 1146 / NOT_FOUND）
         let e = query_error("Error during planning: table 'yuntun.public.foo' not found");
-        assert!(matches!(&e, SqlError::NotFound(t) if t == "yuntun.public.foo"), "{e}");
+        assert!(
+            matches!(&e, SqlError::NotFound(t) if t == "yuntun.public.foo"),
+            "{e}"
+        );
 
         // 其他查询错误仍为内部错误（客户端可重试）
         let e = query_error("Schema error: No field named x");
-        assert!(matches!(&e, SqlError::Internal(m) if m.contains("No field named x")), "{e}");
+        assert!(
+            matches!(&e, SqlError::Internal(m) if m.contains("No field named x")),
+            "{e}"
+        );
     }
 }

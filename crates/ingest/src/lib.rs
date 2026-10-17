@@ -22,20 +22,20 @@ pub mod dml;
 pub use dml::{ReplayDmlStats, replay_wal_dml};
 pub mod flush;
 pub mod pipeline;
-pub mod wal_archive;
 pub mod schema_cache;
 pub mod source;
 pub mod timeutil;
+pub mod wal_archive;
 
 pub use accumulator::{now_ms, window_of};
 pub use flush::{
-    abort_batch, flush_chunk, flush_chunk_with_id, payloads_to_batches, recommit_into_catalog,
-    FlushDeps, FlushOutcome, LiveBatchTracker,
+    FlushDeps, FlushOutcome, LiveBatchTracker, abort_batch, flush_chunk, flush_chunk_with_id,
+    payloads_to_batches, recommit_into_catalog,
 };
 pub use pipeline::{ForceFlushDone, Ingestor, IngestorConfig};
-pub use wal_archive::{archive_once, restore, spawn_archiver, ArchiveConfig};
 pub use schema_cache::SchemaCache;
 pub use source::{IngestSource, Receipt};
+pub use wal_archive::{ArchiveConfig, archive_once, restore, spawn_archiver};
 
 /// chunk 层重导出：写入侧与查询侧共享同一套类型（避免上层重复依赖）。
 pub use yuntun_chunk::{

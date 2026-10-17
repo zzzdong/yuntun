@@ -17,7 +17,7 @@ use object_store::{ObjectStore as _, ObjectStoreExt as _};
 use yuntun_catalog::{CatalogOps, MemoryCatalog};
 use yuntun_ingest::{Ingestor, IngestorConfig};
 use yuntun_model::meta::serialize_schema;
-use yuntun_model::wal_record::{ddl_op, BatchPendingPayload, DataPayload, DdlPayload, Record};
+use yuntun_model::wal_record::{BatchPendingPayload, DataPayload, DdlPayload, Record, ddl_op};
 
 const T1: &str = "public.t1";
 const T2: &str = "public.t2";
@@ -33,10 +33,7 @@ async fn wal_writer(env: &Env) -> yuntun_wal::writer::WalWriter {
         .unwrap()
 }
 
-fn new_ingestor(
-    env: &Env,
-    catalog: Arc<dyn CatalogOps>,
-) -> Ingestor {
+fn new_ingestor(env: &Env, catalog: Arc<dyn CatalogOps>) -> Ingestor {
     let wal = futures::executor::block_on(wal_writer(env));
     Ingestor::new(
         IngestorConfig {
@@ -269,8 +266,9 @@ async fn pending_redo_filters_interleaved_foreign_rows() {
     assert_eq!(redone, 1, "Pending 批次应被重做");
 
     // 重做后的批次只含 t1 的两行（t2 的交错行被过滤，不串表）
-    let rec = yuntun_wal::recovery::recover(&yuntun_wal::WalConfig::for_dir(&env.wal_dir), 0, false)
-        .unwrap();
+    let rec =
+        yuntun_wal::recovery::recover(&yuntun_wal::WalConfig::for_dir(&env.wal_dir), 0, false)
+            .unwrap();
     let st = &rec.states.states["b-t1"];
     assert_eq!(st.status, yuntun_model::batch::BatchStatus::Committed);
     assert_eq!(st.row_count, 2, "重做批次只应包含 t1 的 2 行");

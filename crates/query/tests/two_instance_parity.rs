@@ -26,7 +26,7 @@ use yuntun_catalog::{CatalogOps, MemoryCatalog};
 use yuntun_chunk::{ChunkKey, ChunkStore, ChunkStoreConfig, MemoryLedger, SealPolicy};
 use yuntun_model::ops::CreateTableRequest;
 use yuntun_query::{LocalCatalog, QueryEngine};
-use yuntun_store::{create_store, ShardId, StoreConfig};
+use yuntun_store::{ShardId, StoreConfig, create_store};
 
 /// 全限定表名：必须与 `ChunkKey.shard.table` 一致，否则热读按表名过滤会扑空
 const TABLE: &str = "public.parity";

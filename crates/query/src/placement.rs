@@ -167,7 +167,10 @@ mod tests {
             vec![
                 ("dn1".to_string(), vec!["p/a".to_string()]),
                 ("dn2".to_string(), vec!["p/b".to_string()]),
-                ("dn3".to_string(), vec!["p/c".to_string(), "p/d".to_string()]),
+                (
+                    "dn3".to_string(),
+                    vec!["p/c".to_string(), "p/d".to_string()]
+                ),
             ]
         );
     }
@@ -196,11 +199,11 @@ mod tests {
     #[test]
     fn assign_with_no_files_keeps_every_node_listed() {
         let got = assign(&[], &["dn1".into(), "dn2".into()]);
-        let got: Vec<_> = got.iter().map(|a| (a.instance.clone(), a.files.len())).collect();
-        assert_eq!(
-            got,
-            vec![("dn1".to_string(), 0), ("dn2".to_string(), 0)]
-        );
+        let got: Vec<_> = got
+            .iter()
+            .map(|a| (a.instance.clone(), a.files.len()))
+            .collect();
+        assert_eq!(got, vec![("dn1".to_string(), 0), ("dn2".to_string(), 0)]);
     }
 
     /// 节点顺序与重复都不影响结果（否则"分配"会随调用点漂移）。
@@ -217,6 +220,9 @@ mod tests {
     fn ties_are_broken_by_path_not_by_input_order() {
         let f1 = vec![file("p/a", 1), file("p/b", 1), file("p/c", 1)];
         let f2 = vec![file("p/c", 1), file("p/b", 1), file("p/a", 1)];
-        assert_eq!(assign(&f1, &["dn1".into(), "dn2".into()]), assign(&f2, &["dn1".into(), "dn2".into()]));
+        assert_eq!(
+            assign(&f1, &["dn1".into(), "dn2".into()]),
+            assign(&f2, &["dn1".into(), "dn2".into()])
+        );
     }
 }

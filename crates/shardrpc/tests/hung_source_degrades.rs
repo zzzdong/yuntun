@@ -22,10 +22,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use async_trait::async_trait;
 use tokio::net::TcpListener;
 
 use yuntun_catalog::{CatalogOps, MemoryCatalog};
@@ -102,7 +102,14 @@ fn instance(dir: &yuntun_testkit::TestDir, instance_id: &str) -> Arc<ChunkStore>
 
 fn write(store: &ChunkStore, vals: &[i64]) {
     store
-        .append(ChunkKey::new(shard_id(), 0), 1, schema(), 0, vec![batch(vals)], 0)
+        .append(
+            ChunkKey::new(shard_id(), 0),
+            1,
+            schema(),
+            0,
+            vec![batch(vals)],
+            0,
+        )
         .unwrap();
 }
 
@@ -116,7 +123,11 @@ async fn serve_hung() -> String {
     addr
 }
 
-async fn engine_with(policy: PartialPolicy, hung_addr: &str, healthy: Arc<ChunkStore>) -> QueryEngine {
+async fn engine_with(
+    policy: PartialPolicy,
+    hung_addr: &str,
+    healthy: Arc<ChunkStore>,
+) -> QueryEngine {
     let catalog: Arc<dyn CatalogOps> = Arc::new(MemoryCatalog::new());
     catalog
         .create_table(CreateTableRequest {
@@ -152,8 +163,11 @@ async fn engine_with(policy: PartialPolicy, hung_addr: &str, healthy: Arc<ChunkS
     cache.set_hot_shards("inst-b", Arc::new(RemoteShard::new(fetch)));
     cache.refresh(&catalog).await.unwrap();
 
-    QueryEngine::new(yuntun_store::create_store(&StoreConfig::Memory).unwrap(), cache)
-        .with_partial_policy(policy)
+    QueryEngine::new(
+        yuntun_store::create_store(&StoreConfig::Memory).unwrap(),
+        cache,
+    )
+    .with_partial_policy(policy)
 }
 
 fn values(batches: &[RecordBatch]) -> Vec<i64> {
@@ -228,5 +242,8 @@ async fn reject_policy_also_rejects_a_timeout() {
         .expect_err("reject 策略下超时也必须失败");
     let msg = e.to_string();
     assert!(msg.contains("inst-b"), "错误要点名来源：{msg}");
-    assert!(msg.contains("拒绝部分结果"), "错误要说清是为什么失败：{msg}");
+    assert!(
+        msg.contains("拒绝部分结果"),
+        "错误要说清是为什么失败：{msg}"
+    );
 }

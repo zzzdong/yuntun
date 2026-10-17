@@ -239,7 +239,12 @@ async fn replayed_request_is_deduplicated_batch_by_batch() {
 
     // ① 首次：两个批次都必须落库（派生键保证不被彼此判重）
     let r1 = client
-        .insert_batches("idem", yuntun_client::DEFAULT_SHARD, rows.clone(), Some(key.clone()))
+        .insert_batches(
+            "idem",
+            yuntun_client::DEFAULT_SHARD,
+            rows.clone(),
+            Some(key.clone()),
+        )
         .await
         .unwrap();
     assert_eq!(r1.len(), 2, "每批一个回执");
@@ -295,20 +300,26 @@ impl yuntun_store::ShardReader for Unreachable {
         &self,
         _table: &str,
     ) -> Result<Vec<yuntun_store::ShardId>, yuntun_model::error::LakeError> {
-        Err(yuntun_model::error::LakeError::Other("connection refused".into()))
+        Err(yuntun_model::error::LakeError::Other(
+            "connection refused".into(),
+        ))
     }
     async fn read_shard(
         &self,
         _id: &yuntun_store::ShardId,
         _known_manifest_ver: u64,
     ) -> Result<yuntun_store::ShardRead, yuntun_model::error::LakeError> {
-        Err(yuntun_model::error::LakeError::Other("connection refused".into()))
+        Err(yuntun_model::error::LakeError::Other(
+            "connection refused".into(),
+        ))
     }
     async fn watermark(
         &self,
         _known_manifest_ver: u64,
     ) -> Result<yuntun_store::ShardRead, yuntun_model::error::LakeError> {
-        Err(yuntun_model::error::LakeError::Other("connection refused".into()))
+        Err(yuntun_model::error::LakeError::Other(
+            "connection refused".into(),
+        ))
     }
 }
 
@@ -407,7 +418,10 @@ async fn a_degraded_query_is_flagged_as_partial() {
         .expect("跑 yuntun-cli");
     let err = String::from_utf8_lossy(&out.stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "降级不是失败：CLI 必须退 0；stderr={err}");
+    assert!(
+        out.status.success(),
+        "降级不是失败：CLI 必须退 0；stderr={err}"
+    );
     assert!(
         err.contains("WARN: partial result"),
         "脚本要能认出这件事（判据 ⑥ 靠它区分降级与缺口）：{err}"

@@ -13,8 +13,8 @@ use tokio_util::sync::CancellationToken;
 use yuntun_catalog::CatalogOps;
 use yuntun_catalog::MemoryCatalog;
 use yuntun_ingest::{Ingestor, IngestorConfig};
-use yuntun_model::ops::CreateTableRequest;
 use yuntun_model::IngestBatch;
+use yuntun_model::ops::CreateTableRequest;
 
 fn schema() -> arrow::datatypes::SchemaRef {
     use DataType::*;
@@ -244,7 +244,7 @@ async fn main() {
     println!("target            : 80000 rows/s (E1) —— release 模式 + Flight 并发评估为准");
 
     let _ = catalog; // catalog 保留供检查
-                     // 清理
+    // 清理
     tokio::time::sleep(Duration::from_millis(100)).await;
 }
 

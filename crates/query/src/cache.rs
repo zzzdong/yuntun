@@ -161,10 +161,7 @@ impl CatalogSnapshot {
     /// 为什么不做成公开 API：生产路径的快照一律由 `LocalCatalog` 构建（写时复制），
     /// 手搓一份会让"快照里有什么"多出第二处真相。
     #[cfg(test)]
-    pub(crate) fn from_schema_for_test(
-        ident: &str,
-        schema: arrow::datatypes::SchemaRef,
-    ) -> Self {
+    pub(crate) fn from_schema_for_test(ident: &str, schema: arrow::datatypes::SchemaRef) -> Self {
         let (namespace, table) = ident.split_once('.').unwrap_or(("public", ident));
         let cached = CachedTable {
             meta: TableMeta {
@@ -448,12 +445,7 @@ impl LocalCatalog {
     /// 多实例时取**各实例之和**：任何一个实例有变化都必须触发刷新（取 max 在实例被替换时
     /// 可能"看起来没变"）。实例集合是装配期固定的，所以求和对"是否有变化"是单调可靠的。
     pub fn shard_version(&self) -> u64 {
-        self.hot
-            .read()
-            .unwrap()
-            .values()
-            .map(|s| s.version())
-            .sum()
+        self.hot.read().unwrap().values().map(|s| s.version()).sum()
     }
 
     /// **当前不可变快照**：一次查询取一次，之后整条链路共用（S2-4）。
@@ -619,7 +611,11 @@ impl LocalCatalog {
             nodes: self.member_ids(),
         });
         self.full_reloads.fetch_add(1, Ordering::SeqCst);
-        tracing::debug!(tables = n, snapshot = snapshot_no, "local catalog: full reload");
+        tracing::debug!(
+            tables = n,
+            snapshot = snapshot_no,
+            "local catalog: full reload"
+        );
         Ok(RefreshOutcome {
             full: true,
             tables_refreshed: n,

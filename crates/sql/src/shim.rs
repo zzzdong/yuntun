@@ -84,9 +84,7 @@ fn canned_variable(name: &str) -> &'static str {
         "autocommit" => "1",
         "max_allowed_packet" => "67108864",
         "sql_mode" => "",
-        "character_set_client" | "character_set_results" | "character_set_connection" => {
-            "utf8mb4"
-        }
+        "character_set_client" | "character_set_results" | "character_set_connection" => "utf8mb4",
         "collation_connection" | "collation_server" => "utf8mb4_general_ci",
         "lower_case_table_names" => "0",
         "tx_isolation" | "transaction_isolation" => "READ-COMMITTED",
@@ -139,16 +137,13 @@ pub(crate) async fn intercept(
             Some(SqlResult::Affected(0))
         }
         // 事务 no-op（S-6：单语句自动提交语义；含 ROLLBACK——CLI 友好，偏差留档 operation-log）
-        Statement::StartTransaction { .. } | Statement::Commit { .. } | Statement::Rollback { .. } => {
-            Some(SqlResult::Affected(0))
-        }
+        Statement::StartTransaction { .. }
+        | Statement::Commit { .. }
+        | Statement::Rollback { .. } => Some(SqlResult::Affected(0)),
         // SET ...：no-op
         Statement::Set(_) => Some(SqlResult::Affected(0)),
         Statement::ShowVariable { variable } => {
-            let name = variable
-                .last()
-                .map(|i| i.value.clone())
-                .unwrap_or_default();
+            let name = variable.last().map(|i| i.value.clone()).unwrap_or_default();
             // sqlparser 0.62 没有 SHOW KEYS / INDEX / ENGINES 的独立变体——
             // 它们落到 ShowVariable，且 `SHOW KEYS FROM t` 的表名也被收进
             // variable（["KEYS", "FROM", "t"]）→ 以**首段**判定。
@@ -214,7 +209,10 @@ pub(crate) async fn intercept(
             let s = engine.registry().status();
             let rows = vec![
                 vec!["Uptime".to_string(), s.uptime_secs.to_string()],
-                vec!["Threads_connected".to_string(), s.threads_connected.to_string()],
+                vec![
+                    "Threads_connected".to_string(),
+                    s.threads_connected.to_string(),
+                ],
                 vec!["Threads_running".to_string(), s.threads_running.to_string()],
                 vec!["Connections".to_string(), s.connections_total.to_string()],
                 vec![
@@ -246,9 +244,7 @@ pub(crate) async fn intercept(
         // SHOW TABLES：MySQL 语义（Tables_in_<db>）——**限定库**的表
         // （`D-32`：`SHOW TABLES FROM/IN <db>` 曾忽略限定符，答成当前库的表）
         Statement::ShowTables {
-            full,
-            show_options,
-            ..
+            full, show_options, ..
         } => {
             let schema = schema_from_options(show_options, session);
             let names = engine.list_tables_in(&schema).await?;
@@ -344,9 +340,7 @@ pub(crate) async fn intercept(
         //
         // `SHOW FULL PROCESSLIST` 与不带 FULL 在这里是同一份事实（MySQL 的 FULL 只是
         // 不截断 `Info`；本实现从不截断），所以两个变体共用一个分支。
-        Statement::ShowProcessList { .. } => {
-            Some(processlist_result(engine.registry().snapshot()))
-        }
+        Statement::ShowProcessList { .. } => Some(processlist_result(engine.registry().snapshot())),
         // `KILL [CONNECTION|QUERY] <id>`：点取消位；协议层负责"取消之后断不断连接"。
         // 未知 Id ⇒ 1094（`UnknownThread`），**不静默成功** —— 脚本靠这个报错发现打错了 Id。
         Statement::Kill { modifier, id } => {
@@ -419,14 +413,25 @@ const SHOW_KEYS_COLUMNS: &[&str] = &[
     "Expression",
 ];
 /// `SHOW ENGINES`
-const SHOW_ENGINES_COLUMNS: &[&str] =
-    &["Engine", "Support", "Comment", "Transactions", "XA", "Savepoints"];
+const SHOW_ENGINES_COLUMNS: &[&str] = &[
+    "Engine",
+    "Support",
+    "Comment",
+    "Transactions",
+    "XA",
+    "Savepoints",
+];
 /// `SHOW COLLATION`
-const SHOW_COLLATION_COLUMNS: &[&str] =
-    &["Collation", "Charset", "Id", "Default", "Compiled", "Sortlen"];
+const SHOW_COLLATION_COLUMNS: &[&str] = &[
+    "Collation",
+    "Charset",
+    "Id",
+    "Default",
+    "Compiled",
+    "Sortlen",
+];
 /// `SHOW CHARSET` / `SHOW CHARACTER SET`
-const SHOW_CHARSET_COLUMNS: &[&str] =
-    &["Charset", "Description", "Default collation", "Maxlen"];
+const SHOW_CHARSET_COLUMNS: &[&str] = &["Charset", "Description", "Default collation", "Maxlen"];
 
 /// DataFusion `information_schema` **缺失**而 MySQL 客户端会查的表 → 列名（MySQL 8 定义）。
 ///
@@ -594,11 +599,20 @@ const IS_EMPTY_TABLES: &[(&str, &[&str])] = &[
     ),
     (
         "processlist",
-        &["ID", "USER", "HOST", "DB", "COMMAND", "TIME", "STATE", "INFO"],
+        &[
+            "ID", "USER", "HOST", "DB", "COMMAND", "TIME", "STATE", "INFO",
+        ],
     ),
     (
         "engines",
-        &["ENGINE", "SUPPORT", "COMMENT", "TRANSACTIONS", "XA", "SAVEPOINTS"],
+        &[
+            "ENGINE",
+            "SUPPORT",
+            "COMMENT",
+            "TRANSACTIONS",
+            "XA",
+            "SAVEPOINTS",
+        ],
     ),
 ];
 
@@ -750,7 +764,9 @@ fn var_name(raw: &str) -> String {
 fn classify_probe_expr(expr: &Expr) -> ProbeKind {
     match expr {
         Expr::Value(v) => match &v.value {
-            Value::Placeholder(name) if name.starts_with("@@") => ProbeKind::Variable(var_name(name)),
+            Value::Placeholder(name) if name.starts_with("@@") => {
+                ProbeKind::Variable(var_name(name))
+            }
             _ => ProbeKind::Other,
         },
         // sqlparser 的形态差异：`@@version` → Identifier("@@version")；
@@ -815,14 +831,20 @@ fn processlist_result(rows: Vec<crate::registry::ProcessRow>) -> SqlResult {
         Arc::new(Int64Array::from(
             rows.iter().map(|r| r.id as i64).collect::<Vec<_>>(),
         )),
-        Arc::new(StringArray::from_iter(rows.iter().map(|r| Some(r.user.as_str())))),
-        Arc::new(StringArray::from_iter(rows.iter().map(|r| Some(r.host.as_str())))),
+        Arc::new(StringArray::from_iter(
+            rows.iter().map(|r| Some(r.user.as_str())),
+        )),
+        Arc::new(StringArray::from_iter(
+            rows.iter().map(|r| Some(r.host.as_str())),
+        )),
         Arc::new(StringArray::from_iter(rows.iter().map(db))),
         Arc::new(StringArray::from_iter(rows.iter().map(|r| Some(r.command)))),
         Arc::new(Int64Array::from(
             rows.iter().map(|r| r.time_secs).collect::<Vec<_>>(),
         )),
-        Arc::new(StringArray::from_iter(rows.iter().map(|r| Some(r.state.as_str())))),
+        Arc::new(StringArray::from_iter(
+            rows.iter().map(|r| Some(r.state.as_str())),
+        )),
         Arc::new(StringArray::from_iter(rows.iter().map(info))),
     ];
     let batch = RecordBatch::try_new(schema, cols).expect("processlist batch");
@@ -929,7 +951,10 @@ mod tests {
     #[test]
     fn probe_variables_across_sqlparser_shapes() {
         // Value::Placeholder 形态
-        assert_eq!(probe("SELECT @@version"), [("version".to_string(), "8.0.32-yuntun".to_string())]);
+        assert_eq!(
+            probe("SELECT @@version"),
+            [("version".to_string(), "8.0.32-yuntun".to_string())]
+        );
         // Identifier / CompoundIdentifier 形态（JDBC 握手路径）
         assert_eq!(
             probe("SELECT @@session.auto_increment_increment"),
@@ -948,7 +973,10 @@ mod tests {
             ]
         );
         // DATABASE() / SCHEMA()
-        assert_eq!(probe("SELECT DATABASE()"), [("database".to_string(), "public".to_string())]);
+        assert_eq!(
+            probe("SELECT DATABASE()"),
+            [("database".to_string(), "public".to_string())]
+        );
         // 真实列 → 不拦截（交分流/DataFusion）
         assert_eq!(probe("SELECT user"), [(String::new(), String::new())]);
         // 未知变量：空串（驱动只读取，不报错）

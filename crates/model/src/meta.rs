@@ -4,7 +4,7 @@
 //! 消息结构直接对齐架构 §5.1，阶段 1 切换 gRPC 零改动。
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arrow::ipc::convert::{fb_to_schema, IpcSchemaEncoder};
+use arrow::ipc::convert::{IpcSchemaEncoder, fb_to_schema};
 use arrow::ipc::root_as_schema;
 use std::sync::Arc;
 
@@ -344,7 +344,6 @@ pub fn compaction_shard_lease_purpose(prefix: &str, table: &str, shard: &str) ->
 /// **没有**租约 ⇒ 多节点各跑一份，虽幂等但白白重复扫一遍全bucket）。
 pub const GC_LEASE: &str = "gc";
 
-
 /// 取租约的结果（`AcquireLease` 的 op 结果；trait 返回值同形状）。
 // `prost::Message` 自带 `Debug`/`Default`，重复 derive 会冲突
 #[derive(Clone, PartialEq, prost::Message)]
@@ -415,7 +414,10 @@ impl StatBound {
         matches!(
             (self, other),
             (Self::B(_), Self::B(_))
-                | (Self::I(_) | Self::U(_) | Self::F(_), Self::I(_) | Self::U(_) | Self::F(_))
+                | (
+                    Self::I(_) | Self::U(_) | Self::F(_),
+                    Self::I(_) | Self::U(_) | Self::F(_)
+                )
         )
     }
 }
@@ -474,9 +476,7 @@ impl StatBound {
 pub fn encode_bound(dt: &arrow::datatypes::DataType, b: &StatBound) -> Vec<u8> {
     use arrow::datatypes::DataType as D;
     match (dt, b) {
-        (D::UInt8 | D::UInt16 | D::UInt32 | D::UInt64, StatBound::U(v)) => {
-            v.to_le_bytes().to_vec()
-        }
+        (D::UInt8 | D::UInt16 | D::UInt32 | D::UInt64, StatBound::U(v)) => v.to_le_bytes().to_vec(),
         (D::Float32 | D::Float64, StatBound::F(v)) => v.to_le_bytes().to_vec(),
         (D::Utf8 | D::LargeUtf8 | D::Binary | D::LargeBinary, StatBound::B(v)) => v.clone(),
         (_, StatBound::I(v)) => v.to_le_bytes().to_vec(),

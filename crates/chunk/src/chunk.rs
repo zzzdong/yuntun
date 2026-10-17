@@ -12,8 +12,8 @@ use yuntun_store::ShardId;
 use crate::budget::Pressure;
 use crate::spill::{self, SpillMeta};
 // seal 原因定义在 store（与 `should_seal` 同一处，避免两处枚举漂移）
-use crate::store::SealReason;
 use crate::stats::ColumnStats;
+use crate::store::SealReason;
 
 /// 分钟毫秒（ADR-10：攒批窗口按整分钟对齐）。
 pub const MINUTE_MS: i64 = 60_000;
@@ -293,7 +293,7 @@ impl Chunk {
                 return Err(LakeError::Other(format!(
                     "chunk {} is spilled, cannot append",
                     self.id
-                )))
+                )));
             }
         }
         Ok(())
@@ -377,9 +377,10 @@ impl Chunk {
     pub fn mem_batches(&self) -> Result<Vec<RecordBatch>, LakeError> {
         match &self.data {
             ChunkData::Mem(b) => Ok(b.clone()),
-            ChunkData::Spill(_) => {
-                Err(LakeError::Other(format!("chunk {} already spilled", self.id)))
-            }
+            ChunkData::Spill(_) => Err(LakeError::Other(format!(
+                "chunk {} already spilled",
+                self.id
+            ))),
         }
     }
 

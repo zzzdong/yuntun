@@ -17,7 +17,7 @@ use yuntun_catalog::{CatalogOps, MemoryCatalog};
 use yuntun_model::error::LakeError;
 use yuntun_model::ops::CreateTableRequest;
 use yuntun_query::{LocalCatalog, QueryEngine};
-use yuntun_store::{create_store, ShardId, ShardRead, ShardReader, ShardTier, StoreConfig};
+use yuntun_store::{ShardId, ShardRead, ShardReader, ShardTier, StoreConfig, create_store};
 
 /// 假热读器：按调用次数决定要不要报 STALE，并记录**每次热读时**的
 /// `(known_manifest_ver, 缓存刷新计数)` —— 后者用来证明"重试发生在刷新**之后**"。
@@ -149,7 +149,7 @@ async fn stale_hot_read_is_retried_after_refreshing_manifest() {
         })
         .await
         .unwrap();
-        cache.set_hot_shards("inst-a", hot.clone());
+    cache.set_hot_shards("inst-a", hot.clone());
     cache.refresh(&catalog).await.unwrap();
     let refreshes_before = cache.stats().refreshes;
 
@@ -195,11 +195,13 @@ async fn permanent_stale_fails_loudly_instead_of_returning_partial_result() {
         })
         .await
         .unwrap();
-        cache.set_hot_shards("inst-a", hot.clone());
+    cache.set_hot_shards("inst-a", hot.clone());
     cache.refresh(&catalog).await.unwrap();
 
     let engine = QueryEngine::new(create_store(&StoreConfig::Memory).unwrap(), cache.clone());
-    let err = count(&engine).await.expect_err("永远 STALE 必须报错，不能回不完整结果");
+    let err = count(&engine)
+        .await
+        .expect_err("永远 STALE 必须报错，不能回不完整结果");
     let msg = err.to_string();
     assert!(msg.contains("STALE"), "报错要说清是 STALE：{msg}");
     assert!(
@@ -233,7 +235,7 @@ async fn stale_without_wired_ops_fails_with_a_config_error() {
         })
         .await
         .unwrap();
-        cache.set_hot_shards("inst-a", hot.clone());
+    cache.set_hot_shards("inst-a", hot.clone());
     cache.refresh(&catalog).await.unwrap();
 
     let engine = QueryEngine::new(create_store(&StoreConfig::Memory).unwrap(), cache.clone());
@@ -263,7 +265,7 @@ async fn caught_up_reader_does_not_trigger_retry() {
         })
         .await
         .unwrap();
-        cache.set_hot_shards("inst-a", hot.clone());
+    cache.set_hot_shards("inst-a", hot.clone());
     cache.refresh(&catalog).await.unwrap();
     let refreshes_before = cache.stats().refreshes;
 

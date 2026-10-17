@@ -10,24 +10,23 @@
 //! 表发现路径：`yuntun.public.<table>`；Manifest 驱动（C7）：TableProvider 的
 //! scan 由 `list_visible_files(snapshot)` 结果构造 Parquet 文件组。
 
+pub mod agg_pushdown;
 pub mod cache;
+pub mod cold;
 /// 组级剪枝（`F.4`）：把索引文件变成"跳过哪些行组"。
 pub mod index;
 /// `F.3`：DML 的定位扫描（在一个文件上求谓词，取回命中行号）。
 pub mod locate;
 pub mod partial;
-pub mod agg_pushdown;
-pub mod cold;
 pub mod placement;
-mod stmt;
-pub mod prune;
 pub mod provider;
+pub mod prune;
+mod stmt;
 pub mod table;
 
 pub use cache::{
-    spawn_cache_refresh, CachedTable, CatalogSnapshot, HotShards, LocalCatalog, LocalCatalogStats,
-    RefreshOutcome,
-    Member,
+    CachedTable, CatalogSnapshot, HotShards, LocalCatalog, LocalCatalogStats, Member,
+    RefreshOutcome, spawn_cache_refresh,
 };
 pub use partial::{MissingSource, PartialPolicy, PartialRead, PartialRejected, PartialSink};
 pub use provider::{YuntunCatalogProvider, YuntunSchemaProvider};
@@ -48,13 +47,13 @@ fn hot_read_stale(e: &DataFusionError) -> Option<&HotReadStale> {
     }
 }
 
+use arrow::record_batch::RecordBatch;
 /// 流式元素错误类型（`§191`：取消包装器要在流里投递错误，而不只是截断）。
 pub use datafusion::error::DataFusionError;
 /// 流 trait（`SendableRecordBatchStream` 的元素约束；包装流时要实现它）。
 pub use datafusion::execution::RecordBatchStream;
 use datafusion::execution::memory_pool::GreedyMemoryPool;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
-use arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
 use yuntun_catalog::CatalogOps;
 
@@ -185,19 +184,17 @@ impl QueryEngine {
 
     /// query 执行区当前已预留字节（`None` = 未设上限）。
     pub fn query_memory_reserved(&self) -> Option<usize> {
-        self.runtime
-            .as_ref()
-            .map(|rt| rt.memory_pool.reserved())
+        self.runtime.as_ref().map(|rt| rt.memory_pool.reserved())
     }
 
     /// query 执行区内存上限（`None` = 未设上限）。
     pub fn query_memory_limit(&self) -> Option<usize> {
-        self.runtime.as_ref().and_then(|rt| {
-            match rt.memory_pool.memory_limit() {
+        self.runtime
+            .as_ref()
+            .and_then(|rt| match rt.memory_pool.memory_limit() {
                 datafusion::execution::memory_pool::MemoryLimit::Finite(n) => Some(n),
                 _ => None,
-            }
-        })
+            })
     }
 
     /// 设 partial 策略（装配层从配置来；默认 [`PartialPolicy::Allow`]）。
@@ -412,8 +409,11 @@ impl QueryEngine {
         // （不分组时也常是 1 批，但不能依赖这个 —— 依赖它就会"判定通过却退回原路"，
         //  而那种失败**没有任何报错**，只是悄悄不优化）。
         let cold = match cold_batches.first() {
-            Some(first) => arrow::compute::concat_batches(&first.schema(), &cold_batches)
-                .map_err(|e| DataFusionError::Execution(format!("聚合下推：冷结果拼接失败：{e}")))?,
+            Some(first) => {
+                arrow::compute::concat_batches(&first.schema(), &cold_batches).map_err(|e| {
+                    DataFusionError::Execution(format!("聚合下推：冷结果拼接失败：{e}"))
+                })?
+            }
             None => {
                 tracing::debug!(
                     table = %plan.table,
@@ -467,9 +467,8 @@ impl QueryEngine {
         // 与改造前**逐字相同**：少一跳网络，也少一处风险。
         let partial = std::sync::Arc::new(PartialSink::new(self.partial_policy));
         let cached = snapshot.get(&plan.table);
-        let mut visible: Vec<yuntun_model::meta::FileManifest> = cached
-            .map(|t| t.files.clone())
-            .unwrap_or_default();
+        let mut visible: Vec<yuntun_model::meta::FileManifest> =
+            cached.map(|t| t.files.clone()).unwrap_or_default();
         // `§178` 的引擎级白名单优先：它表达"这个引擎这一支只读这些文件"（对拍与下一刀的载体）。
         // 分配**作用在它过滤之后的集合上** —— 否则引擎说"只读 A"，分配却把 B 也分进来，
         // 于是同一个引擎既读 A 又读 B（那种错没有任何报错，只是多读了数据）。
@@ -481,10 +480,8 @@ impl QueryEngine {
 
         // 候选节点 = 各热实例里**有冷折叠能力的** + 本地（空 id）
         let mut nodes: Vec<String> = Vec::new();
-        let mut cold_readers: Vec<(
-            String,
-            std::sync::Arc<dyn yuntun_store::ColdReader>,
-        )> = Vec::new();
+        let mut cold_readers: Vec<(String, std::sync::Arc<dyn yuntun_store::ColdReader>)> =
+            Vec::new();
         for (id, reader) in self.catalog.hot_shards() {
             if let Some(c) = reader.as_cold() {
                 nodes.push(id.clone());
@@ -537,11 +534,13 @@ impl QueryEngine {
             let schema_arc = table_schema
                 .clone()
                 .unwrap_or_else(|| std::sync::Arc::new(arrow::datatypes::Schema::empty()));
-            let by_id: std::collections::HashMap<&str, std::sync::Arc<dyn yuntun_store::ColdReader>> =
-                cold_readers
-                    .iter()
-                    .map(|(i, c)| (i.as_str(), c.clone()))
-                    .collect();
+            let by_id: std::collections::HashMap<
+                &str,
+                std::sync::Arc<dyn yuntun_store::ColdReader>,
+            > = cold_readers
+                .iter()
+                .map(|(i, c)| (i.as_str(), c.clone()))
+                .collect();
             let outs = futures::future::join_all(remote_shares.iter().map(|(id, files)| {
                 // 每次调用各克隆一份再 `move` 进 async 块（`async move` 会把捕获的变量搬走，
                 // 而 `join_all` 的闭包是 `FnMut`、会被调多次）
@@ -562,7 +561,9 @@ impl QueryEngine {
                 let aq = aq.clone();
                 async move {
                     let outcome = match reader {
-                        None => AggOutcome::Missing("该节点没有冷折叠能力（未装配 ColdReader）".into()),
+                        None => {
+                            AggOutcome::Missing("该节点没有冷折叠能力（未装配 ColdReader）".into())
+                        }
                         Some(r) => {
                             let req = yuntun_store::ColdReadRequest {
                                 table: table_ident.clone(),
@@ -596,11 +597,8 @@ impl QueryEngine {
                             error = %reason,
                             "cold shard fold unavailable; 这一份回退本地读（不是降级）"
                         );
-                        if let Some((_, files)) =
-                            remote_shares.iter().find(|(i, _)| i == &id)
-                        {
-                            fallback_paths
-                                .extend(files.iter().map(|f| f.file_path.clone()));
+                        if let Some((_, files)) = remote_shares.iter().find(|(i, _)| i == &id) {
+                            fallback_paths.extend(files.iter().map(|f| f.file_path.clone()));
                         }
                     }
                     AggOutcome::Stale(e) => {
@@ -614,7 +612,10 @@ impl QueryEngine {
         } else {
             let mut all = local_paths.clone();
             all.extend(fallback_paths);
-            match self.cold_half(query, &plan, schema, partial.clone(), &all).await? {
+            match self
+                .cold_half(query, &plan, schema, partial.clone(), &all)
+                .await?
+            {
                 Some(c) => c,
                 None => return Ok(None),
             }
@@ -723,7 +724,11 @@ impl QueryEngine {
     /// - **必须重试**（不得把不完整结果当答案）；
     /// - **有界**（耗尽即报错，绝不静默降级）；
     /// - 刷新失败**直接冒泡**（刷不动就别硬撑 —— 宁可失败也别给错数据）。
-    async fn with_stale_retry<T, F, Fut>(&self, what: &str, attempt: F) -> Result<T, DataFusionError>
+    async fn with_stale_retry<T, F, Fut>(
+        &self,
+        what: &str,
+        attempt: F,
+    ) -> Result<T, DataFusionError>
     where
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = Result<T, DataFusionError>>,
@@ -866,10 +871,7 @@ impl QueryEngine {
         &self,
         query: &str,
         schema: &str,
-    ) -> Result<
-        (SendableRecordBatchStream, std::sync::Arc<PartialSink>),
-        DataFusionError,
-    > {
+    ) -> Result<(SendableRecordBatchStream, std::sync::Arc<PartialSink>), DataFusionError> {
         // 同上：`scan` 在物理计划期被调用（热读就在那里），所以 STALE 会在 `execute_stream`
         // 这一步冒出来 —— 此时流还没被消费，重试是干净的。
         self.with_stale_retry("sql_stream", || async {
@@ -888,10 +890,12 @@ impl QueryEngine {
         schema: arrow::datatypes::SchemaRef,
         batches: Vec<arrow::record_batch::RecordBatch>,
     ) -> SendableRecordBatchStream {
-        Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-            schema,
-            futures::stream::iter(batches.into_iter().map(Ok)),
-        ))
+        Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                schema,
+                futures::stream::iter(batches.into_iter().map(Ok)),
+            ),
+        )
     }
 
     /// 只取结果集 schema（逻辑计划，不执行物理计划）。

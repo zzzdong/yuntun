@@ -233,10 +233,16 @@ impl MetaStorage {
     /// 网络重传下这是正常现象，报错会让 raft 误判为存储故障。
     pub fn apply_snapshot(&self, mut snap: Snapshot) -> bool {
         let meta = snap.take_metadata();
-        self.trace("recv_snapshot", format!("index={} term={}", meta.index, meta.term));
+        self.trace(
+            "recv_snapshot",
+            format!("index={} term={}", meta.index, meta.term),
+        );
         let mut inner = self.inner.write().unwrap();
         if inner.first_index() > meta.index {
-            self.trace("recv_snapshot", format!("忽略（旧于本地 first={}）", inner.first_index()));
+            self.trace(
+                "recv_snapshot",
+                format!("忽略（旧于本地 first={}）", inner.first_index()),
+            );
             return false;
         }
         inner.entries.clear();
@@ -268,7 +274,10 @@ impl MetaStorage {
         let artifact = self.sm.lock().unwrap().snapshot_artifact();
         let mut inner = self.inner.write().unwrap();
         let applied = inner.applied_index;
-        self.trace("compact", format!("applied={applied} 本已压缩到 {}", inner.compacted_index));
+        self.trace(
+            "compact",
+            format!("applied={applied} 本已压缩到 {}", inner.compacted_index),
+        );
         if applied <= inner.compacted_index {
             return inner.compacted_index;
         }
@@ -361,7 +370,10 @@ impl Storage for MetaStorage {
     /// | `compacted_index > 0` | index = 0 的快照被 raft 视为非法（`need non-empty snapshot`） |
     /// | `compacted_index >= request_index` | 太旧的快照发出去等于把 follower 拉回旧状态 |
     fn snapshot(&self, request_index: u64, to: u64) -> RaftResult<Snapshot> {
-        self.trace("send_snapshot?", format!("request_index={request_index} to={to}"));
+        self.trace(
+            "send_snapshot?",
+            format!("request_index={request_index} to={to}"),
+        );
         let inner = self.inner.read().unwrap();
         let unavailable = || RaftError::Store(StorageError::SnapshotTemporarilyUnavailable);
         let Some(bytes) = inner.artifact.as_ref() else {
@@ -386,8 +398,8 @@ impl Storage for MetaStorage {
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
-    use yuntun_model::ops::{CommitFilesRequest, CreateTableRequest, DEFAULT_SCHEMA};
     use yuntun_model::meta::{FileManifest, IngestConfig};
+    use yuntun_model::ops::{CommitFilesRequest, CreateTableRequest, DEFAULT_SCHEMA};
 
     fn new_sm() -> Arc<Mutex<CatalogState>> {
         let mut st = CatalogState::new();
@@ -395,11 +407,7 @@ mod tests {
             CreateTableRequest {
                 name: "cpu".into(),
                 namespace: DEFAULT_SCHEMA.into(),
-                schema: Arc::new(Schema::new(vec![Field::new(
-                    "ts",
-                    DataType::Int64,
-                    false,
-                )])),
+                schema: Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)])),
                 partition_cols: vec![],
                 default_format: "parquet".into(),
                 ingest_config: IngestConfig::standard(),
@@ -478,7 +486,8 @@ mod tests {
 
         let snap = st.snapshot(0, 2).unwrap();
         assert_eq!(
-            snap.get_metadata().index, i1,
+            snap.get_metadata().index,
+            i1,
             "快照元数据 index 必须仍是压缩位置 {i1}（而不是当前的 {i2}）"
         );
         let restored = CatalogState::restore_snapshot(snap.get_data()).unwrap();
@@ -534,7 +543,10 @@ mod tests {
         commit(&sm, "b1", 4_000);
         st.set_applied(3); // raft 索引 3（日志恰好覆盖 1..=5）
         let c = st.compact_applied();
-        assert!((1..5).contains(&c), "压缩位置应落在这批日志中间（实际 {c}）");
+        assert!(
+            (1..5).contains(&c),
+            "压缩位置应落在这批日志中间（实际 {c}）"
+        );
 
         assert_eq!(st.first_index().unwrap(), c + 1);
         assert_eq!(st.last_index().unwrap(), 5);
@@ -570,7 +582,10 @@ mod tests {
             st.snapshot(0, 2).unwrap()
         };
         // 再造一个更旧的快照（index=1）
-        assert!(!st.apply_snapshot(Snapshot::default()), "index=0 的默认快照应被忽略");
+        assert!(
+            !st.apply_snapshot(Snapshot::default()),
+            "index=0 的默认快照应被忽略"
+        );
         let mut older = Snapshot::default();
         older.mut_metadata().index = 1;
         older.mut_metadata().term = 1;

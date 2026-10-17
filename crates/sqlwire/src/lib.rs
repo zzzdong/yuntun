@@ -19,8 +19,8 @@ use std::io;
 use std::sync::Arc;
 
 use opensrv_mysql::{
-    AsyncMysqlIntermediary, AsyncMysqlShim, Column, ColumnFlags, ColumnType, ErrorKind,
-    InitWriter, OkResponse, ParamParser, QueryResultWriter, StatementMetaWriter, ValueInner,
+    AsyncMysqlIntermediary, AsyncMysqlShim, Column, ColumnFlags, ColumnType, ErrorKind, InitWriter,
+    OkResponse, ParamParser, QueryResultWriter, StatementMetaWriter, ValueInner,
 };
 use tokio::io::AsyncWrite;
 use tokio_util::sync::CancellationToken;
@@ -261,7 +261,8 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MysqlBackend {
         // （表现为间歇 `1210 Incorrect number of arguments executing prepared statement`，
         // 且 `fetch*` 取不到行）。注：opensrv 对 execute 路径本就发二进制行
         // （`QueryResultWriter::new(..., is_bin = true)`），无需也不能在此做文本化处理。
-        let columns: Vec<Column> = match self.engine.schema_of_in(sql, self.session.schema()).await {
+        let columns: Vec<Column> = match self.engine.schema_of_in(sql, self.session.schema()).await
+        {
             Some(schema) => encode::columns_of(&schema),
             None => Vec::new(),
         };
@@ -471,11 +472,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for WireTee<W> {
         buf: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
         let enabled = self.enabled;
-        let head: String = buf
-            .iter()
-            .take(32)
-            .map(|b| format!("{b:02x} "))
-            .collect();
+        let head: String = buf.iter().take(32).map(|b| format!("{b:02x} ")).collect();
         let offered = buf.len();
         let res = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
         if enabled {
@@ -782,7 +779,10 @@ mod tests {
         // 零值
         assert_eq!(decode_datetime(&[]).unwrap(), "0000-00-00 00:00:00");
         // 仅日期：2022-01-08（year = 0x07E6 → LE [E6, 07]）
-        assert_eq!(decode_datetime(&[0xE6, 0x07, 1, 8]).unwrap(), "2022-01-08 00:00:00");
+        assert_eq!(
+            decode_datetime(&[0xE6, 0x07, 1, 8]).unwrap(),
+            "2022-01-08 00:00:00"
+        );
         // 完整：2022-01-08 12:34:56
         assert_eq!(
             decode_datetime(&[0xE6, 0x07, 1, 8, 12, 34, 56]).unwrap(),

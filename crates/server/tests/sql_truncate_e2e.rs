@@ -72,10 +72,7 @@ async fn collect_do_get(
     arrow_flight::utils::flight_data_to_batches(&datas).unwrap()
 }
 
-async fn col_v(
-    client: &mut FlightServiceClient<tonic::transport::Channel>,
-    sql: &str,
-) -> Vec<i64> {
+async fn col_v(client: &mut FlightServiceClient<tonic::transport::Channel>, sql: &str) -> Vec<i64> {
     let batches = collect_do_get(client, sql).await;
     let mut out = Vec::new();
     for b in &batches {
@@ -186,7 +183,9 @@ async fn truncate_empties_the_table_but_keeps_its_definition() {
 
     // ① 一行不剩、没有可见文件（文件级下线）
     assert!(
-        col_v(&mut client, "SELECT v FROM t ORDER BY v").await.is_empty(),
+        col_v(&mut client, "SELECT v FROM t ORDER BY v")
+            .await
+            .is_empty(),
         "TRUNCATE 之后一行都查不到"
     );
     let snap = lakehouse.catalog.current_snapshot().await;
@@ -311,14 +310,18 @@ async fn truncate_also_clears_in_flight_data() {
 
     execute_update_sql(&mut client, "TRUNCATE TABLE t").await;
     assert!(
-        col_v(&mut client, "SELECT v FROM t ORDER BY v").await.is_empty(),
+        col_v(&mut client, "SELECT v FROM t ORDER BY v")
+            .await
+            .is_empty(),
         "TRUNCATE 之后立刻查不到"
     );
 
     // 等一个攒批周期（50ms × 80 = 4s，远超 scan_interval）—— 复活的话这里现形
     tokio::time::sleep(std::time::Duration::from_secs(4)).await;
     assert!(
-        col_v(&mut client, "SELECT v FROM t ORDER BY v").await.is_empty(),
+        col_v(&mut client, "SELECT v FROM t ORDER BY v")
+            .await
+            .is_empty(),
         "在途数据不许复活：TRUNCATE 必须先把它们落成文件再清除"
     );
 
