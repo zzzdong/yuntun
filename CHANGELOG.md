@@ -3,10 +3,13 @@
 所有显著变更记录于此。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
-## [0.1.0-alpha.1] - 2026-10-17
+## [0.1.0-alpha.2] - 2026-10-18
 
 **预发布**：用于验证发布流水线（4 目标构建 / 包 / Release）。流水线验证通过后发布
 `0.1.0`，功能内容不预期再变。
+
+`alpha.1` 的首次流水线暴露了两个构建前置（libclang、musl C++），已修复：
+aarch64-gnu 改用 ARM 原生 runner，musl 改用 musl.cc 工具链。
 
 单节点（standalone）分析型数据湖 —— 直写摄入、可恢复存储、
 两条 SQL 协议（Flight SQL / MySQL wire）共用一套语义。
