@@ -1922,9 +1922,23 @@ error: linking with `cc` failed
 - 用这个**静态二进制**起实例跑 `standalone_smoke.py`：**17/17**；
 - 说明"musl.cc + g++"这条路是通的，不是照文档猜的。
 
-### 198.4 下一步
+### 198.4 第二次 tag（alpha.2）又失败：**锁文件没跟上版本**
 
-- 不移动 `v0.1.0-alpha.1`（保留失败证据）：版本升到 **`0.1.0-alpha.2`**、`CHANGELOG`
-  加一段（写明修复点），重打 tag 触发新一轮流水线；通过后再改 `0.1.0`。
+alpha.2 的四个 job 在 5 分钟内全失败（gnu 退出码 101、musl 2）。真正的根因很朴素：
+
+- `Cargo.toml` 升到 `0.1.0-alpha.2`，但**提交里的 `Cargo.lock` 还是 alpha.1**；
+- 流水线用 `cargo build --locked` ⇒ 直接拒绝（"cannot update the lock file"），
+  连编译都没开始；
+- 本地之所以没发现：工作树里的 lock 被之前的构建更新过（未提交），
+  而 `cargo metadata --locked` 在**已更新的**工作树上当然是绿的。
+
+修：提交 lock；并在 **CI 与 release_check 都加 `cargo metadata --locked`** 这一步
+（这类错误在发布时才暴露，看起来像"构建坏了"）。同时给 build 步骤加了
+失败时把最后 40 行塞进 check-run annotation 的兜底 —— 没有仓库管理权限也能看到真实错误。
+
+### 198.5 下一步
+
+- 不移动已推的 tag（保留失败证据）：继续升 **`0.1.0-alpha.3`**（锁文件 + libclang 路径
+  发现 + musl.cc 下载重试），重打 tag；通过后再改 `0.1.0`。
 - 边界：`ubuntu-24.04-arm` 对**私有**仓库不一定可用（本仓为 public，已用）；
   aarch64 两个目标仍无法在本机验证，CI 是第一现场。

@@ -28,6 +28,11 @@ jobs:
         with:
           shared-key: ci-stable
       # 0.1 起 fmt 是门禁：全仓已对齐（此前从未跑过 rustfmt，884 处差异一次性基线化）。
+      # 锁文件必须与 Cargo.toml 一致：`--locked` 的失败通常在发布时才暴露，
+      # 而它看起来像"构建坏了"（alpha.2 的实际翻车点）。在 CI 的每次提交上先钉住。
+      - name: 锁文件（--locked）
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
       - name: rustfmt（--check）
         run: cargo fmt --all -- --check
       - name: clippy（-D warnings）

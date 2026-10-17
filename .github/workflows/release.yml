@@ -71,7 +71,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang libclang-dev llvm-dev g++ make
-          echo "LIBCLANG_PATH=$(llvm-config --libdir 2>/dev/null || echo /usr/lib/llvm-18/lib)" >> "$GITHUB_ENV"
+          # 不能只信 `llvm-config --libdir`：Ubuntu 上 clang 与 libclang 的版本
+          # 可能不是同一个，设错 LIBCLANG_PATH 反而让 clang-sys 找不到库。
+          dir=$(find /usr/lib -maxdepth 4 -name 'libclang.so*' -printf '%h\n' 2>/dev/null | head -1)
+          echo "libclang dir: ${dir:-<未找到，交给 bindgen 自己搜>}"
+          if [ -n "$dir" ]; then echo "LIBCLANG_PATH=$dir" >> "$GITHUB_ENV"; fi
 
       # musl：musl.cc 的交叉工具链自带 g++（Ubuntu 的 musl-tools 只有 musl-gcc，
       # 而 custom-labels 需要 C++ 编译器）。
@@ -81,7 +85,11 @@ jobs:
           set -euo pipefail
           DIR=/opt/musl
           sudo mkdir -p "$DIR"
-          curl -fsSL "https://musl.cc/${{ matrix.musl }}.tgz" | sudo tar -xz -C "$DIR" --strip-components=1
+          # 下载失败常见于 runner 到 musl.cc 的瞬时问题：重试 + 落盘后再解，错误可读
+          curl -fL --retry 5 --retry-delay 3 --retry-all-errors --max-time 300 \
+            "https://musl.cc/${{ matrix.musl }}.tgz" -o /tmp/musl-cross.tgz
+          ls -lh /tmp/musl-cross.tgz
+          sudo tar -xzf /tmp/musl-cross.tgz -C "$DIR" --strip-components=1
           case "${{ matrix.target }}" in
             x86_64-*) P=x86_64-linux-musl; T=x86_64_unknown_linux_musl ;;
             aarch64-*) P=aarch64-linux-musl; T=aarch64_unknown_linux_musl ;;
@@ -96,7 +104,15 @@ jobs:
           "$DIR/bin/${P}-g++" --version | head -1
 
       - name: build
-        run: cargo build --locked --release --bins --target ${{ matrix.target }}
+        run: |
+          set +e
+          cargo build --locked --release --bins --target ${{ matrix.target }} 2>&1 | tee /tmp/build.log
+          st=${PIPESTATUS[0]}
+          if [ "$st" -ne 0 ]; then
+            # 把真实错误行塞进 check-run annotation（无需登录取日志也能看到）
+            tail -40 /tmp/build.log | sed 's/^/::error::/'
+            exit "$st"
+          fi
 
       - name: 打包
         run: scripts/package_release.sh --no-build --target ${{ matrix.target }}

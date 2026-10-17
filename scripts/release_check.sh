@@ -36,6 +36,9 @@ VERSION=$(awk '/^\[workspace.package\]/{f=1} f&&/^version = /{gsub(/"/,"",$3); p
 echo "workspace version = $VERSION"
 [ -n "$VERSION" ] || { echo "读不到 workspace 版本" >&2; exit 1; }
 
+step "锁文件（--locked）"
+cargo metadata --locked --format-version 1 > /dev/null
+
 step "格式（rustfmt --check）"
 cargo fmt --all -- --check
 
