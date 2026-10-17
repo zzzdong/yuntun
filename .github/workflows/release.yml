@@ -83,6 +83,8 @@ jobs:
         if: matrix.musl != ''
         run: |
           set -euo pipefail
+          # 失败时把具体命令写进 annotation（没有仓库管理权限也能看到）
+          trap 'echo "::error::musl toolchain failed at: $BASH_COMMAND"' ERR
           DIR=/opt/musl
           sudo mkdir -p "$DIR"
           # 下载失败常见于 runner 到 musl.cc 的瞬时问题：重试 + 落盘后再解，错误可读
@@ -101,7 +103,11 @@ jobs:
             echo "AR_${T}=$DIR/bin/${P}-ar"
             echo "CARGO_TARGET_${T^^}_LINKER=$DIR/bin/${P}-gcc"
           } >> "$GITHUB_ENV"
-          "$DIR/bin/${P}-g++" --version | head -1
+          test -x "$DIR/bin/${P}-g++" || { echo "::error::缺少 $DIR/bin/${P}-g++"; exit 1; }
+          # 不要 `g++ --version | head`：`set -o pipefail` 下 head 先退出会让 g++ 吃
+          # SIGPIPE（141），整个步骤莫名失败（alpha.3 的 musl 实际翻车点）。
+          "$DIR/bin/${P}-g++" --version > /tmp/musl-gxx.txt
+          head -1 /tmp/musl-gxx.txt
 
       - name: build
         run: |
@@ -115,7 +121,12 @@ jobs:
           fi
 
       - name: 打包
-        run: scripts/package_release.sh --no-build --target ${{ matrix.target }}
+        run: |
+          if ! scripts/package_release.sh --no-build --target ${{ matrix.target }}; then
+            echo "::error::打包失败（产物应在 target/${{ matrix.target }}/release）"
+            ls -la "target/${{ matrix.target }}/release" | head -20 || true
+            exit 1
+          fi
 
       - name: 产物自检（版本 + 文件）
         run: |

@@ -15,11 +15,12 @@ cd "$(dirname "$0")/.."
 
 BUILD=1
 TARGET=""
+TARGET_SET=0
 BIN_DIR=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --no-build) BUILD=0; shift ;;
-    --target) TARGET=${2:-}; shift 2 ;;
+    --target) TARGET=${2:-}; TARGET_SET=1; shift 2 ;;
     --bin-dir) BIN_DIR=${2:-}; shift 2 ;;
     *) echo "未知参数：$1" >&2; exit 2 ;;
   esac
@@ -30,7 +31,14 @@ VERSION=$(awk '/^\[workspace.package\]/{f=1} f&&/^version = /{gsub(/"/,"",$3); p
 TARGET=${TARGET:-$HOST}
 [ -n "$VERSION" ] && [ -n "$TARGET" ] || { echo "读不到版本/target" >&2; exit 1; }
 if [ -z "$BIN_DIR" ]; then
-  if [ "$TARGET" = "$HOST" ]; then BIN_DIR="target/release"; else BIN_DIR="target/$TARGET/release"; fi
+  # ⚠️ 只要显式传了 `--target`（哪怕等于宿主），Cargo 就把产物放在
+  # `target/<triple>/release` —— 不能按"target == host"猜成 `target/release`。
+  # CI 的 x86_64-gnu 就在这上面翻过车（build 成功、打包报"缺少 target/release/yuntun"）。
+  if [ "$TARGET_SET" -eq 1 ] || [ "$TARGET" != "$HOST" ]; then
+    BIN_DIR="target/$TARGET/release"
+  else
+    BIN_DIR="target/release"
+  fi
 fi
 
 NAME="yuntun-${VERSION}-${TARGET}"

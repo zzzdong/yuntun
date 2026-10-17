@@ -3,7 +3,7 @@
 所有显著变更记录于此。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
-## [0.1.0-alpha.3] - 2026-10-18
+## [0.1.0-alpha.4] - 2026-10-18
 
 **预发布**：用于验证发布流水线（4 目标构建 / 包 / Release）。流水线验证通过后发布
 `0.1.0`，功能内容不预期再变。
@@ -11,6 +11,9 @@
 `alpha.1` 暴露构建前置（libclang、musl C++）；`alpha.2` 修复后仍失败，根因是
 **提交的 `Cargo.lock` 没跟上版本号**（`--locked` 直接拒绝）。`alpha.3` 一并修正：
 锁文件、libclang 路径发现、musl 工具链重试。
+
+`alpha.3`：build 全过（**ARM 原生可用**），但打包脚本把显式 `--target` 的产物
+误当成 `target/release`；musl 工具链步骤未通过。`alpha.4` 修这两处。
 
 单节点（standalone）分析型数据湖 —— 直写摄入、可恢复存储、
 两条 SQL 协议（Flight SQL / MySQL wire）共用一套语义。

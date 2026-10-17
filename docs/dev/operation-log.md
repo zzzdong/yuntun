@@ -1936,9 +1936,19 @@ alpha.2 的四个 job 在 5 分钟内全失败（gnu 退出码 101、musl 2）�
 （这类错误在发布时才暴露，看起来像"构建坏了"）。同时给 build 步骤加了
 失败时把最后 40 行塞进 check-run annotation 的兜底 —— 没有仓库管理权限也能看到真实错误。
 
-### 198.5 下一步
+### 198.5 第三次 tag（alpha.3）：build 全过，两处"最后一公里"
 
-- 不移动已推的 tag（保留失败证据）：继续升 **`0.1.0-alpha.3`**（锁文件 + libclang 路径
-  发现 + musl.cc 下载重试），重打 tag；通过后再改 `0.1.0`。
+- **ARM 原生成功**：`aarch64-gnu` 与 `x86_64-gnu` 的 build 步骤都通过 —— libclang 路径
+  发现修对了；
+- **打包失败**：`package_release.sh` 只在 `target == host` 时用 `target/release`，
+  但 CI 显式传了 `--target`（哪怕等于宿主）⇒ Cargo 实际在
+  `target/<triple>/release`。修：显式 `--target` 一律走 `target/<triple>/release`；
+- **musl 工具链步骤失败**：`set -o pipefail` 下 `g++ --version | head -1` 的 head 先退出，
+  g++ 吃 SIGPIPE（141）⇒ 整步失败。修：先落文件再 head（不再用管道）。
+
+### 198.6 下一步
+
+- 不移动已推的 tag（保留失败证据）：继续升 **`0.1.0-alpha.4`**（打包路径 + SIGPIPE），
+  重打 tag；通过后再改 `0.1.0`。
 - 边界：`ubuntu-24.04-arm` 对**私有**仓库不一定可用（本仓为 public，已用）；
   aarch64 两个目标仍无法在本机验证，CI 是第一现场。
