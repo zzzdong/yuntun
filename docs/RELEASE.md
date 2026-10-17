@@ -66,12 +66,22 @@ tag 里含 `-` ⇒ Release 自动标成 **prerelease**（不会被当成稳定�
 
 `.github/workflows/release.yml` 在 `v*` tag 上构建 **4 个目标**并发布到 GitHub Release：
 
-| 目标 | 方式 | 说明 |
-|---|---|---|
-| `x86_64-unknown-linux-gnu` | 原生 | 绝大多数 Linux 服务器 |
-| `x86_64-unknown-linux-musl` | 原生 + `musl-tools` | 静态链接，无 glibc 依赖 |
-| `aarch64-unknown-linux-gnu` | `cross`（Docker） | ARM64 服务器 / 云主机 |
-| `aarch64-unknown-linux-musl` | `cross`（Docker） | ARM64 静态 |
+| 目标 | runner | 工具链 | 说明 |
+|---|---|---|---|
+| `x86_64-unknown-linux-gnu` | `ubuntu-24.04` | 系统 cc | 绝大多数 Linux 服务器 |
+| `aarch64-unknown-linux-gnu` | **`ubuntu-24.04-arm`** | 系统 cc + 手装 `clang/libclang/g++` | ARM64 服务器 / 云主机（原生编译，不用 cross） |
+| `x86_64-unknown-linux-musl` | `ubuntu-24.04` | [musl.cc] `x86_64-linux-musl-cross` | 静态链接，无 glibc 依赖 |
+| `aarch64-unknown-linux-musl` | `ubuntu-24.04` | [musl.cc] `aarch64-linux-musl-cross` | ARM64 静态 |
+
+[musl.cc]: https://musl.cc/
+
+两个硬前提（都踩过）：
+
+- **libclang**：vortex → `custom-labels` 的 build.rs 用 bindgen 生成绑定，缺 libclang 会
+  报 "Unable to generate bindings"；所有 job 都装 `clang libclang-dev llvm-dev`。
+- **C++ 编译器**：同一个 build.rs 还要编 C++17。`musl-tools` 只有 `musl-gcc`，
+  会报 `musl-g++ not found` ⇒ musl 用 musl.cc 的交叉工具链（自带 g++），并把
+  `CC_/CXX_/AR_<target>` 与 `CARGO_TARGET_<TARGET>_LINKER` 指过去。
 
 每个包：`bin/{yuntun,yuntun-cli,yuntun-datanode,metanode}`、`yuntun.toml.example`、
 `README.md`、`CHANGELOG.md`、两个 LICENSE、`docs/OVERVIEW.md` + `docs/dev/ARCHITECTURE.md`、

@@ -1,7 +1,14 @@
 name: release
 
-# 打 tag（`v0.1.0`）或手动触发。四条产物：x86_64/aarch64 × gnu/musl。
+# 打 tag（`v0.1.0-alpha.1`）或手动触发。四条产物：x86_64/aarch64 × gnu/musl。
 # 版本号唯一来源是 `Cargo.toml`；tag 与它不一致时 build 直接失败（不发错版本）。
+#
+# 平台策略（2026-10-18 实测后定）：
+#   - x86_64-gnu：ubuntu-24.04 原生
+#   - aarch64-gnu：**ubuntu-24.04-arm 原生**（不用 cross；GitHub 公共仓库有 ARM runner）
+#   - 两个 musl：x86_64 runner + musl.cc 的交叉工具链（**带 g++**：vortex 的
+#     `custom-labels` 要编译 C++）
+#   - 所有 job 都要装 clang/libclang：`custom-labels` 的 build.rs 用 bindgen。
 on:
   push:
     tags: ["v*"]
@@ -12,27 +19,34 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # 发布包不带调试信息（否则每个二进制近 1 GB）；需要排障时本地 target/release 仍有行号。
+  # 发布包不带调试信息（否则每个二进制近 1 GB）
   CARGO_PROFILE_RELEASE_DEBUG: "0"
   CARGO_INCREMENTAL: "0"
 
 jobs:
   build:
     name: ${{ matrix.target }}
-    runs-on: ubuntu-24.04
+    # ARM 目标用 ARM runner；其余 x86_64。musl 交叉工具链在 x86_64 上跑。
+    runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 90
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            cross: false
-          - target: x86_64-unknown-linux-musl
-            cross: false
+            runs-on: ubuntu-24.04
+            musl: ""
           - target: aarch64-unknown-linux-gnu
-            cross: true
+            runs-on: ubuntu-24.04-arm
+            musl: ""
+          - target: x86_64-unknown-linux-musl
+            runs-on: ubuntu-24.04
+            musl: x86_64-linux-musl-cross
           - target: aarch64-unknown-linux-musl
-            cross: true
+            runs-on: ubuntu-24.04
+            musl: aarch64-linux-musl-cross
     steps:
       - uses: actions/checkout@v4
 
@@ -51,35 +65,49 @@ jobs:
         with:
           shared-key: release-${{ matrix.target }}
 
-      # musl 用自己的 linker；gnu 走系统 cc。protoc 已由 `protoc-bin-vendored` 自带，
-      # 不需要在 CI 里装 protobuf-compiler（cross 容器里更装不了）。
-      - name: musl linker (x86_64)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
+      # vortex → custom-labels 的 build.rs：C++17 编译 + bindgen（libclang）。
+      # 不装会得到 "Unable to generate bindings" / "musl-g++ not found"。
+      - name: 编译依赖（clang / libclang / g++）
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools
-          echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
-          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc" >> "$GITHUB_ENV"
+          sudo apt-get install -y clang libclang-dev llvm-dev g++ make
+          echo "LIBCLANG_PATH=$(llvm-config --libdir 2>/dev/null || echo /usr/lib/llvm-18/lib)" >> "$GITHUB_ENV"
 
-      - name: build（native）
-        if: matrix.cross == false
+      # musl：musl.cc 的交叉工具链自带 g++（Ubuntu 的 musl-tools 只有 musl-gcc，
+      # 而 custom-labels 需要 C++ 编译器）。
+      - name: musl 交叉工具链（含 g++）
+        if: matrix.musl != ''
+        run: |
+          set -euo pipefail
+          DIR=/opt/musl
+          sudo mkdir -p "$DIR"
+          curl -fsSL "https://musl.cc/${{ matrix.musl }}.tgz" | sudo tar -xz -C "$DIR" --strip-components=1
+          case "${{ matrix.target }}" in
+            x86_64-*) P=x86_64-linux-musl; T=x86_64_unknown_linux_musl ;;
+            aarch64-*) P=aarch64-linux-musl; T=aarch64_unknown_linux_musl ;;
+            *) echo "::error::未知 target"; exit 1 ;;
+          esac
+          {
+            echo "CC_${T}=$DIR/bin/${P}-gcc"
+            echo "CXX_${T}=$DIR/bin/${P}-g++"
+            echo "AR_${T}=$DIR/bin/${P}-ar"
+            echo "CARGO_TARGET_${T^^}_LINKER=$DIR/bin/${P}-gcc"
+          } >> "$GITHUB_ENV"
+          "$DIR/bin/${P}-g++" --version | head -1
+
+      - name: build
         run: cargo build --locked --release --bins --target ${{ matrix.target }}
-
-      # aarch64 用 cross（Docker 提供交叉工具链）。cross 挂载仓库到 /project，
-      # 但本仓的 build.rs 自带 protoc，所以容器里不需要额外依赖。
-      - name: build（cross）
-        if: matrix.cross == true
-        uses: houseabsolute/actions-rust-cross@v1
-        with:
-          command: build
-          target: ${{ matrix.target }}
-          # cross 走 Docker；`--config` 确保容器里也不带调试信息
-          # （action 的 `strip` 只对非 cross 产物生效）
-          args: --locked --release --bins --config profile.release.debug=0
-          strip: true
 
       - name: 打包
         run: scripts/package_release.sh --no-build --target ${{ matrix.target }}
+
+      - name: 产物自检（版本 + 文件）
+        run: |
+          ls -lh "target/${{ matrix.target }}/release/"{yuntun,yuntun-cli,yuntun-datanode,metanode}
+          # 原生目标（runner 架构 == target 架构）才执行；交叉产物只在包内交付
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ] && [ "$(uname -m)" = "x86_64" ]; then
+            "target/${{ matrix.target }}/release/yuntun" --version
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
@@ -92,6 +120,8 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4

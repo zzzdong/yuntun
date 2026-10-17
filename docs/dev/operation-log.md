@@ -1,6 +1,6 @@
 # yuntun 实施操作日志（§169 起）
 
-> 起记时间：2026-10-11（最新：**§197，2026-10-18**）。对应分支：main。
+> 起记时间：2026-10-11（最新：**§198，2026-10-18**）。对应分支：main。
 >
 > **这是什么**：从今天起，**每一刀**（一次成体系的改造）在这里留一节 —— 写清"做了什么、
 > 为什么这么做、边界在哪（**没做什么**）、怎么验的"。它是本项目的**证据出处**：
@@ -1877,3 +1877,54 @@ error: linking with `cc` failed
 - 本轮没有在本机重打 release 包（磁盘原因，且 CI 会构建）；0.1.0 时已在
   `§195/§196` 验证过打包与"包内二进制跑冒烟"的路径。
 - alpha 通过后要做的只有两件：版本改 `0.1.0`、`CHANGELOG` 增加 `[0.1.0]` 段，再打稳定 tag。
+
+---
+
+## 198. **首次 alpha 流水线：CI 全绿、发布 3/4 失败 → 换 ARM 原生与 musl.cc 工具链**（2026-10-18）
+
+### 198.0 首次 tag 的结果（不是猜的）
+
+推 `v0.1.0-alpha.1` 后：
+
+| 流水线 | 结果 |
+|---|---|
+| `ci.yml` | ✅ fmt / clippy / 全量测试 / MSRV 1.95 全绿 |
+| `release.yml` | ❌ `x86_64-gnu`、`x86_64-musl`、`aarch64-gnu`；`aarch64-musl` 随后亦失败 |
+| `publish` | 未运行（build 失败） |
+
+### 198.1 根因：两个构建前置没装
+
+`vortex-io → custom-labels 0.4.6` 的 `build.rs` 同时要两样东西：
+
+1. **bindgen（libclang）** —— GitHub runner 没装 ⇒ `Unable to generate bindings`；
+   本机能过是因为装了 `clang/llvm-config/libclang`。
+2. **C++17 编译器** —— `cc::Build::new().cpp(true)`。
+   `musl-tools` **只有 `musl-gcc`**，没有 `musl-g++` ⇒ musl 目标报
+   `ToolNotFound: musl-g++`（本地复现到一模一样的错）。
+
+### 198.2 改了什么
+
+| 目标 | 之前 | 现在 |
+|---|---|---|
+| `aarch64-unknown-linux-gnu` | cross（Docker） | **`ubuntu-24.04-arm` 原生**（用户建议）；装 `clang/libclang-dev/llvm-dev/g++` |
+| `x86_64-unknown-linux-gnu` | 原生，无 libclang | 原生 + 同一套编译依赖 |
+| `x86_64-unknown-linux-musl` | `musl-tools`（无 g++） | **musl.cc `x86_64-linux-musl-cross`**（自带 g++），显式设 `CC_/CXX_/AR_` 与 `CARGO_TARGET_..._LINKER` |
+| `aarch64-unknown-linux-musl` | cross（Docker） | musl.cc `aarch64-linux-musl-cross`（x86_64 runner 上交叉） |
+
+- 不再依赖 `houseabsolute/actions-rust-cross`（Docker 里装不了 libclang，且 ARM 原生更直接）；
+- 所有 job 增加 `LIBCLANG_PATH`（`llvm-config --libdir`）；
+- 增加"产物自检"步骤：四个二进制存在 + 原生目标打印 `--version`。
+
+### 198.3 本地验证（x86_64-musl）
+
+- 下载 musl.cc 工具链后本地构建成功（8m41s）：
+  `ELF 64-bit LSB pie executable, static-pie linked`、`ldd` = `statically linked`；
+- 用这个**静态二进制**起实例跑 `standalone_smoke.py`：**17/17**；
+- 说明"musl.cc + g++"这条路是通的，不是照文档猜的。
+
+### 198.4 下一步
+
+- 提交后**删除并重建** `v0.1.0-alpha.1` tag（预发布可承受；`RELEASE.md` 写了流程），
+  重新触发流水线；通过后再改 `0.1.0`。
+- 边界：`ubuntu-24.04-arm` 对**私有**仓库不一定可用（本仓为 public，已用）；
+  aarch64 两个目标仍无法在本机验证，CI 是第一现场。
