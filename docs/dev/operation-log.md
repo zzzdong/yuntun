@@ -1989,7 +1989,18 @@ alpha.2 的四个 job 在 5 分钟内全失败（gnu 退出码 101、musl 2）�
 - 版本 `0.1.0-alpha.5`（alpha.4 的 gnu 双目标已通过，但它的 musl 失败让 publish
   永不触发；alpha.5 用干净的 2 目标矩阵跑完整发布）。
 
-### 199.3 边界
+### 199.3 结果：alpha.5 流水线全绿，Release 已发布并验收
+
+- 两个 build job（x86_64-gnu / aarch64-gnu）**success**，`GitHub Release` **success**；
+- Release `v0.1.0-alpha.5` 标记 **prerelease**，资产：
+  `x86_64` 139.0 MB、`aarch64` 145.4 MB、两份 `.sha256`、合并 `SHA256SUMS`；
+- **发布后验收**（`RELEASE.md §5`）：从 Release 下载 x86_64 包到 `/tmp`（tmpfs）→
+  `sha256sum -c` OK → `bin/yuntun --version` = `yuntun 0.1.0-alpha.5` →
+  用**包里的二进制**跑 `standalone_smoke.py`：**17/17**。
+
+⇒ "CI → 双目标构建 → 打包 → Release → 下载验收"这条链第一次完整跑通。
+
+### 199.4 边界
 
 - musl 从"发布目标"降级为"**从源码构建**"；不做静态包的承诺。
 - alpha.5 通过后，0.1.0 的发布内容就固定为 gnu 双平台；`docs/RELEASE.md §6`
