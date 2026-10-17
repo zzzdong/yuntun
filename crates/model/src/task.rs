@@ -107,7 +107,7 @@ impl CompactionTask {
 ///
 /// ⚠️ 它们是**超集**阈值：任务表回答"这个分片**值得看一看**"，真正的合并判定仍在执行者的
 /// `[compaction]` 配置里（`min_files` / `dv_ratio_threshold` / `dv_min_card`）。
-/// 单一来源的说明见 `docs/operation-log.md §169.2`。
+/// 单一来源的说明见 `docs/dev/operation-log.md §169.2`。
 pub mod threshold {
     /// 同分片可见文件数到这么多就登记。
     ///

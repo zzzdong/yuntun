@@ -14,6 +14,10 @@ tonic-prost = "0.14"
 [build-dependencies]
 # tonic 0.14 起 build 侧也拆分了：prost 支持在 tonic-prost-build
 tonic-prost-build = "0.14"
+# **自带 protoc**（不再依赖系统 `protoc`）：CI / 新机器 / cross 容器里都无需 apt 安装，
+# 构建因此可复现。prost-build 与 tonic-prost-build 用的是同一大版本（0.14）。
+prost-build = "0.14"
+protoc-bin-vendored = "3"
 
 [dev-dependencies]
 # 兼容测试要用手写结构做"逐字段对齐"（设计 §6 的 S3-0 验收）

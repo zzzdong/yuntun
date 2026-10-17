@@ -1,12 +1,12 @@
 # yuntun 实施操作日志（§169 起）
 
-> 起记时间：2026-10-11（最新：**§195，2026-10-17**）。对应分支：main。
+> 起记时间：2026-10-11（最新：**§196，2026-10-17**）。对应分支：main。
 >
 > **这是什么**：从今天起，**每一刀**（一次成体系的改造）在这里留一节 —— 写清"做了什么、
 > 为什么这么做、边界在哪（**没做什么**）、怎么验的"。它是本项目的**证据出处**：
 > `OVERVIEW.md` / `ARCHITECTURE.md` / `ROADMAP.md` 里凡是写"已具备"的地方，都应能指向这里的一节。
 >
-> **前 §1…168 在 [`archive/operation-log.md`](archive/operation-log.md)**（2026-10-11 重建时整体归档，
+> **前 §1…168 在 [`archive/operation-log.md`](../archive/operation-log.md)**（2026-10-11 重建时整体归档，
 > 内容**不再维护**，冲突时以现状/架构/计划三份为准）。节号**续号不重号**：
 > 因此代码与文档里的 `§166` / `§164` / `§88.6` 指归档，`§169` 起指本文件。
 >
@@ -1719,3 +1719,93 @@ D-20 的要求是"**先量数**，再决定做流式解码还是冷读预算"。
   要对齐必须单独一笔纯格式化提交（否则功能 diff 被埋）。已写进 `docs/RELEASE.md §1`；
 - 仓库没有 CI：`scripts/release_check.sh` 就是可放进任意 CI 的门禁（本地已实跑通过）；
 - 发布包不带全部 `docs/`（只带 OVERVIEW/ARCHITECTURE）：完整设计与台账留在仓库。
+
+---
+
+## 196. **文档分家 + GitHub 流水线（4 目标）+ 0.1 交付收口**（2026-10-17）
+
+### 196.0 为什么要动
+
+0.1 的**代码**已经够用，剩下的问题是"交付形态"：
+
+1. `docs/` 顶层 7 份混在一起 —— 项目的读者（要用/要发）第一屏是台账与判据；
+2. 没有任何 CI/发布流水线，产物只有本机 `target/release`；
+3. 构建依赖系统 `protoc`（CI 与 cross 容器里各要装一遍，版本还不一致）；
+4. README 没有"下载哪个包"的入口；CHANGELOG 还留着旧草稿的痕迹。
+
+### 196.1 文档分家（项目 / 开发 / 历史）
+
+```
+docs/                 # 项目文档
+  README.md           # 索引与冲突裁决（重写：两套清单）
+  OVERVIEW.md         # 是什么 / 能做什么
+  RELEASE.md          # 发布门禁、产物、tag、发布后验收
+  dev/                # 开发文档
+    ARCHITECTURE.md
+    ROADMAP.md
+    HANDOVER.md
+    operation-log.md
+  archive/            # 历史（冻结，不维护）
+```
+
+- 四份开发文档 `git mv` 进 `dev/`；相对链接（`archive/`、`OVERVIEW`、`../../README.md`）逐个修正；
+- 全仓 `docs/<name>.md` 文本引用同步为 `docs/dev/<name>.md`（含 `crates/meta/Cargo.toml` 注释）；
+- `docs_consistency` 改成**两套清单**：`PROJECT_DOCS` / `DEV_DOCS`，分别核对两个目录；
+  `all_docs` 跨 `docs/` + `docs/dev/` 扫"§1–§N 范围串"；新日志路径变 `dev/operation-log.md`；
+- 没有删除任何**当前**文档：归档本来就是历史区，旧的 12 份仍在 `archive/`（不再维护）。
+
+### 196.2 流水线
+
+| 文件 | 触发 | 内容 |
+|---|---|---|
+| `.github/workflows/ci.yml` | push main / PR | `clippy -D warnings` + `cargo test --workspace`（stable）；另一 job 用 **1.95.0** 跑 `cargo check --workspace --all-targets`（MSRV 承诺） |
+| `.github/workflows/release.yml` | `v*` tag / 手动 | 4 目标构建 → 打包 → GitHub Release（自动附 `SHA256SUMS` 与 CHANGELOG 当前段） |
+
+4 个目标：`x86_64`/`aarch64` × `gnu`/`musl`。宿主 x86_64 上：
+
+- gnu / x86_64-musl **原生**构建（musl 装 `musl-tools` 并显式指定 linker）；
+- aarch64 两个目标用 `houseabsolute/actions-rust-cross`（Docker 提供交叉工具链）。
+
+**版本一致性**：tag ≠ `Cargo.toml` 的 workspace 版本 ⇒ build job 直接失败（发错版本的代价
+比多一条检查大得多）。发布说明从 `CHANGELOG.md` 里取当前版本段，不再手写第二份。
+
+### 196.3 构建不再依赖系统 protoc
+
+`crates/proto/build.rs` 改用 `protoc-bin-vendored`（+ `prost-build` 0.14 的
+`protoc_executable`），把 protoc 变成**构建依赖**：
+CI / 新机器 / cross 容器都不必 `apt install protobuf-compiler`，生成结果与宿主无关。
+（这也是 aarch64 cross 能成立的前提：cross 镜像里没有 protoc，而 build.rs 是要在容器里跑的。）
+
+### 196.4 打包脚本
+
+`scripts/package_release.sh` 新增 `--target` / `--bin-dir`：
+
+- CI 里 `--no-build --target <triple>` 直接打 `target/<triple>/release` 的产物；
+- 只有 `target == host` 时才 `strip --strip-debug`（宿主 strip 不认别的架构）；
+- 包内文档布局跟仓库一致：`docs/OVERVIEW.md` + `docs/dev/ARCHITECTURE.md`（README 的链接
+  在包里仍然可点）。
+
+### 196.5 README / CHANGELOG
+
+- README：顶部按"项目文档 / 开发文档 / 历史"分区；新增**下载矩阵**（4 个包 + 校验）；
+  "构建与启动"改成"从源码构建与启动"；
+- CHANGELOG：**只保留 0.1.0 一段**（按要求不留旧版本；草稿痕迹删除），补"发布与交付"与
+  "构建自带 protoc"两条。
+
+### 196.6 证据
+
+- `docs_consistency` **10/10**（两套文档清单、§范围、规模行都过）；
+- `cargo clippy --workspace --all-targets -- -D warnings` **0 告警**；
+- 按 CI 的方式构建并打包：`CARGO_PROFILE_RELEASE_DEBUG=0 scripts/package_release.sh
+  --target x86_64-unknown-linux-gnu` → 133 MB tarball，`sha256sum -c` OK，包内含
+  `docs/dev/ARCHITECTURE.md`；
+- 把新包解到 `/tmp` 用**包里的 `yuntun`** 跑 standalone 冒烟：**17/17**；
+- 两个 workflow 用 `yaml.safe_load` 解析通过（结构：ci = test/msrv；release = build/publish）。
+
+### 196.7 边界（诚实）
+
+- **流水线没有在 GitHub 上真跑过**：本机无法执行 Actions；aarch64 与 musl 的构建
+  是"按 cross/apt 的标准做法写好"，第一次 tag 才是它们的真实验收。若失败，修
+  workflow 后重打 tag（移动 tag 需删除重建，见 `RELEASE.md`）。
+- 私有仓库可能用不了 ARM 原生 runner —— 所以 aarch64 走 cross（Docker），不依赖 runner 架构。
+- 不发布 crates.io（SDK 仍在 workspace 内）；首页/官网/安装器不在本仓范围。

@@ -1,9 +1,9 @@
-# 发布流程（0.1.0）
+# 发布流程（0.1）
 
 > **口径**：版本号只有一个来源 —— `Cargo.toml` 的 `[workspace.package].version`；
-> 所有 crate 用 `version.workspace = true`。0.1 之前本仓没有对外产物，也从未打过 tag。
+> 所有 crate 用 `version.workspace = true`。tag 与它不一致时发布流水线**直接失败**。
 >
-> **原则**：发布 = 一条命令跑完门禁 + 一条命令产出带校验和的包；不靠"我记得跑过"。
+> **原则**：发布 = 一条命令跑完门禁 + 推一个 tag；产物由 CI 构建，不靠"我记得跑过"。
 
 ---
 
@@ -26,55 +26,58 @@ scripts/release_check.sh              # 含 release 冒烟（需要 python + pym
 scripts/release_check.sh --skip-smoke # 只跑编译/测试/文档
 ```
 
-已知债（**不是本版门禁**，但别装作没有）：
+CI（`.github/workflows/ci.yml`）在每次 push / PR 上跑 1、2 与 MSRV；tag 流水线**不重复**
+跑全量测试（时间 × 4 个目标）——所以**打 tag 前必须先在本地或 main 的 CI 上过第 1–6 项**。
+
+已知债（**不是门禁**，但别装作没有）：
 
 - `cargo fmt --all --check` 有约 884 处差异 —— 本仓从未以 rustfmt 为基线。
-  若要对齐，必须**单独一笔**纯格式化提交（否则会把功能 diff 埋掉），并与发布提交分开。
+  若要对齐，必须**单独一笔**纯格式化提交，并与发布提交分开。
 
-## 2. 产物
+## 2. 产物（CI 自动构建）
 
-```bash
-scripts/package_release.sh
-```
+`.github/workflows/release.yml` 在 `v*` tag 上构建 **4 个目标**并发布到 GitHub Release：
 
-产出：
+| 目标 | 方式 | 说明 |
+|---|---|---|
+| `x86_64-unknown-linux-gnu` | 原生 | 绝大多数 Linux 服务器 |
+| `x86_64-unknown-linux-musl` | 原生 + `musl-tools` | 静态链接，无 glibc 依赖 |
+| `aarch64-unknown-linux-gnu` | `cross`（Docker） | ARM64 服务器 / 云主机 |
+| `aarch64-unknown-linux-musl` | `cross`（Docker） | ARM64 静态 |
 
-```
-dist/yuntun-0.1.0-<target>.tar.gz
-dist/yuntun-0.1.0-<target>.tar.gz.sha256
-```
+每个包：`bin/{yuntun,yuntun-cli,yuntun-datanode,metanode}`、`yuntun.toml.example`、
+`README.md`、`CHANGELOG.md`、两个 LICENSE、`docs/OVERVIEW.md` + `docs/dev/ARCHITECTURE.md`、
+`<pkg>.sha256`；Release 页另附合并的 `SHA256SUMS` 与 CHANGELOG 当前版本段的说明。
 
-包内：`bin/{yuntun,yuntun-cli,yuntun-datanode,metanode}`、`yuntun.toml.example`、
-`README.md`、`CHANGELOG.md`、`LICENSE-MIT`、`LICENSE-APACHE`、`docs/OVERVIEW.md`、
-`docs/ARCHITECTURE.md`。
-
-验收（换一个目录、模拟"用户拿到包"）：
+本地产出同样的包（用于离线/预演）：
 
 ```bash
-tar xzf yuntun-0.1.0-*.tar.gz && cd yuntun-0.1.0-*
-./bin/yuntun --version
-cp yuntun.toml.example yuntun.toml   # 改端口/目录后启动
-scripts/.venv/bin/python ../../scripts/standalone_smoke.py 127.0.0.1:3306 127.0.0.1:50051
+scripts/package_release.sh --target x86_64-unknown-linux-gnu
+# 或只打包已构建的产物：
+scripts/package_release.sh --no-build --bin-dir target/x86_64-unknown-linux-gnu/release
 ```
 
-## 3. 打 tag 与发布（人工一步）
+包内二进制去掉调试信息（`CARGO_PROFILE_RELEASE_DEBUG=0` 或 `strip --strip-debug`）；
+本机 `target/release` 仍保留 line-tables-only，便于排障。
+
+## 3. 打 tag（发布动作本身）
 
 ```bash
 git tag -a v0.1.0 -m "yuntun 0.1.0: standalone analytics lakehouse" && git push --tags
-# 在托管平台创建 Release，附上 dist/ 下两个文件
 ```
 
-发布说明直接用 `CHANGELOG.md` 的 0.1.0 段（**Known limitations 必须原样带上**）。
+推 tag 后：build（4 目标）→ 打包 → GitHub Release（说明取 `CHANGELOG.md` 的当前版本段，
+**Known limitations 原样带上**）。手动触发（`workflow_dispatch`）只构建、不发布。
 
-## 4. 发布后
+## 4. 发布后验收
 
-- 用下载回来的包跑一次第 2 节的"验收"（证明产物本身可用，而不只是本机构建）；
-- 记录 `sha256` 到发布页；
-- 若发现打包/文档问题：**不移动、不删除 tag**，补 `0.1.1`（二进制可回退：0.1 没有
-  数据格式迁移，WAL/清单格式未变）。
+- 从 Release 下载**至少 gnu 与 musl 各一个**包，`sha256sum -c` 通过；
+- 解包后的 `bin/yuntun --version` 与 tag 一致；
+- 用包里的二进制起实例，跑 `scripts/standalone_smoke.py`（**17/17**）；
+- musl 包额外确认 `ldd bin/yuntun` 不是动态链接 glibc（`not a dynamic executable`）。
 
-## 5. 发布记录（模板）
+## 5. 记录（模板）
 
-| 版本 | 日期 | commit | 校验和（sha256） | standalone 冒烟 | auth 冒烟 | 备注 |
+| 版本 | 日期 | commit | 四个目标 | standalone 冒烟 | auth 冒烟 | 备注 |
 |---|---|---|---|---|---|---|
-| 0.1.0 | 2026-10-17 | （填 `git rev-parse --short HEAD`） | （填） | 17/17 | 7/7 | 首个对外版本 |
+| 0.1.0 | 2026-10-17 | （填 `git rev-parse --short HEAD`） | x64/aarch64 × gnu/musl | 17/17（本机） | 7/7（本机） | 首个对外版本 |

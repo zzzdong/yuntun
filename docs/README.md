@@ -1,68 +1,86 @@
-# docs 索引与文档规则（v2，2026-10-11 重建）
+# docs 索引与文档规则（v3，2026-10-17：项目文档 / 开发文档分家）
 
 > **先读这一页**：它回答"想了解 X 该读哪份、两份冲突听谁的、改了代码要同步哪些文档"。
 >
-> 本目录在 2026-10-11 做过一次**重建**：旧文档（12 份，含 §1…168 的操作日志）整体移入
-> [`archive/`](archive/)，现状/架构/计划三份按今天的事实重写 —— 原因与取舍见
-> [`operation-log.md`](operation-log.md) `§170`。
+> **2026-10-17 的调整**：把**开发文档**（架构 / 计划 / 交接 / 证据日志）移入 [`dev/`](dev/)；
+> 本目录顶层只留**项目文档**（现状说明、发布流程）。旧文档（12 份，含 §1…168 的操作日志）
+> 仍在 [`archive/`](archive/)，**冻结不再维护**。
+>
+> 这样分的理由：项目文档的读者是"要用/要发的人"，开发文档的读者是"要改的人"；
+> 混在一起的结果是前者的第一屏全是台账与判据。文件数没变（只是分了两层），
+> `docs_consistency` 同时钉住两个集合。
 
 ## 1. 按目的选文档
+
+### 1.1 项目文档（使用 / 发布）
 
 | 我想…… | 读 |
 |---|---|
 | 知道 **yuntun 是什么、今天能做什么、怎么跑起来** | [`OVERVIEW.md`](OVERVIEW.md) ← **项目说明（现状唯一入口）** |
-| 知道 **架构怎么分层、crate 怎么切、关键决策与不变量** | [`ARCHITECTURE.md`](ARCHITECTURE.md) |
-| 知道 **任务怎么排、下一阶段做什么、还欠哪些账** | [`ROADMAP.md`](ROADMAP.md)（含**台账**：未闭环偏差 + 验收） |
-| **接手开发**：先读什么、别踩哪些坑、提示词 | [`HANDOVER.md`](HANDOVER.md) |
-| 知道 **某个结论的证据 / 某次改造的过程与偏差** | [`operation-log.md`](operation-log.md)（**§169 起**；§1…168 在 [`archive/operation-log.md`](archive/operation-log.md)） |
-| 知道 **历史设计全文**（12 个 ADR、逐模块详细设计、改造指南、SQL 接入设计） | [`archive/`](archive/) —— **是历史，不是现状** |
-| 想跑起来用起来 | 仓库根 [`../README.md`](../README.md) |
 | 要**发版**：门禁、打包、tag、发布后验收 | [`RELEASE.md`](RELEASE.md) |
+| 想跑起来用起来（安装 / 连接 / 最小闭环） | 仓库根 [`../README.md`](../README.md) |
+
+### 1.2 开发文档（实现 / 计划 / 证据）
+
+| 我想…… | 读 |
+|---|---|
+| 知道 **架构怎么分层、crate 怎么切、关键决策与不变量** | [`dev/ARCHITECTURE.md`](dev/ARCHITECTURE.md) |
+| 知道 **任务怎么排、下一阶段做什么、还欠哪些账** | [`dev/ROADMAP.md`](dev/ROADMAP.md)（含**台账**：未闭环偏差 + 验收） |
+| **接手开发**：先读什么、别踩哪些坑、提示词 | [`dev/HANDOVER.md`](dev/HANDOVER.md) |
+| 知道 **某个结论的证据 / 某次改造的过程与偏差** | [`dev/operation-log.md`](dev/operation-log.md)（**§169 起**；§1…168 在 [`archive/operation-log.md`](archive/operation-log.md)） |
+
+### 1.3 历史
+
+| 我想…… | 读 |
+|---|---|
+| 知道 **历史设计全文**（12 个 ADR、逐模块详细设计、改造指南、SQL 接入设计） | [`archive/`](archive/) —— **是历史，不是现状** |
 
 **新读者建议顺序**：根 `README.md`（5 分钟）→ `OVERVIEW.md`（10 分钟）→
-`ARCHITECTURE.md`（20 分钟）→ `ROADMAP.md §下一阶段`。
+`dev/ARCHITECTURE.md`（20 分钟）→ `dev/ROADMAP.md §下一阶段`。
 
 ## 2. 权威性与冲突裁决
 
 ```
 OVERVIEW.md（今天是什么样）               ← 最高
-   > ARCHITECTURE.md（结构为什么这样） / ROADMAP.md（任务与门槛）
-   > operation-log.md（证据与过程）        ← 证据可以推翻前两者，但必须回改它们
+   > dev/ARCHITECTURE.md（结构为什么这样） / dev/ROADMAP.md（任务与门槛）
+   > dev/operation-log.md（证据与过程）    ← 证据可以推翻前两者，但必须回改它们
    > archive/**（历史，只备查；与上面冲突时一律以上面为准）
 ```
 
 - **同一事实出现矛盾时，以上序为准**，并且**必须回改低优先级文档**。
   "实现已改、文档照旧"是本项目最大的返工来源（归档日志 `§25`/`§27` 各有一例，
   `§168` 记的是"整组任务记分卡停在起点"这类更糟的形态）。
-- 文档写"已实现/已具备"时，必须能指向 `operation-log` 的证据段或一个**能跑的用例**；
+- 文档写"已实现/已具备"时，必须能指向 `dev/operation-log` 的证据段或一个**能跑的用例**；
   否则一律视为**意图**而非**现状**。
 
 ### 2.1 归档与 §号映射（重要）
 
 - 归档日志保留原节号 **§1…168**；新日志从 **§169** 起续号，**不重号**。
 - 因此代码注释与本文档里的 `§166` / `§164` / `§88.6` 这类引用，
-  **§1…168 的指向 `docs/archive/operation-log.md`，§169 起的指向 `docs/operation-log.md`**。
+  **§1…168 的指向 `docs/archive/operation-log.md`，§169 起的指向 `docs/dev/operation-log.md`**。
 - 台账编号（`D-4` / `D-20` / `D-21` / `D-23` / `D-24` …）**沿用不变**（代码注释里引用着它们）；
-  旧台账 `archive/closeout.md` 里的已闭环条目作为历史保留，**未闭环项全部搬进** [`ROADMAP.md §4`](ROADMAP.md)。
+  旧台账 `archive/closeout.md` 里的已闭环条目作为历史保留，**未闭环项全部搬进**
+  [`dev/ROADMAP.md §4`](dev/ROADMAP.md)。
 
 ## 3. 改代码时要同步什么（清单）
 
 | 你改了什么 | 必须同步 |
 |---|---|
-| 默认值 / 配置项 | `operation-log`（附**实测**）+ `ARCHITECTURE.md`（配置清单 + ADR 定案表）+ `yuntun.toml.example` |
-| 新增/改变语义契约 | `operation-log` + `ARCHITECTURE.md`（不变量/决策表）+ 一条**断言其反面后果**的用例 |
-| 完成某个任务 / 里程碑 | `ROADMAP.md`（任务状态 + 台账销账）+ `OVERVIEW.md`（能力矩阵若变了） |
-| 发现与文档不符（无论改哪边） | `operation-log`（偏差与理由）+ 回改上游文档对应段落 |
-| 架构级决策 | `ARCHITECTURE.md` 里**就地修订**并写明"谁被谁取代、为什么"，不新建平行文档 |
+| 默认值 / 配置项 | `dev/operation-log`（附**实测**）+ `dev/ARCHITECTURE.md`（配置清单 + ADR 定案表）+ `yuntun.toml.example` |
+| 新增/改变语义契约 | `dev/operation-log` + `dev/ARCHITECTURE.md`（不变量/决策表）+ 一条**断言其反面后果**的用例 |
+| 完成某个任务 / 里程碑 | `dev/ROADMAP.md`（任务状态 + 台账销账）+ `OVERVIEW.md`（能力矩阵若变了） |
+| 发现与文档不符（无论改哪边） | `dev/operation-log`（偏差与理由）+ 回改上游文档对应段落 |
+| 架构级决策 | `dev/ARCHITECTURE.md` 里**就地修订**并写明"谁被谁取代、为什么"，不新建平行文档 |
 
 ## 4. 文档维护的硬规则
 
 1. **就地升版本，不新建平行文档**。归档是"整体换代"这种大动作，不是日常手段（本目录只做过一次）。
-2. **决策不许顺手改**：`ARCHITECTURE.md §5` 的已定案项，改必附**实测数据**。
-3. **先证据后结论**：结论写进 `OVERVIEW.md` / `ROADMAP.md` 之前，证据必须已在 `operation-log` 里。
+2. **决策不许顺手改**：`dev/ARCHITECTURE.md §5` 的已定案项，改必附**实测数据**。
+3. **先证据后结论**：结论写进 `OVERVIEW.md` / `dev/ROADMAP.md` 之前，证据必须已在
+   `dev/operation-log` 里。
 4. **可机核的写成判据**，不要写"请记得同步"：判据在
    `crates/testkit/tests/docs_consistency.rs`（跑 `cargo test -p yuntun-testkit` 即验）。
    ⚠️ 写判据的教训：判据只能依赖**格式明确的声明行 / 表格行**，不能依赖"文件里出现过某字符串"
    （归档日志 `§123`：三条判据分别被它们自己文档里提到的 `oneof kind` / `⏳` / `EvolveSchema` 误伤过）。
 5. **状态列是给人看的任务**：过期就等于让下一位按它重做一遍（`D-15`/`D-17`/`D-19`/`D-24` 四次同类）。
-   ⇒ 每几刀就审一次 `ROADMAP.md` 的状态列，审计时**逐条核到代码/日志**，不要凭印象划勾。
+   ⇒ 每几刀就审一次 `dev/ROADMAP.md` 的状态列，审计时**逐条核到代码/日志**，不要凭印象划勾。

@@ -1,10 +1,10 @@
 # yuntun 架构设计（ARCHITECTURE）
 
 > **版本**：v2.0 ｜ **日期**：2026-10-11 ｜ **依据**：归档架构文档
-> [`archive/architecture.md`](archive/architecture.md)（12 个 ADR + 域设计）、
-> [`archive/architecture-with-chunk.md`](archive/architecture-with-chunk.md)（chunk 层目标态）、
-> [`archive/design.md`](archive/design.md)（详细设计）—— **本文件是它们的"实现后的收敛版"**：
-> 结构原因保留，已被现实推翻/已落地的部分按事实重写。现状见 [`OVERVIEW.md`](OVERVIEW.md)。
+> [`archive/architecture.md`](../archive/architecture.md)（12 个 ADR + 域设计）、
+> [`archive/architecture-with-chunk.md`](../archive/architecture-with-chunk.md)（chunk 层目标态）、
+> [`archive/design.md`](../archive/design.md)（详细设计）—— **本文件是它们的"实现后的收敛版"**：
+> 结构原因保留，已被现实推翻/已落地的部分按事实重写。现状见 [`OVERVIEW.md`](../OVERVIEW.md)。
 >
 > 引用约定：`§1…168` 指向 `archive/operation-log.md`，`§169` 起指向 [`operation-log.md`](operation-log.md)。
 

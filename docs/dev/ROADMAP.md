@@ -4,8 +4,8 @@
 > 与 `closeout.md`（偏差台账），但**只保留今天还有效的部分**：已完成阶段给出证据指针，
 > **未闭环的账全部搬进 §4 台账**，下一阶段任务见 §5。
 >
-> 引用约定：`§1…168` 指向 [`archive/operation-log.md`](archive/operation-log.md)，
-> `§169` 起指向 [`operation-log.md`](operation-log.md)。现状见 [`OVERVIEW.md`](OVERVIEW.md)。
+> 引用约定：`§1…168` 指向 [`archive/operation-log.md`](../archive/operation-log.md)，
+> `§169` 起指向 [`operation-log.md`](operation-log.md)。现状见 [`OVERVIEW.md`](../OVERVIEW.md)。
 
 ---
 
@@ -22,7 +22,7 @@
 | G 组 | 多 datanode 协作与分布式任务 | 🟡 **G.0 ✅（`§166`）/ G.1 代码 ✅（`§169`，文档收尾在本轮）/ G.3 ✅（`§167`）/ G.2 ⏳ / G.4 ⏳** |
 | 阶段 4（下一阶段，**N 组**） | 从"分布式就绪"→"可运维、可交付" | ⏳ 见 §5 |
 | **S 组（本轮，`§184`）** | **Standalone 完备性收口：单机即一个完整的简易列数据库** | 🔄 见 §5.2 |
-| **0.1 发布**（`§195`） | 门禁脚本 + 打包 + 发布文档（`docs/RELEASE.md`） | ✅ **门禁通过**（123 段测试 / clippy 0 / release 冒烟 17+7 / 产物复跑 17）；**tag 与发布待人工** |
+| **0.1 发布**（`§195`/`§196`） | 门禁 + 打包 + GitHub 流水线（x64/aarch64 × gnu/musl）+ 文档分家 | ✅ **本机门禁通过**（clippy 0 / docs 10/10 / release 冒烟 17+7 / 包复跑 17）；**CI 与 4 目标构建待首次 tag 验收** |
 
 **里程碑账**（归档 `plan.md §8.3/§8.4` 的门槛）：
 
@@ -118,7 +118,7 @@
 ### 4.1 已闭环台账（索引：**代码注释里的 `D-*` 都指向这里**）
 
 > 代码里出现 `D-13` / `D-11` / `D-18` 这类引用时，含义在这张表（详细过程在归档
-> [`closeout.md`](archive/closeout.md) 与对应 `§` 节）。有判据盯着：`crates/**/*.rs` 里出现的
+> [`closeout.md`](../archive/closeout.md) 与对应 `§` 节）。有判据盯着：`crates/**/*.rs` 里出现的
 > 每个 `D-*` 都必须能在本文件里找到（否则就是"引用悬空"）。
 
 | # | 结论（一句话） | 证据 |

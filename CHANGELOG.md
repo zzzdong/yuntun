@@ -8,8 +8,6 @@
 **首个对外版本**：单节点（standalone）分析型数据湖 —— 直写摄入、可恢复存储、
 两条 SQL 协议（Flight SQL / MySQL wire）共用一套语义。
 
-> 0.1 之前本仓**没有对外产物**（也没有打过 tag）；2026-09-12 的草稿条目已并入本节。
-
 ### Added
 
 - **写入与存储**：Arrow 批次 → WAL（CRC、组提交、fsync、批次状态机）
@@ -48,6 +46,10 @@
   逐行对拍）、聚合下推（只回标量）、冷文件按节点分配与远端折叠、真实 S3（SeaweedFS/MinIO）。
 - **测试基建**：testkit（tmpfs 测试目录）、chaos 故障注入、`standalone_smoke.py`（17 项）、
   `auth_smoke.py`（7 项）、pymysql/JDBC/pyarrow(ADBC) 冒烟脚本。
+- **发布与交付**：GitHub Actions 在 tag 上产出 **x86_64 / aarch64 × glibc / musl** 四个包
+  （`bin/{yuntun,yuntun-cli,yuntun-datanode,metanode}` + 示例配置 + 文档 + 许可证），
+  附 `sha256` 与合并的 `SHA256SUMS`；`scripts/release_check.sh` 是发布门禁
+  （clippy + 全量测试 + 文档一致性 + release 二进制冒烟）。
 
 ### Changed
 
@@ -56,6 +58,7 @@
   回退到 Generic 再试；两者都不认才报会话方言的错误。
 - 结果完整性（partial）经 Flight SQL metadata 传给调用方：SDK `query_full` 给
   `PartialNotice`，CLI 把 `WARN: partial result` 打到 stderr。
+- 构建不再依赖系统 `protoc`（`protoc-bin-vendored` 自带），CI / 交叉编译容器可复现。
 
 ### Performance
 

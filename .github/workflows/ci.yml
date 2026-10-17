@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # 让 CI 的编译产物与发布包一致（发布包不想要 GB 级调试信息）
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  test:
+    name: clippy + tests (stable, x86_64-gnu)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-stable
+      # 注意：本仓**没有**以 rustfmt 为基线（约 884 处差异，见 docs/RELEASE.md），
+      # 所以 CI 不跑 `cargo fmt --check`；要对齐得单独做一笔纯格式化提交。
+      - name: clippy（-D warnings）
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: tests
+        run: cargo test --workspace
+
+  msrv:
+    name: MSRV 1.95 真编译
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-msrv
+      # 不是摆样子：`Cargo.toml` 里的 rust-version 是对外承诺（§188 本地已验证，
+      # 这条把它钉在每次提交上）。只 check，不跑测试 —— 测试矩阵在 stable 那一份。
+      - name: cargo check（MSRV）
+        run: cargo check --workspace --all-targets

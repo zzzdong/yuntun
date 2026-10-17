@@ -1,0 +1,121 @@
+name: release
+
+# 打 tag（`v0.1.0`）或手动触发。四条产物：x86_64/aarch64 × gnu/musl。
+# 版本号唯一来源是 `Cargo.toml`；tag 与它不一致时 build 直接失败（不发错版本）。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # 发布包不带调试信息（否则每个二进制近 1 GB）；需要排障时本地 target/release 仍有行号。
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            cross: false
+          - target: x86_64-unknown-linux-musl
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            cross: true
+          - target: aarch64-unknown-linux-musl
+            cross: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 版本口径（tag == Cargo.toml）
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          V=$(awk '/^\[workspace.package\]/{f=1} f&&/^version = /{gsub(/"/,"",$3);print $3;exit}' Cargo.toml)
+          echo "tag=$TAG workspace=$V"
+          [ "$TAG" = "$V" ] || { echo "::error::tag 与 workspace 版本不一致"; exit 1; }
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.target }}
+
+      # musl 用自己的 linker；gnu 走系统 cc。protoc 已由 `protoc-bin-vendored` 自带，
+      # 不需要在 CI 里装 protobuf-compiler（cross 容器里更装不了）。
+      - name: musl linker (x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc" >> "$GITHUB_ENV"
+
+      - name: build（native）
+        if: matrix.cross == false
+        run: cargo build --locked --release --bins --target ${{ matrix.target }}
+
+      # aarch64 用 cross（Docker 提供交叉工具链）。cross 挂载仓库到 /project，
+      # 但本仓的 build.rs 自带 protoc，所以容器里不需要额外依赖。
+      - name: build（cross）
+        if: matrix.cross == true
+        uses: houseabsolute/actions-rust-cross@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          # cross 走 Docker；`--config` 确保容器里也不带调试信息
+          # （action 的 `strip` 只对非 cross 产物生效）
+          args: --locked --release --bins --config profile.release.debug=0
+          strip: true
+
+      - name: 打包
+        run: scripts/package_release.sh --no-build --target ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yuntun-${{ matrix.target }}
+          path: dist/yuntun-*.tar.gz*
+          if-no-files-found: error
+
+  publish:
+    name: GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: 校验和汇总
+        run: |
+          cd dist
+          cat *.sha256 | sort > SHA256SUMS
+          ls -lh
+      - name: 发布说明（CHANGELOG 的当前版本段）
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          awk -v v="$V" '$0 ~ "^## \\["v"\\]" {f=1} f && $0 ~ "^## \\[" && $0 !~ "\\["v"\\]" {exit} f' CHANGELOG.md > RELEASE_NOTES.md
+          test -s RELEASE_NOTES.md || { echo "::error::CHANGELOG 里没有 [$V] 段"; exit 1; }
+          cat RELEASE_NOTES.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/SHA256SUMS
+          body_path: RELEASE_NOTES.md
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false

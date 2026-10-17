@@ -1,7 +1,7 @@
 # 交接：给下一位开发者（含可直接使用的提示词）
 
 > **用途**：本文回答"接手 yuntun 时先读什么、必须守哪些纪律、今天该干哪一刀、怎么算干完"。
-> 现状见 [`OVERVIEW.md`](OVERVIEW.md)，结构见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，
+> 现状见 [`OVERVIEW.md`](../OVERVIEW.md)，结构见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，
 > 任务与台账见 [`ROADMAP.md`](ROADMAP.md)，证据见 [`operation-log.md`](operation-log.md)。
 >
 > **这一页本身就是提示词素材**：把 §2 的代码块整段贴给下一个 AI 会话即可开工。
@@ -18,7 +18,7 @@ cargo clippy --workspace --all-targets      # 本仓应 0 告警
 cargo test -p yuntun-testkit --test docs_consistency   # 文档判据（改代码/改文档后必跑）
 ```
 
-最小闭环（MySQL 端口）与客户端用法见根 [`../README.md`](../README.md)；集群 rig 见
+最小闭环（MySQL 端口）与客户端用法见根 [`../README.md`](../../README.md)；集群 rig 见
 `tests/cluster.sh` / `tests/datanode_cluster.sh`（需 podman；**跑 rig 时不要并发跑别的 cargo**）。
 
 ---
@@ -32,23 +32,23 @@ cargo test -p yuntun-testkit --test docs_consistency   # 文档判据（改代�
 
 【第一步：先读完这五份，再动手（这是硬要求，不要跳）】
 1. docs/OVERVIEW.md       —— 今天实际能做到什么、明确不能做什么、已知限制
-2. docs/ARCHITECTURE.md   —— 分层/crate 边界/写入与读路径/已定案决策 §7/配置清单 §8/不变量 §9
-3. docs/ROADMAP.md        —— 已完成清单、准出门槛、§4 台账（未闭环偏差）、§5 下一阶段（N 组）
-4. docs/operation-log.md  —— §169 起的新日志；§1…168 在 docs/archive/operation-log.md（历史，只备查）
+2. docs/dev/ARCHITECTURE.md   —— 分层/crate 边界/写入与读路径/已定案决策 §7/配置清单 §8/不变量 §9
+3. docs/dev/ROADMAP.md        —— 已完成清单、准出门槛、§4 台账（未闭环偏差）、§5 下一阶段（N 组）
+4. docs/dev/operation-log.md  —— §169 起的新日志；§1…168 在 docs/archive/operation-log.md（历史，只备查）
 5. docs/README.md         —— 文档权威顺序、§号映射、改代码要同步什么
 
 【纪律（违反这些的改动一律不接受）】
 - 先证据后结论：任何"已具备/已修复"的说法，必须指向 operation-log 里的一节或一条能跑的用例；
   没有证据的写法只算"意图"。
-- 改默认值/语义契约：必须先在 docs/operation-log.md 附**实测数据**（新开一节），
-  再回改 docs/ARCHITECTURE.md §7/§8 与根 README.md；顺带更新 yuntun.toml.example。
+- 改默认值/语义契约：必须先在 docs/dev/operation-log.md 附**实测数据**（新开一节），
+  再回改 docs/dev/ARCHITECTURE.md §7/§8 与根 README.md；顺带更新 yuntun.toml.example。
 - 凡"已具备"的能力，必须有一条**断言其反面后果**的用例（本项目五个真缺陷都是"不报错、只产出错数据"，
   功能测试全绿时抓到的）。
-- 完成一个任务：更新 docs/ROADMAP.md §5 状态列 + 台账销账；发现与文档不符：先在台账加一行（哪怕还没决定）。
-- 不许顺手改 docs/ARCHITECTURE.md §7 的已定案决策（D1–D13）；必须改时附实测并写明原因。
+- 完成一个任务：更新 docs/dev/ROADMAP.md §5 状态列 + 台账销账；发现与文档不符：先在台账加一行（哪怕还没决定）。
+- 不许顺手改 docs/dev/ARCHITECTURE.md §7 的已定案决策（D1–D13）；必须改时附实测并写明原因。
 - 不要新建平行的设计/计划文档（就地升版本）；docs/archive/ 是冻结历史，不要改它。
 
-【这一刀要做的事（按 docs/ROADMAP.md §5，从最小的开始，做完再挑下一项）】
+【这一刀要做的事（按 docs/dev/ROADMAP.md §5，从最小的开始，做完再挑下一项）】
 N1/N2/N3 已完成（§170 文档重建；§171 测试可靠；§172 任务目录收尾 + /metrics 的 jobs 段），
 N4 的**上半刀也已落地**（`§173`：可分解聚合下推 —— 3 万行从 244KB 降到 64 字节），
 N5 的归因推进到只剩一层（`§174`）。

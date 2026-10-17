@@ -1,8 +1,8 @@
 # yuntun 项目说明与现状（OVERVIEW）
 
 > **版本**：v2.0 ｜ **日期**：2026-10-11 ｜ **定位**：**现状唯一入口**。
-> 本文件说的是"**今天实际是什么样、还缺什么**"；结构原因见 [`ARCHITECTURE.md`](ARCHITECTURE.md)，
-> 任务与台账见 [`ROADMAP.md`](ROADMAP.md)，证据见 [`operation-log.md`](operation-log.md)
+> 本文件说的是"**今天实际是什么样、还缺什么**"；结构原因见 [`ARCHITECTURE.md`](dev/ARCHITECTURE.md)，
+> 任务与台账见 [`ROADMAP.md`](dev/ROADMAP.md)，证据见 [`operation-log.md`](dev/operation-log.md)
 > （§169 起）与 [`archive/operation-log.md`](archive/operation-log.md)（§1…168）。
 
 ---
@@ -110,7 +110,7 @@
 
 ## 6. 质量与证据网
 
-规模：**81,114 行 Rust / 20 个 crate / 670 个测试函数 / 用例全绿 / clippy 本仓 0 告警**
+规模：**81,124 行 Rust / 20 个 crate / 670 个测试函数 / 用例全绿 / clippy 本仓 0 告警**
 （工具链：本机 rustc 1.98.1 + edition 2024；**MSRV 1.95 已真编译验证**（`§188`：
 `rustup run 1.95.0 cargo check --workspace --all-targets` EXIT=0、0 告警）——
 下界由 `vortex 0.86` 顶出，全仓按 1.95 要求）
@@ -180,4 +180,4 @@
 
 **测试**：并行全量测试的计时 flaky（§6.1）。
 
-> 逐条的任务化、优先级与验收见 [`ROADMAP.md`](ROADMAP.md)。
+> 逐条的任务化、优先级与验收见 [`ROADMAP.md`](dev/ROADMAP.md)。

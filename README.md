@@ -4,18 +4,32 @@
 对外暴露 **Arrow Flight SQL（gRPC）** 与 **MySQL wire（:3306）** 两个 SQL 协议端口，
 两者共用同一套 SQL 语义实现（`crates/sql`）。
 
-> **项目说明与现状**见 [`docs/OVERVIEW.md`](docs/OVERVIEW.md)（唯一现状入口）；
-> 结构见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)，任务与台账见 [`docs/ROADMAP.md`](docs/ROADMAP.md)，
-> 交接与提示词见 [`docs/HANDOVER.md`](docs/HANDOVER.md)，
-> 文档索引与冲突裁决顺序见 [`docs/README.md`](docs/README.md)。
-> 实施日志：[`docs/operation-log.md`](docs/operation-log.md)（§169 起）；
-> **旧文档（含 §1…168 的操作日志、ADR 全文、逐模块详细设计）已归档在 [`docs/archive/`](docs/archive/)** —— 是历史，不是现状。
+> **项目文档**：[`docs/OVERVIEW.md`](docs/OVERVIEW.md)（现状唯一入口）、
+> [`docs/RELEASE.md`](docs/RELEASE.md)（发布与验收）、[`docs/README.md`](docs/README.md)（索引与冲突裁决）。
+> **开发文档**（[`docs/dev/`](docs/dev/)）：[架构](docs/dev/ARCHITECTURE.md) ·
+> [任务与台账](docs/dev/ROADMAP.md) · [交接](docs/dev/HANDOVER.md) ·
+> [实施日志](docs/dev/operation-log.md)（§169 起）。
+> **历史**（[`docs/archive/`](docs/archive/)）：§1…168 的操作日志、ADR 全文、旧设计 —— 是历史，不是现状。
 
 ---
 
 ## 1. 快速开始
 
-### 构建与启动
+### 下载（0.1 起）
+
+每个 tag 由 GitHub Actions 产出 4 个包（流程见 [`docs/RELEASE.md`](docs/RELEASE.md)）：
+
+| 平台 | 包名 |
+|---|---|
+| Linux x86_64（glibc） | `yuntun-<ver>-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux x86_64（musl，静态） | `yuntun-<ver>-x86_64-unknown-linux-musl.tar.gz` |
+| Linux aarch64（glibc） | `yuntun-<ver>-aarch64-unknown-linux-gnu.tar.gz` |
+| Linux aarch64（musl，静态） | `yuntun-<ver>-aarch64-unknown-linux-musl.tar.gz` |
+
+解包即用：`bin/yuntun`、`bin/yuntun-cli`、`bin/yuntun-datanode`、`bin/metanode`；
+解包后先 `sha256sum -c *.sha256`（发布页另附合并的 `SHA256SUMS`）。
+
+### 从源码构建与启动
 
 ```bash
 cargo build --release                                   # 或 cargo build（debug）
@@ -23,7 +37,7 @@ cargo build --release                                   # 或 cargo build（debu
 ./target/release/yuntun --version
 ```
 
-发布产物与验收流程见 [`docs/RELEASE.md`](docs/RELEASE.md)（`scripts/release_check.sh`
+发布门禁与打包见 [`docs/RELEASE.md`](docs/RELEASE.md)（`scripts/release_check.sh`
 一条命令跑完门禁；`scripts/package_release.sh` 产出带校验和的压缩包）。
 
 配置文件模板见 [`yuntun.toml.example`](yuntun.toml.example)（复制为 `yuntun.toml` 后改端口/目录即可）：
@@ -156,7 +170,7 @@ java -cp "$JAR:scripts" dbeaver_jdbc_probe
   未做：**按查询限流**（只有连接级）、`SHOW STATUS WHERE`、超限时的 MySQL ERR 1040（opensrv 握手前没有写包接缝，见 `§192.4`）；
 - **写后可查（读己之写）**：`INSERT` 成功即落 WAL；攒批线程在一个扫描周期（`[ingest].scan_interval_ms`，
   默认 100ms）内把该批数据发布到 store 层的**内存分片**，查询立即可见 —— **不再受 flush 相位分散（默认 ≤30s）
-  与查询缓存 TTL（默认 30s）影响**（`docs/ARCHITECTURE.md` §3）；
+  与查询缓存 TTL（默认 30s）影响**（`docs/dev/ARCHITECTURE.md` §3）；
   数据落对象存储（vortex（默认）/ Parquet + Manifest）仍按攒批窗口进行，落盘后进入快照隔离 / Compaction 语义；
   回执的 `expected_visible_in_secs` = 该扫描周期上界；
 - **服务端预编译（prepared）**：已可用（写入 + prepared SELECT 二进制结果集，见 T2）。
@@ -323,7 +337,9 @@ crates/
   standalone # bin: yuntun（全组件参考装配）
   chaos      # 故障注入工具
   testkit    # 测试基建（tmpfs/disk 测试目录 + 文档一致性判据）
-docs/        # 项目说明 / 架构 / 任务计划 / 交接 + 操作日志（旧文档归档在 docs/archive/）
+docs/        # 项目文档（OVERVIEW / RELEASE / 索引）
+docs/dev/    # 开发文档（架构 / 任务 / 交接 / 操作日志）
+docs/archive/  # 历史（冻结，不维护）
 scripts/     # 独立客户端冒烟脚本
 ```
 
@@ -355,6 +371,6 @@ let dir = yuntun_testkit::TestDir::tmpfs("wal-e2e");   // 自动创建 + Drop �
 let wal_dir = dir.string();                            // 直接塞进 TOML 配置
 ```
 
-文档：现状 [`docs/OVERVIEW.md`](docs/OVERVIEW.md) ｜ 架构 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) ｜
-任务与台账 [`docs/ROADMAP.md`](docs/ROADMAP.md) ｜ 交接与提示词 [`docs/HANDOVER.md`](docs/HANDOVER.md) ｜
-实施日志 [`docs/operation-log.md`](docs/operation-log.md)（§169 起）。
+文档：现状 [`docs/OVERVIEW.md`](docs/OVERVIEW.md) ｜ 架构 [`docs/dev/ARCHITECTURE.md`](docs/dev/ARCHITECTURE.md) ｜
+任务与台账 [`docs/dev/ROADMAP.md`](docs/dev/ROADMAP.md) ｜ 交接与提示词 [`docs/dev/HANDOVER.md`](docs/dev/HANDOVER.md) ｜
+实施日志 [`docs/dev/operation-log.md`](docs/dev/operation-log.md)（§169 起）。

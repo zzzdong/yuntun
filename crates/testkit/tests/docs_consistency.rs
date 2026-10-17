@@ -7,8 +7,9 @@
 //! `meta.proto` 的迁移进度表把已迁移的 op 标成 ⏳、`status.md` 的规模行落后于代码、
 //! 以及**整组任务记分卡停在起点**（归档 `D-24`）。这些**都不是"读一遍能发现"的**。
 //!
-//! 2026-10-11 文档整体归档重建（`§170`）之后：
-//! - 顶层只有 6 份（`README` / `OVERVIEW` / `ARCHITECTURE` / `ROADMAP` / `HANDOVER` / `operation-log`）；
+//! 2026-10-17 起文档分两层：
+//! - **项目文档** `docs/*.md`：`README`（索引）/ `OVERVIEW`（现状）/ `RELEASE`（发布流程）；
+//! - **开发文档** `docs/dev/*.md`：`ARCHITECTURE` / `ROADMAP` / `HANDOVER` / `operation-log`；
 //! - 旧文档（含 §1…168 的日志）在 `docs/archive/`，**冻结不再维护**；
 //! - 本文件只钉**可机械核对**的那几项，且每条失败时的输出必须**直接告诉你改哪里**。
 //!
@@ -26,19 +27,18 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-/// 顶层文档集合（`§170` 之后就是这个集合；多一份 = 又开了一份会漂移的平行文档）。
+/// 项目文档（`docs/*.md`）：读者是"要用 / 要发的人"。
+const PROJECT_DOCS: [&str; 3] = ["README.md", "OVERVIEW.md", "RELEASE.md"];
+
+/// 开发文档（`docs/dev/*.md`）：读者是"要改的人"（架构 / 计划 / 交接 / 证据）。
 ///
-/// 0.1 发布时加了第 7 份 `RELEASE.md`：发布门禁/产物/打 tag 的步骤**不属于**现状、
-/// 架构、任务或过程日志任何一份（它们是"是什么/为什么/下一步/证据"），硬塞进去只会让
-/// 那四份各长出一段会被遗忘的操作步骤。加它时同步改了本判据与 `docs/README.md §1`。
-const TOP_LEVEL_DOCS: [&str; 7] = [
-    "README.md",
-    "OVERVIEW.md",
+/// 2026-10-17 从 `docs/` 顶层移入 `dev/`：文件数没变，但项目文档的第一屏不再被台账与
+/// 判据占据。加/移文档时**同时**改这两个常量与 `docs/README.md §1`（判据会拦）。
+const DEV_DOCS: [&str; 4] = [
     "ARCHITECTURE.md",
     "ROADMAP.md",
     "HANDOVER.md",
     "operation-log.md",
-    "RELEASE.md",
 ];
 
 // ---------------------------------------------------------------- 基础设施
@@ -66,16 +66,19 @@ fn docs_file(root: &Path, name: &str) -> String {
     read(&root.join("docs").join(name))
 }
 
-/// 顶层 `docs/*.md` + 根 `README.md`（"范围串"这类判据要跨文档扫）。
+/// `docs/*.md` + `docs/dev/*.md` + 根 `README.md`（"范围串"这类判据要跨文档扫）。
 ///
 /// ⚠️ **不含 `docs/archive/`**：归档是历史，里面的旧串"当时是对的"，不是导航。
 fn all_docs(root: &Path) -> Vec<(PathBuf, String)> {
     let mut out: Vec<(PathBuf, String)> = Vec::new();
-    let dir = root.join("docs");
-    for e in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("读 {} 失败：{e}", dir.display())) {
-        let p = e.expect("目录项").path();
-        if p.extension().is_some_and(|x| x == "md") {
-            out.push((p.clone(), read(&p)));
+    for dir in [root.join("docs"), root.join("docs/dev")] {
+        for e in
+            std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("读 {} 失败：{e}", dir.display()))
+        {
+            let p = e.expect("目录项").path();
+            if p.extension().is_some_and(|x| x == "md") {
+                out.push((p.clone(), read(&p)));
+            }
         }
     }
     let readme = root.join("README.md");
@@ -236,10 +239,10 @@ fn ledger_ids(text: &str) -> BTreeSet<String> {
 
 // ---------------------------------------------------------------- 判据
 
-/// **新日志**（`docs/operation-log.md`）的头部索引必须等于正文最后一节（号与日期都算）。
+/// **新日志**（`docs/dev/operation-log.md`）的头部索引必须等于正文最后一节（号与日期都算）。
 #[test]
 fn new_operation_log_header_index_matches_last_section() {
-    check_log_index(&repo_root(), "operation-log.md");
+    check_log_index(&repo_root(), "dev/operation-log.md");
 }
 
 /// **归档日志**（`docs/archive/operation-log.md`）的头部索引必须等于它自己正文的最后一节。
@@ -328,34 +331,15 @@ fn overview_scale_line_matches_the_code() {
     }
 }
 
-/// 顶层文档集合必须**正好**是 `docs/README.md §1` 与 `§170` 约定的那 7 份。
+/// 文档集合必须**正好**是 `docs/README.md §1` 约定的两份清单。
 ///
 /// 这条守的是本仓的硬规则："就地升版本，不新建平行文档"。多出来的每一份都是将来会漂移的地方；
-/// 真需要新维度时，改 [`TOP_LEVEL_DOCS`] 并在 `docs/README.md §1` 的表里登记它。
+/// 真需要新维度时，改 [`PROJECT_DOCS`] / [`DEV_DOCS`] 并在 `docs/README.md §1` 的表里登记它。
 #[test]
 fn docs_top_level_set_is_the_documented_one() {
     let root = repo_root();
-    let dir = root.join("docs");
-    let mut found: Vec<String> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("读 {} 失败：{e}", dir.display()))
-        .flatten()
-        .filter_map(|e| {
-            let p = e.path();
-            (p.is_file() && p.extension().is_some_and(|x| x == "md"))
-                .then(|| p.file_name().unwrap().to_string_lossy().into_owned())
-        })
-        .collect();
-    found.sort();
-    let mut want: Vec<String> = TOP_LEVEL_DOCS.iter().map(|s| s.to_string()).collect();
-    want.sort();
-    assert_eq!(
-        found, want,
-        "`docs/` 顶层文档集合与约定不符\n\
-         → 期望 {:?}\n→ 实际 {:?}\n\
-         （新维度要么并进这四份，要么就先改本判据与 `docs/README.md §1`；\
-         历史文档放 `docs/archive/`，那里不受本判据约束）",
-        want, found
-    );
+    check_doc_set(&root.join("docs"), &PROJECT_DOCS, "docs/");
+    check_doc_set(&root.join("docs/dev"), &DEV_DOCS, "docs/dev/");
 
     // 归档必须还在（新文档里的 §号与台账靠它解释）。
     for need in ["operation-log.md", "closeout.md", "architecture.md", "design.md"] {
@@ -365,6 +349,29 @@ fn docs_top_level_set_is_the_documented_one() {
             "归档缺了 `docs/archive/{need}` —— 它被新文档引用（§号映射 / 台账索引），不许删"
         );
     }
+}
+
+/// 一个目录里的 `*.md` 必须**正好**等于清单（多一份/少一份都红）。
+fn check_doc_set(dir: &Path, want: &[&str], label: &str) {
+    let mut found: Vec<String> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("读 {} 失败：{e}", dir.display()))
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            (p.is_file() && p.extension().is_some_and(|x| x == "md"))
+                .then(|| p.file_name().unwrap().to_string_lossy().into_owned())
+        })
+        .collect();
+    found.sort();
+    let mut want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
+    want.sort();
+    assert_eq!(
+        found, want,
+        "`{label}` 文档集合与约定不符\n\
+         → 期望 {want:?}\n→ 实际 {found:?}\n\
+         （新维度要么并进对应清单，要么就先改本判据与 `docs/README.md §1`；\
+         历史文档放 `docs/archive/`，那里不受本判据约束）"
+    );
 }
 
 /// `meta.proto` 的"迁移进度"表必须诚实：
@@ -441,7 +448,7 @@ fn proto_migration_table_is_honest() {
 #[test]
 fn adr10_decided_numbers_match_the_config_defaults() {
     let root = repo_root();
-    let arch = docs_file(&root, "ARCHITECTURE.md");
+    let arch = docs_file(&root, "dev/ARCHITECTURE.md");
     let cfg = read(&root.join("crates/server/src/config.rs"));
 
     let adr_md = arch
@@ -510,7 +517,7 @@ fn adr10_decided_numbers_match_the_config_defaults() {
 #[test]
 fn architecture_config_keys_exist_in_the_parser() {
     let root = repo_root();
-    let arch = docs_file(&root, "ARCHITECTURE.md");
+    let arch = docs_file(&root, "dev/ARCHITECTURE.md");
     let cfg = read(&root.join("crates/server/src/config.rs"));
 
     let start = arch
@@ -627,13 +634,13 @@ fn wall_clock_assertions_need_a_reviewed_waiver() {
 
 /// **代码注释里引用的台账编号（`D-*`）必须能在 `ROADMAP.md` 里找到**。
 ///
-/// 为什么值得钉：`docs/ROADMAP.md §4` 的台账是"实现与文档不符"的唯一登记处，而代码注释里
+/// 为什么值得钉：`docs/dev/ROADMAP.md §4` 的台账是"实现与文档不符"的唯一登记处，而代码注释里
 /// 直接引用着 `D-13` / `D-18` 这类编号。归档重建时最容易出的事故就是"新台账没抄全"
 /// ⇒ 代码里那句注释变成**悬空引用**（下一位看不懂，只能去翻 10k 行的归档）。
 #[test]
 fn ledger_ids_referenced_from_code_exist_in_the_roadmap() {
     let root = repo_root();
-    let roadmap = docs_file(&root, "ROADMAP.md");
+    let roadmap = docs_file(&root, "dev/ROADMAP.md");
     let known = ledger_ids(&roadmap);
 
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -665,7 +672,7 @@ fn ledger_ids_referenced_from_code_exist_in_the_roadmap() {
     assert!(
         dangling.is_empty(),
         "这些代码注释引用了 `ROADMAP.md` 里**不存在**的台账编号（悬空引用）：\n  {}\n\
-         → 在 `docs/ROADMAP.md §4` 里补上（未闭环的进 §4 表，已闭环的进 §4.1 索引）",
+         → 在 `docs/dev/ROADMAP.md §4` 里补上（未闭环的进 §4 表，已闭环的进 §4.1 索引）",
         dangling.join("\n  ")
     );
 }
