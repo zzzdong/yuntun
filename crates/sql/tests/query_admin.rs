@@ -229,3 +229,121 @@ async fn kill_interrupts_a_stream_that_has_not_started_yet() {
     }
     let _ = conn;
 }
+
+/// `SHOW STATUS` 是**真实计数器**（`§192`），不是 canned 常量；`max_connections`
+/// 在 `SHOW VARIABLES` / `SELECT @@` 与准入闸门之间必须同一个数。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_and_variable_come_from_the_registry() {
+    let engine = engine().with_max_connections(7);
+    assert_eq!(engine.registry().max_connections(), 7);
+
+    let registry: Arc<QueryRegistry> = Arc::clone(engine.registry());
+    let id = registry.alloc_id();
+    let conn = registry.attach(id, "h");
+    let mut session = SessionCtx::mysql();
+
+    let out = engine.execute("SHOW STATUS", &mut session).await.unwrap();
+    let (names, batches) = rows_of(out);
+    assert_eq!(names, vec!["Variable_name", "Value"]);
+    let batch = &batches[0];
+    let get = |var: &str| -> String {
+        for row in 0..batch.num_rows() {
+            if col_str(batch, "Variable_name", row) == var {
+                return col_str(batch, "Value", row);
+            }
+        }
+        panic!("SHOW STATUS 缺 `{var}` 行");
+    };
+    // 这条 SHOW STATUS 自己挂在一条**临时会话**上（裸引擎：没有 conn_id）：
+    // `Threads_connected` 只数客户端连接（=1），`Threads_running` 含它自己（=1）。
+    assert_eq!(get("Threads_connected"), "1", "一条客户端连接");
+    assert_eq!(get("Threads_running"), "1", "正在跑的就是 SHOW STATUS 自己");
+    assert_eq!(get("Max_connections"), "7");
+    assert!(
+        get("Questions").parse::<u64>().unwrap() >= 1,
+        "SHOW STATUS 自己也算一条语句"
+    );
+
+    // 再加一条在跑的查询 ⇒ Threads_running 必须变成 2（真有别的活）
+    let running = conn.begin("SELECT 1", "public");
+    let out = engine.execute("SHOW STATUS", &mut session).await.unwrap();
+    let (_, batches) = rows_of(out);
+    let batch = &batches[0];
+    let get = |var: &str| -> String {
+        for row in 0..batch.num_rows() {
+            if col_str(batch, "Variable_name", row) == var {
+                return col_str(batch, "Value", row);
+            }
+        }
+        panic!("SHOW STATUS 缺 `{var}` 行");
+    };
+    assert_eq!(get("Threads_running"), "2", "两条查询同时在跑");
+
+    // `LIKE` 在服务端过滤；不存在的名字必须是**空集**（返回全部 = 让"读不到"伪装成"读到了"）
+    let out = engine
+        .execute("SHOW STATUS LIKE 'Threads%'", &mut session)
+        .await
+        .unwrap();
+    let (_, batches) = rows_of(out);
+    let batch = &batches[0];
+    assert_eq!(batch.num_rows(), 2, "Threads_connected / Threads_running");
+    assert!(batch.num_rows() < 8, "LIKE 必须真的过滤");
+
+    let out = engine
+        .execute("SHOW VARIABLES LIKE 'max_connections'", &mut session)
+        .await
+        .unwrap();
+    let (_, batches) = rows_of(out);
+    let batch = &batches[0];
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(col_str(batch, "Value", 0), "7");
+
+    let out = engine
+        .execute("SHOW VARIABLES LIKE 'no_such_variable'", &mut session)
+        .await
+        .unwrap();
+    let (_, batches) = rows_of(out);
+    assert_eq!(batches[0].num_rows(), 0, "不存在的变量必须是空集");
+
+    // 驱动的探测表达式与 SHOW VARIABLES 同一事实源（列名 = 变量名，值是字符串）
+    let out = engine
+        .execute("SELECT @@max_connections", &mut session)
+        .await
+        .unwrap();
+    let (_, batches) = rows_of(out);
+    assert_eq!(batches[0].num_rows(), 1);
+    assert_eq!(col_str(&batches[0], "max_connections", 0), "7");
+
+    drop(running);
+    drop(conn);
+    assert_eq!(registry.status().threads_connected, 0);
+}
+
+/// 一道准入闸门的**语义**（`§192`）：超限拒绝、断开后归还。
+///
+/// 这里只测注册表这一层的计数与配额事实；"socket 那侧真的被关"由
+/// `server/tests/sql_limits_e2e.rs` 进程内验证。
+#[test]
+fn admission_counters_are_observable() {
+    let r = Arc::new(QueryRegistry::new());
+    r.set_max_connections(2);
+    assert_eq!(r.max_connections(), 2);
+    r.set_max_connections(0);
+    assert_eq!(r.max_connections(), 1, "0 不是无限，clamp 到 1");
+
+    let a = r.attach(r.alloc_id(), "a");
+    r.note_connection();
+    let b = r.attach(r.alloc_id(), "b");
+    r.note_connection();
+    r.note_rejected();
+    let s = r.status();
+    assert_eq!(s.threads_connected, 2);
+    assert_eq!(s.connections_total, 2);
+    assert_eq!(s.max_used_connections, 2);
+    assert_eq!(s.connection_errors_max_connections, 1);
+
+    drop(a);
+    assert_eq!(r.status().threads_connected, 1, "断开必须归还");
+    drop(b);
+    assert_eq!(r.status().threads_connected, 0);
+}

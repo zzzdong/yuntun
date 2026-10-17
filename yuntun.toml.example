@@ -126,6 +126,10 @@ listen = "0.0.0.0:3306"
 auth = "trust"
 # 账号表：user + 明文口令。空口令 = 允许空密码登录（与 MySQL 一致）
 # users = [{ user = "yuntun", password = "s3cret" }]
+# 准入闸门（§192）：同时打开的客户端连接上限（MySQL 默认 151）
+#   超限的连接在握手**前**被关闭，并计入 SHOW STATUS 的
+#   Connection_errors_max_connections。0 ⇒ 启动报错（不是"无限"）。
+max_connections = 151
 
 [meta]
 # 元数据的装配形态（S3-4）：

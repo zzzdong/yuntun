@@ -321,6 +321,30 @@ def t_processlist_and_kill():
         cur.execute(f"DROP TABLE {live}")
 
 
+def t_show_status():
+    """U4b / §192：`SHOW STATUS` 是真实计数器，`max_connections` 只有一个事实源。"""
+    with mysql_conn() as conn, conn.cursor() as cur:
+        cur.execute("SHOW STATUS")
+        cols = [d[0] for d in cur.description]
+        assert cols == ["Variable_name", "Value"], cols
+        st = dict(cur.fetchall())
+        assert int(st["Threads_connected"]) >= 1, st
+        assert int(st["Threads_running"]) >= 1, st
+        assert int(st["Questions"]) >= 1, st
+        assert int(st["Max_connections"]) == 151, st
+
+        cur.execute("SHOW VARIABLES LIKE 'max_connections'")
+        assert cur.fetchall() == (("max_connections", "151"),), "变量值必须与闸门同源"
+
+        # LIKE 在服务端过滤：不存在的变量必须是空集（返回全部 = 让"读不到"伪装成"读到了"）
+        cur.execute("SHOW VARIABLES LIKE 'no_such_variable'")
+        assert cur.fetchall() == (), "SHOW VARIABLES LIKE 必须过滤"
+
+        # 驱动的探测表达式走同一个取值入口
+        cur.execute("SELECT @@max_connections")
+        assert cur.fetchone() == ("151",), "@@max_connections 必须是真值"
+
+
 # ---------------- 汇总 ----------------
 
 def main():
@@ -337,6 +361,7 @@ def main():
     check("prepared", t_prepared)
     check("error_codes", t_error_codes)
     check("processlist_and_kill", t_processlist_and_kill)
+    check("show_status", t_show_status)
     check("timestamp_types", t_timestamp_types)
     check("json_functions", t_json_functions)
     check("binary_roundtrip", t_binary_roundtrip)

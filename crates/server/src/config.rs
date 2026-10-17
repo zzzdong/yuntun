@@ -354,6 +354,11 @@ pub struct MysqlSection {
     /// trust | native_password（users 非空时自动切换）
     pub auth: String,
     pub users: Vec<MysqlUser>,
+    /// **准入闸门**（`§192`）：同时打开的客户端连接上限（MySQL 默认 151）。
+    ///
+    /// 超限的连接在握手**前**被关闭，并计入 `Connection_errors_max_connections`。
+    /// `0` ⇒ 启动报错（不是"无限"）；要放开请给一个大数。
+    pub max_connections: u32,
 }
 
 impl Default for MysqlSection {
@@ -363,6 +368,7 @@ impl Default for MysqlSection {
             listen: "0.0.0.0:3306".into(),
             auth: "trust".into(),
             users: Vec::new(),
+            max_connections: 151,
         }
     }
 }

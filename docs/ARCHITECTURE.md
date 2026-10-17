@@ -150,12 +150,13 @@ client    ─► arrow-flight（可独立编译，不依赖 server）
 - **DML 的读**：`DELETE`/`UPDATE` 的定位是**扫描 + 文件内行号**；
   读文件后先按**表 schema** 对齐（缺列补 NULL / 多余列丢掉 / 类型宽化，复用同一个 `align_batch`）
   再补行号列 ⇒ DML 与 `SELECT` 对同一批行**永远同一答案**。
-- **查询管理 / 取消**（`§191`）：进程内一张**会话表**（`yuntun_sql::registry`，MySQL 与 Flight 共用）。
+- **查询管理 / 取消 / 准入**（`§191`/`§192`）：进程内一张**会话表**（`yuntun_sql::registry`，MySQL 与 Flight 共用）。
   `Id` 是**连接**（跨查询稳定）；每次执行把会话标成 `Query` 并重置取消位，结束回 `Sleep`。
   `KILL QUERY` 点取消位 ⇒ 引擎的 `select!`（eager）或流包装器（Flight 流式）**投递错误**，
   而不是截断（截断 = 客户端以为读完了）。**取消是协作式的**，已发出的批次不撤回。
   控制面要能递进来 ⇒ standalone 的运行时比核数多 2 个 worker
   （DataFusion 并行度也 = 核数，否则一条 CPU 打满的查询会把 `KILL` 本身饿死，`§191.3`）。
+  准入：MySQL 监听器持一枚 `Semaphore`（许可数 = `[sql.mysql].max_connections`），超限在握手前关 socket 并计入 `Connection_errors_max_connections`；`SHOW STATUS` 与闸门读同一份计数器。
 
 ---
 
@@ -328,6 +329,7 @@ enabled = true
 listen = "0.0.0.0:3306"
 auth = "trust"                      # trust | native_password（§190：users 非空时自动切换；每连接随机 salt）
 # users = [{ user = "root", password = "..." }]
+max_connections = 151               # 连接准入上限（§192）：超限在握手前关闭；0 = 启动报错
 
 [metrics]
 enabled = false                     # 指标 HTTP 导出；默认关：它会绑端口

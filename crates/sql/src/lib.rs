@@ -258,6 +258,13 @@ impl SqlEngine {
         self
     }
 
+    /// 连接数上限（`[sql.mysql].max_connections`）：`SHOW VARIABLES` / `SHOW STATUS`
+    /// 与 MySQL 监听器的准入闸门读**同一个数**。
+    pub fn with_max_connections(self, n: u32) -> Self {
+        self.registry.set_max_connections(u64::from(n));
+        self
+    }
+
     /// 查询注册表（协议层用它分配连接 Id / 观察 `KILL`）。
     pub fn registry(&self) -> &Arc<registry::QueryRegistry> {
         &self.registry
@@ -269,11 +276,12 @@ impl SqlEngine {
     /// 建一条临时会话 —— 这样"每个正在跑的查询都出现在 `SHOW PROCESSLIST` 里"
     /// 在两种形态下都成立。
     fn begin_query(&self, sql: &str, session: &SessionCtx) -> registry::QueryGuard {
+        self.registry.note_question();
         let conn = match session.conn_id.and_then(|id| self.registry.lookup(id)) {
             Some(c) => c,
             None => {
                 let id = self.registry.alloc_id();
-                self.registry.attach(id, "flight")
+                self.registry.attach_ephemeral(id, "flight")
             }
         };
         conn.begin(sql, session.schema())

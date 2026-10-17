@@ -71,7 +71,7 @@
 | 索引 | **行组级**：写时随 flush 生成 `{batch}.idx`（逐组 min/max + XOR，只给排序列）；读时文件级 → 组级两级剪枝。⚠️ **只对 parquet 生效**，vortex 路径无组级剪枝 |
 | **分布式聚合下推** | `SELECT 维度, count(*) / sum(整数) / min / max FROM t`，**含 `WHERE` 与 `GROUP BY`**（谓词 `§176`、分组 `§177`：整数与字符串键、NULL 是一组、多列键）在多节点下**只回标量**：热来源在它那边筛+折（`FetchShardAggs`），冷的一半仍由 DataFusion 算，协调者合并 —— 实测 3 万行从 **244KB 降到 64 字节（3814×，带/不带 `WHERE` 都一样）**。其余形状（`avg` / 浮点 `sum` / 复杂谓词 / 表达式分组键 / `HAVING`）**原路**（正确但不过网省），见 `ARCHITECTURE.md §4`。⚠️ **冷的一半仍由协调者自己全读** —— 冷文件的"按节点分配"未做（台账 `D-4` 第二半 / `ROADMAP` 的 N4b） |
 | 元数据 | `SHOW TABLES/COLUMNS/DATABASES`、`DESCRIBE`、`SHOW CREATE TABLE` |
-| **查询管理** | `SHOW [FULL] PROCESSLIST`（MySQL 8 的 8 列：Id/User/Host/db/Command/Time/State/Info）+ `KILL [CONNECTION\|QUERY] <id>`：**真取消**执行段（eager 与 Flight 流式两条路）；未知 Id ⇒ 1094、被杀 ⇒ 1317（`§191`）。**无并发闸门 / 连接数上限 / `SHOW STATUS`** |
+| **查询管理** | `SHOW [FULL] PROCESSLIST`（MySQL 8 的 8 列）+ `KILL [CONNECTION\|QUERY] <id>`：**真取消**执行段（eager 与 Flight 流式两条路）；未知 Id ⇒ 1094、被杀 ⇒ 1317（`§191`）。`SHOW [GLOBAL\|SESSION] STATUS [LIKE]` 的 8 个真实计数器 + 连接级闸门 `[sql.mysql].max_connections`（超限握手前关闭，计入 `Connection_errors_max_connections`；`§192`）。**未做**：按查询限流、`SHOW STATUS WHERE`、超限时的 ERR 1040 |
 | 客户端 | mysql CLI / 驱动预编译 / DBeaver+JDBC / ADBC+pyarrow 均已验 |
 | **鉴权** | MySQL 端口 `mysql_native_password`（每连接随机 salt；`users` 非空自动启用）+ Flight 端口 `auth_token`（`authorization: Bearer`）；默认 trust（`§190`）。**无 TLS / 无 GRANT 权限矩阵** |
 | 幂等 | 三通道（SQL 注释 / CLI `--key` / `FlightData.app_metadata`）；**一次请求一次键 + 批次派生键** |
@@ -87,7 +87,7 @@
 - `ALTER TABLE` 只支持 `ADD COLUMN` / `DROP COLUMN`：**改类型（破坏性）、可空性变更、重命名**都是明确拒绝；
 - `UPDATE` 不支持 `FROM` / `RETURNING`，也不支持无 `WHERE` 的全表更新；
 - 鉴权只有**登录**粒度（配置账号 + 口令；Flight 用 token）：**无 TLS、无 `GRANT` 权限矩阵**，metanode 端口仍无鉴权；
-- 查询管理只做"看见 + 取消"：**没有并发闸门 / 连接数上限**（`max_connections` 仍是 canned 文本），没有 `SHOW STATUS`；Flight 轨没有 PROCESSLIST/KILL（它只看得到自己的查询出现在 MySQL 侧列表里）；
+- 查询管理只有**连接级**闸门（`max_connections`），没有按查询限流；`SHOW STATUS` 的 GLOBAL/SESSION 共用一份进程级计数、`WHERE` 不解释；超限连接被关闭而非收到 ERR 1040；Flight 轨没有 PROCESSLIST/KILL/STATUS（它只看得到自己的查询出现在 MySQL 侧列表里）；
 - MySQL 轨结果集仍先收集后逐行写（Flight 轨已流式）；MySQL 轨给不出 `partial` 标记（上游 `opensrv` 卡住）；
 - SQL DDL 的 `TIMESTAMP(p)` 精度不入 schema（一律 `Timestamp(ns)`）。
 
@@ -110,7 +110,7 @@
 
 ## 6. 质量与证据网
 
-规模：**80,235 行 Rust / 20 个 crate / 661 个测试函数 / 用例全绿 / clippy 本仓 0 告警**
+规模：**80,742 行 Rust / 20 个 crate / 664 个测试函数 / 用例全绿 / clippy 本仓 0 告警**
 （工具链：本机 rustc 1.98.1 + edition 2024；**MSRV 1.95 已真编译验证**（`§188`：
 `rustup run 1.95.0 cargo check --workspace --all-targets` EXIT=0、0 告警）——
 下界由 `vortex 0.86` 顶出，全仓按 1.95 要求）

@@ -213,7 +213,7 @@
 | **U1** | **分区键/排序列可声明**（第 ⑤ 项的实质） | **P0** | 它是"列数据库"核心收益（跳过多少数据）的开关。今天两套剪枝机制**写好了却对 99% 的表不生效**，且不报错 —— 这正是本项目最忌的失败形态。语法 `CREATE TABLE … WITH (partition_by='ts')` 已被 sqlparser 解析成 `CreateTableOptions::With`（实测），载体用**已存在且贯穿 proto/catalog 的 `partition_cols`**（`§189`） |
 | **U2** | `ALTER TABLE ADD COLUMN IF NOT EXISTS` | **P0** | 半天成本，修的是**文档与实现不符**（本项目四次栽在这类漂移上）；且它是 DDL 幂等脚本的常用形态 |
 | **U3** | **登录鉴权**（第 ① 项） | ✅ **已达成（`§190`）** | 出局域网部署的**硬前提**，但价值只在部署时兑现；风险在中（多协议一致、口令存储、随机 salt）。默认仍 trust ⇒ 不破坏既有部署。**落地**：MySQL `mysql_native_password`（随机 salt）+ Flight `auth_token`；`auth_smoke.py` 7/7 |
-| **U4** | **查询管理**（第 ② 项） | ✅ **已达成（`§191`，可见 + 可取消）**；**准入闸门 ⏳** | 可观测 + 防过载。**落地**：`SHOW [FULL] PROCESSLIST`（MySQL 8 的 8 列）+ `KILL [CONNECTION|QUERY]` + **真取消**（eager 与流式两条路）；未知 Id ⇒ 1094、被杀 ⇒ 1317；进程级判据含"慢查询真被打断"。**仍未做**：并发闸门 / `max_connections` / `SHOW STATUS`（准入是另一件事，下一刀） |
+| **U4** | **查询管理**（第 ② 项） | ✅ **已达成（`§191` 可见 + 可取消；`§192` 准入 + STATUS）** | 可观测 + 防过载。**落地**：`SHOW [FULL] PROCESSLIST`（MySQL 8 的 8 列）、`KILL [CONNECTION|QUERY]` + **真取消**（eager 与流式两条路）、`[sql.mysql].max_connections` 闸门、`SHOW [GLOBAL\|SESSION] STATUS [LIKE]`（8 个真实计数器）。进程级判据含"慢查询真被打断"与"第 3 条连接被拒、断开后归还"。**仍未做**：按查询限流（只有连接级）、`SHOW STATUS WHERE`、MySQL 的 ERR 1040（握手前没有写包接缝，见 `§192.4`） |
 | **U5** | 冷读预算（`D-20`） | **P2** | 与 U1 同源（vortex 整文件解码 ⇒ 单文件内存/IO 无上界）；先量数再定方案（ROADMAP §4 的 D-20 原文就是"先量"） |
 
 **我另行建议的改进**（基于现状，价值高于上面部分项）：

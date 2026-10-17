@@ -1,6 +1,6 @@
 # yuntun 实施操作日志（§169 起）
 
-> 起记时间：2026-10-11（最新：**§191，2026-10-17**）。对应分支：main。
+> 起记时间：2026-10-11（最新：**§192，2026-10-17**）。对应分支：main。
 >
 > **这是什么**：从今天起，**每一刀**（一次成体系的改造）在这里留一节 —— 写清"做了什么、
 > 为什么这么做、边界在哪（**没做什么**）、怎么验的"。它是本项目的**证据出处**：
@@ -1472,3 +1472,63 @@ MySQL 端口此前是 **trust**：任意用户名、空密码直接进；`[sql.m
 - **空闲连接**被 `KILL CONNECTION` 点名后，要等**下一条命令**才断开（opensrv 的连接循环
   没有"取消阻塞读"的接缝）。有查询在跑时是立即取消 + 响应后断开。
 - 取消是**协作式**的：只能打断引擎的 `select!` 段与流包装器；已发给客户端的批次不撤回。
+
+---
+
+## 192. **U4b 准入面：`max_connections` + `SHOW STATUS`**（2026-10-17）
+
+### 192.0 缺口：看得见、杀得掉，但挡不住
+
+`§191` 交付了"看见 + 取消"，但审计同时指出：全仓**没有任何准入闸门** ——
+`max_connections=151` 只是 `SHOW VARIABLES` 里的一句 canned 文本，
+`SHOW STATUS` 报 1149。后果：
+
+* 一个写错的连接池（默认 151 × N 个客户端）能把 fd / 内存打爆，
+  而服务端**不拒绝、不计数**，事后只能从内核日志里倒推；
+* 运维问"现在多少连接、拒绝过几次" ⇒ 无答案。`§191` 的进程列表只给了"谁在跑"。
+
+### 192.1 做了什么
+
+| 层 | 内容 |
+|---|---|
+| `config` | `[sql.mysql].max_connections`（默认 151）；`0` ⇒ **启动报错**（不是"无限"） |
+| `sql::registry` | `set_max_connections`（clamp ≥1）/ `max_connections()`；计数器 `Connections` / `Max_used_connections` / `Connection_errors_max_connections` / `Questions`；`status()` 快照；`attach_ephemeral`（Flight 一次查询一条，**不算连接**） |
+| `sql::shim` | `SHOW [GLOBAL|SESSION] STATUS [LIKE]`（8 个真实计数器）；`SHOW VARIABLES` 支持 `LIKE` 且 `max_connections` 从注册表取；`SELECT @@max_connections` 同源 |
+| `sqlwire` | accept 后 `try_acquire` 一枚 `Semaphore` 许可：拿不到 ⇒ **握手前关 socket** + 计数 + warn；许可随连接任务存活（断开/握手失败即归还） |
+| `server` | 装配时 `SqlEngine::with_max_connections(cfg.sql.mysql.max_connections)` |
+
+**为什么闸门在 accept 而不是握手后**：握手会读包、会校验口令（CPU + 内存），
+超限连接不该走到那里。代价是客户端看到的是"连接被关闭"而不是 MySQL 的
+ERR 1040 —— opensrv 0.7 在握手前没有写包接缝，这个偏差在文档与 `SHOW STATUS`
+里都不掩盖。
+
+### 192.2 判据
+
+- `sql/tests/query_admin.rs`：`SHOW STATUS` 列名 `Variable_name/Value`；
+  `Threads_connected` 只数客户端连接（临时会话不算）、`Threads_running` 含自己；
+  再加一条在跑的查询 ⇒ 2；`LIKE 'Threads%'` 真的过滤；`SHOW VARIABLES LIKE
+  'no_such_variable'` ⇒ **空集**（不是全部）；`SELECT @@max_connections` 与
+  `SHOW VARIABLES` 同值；`0` clamp 到 1；断开归还。
+- `server/tests/sql_limits_e2e.rs`（socket 层）：`max_connections = 2` 时
+  ①③ 两条拿到握手包、第三条**立刻收到 EOF**（不是挂着等超时）；
+  `Connection_errors_max_connections == 1`；断开一条后新连接**重新**拿到握手
+  （反证：许可不归还 ⇒ 服务在第一次拒绝后永久不可用）；`Max_used_connections == 2`。
+- 进程级：`standalone_smoke.py::show_status`（默认 151 与变量/`@@` 三处一致）；
+  冒烟 **17/17**。
+
+### 192.3 过程中踩到的坑
+
+**`Max_used_connections` 少 1**。第一版在 accept 后立刻调 `note_connection()` 刷新峰值，
+但**会话要到 `spawn` 里才 `attach`** —— 计数时表里还没有这一条，实测峰值 = 1 而实际
+有 2 条。修法：`Connections++` 留在 accept，峰值改到 `insert_session` **入表时**更新
+（e2e 的 `Max_used_connections == 2` 就是这条判据；不修它，`SHOW STATUS` 会永远低估）。
+
+### 192.4 边界
+
+- **只有连接级闸门**，没有"并发查询数"闸门：一条连接一条在跑的语句，
+  `Threads_running` 的上界就是 `max_connections`。按查询限流（排队 vs 拒绝）是另一件事。
+- **无等待队列**：超限立即关闭，不排队（MySQL 的行为也是立即拒绝，不是排队）。
+- `SHOW STATUS` 的 `GLOBAL` 与 `SESSION` 答同一份进程级计数（没有会话级计数器，
+  不编造第二张表）。
+- `SHOW STATUS WHERE ...` 不解释表达式 ⇒ 返回全部（`LIKE` 才是过滤路径）。
+- 以上偏差都在 README / OVERVIEW 的"已知限制"里有一行。

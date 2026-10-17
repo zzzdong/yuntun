@@ -680,6 +680,11 @@ pub async fn serve_mysql_on(
     } else {
         tracing::info!("mysql wire auth: trust（不校验口令，按网络隔离部署）");
     }
+    // **准入闸门**（`§192`）：上限与 `SHOW VARIABLES` 读同一个数（注册表）。
+    // 用 `try_acquire` 而不是 `acquire().await`：排队等连接会让客户端卡在握手前，
+    // 与 MySQL 的"立刻 1040"语义差得更远；这里选择**立即关闭**（见下）。
+    let limit = engine.registry().max_connections();
+    let gate = Arc::new(tokio::sync::Semaphore::new(limit as usize));
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
@@ -694,10 +699,29 @@ pub async fn serve_mysql_on(
                         continue;
                     }
                 };
+                // 超限：**在握手前关掉 socket**，并计入 `Connection_errors_max_connections`。
+                // ⚠️ 偏差：MySQL 会回一个 ERR 1040 包；opensrv 的握手前没有写包接缝，
+                // 客户端这里看到的是"连接被关闭"。文档与 `SHOW STATUS` 都不掩盖这件事。
+                let permit = match Arc::clone(&gate).try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        engine.registry().note_rejected();
+                        tracing::warn!(
+                            %peer,
+                            limit,
+                            "mysql connection refused: max_connections reached"
+                        );
+                        drop(stream);
+                        continue;
+                    }
+                };
+                engine.registry().note_connection();
                 let engine = engine.clone();
                 let auth = auth.clone();
                 let shutdown = shutdown.clone();
                 tokio::spawn(async move {
+                    // 配额随任务活：连接断开（含握手失败）才归还
+                    let _permit = permit;
                     if shutdown.is_cancelled() {
                         return;
                     }

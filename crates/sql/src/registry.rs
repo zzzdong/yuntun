@@ -110,6 +110,9 @@ pub struct Session {
     idle_since: Mutex<Instant>,
     cancel: Cancellation,
     kill_connection: AtomicBool,
+    /// **一次查询一条**的临时会话（Flight 轨）：`Threads_connected` / `Connections`
+    /// 不该把它算成客户端连接。
+    ephemeral: bool,
 }
 
 impl Session {
@@ -261,11 +264,51 @@ impl Drop for QueryGuard {
     }
 }
 
+/// `SHOW STATUS` 的快照（`§192`）。**在取快照那一刻**算好，不是一段字符串。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusSnapshot {
+    pub uptime_secs: i64,
+    pub threads_connected: u64,
+    pub threads_running: u64,
+    pub connections_total: u64,
+    pub max_used_connections: u64,
+    /// 被 `max_connections` 挡在门外的次数（MySQL 的 `Connection_errors_max_connections`）
+    pub connection_errors_max_connections: u64,
+    /// 已执行的语句数（MySQL 的 `Questions`：含 `SHOW PROCESSLIST` 自己）
+    pub questions_total: u64,
+    pub max_connections: u64,
+}
+
 /// 会话表。**一个进程一份**（`SqlEngine` 持有；MySQL 与 Flight 共用）。
-#[derive(Default)]
 pub struct QueryRegistry {
     next_id: AtomicU64,
     sessions: Mutex<BTreeMap<u64, Arc<Session>>>,
+    /// 本进程的 SQL 面启动时刻（`Uptime` 的零点）
+    started: Instant,
+    /// 准入上限（`[sql.mysql].max_connections`）：只在 MySQL 监听器上执行。
+    /// **为什么放在注册表**：`SHOW VARIABLES` 与 `SHOW STATUS` 要答的就是这个同一个数，
+    /// 两份拷贝迟早对不上。
+    max_connections: AtomicU64,
+    connections_total: AtomicU64,
+    max_used_connections: AtomicU64,
+    rejected: AtomicU64,
+    questions: AtomicU64,
+}
+
+impl Default for QueryRegistry {
+    fn default() -> Self {
+        Self {
+            next_id: AtomicU64::new(0),
+            sessions: Mutex::new(BTreeMap::new()),
+            started: Instant::now(),
+            // 与 MySQL 默认一致；`0` 会被 clamp 成 1（0 = 谁都连不上不是"无限"）
+            max_connections: AtomicU64::new(151),
+            connections_total: AtomicU64::new(0),
+            max_used_connections: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
+            questions: AtomicU64::new(0),
+        }
+    }
 }
 
 impl QueryRegistry {
@@ -273,14 +316,67 @@ impl QueryRegistry {
         Self::default()
     }
 
+    /// 设连接数上限（`0` ⇒ 1：**不是**"无限"，MySQL 也不接受 0）。
+    pub fn set_max_connections(&self, n: u64) {
+        self.max_connections.store(n.max(1), Ordering::SeqCst);
+    }
+
+    pub fn max_connections(&self) -> u64 {
+        self.max_connections.load(Ordering::SeqCst)
+    }
+
+    /// 门卫拒了一条连接（`Connection_errors_max_connections++`）。
+    pub fn note_rejected(&self) {
+        self.rejected.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// 一条**客户端连接**被接纳（`Connections++`）。
+    ///
+    /// 只由协议层在真正接受连接时调：Flight 的临时会话（一次查询一条）不是"连接"，
+    /// 把它们算进 `Connections` 会让监控以为连接数在飙升。
+    ///
+    /// 峰值 `Max_used_connections` **不在这里**刷新：本函数在 `spawn` 之前调，
+    /// 而会话要到 spawn 里才 `attach` —— 在这里数会把峰值少算 1（实测 `=1` 而
+    /// 实际有 2 条）。峰值在 [`Self::insert_session`] 真正入表时更新。
+    pub fn note_connection(&self) {
+        self.connections_total.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// 一条语句开始执行（`Questions++`；引擎在 `begin_query` 里调）。
+    pub fn note_question(&self) {
+        self.questions.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// `SHOW STATUS` 的数据源。
+    pub fn status(&self) -> StatusSnapshot {
+        let sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let running = sessions
+            .values()
+            .filter(|s| s.running_guard().is_some())
+            .count() as u64;
+        StatusSnapshot {
+            uptime_secs: secs(self.started.elapsed()),
+            threads_connected: sessions.values().filter(|s| !s.ephemeral).count() as u64,
+            threads_running: running,
+            connections_total: self.connections_total.load(Ordering::SeqCst),
+            max_used_connections: self.max_used_connections.load(Ordering::SeqCst),
+            connection_errors_max_connections: self.rejected.load(Ordering::SeqCst),
+            questions_total: self.questions.load(Ordering::SeqCst),
+            max_connections: self.max_connections(),
+        }
+    }
+
     /// 分配一个永远不会复用的 Id（连接与临时查询共用一个号段，避免 `KILL` 撞号）。
     pub fn alloc_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    /// 登记一条连接（`Drop` 即注销）。
+    /// 登记一条**客户端连接**（`Drop` 即注销）。
     pub fn attach(self: &Arc<Self>, id: u64, host: impl Into<String>) -> Arc<ConnectionGuard> {
-        let session = self.insert_session(id, host);
+        let session = self.insert_session(id, host, false);
         Arc::new(ConnectionGuard {
             registry: Arc::clone(self),
             session,
@@ -288,7 +384,26 @@ impl QueryRegistry {
         })
     }
 
-    fn insert_session(&self, id: u64, host: impl Into<String>) -> Arc<Session> {
+    /// 登记一条**临时会话**（Flight / 裸引擎：一次查询一条，不占连接配额）。
+    pub fn attach_ephemeral(
+        self: &Arc<Self>,
+        id: u64,
+        host: impl Into<String>,
+    ) -> Arc<ConnectionGuard> {
+        let session = self.insert_session(id, host, true);
+        Arc::new(ConnectionGuard {
+            registry: Arc::clone(self),
+            session,
+            registered: true,
+        })
+    }
+
+    fn insert_session(
+        &self,
+        id: u64,
+        host: impl Into<String>,
+        ephemeral: bool,
+    ) -> Arc<Session> {
         let session = Arc::new(Session {
             id,
             host: host.into(),
@@ -298,11 +413,20 @@ impl QueryRegistry {
             idle_since: Mutex::new(Instant::now()),
             cancel: Cancellation::default(),
             kill_connection: AtomicBool::new(false),
+            ephemeral,
         });
-        self.sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id, Arc::clone(&session));
+        let live = {
+            let mut map = self
+                .sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            map.insert(id, Arc::clone(&session));
+            map.values().filter(|s| !s.ephemeral).count() as u64
+        };
+        if !ephemeral {
+            // 真实连接入表时才可能刷新峰值（见 `note_connection` 的说明）
+            self.max_used_connections.fetch_max(live, Ordering::SeqCst);
+        }
         session
     }
 

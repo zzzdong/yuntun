@@ -641,11 +641,11 @@ async fn build_embedded_catalog(
         );
 
         // ⑦ SqlEngine（SQL 语义唯一实现；MySQL wire / Flight 共用同一份能力句柄）
-        let sql = Arc::new(SqlEngine::new(
-            ingestor.clone(),
-            query.clone(),
-            catalog.clone(),
-        ));
+        let sql = Arc::new(
+            SqlEngine::new(ingestor.clone(), query.clone(), catalog.clone())
+                // `§192`：准入上限与 `SHOW VARIABLES` 读同一个数
+                .with_max_connections(cfg.sql.mysql.max_connections),
+        );
 
         Ok(Self {
             catalog,
@@ -853,10 +853,19 @@ pub async fn spawn_mysql(
             "mysql wire auth = trust：配置了用户但**不校验口令**（请确认这是你想要的）"
         );
     }
+    // `§192`：`max_connections = 0` 是配置错误（不是"无限"）——启动就说清楚，
+    // 否则跑起来后每条连接都被闸门拒绝，现场只会看到"连不上"。
+    if cfg.max_connections == 0 {
+        return Err("[sql.mysql] max_connections = 0：要限制就给正数；要放开请给一个大数".into());
+    }
     let listener = tokio::net::TcpListener::bind(&cfg.listen)
         .await
         .map_err(|e| format!("mysql wire bind {}: {e}", cfg.listen))?;
-    tracing::info!(listen = %cfg.listen, "mysql wire protocol listening");
+    tracing::info!(
+        listen = %cfg.listen,
+        max_connections = cfg.max_connections,
+        "mysql wire protocol listening"
+    );
     let engine = lakehouse.sql.clone();
     let shutdown = lakehouse.shutdown.clone();
     Ok(Some(tokio::spawn(async move {

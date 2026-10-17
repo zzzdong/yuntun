@@ -26,10 +26,57 @@ use crate::{SqlEngine, SqlError, SqlResult};
 /// 版本降级功能；5.1.10 会让现代驱动走老路径。
 pub const MYSQL_VERSION: &str = "8.0.32-yuntun";
 
+/// 系统变量的**当前值**：动态项（`max_connections`）走注册表，其余走 canned 表。
+///
+/// 为什么单独一层：`max_connections` 是唯一"由配置决定、且必须与实际准入一致"的变量。
+/// 让它和别的变量共用一个 `&'static str` 表，就等于允许"变量说 151、闸门按 20 拦"。
+fn variable_value(name: &str, engine: &SqlEngine) -> String {
+    match name {
+        "max_connections" => engine.registry().max_connections().to_string(),
+        _ => canned_variable(name).to_string(),
+    }
+}
+
+/// MySQL `LIKE` 的核心子集：`%`（任意串）、`_`（单字符），其余按字面比较，大小写不敏感。
+///
+/// 只做到"够客户端按变量名筛"的程度：不实现转义符 —— 变量名里没有 `%`/`_`，
+/// 而写错模式时"多返回"比"漏返回"更难造成误判（这里刻意不做正则/全语法）。
+fn like_match(value: &str, pattern: &str) -> bool {
+    fn go(v: &[char], p: &[char]) -> bool {
+        match p.first() {
+            None => v.is_empty(),
+            Some('%') => go(v, &p[1..]) || (!v.is_empty() && go(&v[1..], p)),
+            Some('_') => !v.is_empty() && go(&v[1..], &p[1..]),
+            Some(c) => v.first() == Some(c) && go(&v[1..], &p[1..]),
+        }
+    }
+    let v: Vec<char> = value.to_lowercase().chars().collect();
+    let p: Vec<char> = pattern.to_lowercase().chars().collect();
+    go(&v, &p)
+}
+
+/// `SHOW ... LIKE` 的过滤。`WHERE` 表达式**不解释** ⇒ 返回全部：
+/// "少返回一行"会让客户端以为那个变量不存在（静默），而多返回它自己会筛掉。
+fn filter_rows(
+    rows: Vec<Vec<String>>,
+    filter: Option<&sqlparser::ast::ShowStatementFilter>,
+) -> Vec<Vec<String>> {
+    use sqlparser::ast::ShowStatementFilter as F;
+    match filter {
+        Some(F::Like(pat)) | Some(F::ILike(pat)) => rows
+            .into_iter()
+            .filter(|r| r.first().is_some_and(|n| like_match(n, pat)))
+            .collect(),
+        _ => rows,
+    }
+}
+
 /// canned 系统变量（MySQL 客户端握手/元数据探测高频项）。
 ///
 /// 未收录项返回 `""`（与 MySQL 未知变量行为不同，但对驱动更友好：
 /// 驱动多只做字符串读取）。JDBC/DBeaver 握手必需的项已在此列全。
+///
+/// `max_connections` **不在这里**：它由 [`variable_value`] 从注册表读（唯一事实源）。
 fn canned_variable(name: &str) -> &'static str {
     match name {
         "version" => MYSQL_VERSION,
@@ -53,7 +100,6 @@ fn canned_variable(name: &str) -> &'static str {
         "time_zone" => "SYSTEM",
         "wait_timeout" | "interactive_timeout" => "28800",
         "net_read_timeout" | "net_write_timeout" => "60",
-        "max_connections" => "151",
         "query_cache_size" | "query_cache_type" => "0",
         "transaction_read_only" => "0",
         "sql_auto_is_null" => "0",
@@ -132,12 +178,13 @@ pub(crate) async fn intercept(
                 ),
             }
         }
-        Statement::ShowVariables { .. } => {
+        Statement::ShowVariables { filter, .. } => {
             let vars: &[&str] = &[
                 "version",
                 "version_comment",
                 "autocommit",
                 "max_allowed_packet",
+                "max_connections",
                 "sql_mode",
                 "character_set_client",
                 "character_set_results",
@@ -149,9 +196,42 @@ pub(crate) async fn intercept(
             ];
             let rows: Vec<Vec<String>> = vars
                 .iter()
-                .map(|v| vec![v.to_string(), canned_variable(v).to_string()])
+                .map(|v| vec![(*v).to_string(), variable_value(v, engine)])
                 .collect();
-            strings_result(&["Variable_name", "Value"], &rows)
+            // `SHOW VARIABLES LIKE 'max_connections'`：**过滤在服务端做** —— 客户端
+            // （Connector/J）拿到 13 行再自己筛也行，但 `LIKE` 一个不存在的变量时要
+            // 返回空集，而不是"全部变量"（后者会让"读不到"伪装成"读到了"）。
+            strings_result(
+                &["Variable_name", "Value"],
+                &filter_rows(rows, filter.as_ref()),
+            )
+        }
+        // `SHOW [GLOBAL|SESSION] STATUS`：**真实计数器**（`§192`）。
+        //
+        // GLOBAL 与 SESSION 共用一份：本实现没有"会话级计数器"，与其编造两张表，
+        // 不如让两者答同一个数（并在文档里写明这个偏差）。
+        Statement::ShowStatus { filter, .. } => {
+            let s = engine.registry().status();
+            let rows = vec![
+                vec!["Uptime".to_string(), s.uptime_secs.to_string()],
+                vec!["Threads_connected".to_string(), s.threads_connected.to_string()],
+                vec!["Threads_running".to_string(), s.threads_running.to_string()],
+                vec!["Connections".to_string(), s.connections_total.to_string()],
+                vec![
+                    "Max_used_connections".to_string(),
+                    s.max_used_connections.to_string(),
+                ],
+                vec![
+                    "Connection_errors_max_connections".to_string(),
+                    s.connection_errors_max_connections.to_string(),
+                ],
+                vec!["Questions".to_string(), s.questions_total.to_string()],
+                vec!["Max_connections".to_string(), s.max_connections.to_string()],
+            ];
+            strings_result(
+                &["Variable_name", "Value"],
+                &filter_rows(rows, filter.as_ref()),
+            )
         }
         // SHOW DATABASES：catalog 中的 schema 清单（多 schema）
         Statement::ShowDatabases { .. } => {
@@ -289,7 +369,7 @@ pub(crate) async fn intercept(
                 _ => return Ok(None),
             };
             if sel.from.is_empty() {
-                return canned_probe(q, session).await;
+                return canned_probe(q, session, engine).await;
             }
             // information_schema 补洞：DataFusion 只提供 tables / views / columns /
             // schemata / routines / df_settings 等少数几张，而 MySQL 客户端（DBeaver）
@@ -618,6 +698,7 @@ pub(crate) fn schema_from_options(
 async fn canned_probe(
     q: &sqlparser::ast::Query,
     session: &SessionCtx,
+    engine: &SqlEngine,
 ) -> Result<Option<SqlResult>, SqlError> {
     let sel = match q.body.as_ref() {
         sqlparser::ast::SetExpr::Select(sel) => sel,
@@ -637,7 +718,8 @@ async fn canned_probe(
         match classify_probe_expr(expr) {
             ProbeKind::Variable(name) => {
                 names.push(alias.unwrap_or_else(|| name.clone()));
-                values.push(canned_variable(&name).to_string());
+                // 与 `SHOW VARIABLES` 同一个取值入口（`@@max_connections` 也必须是真值）
+                values.push(variable_value(&name, engine));
             }
             ProbeKind::Database(name) => {
                 names.push(alias.unwrap_or(name));
