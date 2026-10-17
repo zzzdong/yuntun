@@ -23,6 +23,9 @@ cargo build --release                                   # 或 cargo build（debu
 ./target/release/yuntun --version
 ```
 
+发布产物与验收流程见 [`docs/RELEASE.md`](docs/RELEASE.md)（`scripts/release_check.sh`
+一条命令跑完门禁；`scripts/package_release.sh` 产出带校验和的压缩包）。
+
 配置文件模板见 [`yuntun.toml.example`](yuntun.toml.example)（复制为 `yuntun.toml` 后改端口/目录即可）：
 
 ```toml
@@ -56,7 +59,7 @@ conn = pymysql.connect(host="127.0.0.1", port=3306, user="yuntun", database="pub
 with conn, conn.cursor() as cur:
     cur.execute("CREATE TABLE api_audit (event_time TIMESTAMP, user TEXT, endpoint TEXT, cost_ms INT)")
     cur.execute("INSERT INTO api_audit VALUES (TIMESTAMP '2026-09-11 01:00:00', 'alice', '/v1/put', 12)")
-    # 写入先落 WAL；攒批线程在一个扫描周期内把它放进 store 层"内存分片" → 立即可查（读己之写，默认 ≤1s）
+    # 写入先落 WAL；攒批线程在一个扫描周期内把它放进 store 层"内存分片" → 立即可查（读己之写，默认 ≤100 ms）
     cur.execute("SELECT user, count(*) AS cnt FROM api_audit GROUP BY user")
     print(cur.fetchall())          # [('alice', 1)]
 ```

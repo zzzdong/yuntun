@@ -3,42 +3,78 @@
 所有显著变更记录于此。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
-## [0.1.0] - 2026-09-12
+## [0.1.0] - 2026-10-17
 
-首个实验性发布：**单节点（standalone）分析型 lakehouse**——append-only 时序/事件数据
-的写入、可恢复存储与 SQL 查询。
+**首个对外版本**：单节点（standalone）分析型数据湖 —— 直写摄入、可恢复存储、
+两条 SQL 协议（Flight SQL / MySQL wire）共用一套语义。
+
+> 0.1 之前本仓**没有对外产物**（也没有打过 tag）；2026-09-12 的草稿条目已并入本节。
 
 ### Added
 
-- **写入管线**：Arrow 批次 → WAL（fsync、组提交、批次状态机 Pending/S3Written/Committed）
-  → Parquet（`dt`/`shard` 分区）→ Manifest；幂等键去重（app_metadata / SQL 注释 /
-  语句级生成三通道）；schema 演进（追加列，OCC + 冲突重试）。
-- **崩溃恢复**：WAL 重放 + 批次分流（Pending 重做 flush / Committed 补记 / Abort 跳过），
-  chaos 故障注入用例覆盖硬崩溃多轮无丢失无重复。
-- **查询**：DataFusion 55（`SELECT` / 聚合 / CTE），本地 catalog 缓存，小文件 compaction，
-  Flight 轨结果集流式回传。
-- **多 schema**：`CREATE/DROP DATABASE`、`USE` 真实切换（MySQL wire）、跨库限定名查询、
-  对象路径按 schema 分层；schema 与表定义均由 WAL DDL 重放恢复。
-- **协议端口**：
-  - FlightSQL 标准轨：查询 / DDL / `INSERT ... VALUES` / DoPut 批量写入 / prepared statement；
-  - MySQL wire（`:3306`）：文本协议、预编译写入与查询（COM_STMT_PREPARE/EXECUTE，
-    二进制参数与二进制结果集）、DBeaver 全兼容元数据（DatabaseMetaData +
-    `SHOW ...` + `information_schema` 补全）。
-- **客户端**：`yuntun-client` SDK（Rust，简易轨批量写入 + 查询）与 `yuntun-cli`
-  （`query` / `insert` / `tables` / `schema` 子命令）。
-- **运维**：`yuntun.toml` 配置、写后可见性窗口可调、孤儿文件清理、WAL 磁盘水位保护。
-- **测试基建**：testkit（tmpfs 测试目录，fsync 基准 64×）、chaos 故障注入套件、
-  pymysql / JDBC / pyarrow(ADBC) 冒烟脚本。
+- **写入与存储**：Arrow 批次 → WAL（CRC、组提交、fsync、批次状态机）
+  → 攒批（按 `dt`/`shard` 分区）→ **vortex（默认）/ parquet** → Manifest；
+  幂等键三通道（`app_metadata` / SQL 注释 / 语句级生成）；写入侧 schema 演化（追加列）；
+  读己之写（fsync 后 ≤1 个扫描周期，默认 100 ms）。
+- **崩溃恢复**：WAL 重放 + 批次分流（Pending 重做 / Committed 补记 / Abort 跳过）；
+  DDL 重放恢复表与库；chaos 故障注入覆盖多轮硬崩溃无丢失无重复。
+- **SQL 面**（`crates/sql` 为唯一实现，两端口共用）：
+  - 查询：`SELECT`（CTE / 聚合 / JOIN / 窗口 / `information_schema`）、`EXPLAIN [ANALYZE]`；
+  - 写入：`INSERT ... VALUES` / `INSERT ... SELECT` / `TRUNCATE TABLE`；
+  - **行级 `DELETE ... WHERE` / `UPDATE ... SET ... WHERE`**（删除向量；UPDATE 原子可见）；
+  - DDL：`CREATE/DROP TABLE`（`IF [NOT] EXISTS`、`CREATE TABLE new LIKE old`、
+    `WITH (partition_by='ts')`）、`CREATE/DROP DATABASE`、`ALTER TABLE ADD/DROP COLUMN`；
+  - 多 schema（`USE` / 限定名 / handshake database）、prepared statement、
+    8 个 JSON 函数、二进制/无符号/时间/`DECIMAL`/`ARRAY`/`MAP` 类型。
+- **协议端口**：Arrow Flight SQL（`do_get` 流式回传、`do_put` 批量写入、prepared）；
+  MySQL wire（文本协议 + `COM_STMT_PREPARE/EXECUTE` 二进制参数与结果集，
+  DBeaver/JDBC 元数据兼容含 `information_schema` 补洞）；可选指标 HTTP
+  （`/metrics`、`/metrics.json`、`/healthz`）。
+- **客户端**：`yuntun-client` SDK（`query` / `query_full`（partial 可见）/
+  `query_stream` / `schema_of` / `table_schema` / `insert` / `insert_batches`）
+  与 `yuntun-cli`（`query` / `insert`（CSV/JSONL/Parquet）/ `tables` / `schema` /
+  `meta`）；令牌经 `--token` / `YUNTUN_TOKEN`，拦截器统一附加。
+- **鉴权**：MySQL `mysql_native_password`（`users` 非空自动启用、**每连接随机 salt**）；
+  Flight `auth_token`（`authorization: Bearer`）；默认 trust（按网络隔离部署）。
+- **查询管理**：`SHOW [FULL] PROCESSLIST`、`KILL [CONNECTION|QUERY]`（真取消，
+  未知 Id ⇒ 1094 / 被杀 ⇒ 1317）、`SHOW [GLOBAL|SESSION] STATUS [LIKE]`
+  （真实计数器）、`[sql.mysql].max_connections` 连接准入闸门。
+- **冷读预算**：vortex 整文件解码按**解码字节**累计，`[query].cold_read_budget_mb`
+  （默认 512 MB）超限整次查询失败并点名文件。
+- **运维**：结构化日志、SIGINT/SIGTERM 优雅关闭（WAL 封口、任务 join、租约释放）、
+  compaction（按 `(table, shard)` 分租约）、孤儿文件 GC、任务目录、WAL 磁盘水位保护、
+  内存硬分区 + spill。
+- **可选分布式**（`yuntun-datanode` / `metanode`）：多节点写同一分片（查询侧合并、
+  逐行对拍）、聚合下推（只回标量）、冷文件按节点分配与远端折叠、真实 S3（SeaweedFS/MinIO）。
+- **测试基建**：testkit（tmpfs 测试目录）、chaos 故障注入、`standalone_smoke.py`（17 项）、
+  `auth_smoke.py`（7 项）、pymysql/JDBC/pyarrow(ADBC) 冒烟脚本。
+
+### Changed
+
+- 默认存储格式为 **vortex**（ADR-1）；`.idx` 行组级索引只对 parquet 生效。
+- DDL 解析方言回退：会话方言不认的扩展语法（如 `ADD COLUMN IF NOT EXISTS`）
+  回退到 Generic 再试；两者都不认才报会话方言的错误。
+- 结果完整性（partial）经 Flight SQL metadata 传给调用方：SDK `query_full` 给
+  `PartialNotice`，CLI 把 `WARN: partial result` 打到 stderr。
 
 ### Performance
 
-- 100 万行 DoPut 写入 2.6s（10×10 万批次，debug 构建）；
-- 500 万行 / 114 MB 结果集流式回传，服务端 RSS 增量 ≈ 2 MB。
+- 100 万行 DoPut 写入 2.6 s（10×10 万批次，**debug** 构建）；
+- 500 万行 / 114 MB 结果集流式回传，服务端 RSS 增量 ≈ 2 MB；
+- 分布式聚合下推：3 万行查询的网络量从 244 KB 降到 64 字节（3814×）。
 
 ### Known limitations
 
-详见 README §4：无事务（单语句自动提交）；trust 鉴权（需网络隔离部署）；
-MySQL wire 结果集先收集后逐行写（Flight 轨已流式）。
-（更正：早期版本此处曾写"预编译查询为文本结果集"——有误，opensrv 的
-COM_STMT_EXECUTE 本就走二进制行；当时 prepared SELECT 取不到行的真因是
-opensrv 0.7 PacketReader 的 UAF 触发条件，见 docs/operation-log.md §22。）
+- 无事务（单语句自动提交，`BEGIN/COMMIT/ROLLBACK` 为 no-op）、无视图/存储过程；
+- 鉴权只有**登录**粒度：无 TLS、无 `GRANT` 权限矩阵、metanode 端口无鉴权；默认 trust；
+- MySQL 轨结果集先收集后逐行写，且无法携带 partial 标记（上游 opensrv 0.7 限制）；
+- vortex 读路径无行组级剪枝，单文件解码峰值 ≈ 该文件解码后大小（流式解码未做）；
+- 查询管理只有**连接级**闸门（无按查询限流）；`SHOW STATUS WHERE` 不解释；
+  超限连接被关闭而非收到 ERR 1040；Flight 轨无 PROCESSLIST/KILL/STATUS；
+- `CREATE TABLE ... AS SELECT` 未支持（用 `CREATE TABLE` + `INSERT ... SELECT`）；
+- `ALTER TABLE` 只支持增删列（改类型/可空性/重命名明确拒绝）；`TIMESTAMP(p)` 精度不入 schema；
+- 客户端没有发现/软路由：连接显式给定的 contact point，扇出由服务端负责。
+
+### 升级说明
+
+0.1 之前没有对外产物，无需迁移。

@@ -15,5 +15,5 @@ tmp_dl/
 __pycache__/
 /vendor/
 
-# 误重定向产物（`cmd =1 file` 会把 `=1` 当文件名；已被误提交过一次）
-/=1
+# 发布产物（scripts/package_release.sh 生成；不入库）
+/dist

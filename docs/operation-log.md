@@ -1,6 +1,6 @@
 # yuntun 实施操作日志（§169 起）
 
-> 起记时间：2026-10-11（最新：**§194，2026-10-17**）。对应分支：main。
+> 起记时间：2026-10-11（最新：**§195，2026-10-17**）。对应分支：main。
 >
 > **这是什么**：从今天起，**每一刀**（一次成体系的改造）在这里留一节 —— 写清"做了什么、
 > 为什么这么做、边界在哪（**没做什么**）、怎么验的"。它是本项目的**证据出处**：
@@ -1674,3 +1674,48 @@ D-20 的要求是"**先量数**，再决定做流式解码还是冷读预算"。
 - 本篇**没有**实现 CTAS；ROADMAP §5.1 的"不做"清单已登记，避免下次重新讨论一遍。
 - `CREATE TABLE LIKE` 不拷 `default_format` / `ingest_config`（MySQL 里没有这两个概念；
   "表定义"在本库指 schema + 分区键，文档已按此表述）。
+
+---
+
+## 195. **0.1 发布准备：门禁脚本 + 打包 + 文档收口**（2026-10-17）
+
+### 195.0 口径与发现
+
+- 版本：`Cargo.toml` 的 `[workspace.package].version = 0.1.0`（唯一来源，所有 crate 继承）。
+- **0.1 之前没有对外产物、也没有 tag**；`CHANGELOG` 里 2026-09-12 的条目只是草稿，
+  已并入本次 0.1.0（日期 2026-10-17）。
+- 发现的发布阻塞/漂移：
+  1. `CHANGELOG` 的 Known limitations 还写着"trust 鉴权"（`§190` 后已不成立）；
+  2. README 快速开始写"读己之写 ≤1s"（实现是 ≤1 个 scan 周期，默认 100 ms）；
+  3. 全仓没有一条命令能回答"现在能不能发"；`dist/` 产物也没有被忽略；
+  4. `docs/` 顶层文档集合有判据（只允许 6 份），新增发布文档必须**同时**登记判据与索引。
+
+### 195.1 做了什么
+
+| 文件 | 内容 |
+|---|---|
+| `CHANGELOG.md` | 重写 0.1.0：合并草稿 + 补齐 0.1 前全部能力（鉴权/查询管理/冷读预算/分区键/行级 DML/客户端令牌…），Known limitations 按今天的事实重写 |
+| `README.md` | 修正可见性窗口（100 ms）；快速开始指向发布流程 |
+| `docs/RELEASE.md`（新） | 门禁清单、一条命令、产物与验收、tag/发布步骤、发布后验收、记录模板 |
+| `docs/README.md` + `docs_consistency.rs` | 顶层文档集合登记第 7 份 `RELEASE.md`（判据与索引同时改，避免"文档有了但判据不知道"） |
+| `scripts/release_check.sh`（新） | clippy(-D warnings) → 全量测试 → 文档一致性 → release 构建 → `--version` 校验 → **release 二进制**冒烟（standalone 17 项 + 鉴权 7 项）；缺 python 依赖时明确记 SKIP，不伪装通过 |
+| `scripts/package_release.sh`（新） | `dist/yuntun-<ver>-<target>.tar.gz`：4 个二进制 + 示例配置 + README/CHANGELOG/LICENSE + OVERVIEW/ARCHITECTURE；**包内二进制 `strip --strip-debug`**（target 里保留 line-tables-only 供排障）；sha256 |
+| `.gitignore` | 忽略 `/dist` |
+
+### 195.2 证据（本机实测）
+
+- `scripts/release_check.sh` **EXIT=0**：clippy 0 告警；`cargo test --workspace` 123 段
+  `test result: ok`、0 failed、0 ignored；`docs_consistency` 10/10；
+  `target/release/yuntun --version` = `yuntun 0.1.0`；
+  **release 二进制**冒烟：standalone **17/17**、鉴权 **7/7**（含该拒的拒、该过的过）。
+- 打包：未 strip 时 470 MB → strip 后 **133 MB**；`sha256sum -c` OK；
+  把包解到 `/tmp` 用**包里的 `yuntun`** 起实例再跑 standalone 冒烟：**17/17**
+  （证明产物本身可用，而不是只有 `target/release` 可用）。
+
+### 195.3 边界与已知债
+
+- **没有打 tag、没有 publish**：按惯例留给人工一步（`docs/RELEASE.md §3`）；
+- **`cargo fmt --check` 约 884 处差异**：本仓从未以 rustfmt 为基线，本版**不作门禁**；
+  要对齐必须单独一笔纯格式化提交（否则功能 diff 被埋）。已写进 `docs/RELEASE.md §1`；
+- 仓库没有 CI：`scripts/release_check.sh` 就是可放进任意 CI 的门禁（本地已实跑通过）；
+- 发布包不带全部 `docs/`（只带 OVERVIEW/ARCHITECTURE）：完整设计与台账留在仓库。

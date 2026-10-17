@@ -17,6 +17,7 @@
 | 知道 **某个结论的证据 / 某次改造的过程与偏差** | [`operation-log.md`](operation-log.md)（**§169 起**；§1…168 在 [`archive/operation-log.md`](archive/operation-log.md)） |
 | 知道 **历史设计全文**（12 个 ADR、逐模块详细设计、改造指南、SQL 接入设计） | [`archive/`](archive/) —— **是历史，不是现状** |
 | 想跑起来用起来 | 仓库根 [`../README.md`](../README.md) |
+| 要**发版**：门禁、打包、tag、发布后验收 | [`RELEASE.md`](RELEASE.md) |
 
 **新读者建议顺序**：根 `README.md`（5 分钟）→ `OVERVIEW.md`（10 分钟）→
 `ARCHITECTURE.md`（20 分钟）→ `ROADMAP.md §下一阶段`。

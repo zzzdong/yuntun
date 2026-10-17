@@ -27,13 +27,18 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// 顶层文档集合（`§170` 之后就是这个集合；多一份 = 又开了一份会漂移的平行文档）。
-const TOP_LEVEL_DOCS: [&str; 6] = [
+///
+/// 0.1 发布时加了第 7 份 `RELEASE.md`：发布门禁/产物/打 tag 的步骤**不属于**现状、
+/// 架构、任务或过程日志任何一份（它们是"是什么/为什么/下一步/证据"），硬塞进去只会让
+/// 那四份各长出一段会被遗忘的操作步骤。加它时同步改了本判据与 `docs/README.md §1`。
+const TOP_LEVEL_DOCS: [&str; 7] = [
     "README.md",
     "OVERVIEW.md",
     "ARCHITECTURE.md",
     "ROADMAP.md",
     "HANDOVER.md",
     "operation-log.md",
+    "RELEASE.md",
 ];
 
 // ---------------------------------------------------------------- 基础设施
@@ -323,7 +328,7 @@ fn overview_scale_line_matches_the_code() {
     }
 }
 
-/// 顶层文档集合必须**正好**是 `docs/README.md §1` 与 `§170` 约定的那 6 份。
+/// 顶层文档集合必须**正好**是 `docs/README.md §1` 与 `§170` 约定的那 7 份。
 ///
 /// 这条守的是本仓的硬规则："就地升版本，不新建平行文档"。多出来的每一份都是将来会漂移的地方；
 /// 真需要新维度时，改 [`TOP_LEVEL_DOCS`] 并在 `docs/README.md §1` 的表里登记它。
