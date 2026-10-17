@@ -148,7 +148,9 @@ java -cp "$JAR:scripts" dbeaver_jdbc_probe
 ## 4. 已知限制（MVP）
 
 - **无事务**：单语句自动提交，`BEGIN/COMMIT/ROLLBACK` 为 no-op；
-- **trust 鉴权**：`[sql.mysql].users` 非空仅告警，当前不做口令校验——请按网络隔离部署；
+- **鉴权**：默认 trust（不校验）；配 `users` 自动切 `native_password`，Flight 可配 `auth_token`。**无 TLS**、无 `GRANT` 权限矩阵（`§190`）；
+- **查询管理**：`SHOW [FULL] PROCESSLIST` / `KILL [CONNECTION|QUERY] <id>` 可用（`§191`）；
+  但**没有并发闸门 / 连接数上限**（`max_connections=151` 只是给驱动看的文本），也没有 `SHOW STATUS`；
 - **写后可查（读己之写）**：`INSERT` 成功即落 WAL；攒批线程在一个扫描周期（`[ingest].scan_interval_ms`，
   默认 100ms）内把该批数据发布到 store 层的**内存分片**，查询立即可见 —— **不再受 flush 相位分散（默认 ≤30s）
   与查询缓存 TTL（默认 30s）影响**（`docs/ARCHITECTURE.md` §3）；
@@ -169,6 +171,44 @@ java -cp "$JAR:scripts" dbeaver_jdbc_probe
   （UAF #66/#67、OK 包合规 #75/#78 等）仅存在于 git。0.1 以 sqlwire 的
   `PacketFramedReader`（按包边界分帧）规避 UAF；后续建议把依赖切到上游 git 固定 rev，
   届时可移除该适配器（`vendor/opensrv-mysql/` 仅为分析用拷贝，未接入构建）。
+
+### 鉴权（U3，§190）
+
+默认 **trust**（不校验，按网络隔离部署）。两种端口各有一套机制：
+
+```toml
+[server]
+auth_token = "change-me"          # Flight：要求 authorization: Bearer <token>
+
+[sql.mysql]
+auth = "trust"                    # trust | native_password
+users = [{ user = "yuntun", password = "s3cret" }]   # 非空 ⇒ 自动切 native_password
+```
+
+- **MySQL 端口**：`mysql_native_password` 握手（SHA1 双次 + scramble XOR），口令不过网；
+  **每连接随机 salt**（opensrv 默认是固定串 ⇒ 重放面）。
+- **Flight 端口**：请求头 `authorization: Bearer <token>`（ADBC：`db_kwargs` 里
+  `adbc.flight.sql.rpc.call_header.authorization`）。
+- **自有客户端**：`yuntun-cli --token <token> query '…'`（或环境变量 `YUNTUN_TOKEN`；
+  SDK 用 `Client::connect_with_token`）。令牌由客户端拦截器统一加到**每个** RPC 上。
+- 该拒的都会拒：错口令 / 未知用户 / 空口令 / 缺 token / 错 token。
+- **边界**：无 TLS（明文传输，与 MySQL 自己同款）；只有**登录**鉴权，没有
+  `CREATE USER` / `GRANT` 权限矩阵（用户表走配置）。
+
+一键验证：`scripts/.venv/bin/python scripts/auth_smoke.py --mysql 127.0.0.1:3306 --user yuntun --password s3cret --flight 127.0.0.1:50051 --token change-me`
+
+### 查询管理（U4，§191）
+
+```sql
+mysql> SHOW PROCESSLIST;              -- Id / User / Host / db / Command / Time / State / Info
+mysql> KILL QUERY 12;                 -- 取消 12 号连接上正在跑的查询（客户端收到 1317）
+mysql> KILL 12;                       -- = KILL CONNECTION（取消 + 断开）
+mysql> KILL QUERY 999999;             -- 1094 unknown thread（打错 Id 不会静默成功）
+```
+
+- `Id` 是**连接**（跨查询稳定），空闲连接显示 `Command=Sleep`；
+- 取消是**协作式**的：命中引擎的执行段（含 Flight 流式结果），已发出的批次不撤回；
+- 进程级判据（真·慢查询被打断）在 `scripts/standalone_smoke.py` 的 `processlist_and_kill`。
 
 ### 分区键（事件时间列 / 时间分片）
 
@@ -245,8 +285,9 @@ scripts/.venv/bin/pip install -r scripts/requirements.txt -i https://mirrors.ali
 |---|---|
 | `scripts/pyarrow_smoke.py <flight地址>` | Flight SQL：ADBC 查询 + 元数据 + 原始 Flight prepared 写入（**需 demo 种子实例**，见 §4 时间精度条目） |
 | `scripts/pyarrow_sqlinfo_smoke.py <flight地址>` | Flight SQL：`GetSqlInfo` 信息项 |
+| `scripts/auth_smoke.py --mysql … --user … --password … [--flight … --token …]` | MySQL 口令 + Flight token 鉴权：**三态对拍**（对的过、错的拒） |
 | `scripts/pymysql_smoke.py <mysql地址>` | MySQL wire：T1 文本协议（DDL/INSERT/SELECT/SHOW/错误码 1146）+ T2 预编译 |
-| `scripts/standalone_smoke.py <mysql地址> <flight地址>` | **standalone 全功能冒烟**（`§184`）：MySQL wire 12 项（CRUD/聚合/元数据/DML/TRUNCATE/加列删列/无符号类型/多 schema/prepared/错误码/时间类型/JSON 函数）+ Flight SQL 2 项（查询 + `information_schema`）；退出码即结论 |
+| `scripts/standalone_smoke.py <mysql地址> <flight地址>` | **standalone 全功能冒烟**（`§184`）：MySQL wire 13 项（CRUD/聚合/元数据/DML/TRUNCATE/加列删列/无符号类型/多 schema/prepared/错误码/**查询管理**/时间类型/JSON 函数）+ Flight SQL 2 项（查询 + `information_schema`）；退出码即结论 |
 | `scripts/flight_stream_smoke.py <flight地址> <表> [批数 行数]` | Flight `do_get` 流式（S1.10）：灌数 + ADBC 流式读取 + 服务端 RSS 采样（`0 0` = 只读模式） |
 | `scripts/dbeaver_jdbc_probe.java` | DBeaver / JDBC：T3 元数据与预览（需 `javac` + Connector/J） |
 | `scripts/s3_smoke.sh` | 真实 S3（SeaweedFS / MinIO）**网络读写**：flush → HTTP PUT 可见于桶；**删 WAL** 重启后冷读 → HTTP GET。`S3_ENDPOINT` / `S3_BUCKET` 可配（见 `docs/archive/operation-log.md` §101） |

@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, StringArray};
+use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use sqlparser::ast::{Expr, Statement, Value};
@@ -258,6 +258,28 @@ pub(crate) async fn intercept(
                     strings_result(&["Table", "Create Table"], &[vec![desc.name.clone(), ddl]])
                 }
                 None => return Err(SqlError::NotFound(table)),
+            }
+        }
+        // **查询管理面**（U4 / `§191`）：看到谁在跑什么。
+        //
+        // `SHOW FULL PROCESSLIST` 与不带 FULL 在这里是同一份事实（MySQL 的 FULL 只是
+        // 不截断 `Info`；本实现从不截断），所以两个变体共用一个分支。
+        Statement::ShowProcessList { .. } => {
+            Some(processlist_result(engine.registry().snapshot()))
+        }
+        // `KILL [CONNECTION|QUERY] <id>`：点取消位；协议层负责"取消之后断不断连接"。
+        // 未知 Id ⇒ 1094（`UnknownThread`），**不静默成功** —— 脚本靠这个报错发现打错了 Id。
+        Statement::Kill { modifier, id } => {
+            // MySQL 语义：**裸 `KILL <id>` = KILL CONNECTION**（不是 KILL QUERY）。
+            // 写成 `matches!(modifier, Some(Connection))` 会让 `KILL 7` 退化成"只取消
+            // 当前查询"，客户端以为连接已经断开 —— 静默的语义偏差。
+            let connection = !matches!(
+                modifier,
+                Some(sqlparser::ast::KillType::Query) | Some(sqlparser::ast::KillType::Mutation)
+            );
+            match engine.registry().kill(*id, connection) {
+                Ok(()) => Some(SqlResult::Affected(0)),
+                Err(id) => return Err(SqlError::UnknownThread(id)),
             }
         }
         // SELECT @@var / SELECT DATABASE()：无 FROM 的探测查询 → canned
@@ -677,6 +699,58 @@ fn classify_probe_expr(expr: &Expr) -> ProbeKind {
 }
 
 /// 单一字符串列批次。
+/// `SHOW [FULL] PROCESSLIST`：列名/类型与 MySQL 8 一致。
+///
+/// `Id` / `Time` 用 **Int64**（不是 UInt64）：JDBC 的 `getLong` 对无符号列也能读，
+/// 但部分客户端把 `BIGINT UNSIGNED` 显示成超过 i64 的值；进程 Id 不可能那么大，
+/// 用有符号类型最省事。
+fn processlist_result(rows: Vec<crate::registry::ProcessRow>) -> SqlResult {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("Id", DataType::Int64, false),
+        Field::new("User", DataType::Utf8, false),
+        Field::new("Host", DataType::Utf8, false),
+        Field::new("db", DataType::Utf8, true),
+        Field::new("Command", DataType::Utf8, false),
+        Field::new("Time", DataType::Int64, false),
+        Field::new("State", DataType::Utf8, true),
+        Field::new("Info", DataType::Utf8, true),
+    ]));
+    let db = |r: &crate::registry::ProcessRow| {
+        if r.db.is_empty() {
+            None
+        } else {
+            Some(r.db.clone())
+        }
+    };
+    let info = |r: &crate::registry::ProcessRow| {
+        if r.info.is_empty() {
+            None
+        } else {
+            Some(r.info.clone())
+        }
+    };
+    let cols: Vec<ArrayRef> = vec![
+        Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.id as i64).collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from_iter(rows.iter().map(|r| Some(r.user.as_str())))),
+        Arc::new(StringArray::from_iter(rows.iter().map(|r| Some(r.host.as_str())))),
+        Arc::new(StringArray::from_iter(rows.iter().map(db))),
+        Arc::new(StringArray::from_iter(rows.iter().map(|r| Some(r.command)))),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.time_secs).collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from_iter(rows.iter().map(|r| Some(r.state.as_str())))),
+        Arc::new(StringArray::from_iter(rows.iter().map(info))),
+    ];
+    let batch = RecordBatch::try_new(schema, cols).expect("processlist batch");
+    SqlResult::Rows {
+        schema: batch.schema(),
+        batches: vec![batch],
+        partial: yuntun_query::PartialRead::default(),
+    }
+}
+
 fn strings_result(col_names: &[&str], rows: &[Vec<String>]) -> Option<SqlResult> {
     let schema: SchemaRef = Arc::new(Schema::new(
         col_names

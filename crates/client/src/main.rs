@@ -42,6 +42,13 @@ struct Cli {
     #[arg(long, env = "YUNTUN_ADDR", default_value = "127.0.0.1:50051", global = true)]
     addr: String,
 
+    /// Flight 访问令牌（`§190`）：服务端配了 `[server].auth_token` 时必须给。
+    ///
+    /// 也可用环境变量 `YUNTUN_TOKEN`（避免令牌进 shell 历史）。`--meta` 子命令不走
+    /// Flight，不需要它（metanode 端口无鉴权）。
+    #[arg(long, env = "YUNTUN_TOKEN", global = true, hide_env_values = true)]
+    token: Option<String>,
+
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -155,6 +162,7 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = cli.addr;
+    let token = cli.token;
     let Some(cmd) = cli.cmd else {
         // 没给子命令 = 想看用法。这**不是错误**（退 0），但帮助走 stderr 更符合直觉？
         // 不：`--help` 走 stdout（可管道），裸调用与之保持一致。
@@ -181,7 +189,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
         Cmd::Query { sql, format } => {
-            let client = Client::connect(&addr).await?;
+            let client = Client::connect_with_token(&addr, token.as_deref()).await?;
             // `§174`：**把"结果不完整"这件事走到用户面前**。
             //
             // 服务端在有来源读不到时会照常返回可用结果并标记 partial（故意的降级）——
@@ -229,7 +237,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             shard,
             key,
         } => {
-            let client = Client::connect(&addr).await?;
+            let client = Client::connect_with_token(&addr, token.as_deref()).await?;
             // 目标表 schema：取不到说明表不存在（CREATE TABLE 请先执行）
             let target = client.table_schema(&table).await.map_err(|e| {
                 format!("读取表 {table} schema 失败（表是否已创建？）：{e}")
@@ -279,7 +287,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Cmd::Tables => {
-            let client = Client::connect(&addr).await?;
+            let client = Client::connect_with_token(&addr, token.as_deref()).await?;
             for t in client.list_tables().await? {
                 println!("{t}");
             }
@@ -287,7 +295,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Cmd::Schema { table } => {
-            let client = Client::connect(&addr).await?;
+            let client = Client::connect_with_token(&addr, token.as_deref()).await?;
             let schema = client.table_schema(&table).await?;
             print_schema(&schema);
             Ok(())

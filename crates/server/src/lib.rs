@@ -838,12 +838,19 @@ pub async fn spawn_mysql(
         tracing::info!("mysql wire disabled by config ([sql.mysql].enabled = false)");
         return Ok(None);
     }
-    if !cfg.users.is_empty() {
-        // R-1/§6.3：users 非空应切 native_password；当前仅实现 trust（无鉴权）
+    // 鉴权策略（`§190`）：`auth` 写错 ⇒ **启动即报错**（不静默降级成 trust ——
+    // 那会让"我配了鉴权"变成一句谎言）；users 非空而 auth=trust ⇒ 自动切 native_password。
+    let users: Vec<(&str, &str)> = cfg
+        .users
+        .iter()
+        .map(|u| (u.user.as_str(), u.password.as_str()))
+        .collect();
+    let auth = yuntun_sqlwire::auth::AuthPolicy::from_config(&cfg.auth, &users)
+        .map_err(|e| format!("[sql.mysql] {e}"))?;
+    if !cfg.users.is_empty() && !auth.is_enforcing() {
         tracing::warn!(
             users = cfg.users.len(),
-            "mysql wire auth users configured, but only trust (no auth) is implemented — \
-             connections are accepted without credential check"
+            "mysql wire auth = trust：配置了用户但**不校验口令**（请确认这是你想要的）"
         );
     }
     let listener = tokio::net::TcpListener::bind(&cfg.listen)
@@ -853,26 +860,72 @@ pub async fn spawn_mysql(
     let engine = lakehouse.sql.clone();
     let shutdown = lakehouse.shutdown.clone();
     Ok(Some(tokio::spawn(async move {
-        if let Err(e) = yuntun_sqlwire::serve_mysql_on(engine, listener, shutdown).await {
+        if let Err(e) = yuntun_sqlwire::serve_mysql_on(engine, listener, auth, shutdown).await {
             tracing::error!(error = %e, "mysql wire server stopped with error");
         }
     })))
 }
 
+/// Flight 端口的 **token 拦截器**（`§190`）。
+///
+/// 接受两种头形态（都放在 `authorization` 里）：
+/// - `Bearer <token>`（标准，ADBC/pyarrow 的惯用写法）
+/// - `<token>`（裸值：某些客户端只能设"值"不能设"scheme"）
+///
+/// 比较用**定长**（不提前退出）：令牌比对不该通过耗时泄露前缀。
+fn token_interceptor(
+    token: Option<String>,
+) -> impl FnMut(
+    tonic::Request<()>,
+) -> Result<tonic::Request<()>, tonic::Status>
+       + Clone
+       + Send
+       + Sync
+       + 'static {
+    move |req: tonic::Request<()>| {
+        // `None` = 未配置令牌 ⇒ 全部放行（默认形态；保留拦截器是为了让服务类型统一，
+        // 否则"开/关鉴权"会让 `impl Service` 的具体类型不同 → 装配处无法共用一段代码）
+        let Some(token) = token.as_ref() else {
+            return Ok(req);
+        };
+        let provided = req
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim())
+            .unwrap_or_default();
+        let provided = provided
+            .strip_prefix("Bearer ")
+            .or_else(|| provided.strip_prefix("bearer "))
+            .unwrap_or(provided);
+        let a = provided.as_bytes();
+        let b = token.as_bytes();
+        let mut diff = (a.len() != b.len()) as u8;
+        for (x, y) in a.iter().zip(b) {
+            diff |= x ^ y;
+        }
+        if diff == 0 {
+            Ok(req)
+        } else {
+            Err(tonic::Status::unauthenticated(
+                "missing or invalid authorization token",
+            ))
+        }
+    }
+}
+
 /// 启动 Arrow Flight gRPC 服务（单端点多轨：FlightSQL 标准轨 + 简易写入/查询轨）。
+///
+/// `auth_token`（`§190`）：给了就要求每个请求带 `authorization: Bearer <token>`
+/// 或裸 `<token>` 头；`None` = 不鉴权（默认，不破坏既有部署）。
 pub async fn serve_flight(
     lakehouse: &Lakehouse,
     listen: &str,
+    auth_token: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let catalog: Arc<dyn CatalogOps> = lakehouse.catalog.clone();
-    let svc = arrow_flight::flight_service_server::FlightServiceServer::new(
-        FlightServer::new(
-            lakehouse.ingestor.clone(),
-            lakehouse.query.clone(),
-            catalog,
-        )
-        .with_sql(lakehouse.sql.clone()),
-    );
+    if auth_token.is_some() {
+        tracing::info!("flight 端口已启用 token 鉴权（authorization: Bearer …）");
+    }
     let addr = listen
         .parse::<std::net::SocketAddr>()
         .map_err(|e| format!("invalid listen addr {listen}: {e}"))?;
@@ -886,6 +939,29 @@ pub async fn serve_flight(
     let bound = listener.local_addr()?;
     println!("LISTEN {bound}");
     tracing::info!(%bound, "flight server listening (do_put ingest + do_get sql)");
+    serve_flight_on(lakehouse, listener, auth_token).await
+}
+
+/// 同 [`serve_flight`]，但接管**外部已绑定**的 listener（与 `sqlwire::serve_mysql_on` 同形）。
+///
+/// 存在的理由只有一个：**让用例走生产路径**。鉴权这种"关掉就静默放行"的东西，
+/// 如果用例自己复刻一遍拦截器，生产代码写错了用例照样绿（`§190.3`）。
+pub async fn serve_flight_on(
+    lakehouse: &Lakehouse,
+    listener: tokio::net::TcpListener,
+    auth_token: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let catalog: Arc<dyn CatalogOps> = lakehouse.catalog.clone();
+    let inner = FlightServer::new(
+        lakehouse.ingestor.clone(),
+        lakehouse.query.clone(),
+        catalog,
+    )
+    .with_sql(lakehouse.sql.clone());
+    let svc = arrow_flight::flight_service_server::FlightServiceServer::with_interceptor(
+        inner,
+        token_interceptor(auth_token.map(|s| s.to_string())),
+    );
     tonic::transport::Server::builder()
         .add_service(svc)
         .serve_with_incoming_shutdown(

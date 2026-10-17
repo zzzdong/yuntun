@@ -1,6 +1,6 @@
 # yuntun 实施操作日志（§169 起）
 
-> 起记时间：2026-10-11（最新：**§189，2026-10-17**）。对应分支：main。
+> 起记时间：2026-10-11（最新：**§191，2026-10-17**）。对应分支：main。
 >
 > **这是什么**：从今天起，**每一刀**（一次成体系的改造）在这里留一节 —— 写清"做了什么、
 > 为什么这么做、边界在哪（**没做什么**）、怎么验的"。它是本项目的**证据出处**：
@@ -1331,3 +1331,144 @@ public/t_ts/dt=2026-10-16T17:37/.../01a145cb-....vortex   ← 无索引，dt = �
 - `WITH (...)` 目前**只接受** `partition_by` 一个键（其余键明确报错，不给"以后再说"留口子）；
 - 分区键只驱动**窗口归属 + stats + idx**，不做 `PARTITION BY` 的目录枚举（sqlparser 不解析该语法）；
 - U3（鉴权）/ U4（查询管理）/ U5（冷读预算）未动，见 `ROADMAP §5.2`。
+
+---
+
+## 190. **U3 登录鉴权：MySQL 口令握手 + Flight token**（2026-10-17）
+
+### 190.0 缺口与两个白送的攻击面
+
+MySQL 端口此前是 **trust**：任意用户名、空密码直接进；`[sql.mysql].users` 配了
+只打一条告警（"only trust is implemented"）。按网络隔离部署是文档里的口径，
+但只要端口暴露（DBeaver 从桌面连、容器端口映射），trust 就等于没有门。
+
+读 opensrv 0.7 的 `MysqlShim` 时发现两个**现成的**钩子与一个**现成的坑**：
+
+| | 发现 |
+|---|---|
+| 钩子 | `authenticate(plugin, username, salt, auth_data) -> bool` —— 可做 native password |
+| 钩子 | `default_auth_plugin()` / `auth_plugin_for_username()` |
+| **坑** | `salt()` 的默认实现返回**固定字符串**（`";X,po_k}>o6^Wz!/kM}N"`）⇒ 抓一次握手包就能离线复用同一个 scramble。不覆盖它，鉴权是"有形状但可重放"的 |
+
+### 190.1 做了什么
+
+| 层 | 内容 |
+|---|---|
+| `sqlwire::auth`（新） | `AuthPolicy`（trust / native_password）+ `native_scramble`（`SHA1(salt‖SHA1(SHA1(pw))) XOR SHA1(pw)`）+ `random_salt` + 定长比较 |
+| `sqlwire::MysqlBackend` | 实现 `authenticate` / `default_auth_plugin`，**覆盖 `salt()` 为每连接随机**（构造时生成） |
+| `sqlwire::serve_mysql_on` | 新增 `auth` 参数；启动日志明确报"native_password / trust" |
+| `server::spawn_mysql` | 从 `[sql.mysql]` 构造策略：`auth` 写错 ⇒ **启动即报错**；`users` 非空而 `auth=trust` ⇒ 自动切 native（配置注释里一直是这么写的语义） |
+| `server::serve_flight` | 新增 `[server].auth_token`：`authorization: Bearer <token>` 或裸 token；未配置恒放行 |
+| `server::serve_flight_on`（新） | 与 `serve_mysql_on` 同形的"接管已 bind 的 listener"入口 —— **为了让用例走生产路径**（详见 190.3） |
+| `client::TokenInterceptor`（新） | tonic 客户端拦截器：`Client::connect_with_token` 一次配好，**所有** RPC 自动带头（手塞必然漏 `do_get`，见 190.3 第 2 条） |
+| `client::main` | `yuntun-cli --token` / `YUNTUN_TOKEN`：服务端开了令牌，自家 CLI 才不会被锁在门外 |
+
+### 190.2 判据
+
+- **单测**（`sqlwire::auth`，6 条）：scramble 自洽（不同 salt 不同响应）、
+  对/错/未知用户/空 auth-data、空口令用户的空响应、trust 全放行、
+  **配置解析**（拼错必须报错，不静默回退 trust）、**salt 每连接不同且避开 0/$**；
+- **Flight e2e**（`server/tests/flight_auth_e2e.rs`）：无令牌/错令牌 ⇒
+  `UNAUTHENTICATED`、对令牌 ⇒ 真答回 SQL，**再反证**（未配 token 时同一请求成功）；
+- **进程级**（`scripts/auth_smoke.py`）：MySQL 四态（对/错/未知/空）+ Flight 三态
+  （对/缺/错），**7/7**。三态对拍的用意：只验"错的被拒"的话，服务没起来也会绿；
+- **客户端侧**（`client/tests/flight_token_e2e.rs`）：SDK 带对/缺/错令牌三态 +
+  非法令牌字符（连接阶段报错）+ **反证**（服务端未启用鉴权时无令牌仍可查）。
+
+### 190.3 过程中踩到的两个坑（都写进了代码/用例的注释）
+
+1. **用例自己复刻拦截器 ⇒ 生产代码坏了照样绿**。第一版 `flight_auth_e2e.rs` 把
+   `token_interceptor` 抄了一遍——它连"正确令牌被拒"都能通过（因为拒绝来自抄来的那份）。
+   ⇒ 拆出 `serve_flight_on`，让用例调用**真实现**。
+2. **`do_get` 是第二个 RPC**：只给 `get_flight_info` 带头，会看到"元数据查询过了、
+   取数被拒"。生产实现是**每请求**校验（这是对的），测试得两处都带。
+
+### 190.4 收尾时发现的第三处缺口：客户端没有令牌入口
+
+服务端把门关上了，客户端的钥匙却没配 —— `Client::connect` 与 `yuntun-cli` 都无处传令牌。
+**开了 `auth_token` 就把自家 CLI/SDK 锁在门外**，这比"没有鉴权"更糟：功能开关一打开，
+运维只能改用 ADBC/其它客户端。
+
+修法与 190.3 第 2 条同源：令牌放在 **tonic 客户端拦截器**（`TokenInterceptor`）里，
+一次配好、`do_get` / `get_schema` / `get_flight_info` / `do_put` **全部自动带头**。
+`yuntun-cli` 加 `--token`（env `YUNTUN_TOKEN`，避免令牌进 shell 历史）；
+`token = None` 时拦截器不加任何头 ⇒ 默认形态与之前逐字节相同。
+
+### 190.5 边界（明确不做）
+
+- **无 TLS**：口令不过网，但**明文 gRPC/MySQL 帧可嗅探**；跨网请套隧道
+  （stunnel / 服务网格）。与 MySQL 自己的默认形态一致，不是本刀引入的缺口。
+- **无 `CREATE USER` / `GRANT`**：用户表在配置里（`[sql.mysql].users`），
+  没有授权粒度（能登录 = 能读写全库）。写进 `ROADMAP §5.1` 不做清单。
+- 不做 `caching_sha2_password`（MySQL 8 默认）：opensrv 0.7 只暴露 native 插件。
+- metanode 端口仍无鉴权（控制平面按内网部署）。
+
+---
+
+## 191. **U4 查询管理：`SHOW PROCESSLIST` + `KILL` + 真取消**（2026-10-17）
+
+### 191.0 缺口：一条跑飞的查询既看不见、也杀不掉
+
+`SHOW PROCESSLIST` / `KILL` / `SHOW STATUS` 在 `§189` 的普查里全是 1149
+（"only SELECT / … are supported"），全仓**没有**任何 in-flight 查询表。
+对一个"单机即完整列数据库"来说，这是最后的**功能面**硬缺口：
+
+* 运维**看不见**谁在跑什么（DBeaver 的监控面板直接报错）；
+* 跑飞的大查询**无法取消** —— 只能重启进程（连 WAL 一起遭殃）。
+
+### 191.1 做了什么
+
+| 层 | 内容 |
+|---|---|
+| `sql::registry`（新） | 会话表 `QueryRegistry`：`Session { id, user, host, db, running, cancel, kill_connection }`；`ConnectionGuard`（Drop = 连接断开）+ `QueryGuard`（Drop = 回到 `Sleep`）；`snapshot()`；`kill(id, connection)` |
+| `sql::registry::Cancellation` | `AtomicBool` + `Notify`：先看旗标再等通知、醒后再看一次（消解 lost wakeup；只轮询要定时器，只等通知会丢） |
+| `sql::SessionCtx` | 新增 `conn_id`（协议层分配，引擎只读）—— 查询要能挂到"哪条连接"上 |
+| `sql::SqlEngine` | 持有 `Arc<QueryRegistry>`（一进程一份，MySQL/Flight 共用）；`execute_with_key` 用 `select!` 把执行段与取消位竞速；`execute_stream` 把句柄**移进**流包装器 |
+| `sql::CancellableStream`（新） | `KILL` 后**下一次 poll 投递错误**；不是 `take_until` 截断 —— 截断与"正常读完"客户端分不出来（静默少数据，本项目最忌的形态） |
+| `sql::shim` | `SHOW [FULL] PROCESSLIST`（MySQL 8 的 8 列）+ `KILL [CONNECTION|QUERY] <id>`；未知 Id ⇒ `SqlError::UnknownThread` |
+| `sqlwire` | 连接建立即 `alloc_id` + `attach(peer)`；握手成功回填 `User`；`KILL CONNECTION` 在响应后断开（空闲连接则在下一条命令时断）；错误码 1317 / 1094 |
+| `standalone` | 运行时 worker 数 = 核数 **+2**（理由见 191.3 第 3 条） |
+
+**语义**：裸 `KILL <id>` = `KILL CONNECTION`（MySQL 语义）；`KILL QUERY` 只点当前查询的
+取消位，**每条新查询开始时重置**（上一条的 KILL 不能波及下一条）。
+`SHOW PROCESSLIST` 的 `Id` 是**连接**（跨查询稳定），Flight 没有连接概念 ⇒ 每次查询一条
+临时会话（`host = "flight"`）。
+
+### 191.2 判据
+
+- **单测**（`sql::registry`，8 条）：Id 唯一；`Sleep → Query → Sleep` 与 `db`/`User`/`Info`；
+  `KILL QUERY` 只点目标（旁观者不受影响）；取消位每查询重置；`KILL CONNECTION` 立旗标；
+  未知 Id 报错；lost-wakeup 两态；**借用句柄不注销连接**（见 191.3 第 1 条）。
+- **引擎级**（`sql/tests/query_admin.rs`，4 条）：MySQL 8 列名逐字相等；正在跑的查询与
+  `SHOW PROCESSLIST` **自己**都在表里；查询结束变 `Sleep` 且 Id 不变；`KILL QUERY` 只杀目标、
+  未知 Id 报 1094 语义；**流式**查询被 KILL 后第一次 poll 返回错误（不是空流）。
+- **进程级**（`scripts/standalone_smoke.py::processlist_and_kill`）：
+  ① 自己的 `SHOW PROCESSLIST` 可见且 `User` 是登录名；② `KILL QUERY 424242` ⇒ 1094；
+  ③ 4 路自连接慢查询（≈12s）被 `KILL QUERY` 打断 ⇒ 客户端收到 **1317**，线程退出。
+- **回归**：`standalone_smoke.py` **16/16**；`sql / sqlwire / client / server` 全绿；clippy 0 告警。
+
+### 191.3 过程中踩到的三个坑（都写进了代码/用例注释）
+
+1. **借用句柄把连接注销了**。`lookup()` 为同一个会话再造一份 `ConnectionGuard`（引擎把查询
+   挂到连接上），而 `Drop` 无条件从表里删 —— 结果是**第一条查询之后连接就从进程列表消失**，
+   下一条查询变成一个新的临时 Id（宿主 `host=flight` 的幽灵行）。修法：`registered` 旗标，
+   只有 `attach` 的那份 Drop 才注销；判据 `a_borrowed_guard_does_not_unregister_the_connection`。
+2. **`count(*)` 的慢查询不慢**。冒烟第一版用 `SELECT count(*) FROM t a,t b,t c,t d`
+   （1.6e9 行）当"跑飞的查询" —— 优化器把它折算成各表行数的乘积，**0.1s 就答完**，
+   根本没有可杀的窗口。换成 `sum(a.id*b.id + c.id*d.id)`（不可折算）才有 ≈12s 的窗口。
+3. **worker 被打满 ⇒ 取消能力等于不存在**。默认 `#[tokio::main]` 的 worker 数 = 核数，
+   DataFusion 的并行度也 = 核数：一条 CPU 打满的查询占住全部 worker，
+   `SELECT 1` 实测等了 **10.9s**（查询本身 11.5s）—— 这期间 `KILL` 命令**递不进来**。
+   修法：standalone 运行时多给 2 个 worker（查询仍用满核数）。这是 U4 的**成立条件**，
+   不是调优：先让控制面有地方跑，取消才有意义。
+
+### 191.4 边界（明确不做 / 仍未做）
+
+- **没有并发闸门**：`max_connections`（151）仍是 canned 文本，`Semaphore` 一个都没有 ——
+  本刀只做"看见 + 取消"，准入是另一件事（U4 的下一刀）。
+- **`SHOW STATUS` 仍未支持**（与"进程/查询"不同族，属于计数器面）。
+- **Flight 轨没有 PROCESSLIST/KILL**：shim 只对 MySQL 方言生效；Flight 客户端拿到的是
+  1149 语义的 `Unsupported`。查询**会**出现在 MySQL 侧的进程列表里（临时会话）。
+- **空闲连接**被 `KILL CONNECTION` 点名后，要等**下一条命令**才断开（opensrv 的连接循环
+  没有"取消阻塞读"的接缝）。有查询在跑时是立即取消 + 响应后断开。
+- 取消是**协作式**的：只能打断引擎的 `select!` 段与流包装器；已发给客户端的批次不撤回。

@@ -7147,6 +7147,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "arrow-cast",
+ "futures",
  "object_store",
  "sqlparser",
  "thiserror 2.0.21",
@@ -7168,6 +7169,8 @@ dependencies = [
  "arrow",
  "async-trait",
  "opensrv-mysql",
+ "rand 0.8.8",
+ "sha1",
  "tokio",
  "tokio-util",
  "tracing",

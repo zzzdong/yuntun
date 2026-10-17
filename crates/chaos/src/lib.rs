@@ -1777,7 +1777,7 @@ async fn disk_watermark_aborts_oldest_batch_then_releases_segments() {
     // 判据仍是事件（WAL 恢复也全终态），不是墙钟。
     wait_until("WAL 侧仍有非终态批次", || {
         let rec = setup.ingestor.wal.full_recovery().unwrap();
-        rec.states.states.values().all(|s| s.is_terminal()).then(|| ())
+        rec.states.states.values().all(|s| s.is_terminal()).then_some(())
     })
     .await;
     // 终态后复核一次完整状态（顺带把"全部终态"这个事实钉在断言里）

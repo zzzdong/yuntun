@@ -150,6 +150,12 @@ client    ─► arrow-flight（可独立编译，不依赖 server）
 - **DML 的读**：`DELETE`/`UPDATE` 的定位是**扫描 + 文件内行号**；
   读文件后先按**表 schema** 对齐（缺列补 NULL / 多余列丢掉 / 类型宽化，复用同一个 `align_batch`）
   再补行号列 ⇒ DML 与 `SELECT` 对同一批行**永远同一答案**。
+- **查询管理 / 取消**（`§191`）：进程内一张**会话表**（`yuntun_sql::registry`，MySQL 与 Flight 共用）。
+  `Id` 是**连接**（跨查询稳定）；每次执行把会话标成 `Query` 并重置取消位，结束回 `Sleep`。
+  `KILL QUERY` 点取消位 ⇒ 引擎的 `select!`（eager）或流包装器（Flight 流式）**投递错误**，
+  而不是截断（截断 = 客户端以为读完了）。**取消是协作式的**，已发出的批次不撤回。
+  控制面要能递进来 ⇒ standalone 的运行时比核数多 2 个 worker
+  （DataFusion 并行度也 = 核数，否则一条 CPU 打满的查询会把 `KILL` 本身饿死，`§191.3`）。
 
 ---
 
@@ -266,6 +272,7 @@ orphan_cleanup（全局 `gc` 租约单跑）：在途登记 + 静置期 + 两条
 [server]
 listen = "0.0.0.0:50051"
 shards = 1                          # MVP 单 shard；多 shard 需 ShardMapper（未做）
+# auth_token = "…"                  # Flight 端口 token 鉴权（§190；不给 = 不鉴权）
 
 [meta]
 mode = "embedded"                   # embedded（默认：进程内 1 节点 raft + fjall）| memory（测试/回滚）
@@ -319,8 +326,8 @@ hot_read_budget_secs = 2            # 热读（未落盘数据）的等待预算
 [sql.mysql]
 enabled = true
 listen = "0.0.0.0:3306"
-auth = "trust"                      # trust | native_password（users 非空时自动切换；今天只实现 trust）
-# users = [{ name = "root", password = "..." }]
+auth = "trust"                      # trust | native_password（§190：users 非空时自动切换；每连接随机 salt）
+# users = [{ user = "root", password = "..." }]
 
 [metrics]
 enabled = false                     # 指标 HTTP 导出；默认关：它会绑端口

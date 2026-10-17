@@ -71,7 +71,9 @@
 | 索引 | **行组级**：写时随 flush 生成 `{batch}.idx`（逐组 min/max + XOR，只给排序列）；读时文件级 → 组级两级剪枝。⚠️ **只对 parquet 生效**，vortex 路径无组级剪枝 |
 | **分布式聚合下推** | `SELECT 维度, count(*) / sum(整数) / min / max FROM t`，**含 `WHERE` 与 `GROUP BY`**（谓词 `§176`、分组 `§177`：整数与字符串键、NULL 是一组、多列键）在多节点下**只回标量**：热来源在它那边筛+折（`FetchShardAggs`），冷的一半仍由 DataFusion 算，协调者合并 —— 实测 3 万行从 **244KB 降到 64 字节（3814×，带/不带 `WHERE` 都一样）**。其余形状（`avg` / 浮点 `sum` / 复杂谓词 / 表达式分组键 / `HAVING`）**原路**（正确但不过网省），见 `ARCHITECTURE.md §4`。⚠️ **冷的一半仍由协调者自己全读** —— 冷文件的"按节点分配"未做（台账 `D-4` 第二半 / `ROADMAP` 的 N4b） |
 | 元数据 | `SHOW TABLES/COLUMNS/DATABASES`、`DESCRIBE`、`SHOW CREATE TABLE` |
+| **查询管理** | `SHOW [FULL] PROCESSLIST`（MySQL 8 的 8 列：Id/User/Host/db/Command/Time/State/Info）+ `KILL [CONNECTION\|QUERY] <id>`：**真取消**执行段（eager 与 Flight 流式两条路）；未知 Id ⇒ 1094、被杀 ⇒ 1317（`§191`）。**无并发闸门 / 连接数上限 / `SHOW STATUS`** |
 | 客户端 | mysql CLI / 驱动预编译 / DBeaver+JDBC / ADBC+pyarrow 均已验 |
+| **鉴权** | MySQL 端口 `mysql_native_password`（每连接随机 salt；`users` 非空自动启用）+ Flight 端口 `auth_token`（`authorization: Bearer`）；默认 trust（`§190`）。**无 TLS / 无 GRANT 权限矩阵** |
 | 幂等 | 三通道（SQL 注释 / CLI `--key` / `FlightData.app_metadata`）；**一次请求一次键 + 批次派生键** |
 | 持久性 | WAL 权威（CRC + 组提交 + fsync）；崩溃恢复含 DDL 重放 + 非终态批次重提交；`durable` 档 = WAL 段归档到共享存储（**RPO = 归档间隔 + 一次上传时延**，默认秒级） |
 | 可见性 | 读己之写：fsync 后 ≤1 个 scan 周期（默认 100ms）可查，此时零已提交文件 |
@@ -84,7 +86,8 @@
 - 事务语义（单语句自动提交；`BEGIN/COMMIT/ROLLBACK` 为 no-op）、视图、存储过程；
 - `ALTER TABLE` 只支持 `ADD COLUMN` / `DROP COLUMN`：**改类型（破坏性）、可空性变更、重命名**都是明确拒绝；
 - `UPDATE` 不支持 `FROM` / `RETURNING`，也不支持无 `WHERE` 的全表更新；
-- MySQL 端口 **trust 无鉴权**（按网络隔离部署）；metanode 端口同样无鉴权；
+- 鉴权只有**登录**粒度（配置账号 + 口令；Flight 用 token）：**无 TLS、无 `GRANT` 权限矩阵**，metanode 端口仍无鉴权；
+- 查询管理只做"看见 + 取消"：**没有并发闸门 / 连接数上限**（`max_connections` 仍是 canned 文本），没有 `SHOW STATUS`；Flight 轨没有 PROCESSLIST/KILL（它只看得到自己的查询出现在 MySQL 侧列表里）；
 - MySQL 轨结果集仍先收集后逐行写（Flight 轨已流式）；MySQL 轨给不出 `partial` 标记（上游 `opensrv` 卡住）；
 - SQL DDL 的 `TIMESTAMP(p)` 精度不入 schema（一律 `Timestamp(ns)`）。
 
@@ -101,13 +104,13 @@
 | **数据进程的元数据面** | ⚠️ **必须给多台** | `yuntun-datanode --meta` 支持逗号分隔的**种子列表**（`§172`）：只给一台时，那一台不是 leader ⇒ 这个节点的**所有写都失败**（重试只能在已知地址集合里换）。容器 rig 里给全三台 |
 | 真实对象存储（本机 S3/MinIO） | ✅ | 单机读写两向（`§101`）+ 多节点真写对拍与冷读（`§102`） |
 | **真云 S3（TLS/签名/限流）与跨机 / 跨可用区** | ⚠️ **未验** | 未测；且部署包线已有量过的数字，见 §7 |
-| **鉴权 / 多租户** | ❌ | 端口 trust 无鉴权（metanode 的成员变更已做，鉴权没做） |
+| **鉴权 / 多租户** | 🟡 **登录已做（`§190`）** | MySQL 口令 + Flight token 可用；**多租户隔离 / 授权粒度 / TLS / metanode 端口鉴权**仍没有 |
 
 ---
 
 ## 6. 质量与证据网
 
-规模：**78,416 行 Rust / 20 个 crate / 641 个测试函数 / 用例全绿 / clippy 本仓 0 告警**
+规模：**80,235 行 Rust / 20 个 crate / 661 个测试函数 / 用例全绿 / clippy 本仓 0 告警**
 （工具链：本机 rustc 1.98.1 + edition 2024；**MSRV 1.95 已真编译验证**（`§188`：
 `rustup run 1.95.0 cargo check --workspace --all-targets` EXIT=0、0 告警）——
 下界由 `vortex 0.86` 顶出，全仓按 1.95 要求）
@@ -171,7 +174,7 @@
 **任务与租约的"关联视图"**（`/metrics` 把"有哪些活"与"谁在做"分两张表报，靠 `task:<表>:<分片>`
 前缀人工对应；G.4 的下一格）、按记录过滤归档（`D-18`）。
 
-**工程化**：真云 S3 + 跨机、端口鉴权、冷读预算、WAL segment 清理闸门（`T6.15`）、spill 复用、MSRV 1.95 真编译。
+**工程化**：真云 S3 + 跨机、~~端口鉴权~~（登录已做，授权粒度未做）、冷读预算、WAL segment 清理闸门（`T6.15`）、spill 复用、MSRV 1.95 真编译。
 
 **正确性待查**：`D-23`（合并提交期间观测到一次行数瞬时不可见）。
 

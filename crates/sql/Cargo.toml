@@ -17,6 +17,10 @@ object_store = { workspace = true }
 arrow = { workspace = true }
 arrow-cast = "59"
 sqlparser = { workspace = true, features = ["visitor"] }
+# `§191`：会话表的取消位（Notify）与查询执行的 select!
+tokio = { workspace = true, features = ["sync", "macros"] }
+# `§191`：流式查询的取消包装器（实现 `Stream`）
+futures = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

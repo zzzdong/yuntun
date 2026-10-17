@@ -29,6 +29,12 @@ pub struct SessionCtx {
     /// 当前 schema（MySQL 的 database 概念）：`USE db` / handshake database /
     /// PG `\c db` 切换；`None` = [`yuntun_model::ops::DEFAULT_SCHEMA`]。
     pub default_db: Option<String>,
+    /// 在查询注册表里的**连接 Id**（`U4` / `§191`）：`SHOW PROCESSLIST` 的 `Id` 列，
+    /// `KILL` 的寻址键。`None` = 没有连接概念（裸 `SqlEngine` / 测试）⇒ 引擎会为
+    /// 本次查询建一条临时会话。
+    ///
+    /// 由协议层（`sqlwire`）在连接建立时分配并填入；引擎**只读**，不改它。
+    pub conn_id: Option<u64>,
 }
 
 impl Default for SessionCtx {
@@ -36,6 +42,7 @@ impl Default for SessionCtx {
         Self {
             dialect: SqlDialect::Generic,
             default_db: None,
+            conn_id: None,
         }
     }
 }
@@ -45,6 +52,7 @@ impl SessionCtx {
         Self {
             dialect: SqlDialect::MySql,
             default_db: None,
+            conn_id: None,
         }
     }
 

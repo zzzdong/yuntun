@@ -27,8 +27,27 @@ struct Args {
     config: Option<PathBuf>,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // **控制面余量**（`§191`）：默认 `#[tokio::main]` 的 worker 数 = 核数，
+    // 而 DataFusion 的并行度（`target_partitions`）也默认 = 核数 ⇒ 一条
+    // CPU 打满的大查询会把**所有** worker 都占住，`SHOW PROCESSLIST` / `KILL`
+    // 这些控制面命令要排队到查询结束（实测 11.5s 的查询让 `SELECT 1` 等了 10.9s，
+    // 期间 `KILL` 根本递不进来 —— 那等于没有取消能力）。
+    //
+    // 多给 2 个 worker 是**便宜且有效**的：查询仍用满核数（不损吞吐），控制面
+    // 有独立 OS 线程可调度。这不是"调优彩蛋"，而是 U4 的成立条件之一。
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        + 2;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()?;
+    rt.block_on(run())
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ---- 参数（clap：help/version/用法错的文案与退出码全仓统一）----
     let config_path = <Args as clap::Parser>::parse().config;
 
@@ -96,7 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // ---- Flight gRPC（阻塞至 shutdown）----
     let listen = cfg.server.listen.clone();
-    yuntun_server::serve_flight(&lakehouse, &listen).await?;
+    yuntun_server::serve_flight(&lakehouse, &listen, cfg.server.auth_token.as_deref()).await?;
 
     // ---- 收尾 ----
     shutdown.cancel();

@@ -31,6 +31,8 @@ use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::{FlightDescriptor, Ticket};
 use futures::{Stream, StreamExt};
+use tonic::metadata::{Ascii, MetadataValue};
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
 pub use input::InputFormat;
@@ -159,15 +161,58 @@ pub struct InsertReceipt {
     pub duplicate: bool,
 }
 
+/// **令牌拦截器**（`§190`）：服务端配了 `[server].auth_token` 时，每个 Flight 请求
+/// 都要带 `authorization: Bearer <token>`。
+///
+/// 为什么放在**客户端**而不是让调用方自己往每个 `Request` 上手塞：
+/// `Client` 内部有 4 处 RPC（`do_get` / `get_schema` / `get_flight_info` / `do_put`），
+/// 逐一加头必漏 —— 与 `§190.3` 里"`do_get` 是第二个 RPC"同一个坑。拦截器是 tonic
+/// 的原生位置，**一次配好、所有 RPC 生效**。
+///
+/// `token = None` ⇒ 不加任何头（服务端未启用鉴权时的默认形态）。
+#[derive(Clone)]
+pub struct TokenInterceptor {
+    header: Option<MetadataValue<Ascii>>,
+}
+
+impl TokenInterceptor {
+    /// 令牌非法（含非 ASCII / 换行等）⇒ 连接阶段就报错，不留到第一次查询。
+    pub fn new(token: Option<&str>) -> Result<Self> {
+        match token {
+            None => Ok(Self { header: None }),
+            Some(t) => {
+                let header = format!("Bearer {t}").parse::<MetadataValue<Ascii>>().map_err(|e| {
+                    ClientError::Other(format!("invalid Flight auth token: {e}"))
+                })?;
+                Ok(Self {
+                    header: Some(header),
+                })
+            }
+        }
+    }
+}
+
+impl tonic::service::Interceptor for TokenInterceptor {
+    fn call(
+        &mut self,
+        mut req: tonic::Request<()>,
+    ) -> std::result::Result<tonic::Request<()>, tonic::Status> {
+        if let Some(header) = &self.header {
+            req.metadata_mut().insert("authorization", header.clone());
+        }
+        Ok(req)
+    }
+}
+
 /// yuntun 客户端（可 clone 共享；tonic channel 内部为多路复用）。
 #[derive(Clone)]
 pub struct Client {
-    inner: FlightServiceClient<Channel>,
+    inner: FlightServiceClient<InterceptedService<Channel, TokenInterceptor>>,
     addr: String,
 }
 
 impl Client {
-    /// 连接 Flight 端点；`addr` 支持 `host:port` 或 `http://host:port`。
+    /// 连接 Flight 端点（**不鉴权**）；`addr` 支持 `host:port` 或 `http://host:port`。
     ///
     /// **连任一"能接 SQL"的端点即可**：standalone 的 Flight 端口，或某个数据进程的
     /// `--sql-listen`。多节点时**扇出 / 合并由该节点（协调者）负责**（`architecture §4.2`），
@@ -176,6 +221,13 @@ impl Client {
     /// 落点由**部署显式给定**（**contact point**，设计如此）——客户端**不做**名录发现、
     /// 一致性哈希软路由或存活感知（决策 `D13` / `operation-log §100`）。
     pub async fn connect(addr: &str) -> Result<Self> {
+        Self::connect_with_token(addr, None).await
+    }
+
+    /// 同 [`Client::connect`]，但可带 **Flight 访问令牌**（`§190`）；
+    /// `token = None` 与 [`Client::connect`] 等价。
+    pub async fn connect_with_token(addr: &str, token: Option<&str>) -> Result<Self> {
+        let interceptor = TokenInterceptor::new(token)?;
         let url = if addr.starts_with("http://") || addr.starts_with("https://") {
             addr.to_string()
         } else {
@@ -187,7 +239,7 @@ impl Client {
             .await
             .map_err(|e| ClientError::Connect(url, e.to_string()))?;
         Ok(Self {
-            inner: FlightServiceClient::new(channel),
+            inner: FlightServiceClient::with_interceptor(channel, interceptor),
             addr: addr.to_string(),
         })
     }

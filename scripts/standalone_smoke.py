@@ -12,6 +12,7 @@
   下一次的 `DROP DATABASE IF EXISTS` 打成 1008（本项目设计：非空库不删）。
 """
 import sys
+import threading
 import time
 import uuid
 import datetime
@@ -246,6 +247,80 @@ def t_flight_metadata():
         assert T in names, names
 
 
+def t_processlist_and_kill():
+    """U4 / §191：查询管理面（看得见 + 杀得掉 + 打错 Id 会报错）。
+
+    三态判据，缺一不可：
+    ① 自己的查询必须在 `SHOW PROCESSLIST` 里（否则"没查询在跑"是假象）；
+    ② 未知 Id 必须报 1094（否则脚本以为杀掉了）；
+    ③ 真的能打断一条在跑的慢查询（1317）—— 前两条都过了但取消没接线时，
+       这个用例是唯一能红的一条。
+    """
+    with mysql_conn() as conn, conn.cursor() as cur:
+        cur.execute("SHOW PROCESSLIST")
+        cols = [d[0] for d in cur.description]
+        assert cols == ["Id", "User", "Host", "db", "Command", "Time", "State", "Info"], cols
+        rows = cur.fetchall()
+        mine = [r for r in rows if r[4] == "Query" and "SHOW PROCESSLIST" in (r[7] or "")]
+        assert mine, f"自己的 SHOW PROCESSLIST 不在结果里：{rows}"
+        assert mine[0][1] == "yuntun", f"User 列应当是登录名：{mine[0]}"
+
+    # ② 未知 Id ⇒ 1094（不是 OK）
+    try:
+        with mysql_conn() as conn, conn.cursor() as cur:
+            cur.execute("KILL QUERY 424242")
+        raise AssertionError("KILL 未知 Id 应当报 1094，实际成功")
+    except pymysql.err.OperationalError as e:
+        assert e.args[0] == 1094, f"期望 1094，实际 {e.args}"
+
+    # ③ 慢查询（4 路自连接）被 KILL QUERY 打断。
+    #    ⚠️ 不要用 `count(*)`：优化器把它折算成"各表行数相乘"（1.6e9 行 0.1s 就答完），
+    #    根本没有可杀的窗口 —— 这是本用例第一版的实际翻车点。
+    live = f"kill_t_{RUN}"
+    with mysql_conn() as conn, conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS {live}")
+        cur.execute(f"CREATE TABLE {live} (id BIGINT)")
+        cur.executemany(f"INSERT INTO {live} VALUES (%s)", [(i,) for i in range(200)])
+        query_until(cur, f"SELECT count(*) FROM {live}", ((200,),))
+
+    result = {}
+
+    def slow():
+        try:
+            with mysql_conn() as c, c.cursor() as k:
+                k.execute(
+                    f"SELECT sum(a.id * b.id + c.id * d.id) FROM {live} a, {live} b, {live} c, {live} d"
+                )
+                k.fetchall()
+            result["ok"] = True
+        except Exception as e:  # noqa: BLE001 —— 错误码在下面断言
+            result["err"] = e
+
+    t = threading.Thread(target=slow, daemon=True)
+    t.start()
+    victim = None
+    deadline = time.time() + 10
+    with mysql_conn() as conn, conn.cursor() as cur:
+        while time.time() < deadline and victim is None:
+            cur.execute("SHOW PROCESSLIST")
+            for r in cur.fetchall():
+                if r[4] == "Query" and live in (r[7] or ""):
+                    victim = r[0]
+                    break
+            if victim is None:
+                time.sleep(0.05)
+        assert victim is not None, "10s 内没在进程列表里看到慢查询（慢查询没起来？）"
+        cur.execute(f"KILL QUERY {victim}")
+    t.join(timeout=10)
+    assert not t.is_alive(), "KILL 之后查询仍在跑（取消没接线）"
+    err = result.get("err")
+    assert err is not None, f"被 KILL 的查询应当报错，实际 result={result}"
+    assert getattr(err, "args", (None,))[0] == 1317, f"期望 1317，实际 {err!r}"
+
+    with mysql_conn() as conn, conn.cursor() as cur:
+        cur.execute(f"DROP TABLE {live}")
+
+
 # ---------------- 汇总 ----------------
 
 def main():
@@ -261,6 +336,7 @@ def main():
     check("multi_schema", t_multi_schema)
     check("prepared", t_prepared)
     check("error_codes", t_error_codes)
+    check("processlist_and_kill", t_processlist_and_kill)
     check("timestamp_types", t_timestamp_types)
     check("json_functions", t_json_functions)
     check("binary_roundtrip", t_binary_roundtrip)

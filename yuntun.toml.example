@@ -2,6 +2,9 @@
 
 [server]
 listen = "0.0.0.0:50051"
+# Flight 端口访问令牌（§190）：给了就要求每个请求带 `authorization: Bearer <token>`。
+# 不给 = 不鉴权（默认；局域网/本地开发）。明文 gRPC，跨网请套 TLS 隧道。
+# auth_token = "change-me"
 # MVP 单 shard（0）；多 shard 分配在阶段 1（ShardMapper）
 shards = 1
 
@@ -113,9 +116,16 @@ cache_ttl_secs = 30
 # MySQL wire 协议端口（sql-access-design.md §6.3；默认开启 = 标准端口 3306）
 enabled = true
 listen = "0.0.0.0:3306"
-# trust | native_password（users 非空时自动切换；当前仅实现 trust 无鉴权）
+# trust | native_password（§190）
+#   trust           = 不校验口令（任意用户名直接进；按网络隔离部署时用）
+#   native_password = mysql_native_password 握手校验（每连接随机 salt）
+# ⚠️ **users 非空时自动切换为 native_password**（即便这里写 trust）——
+#    避免"配了用户却仍然谁都能进"这种静默失效。
+# ⚠️ 口令在配置里是**明文**（部署时用文件权限/密钥管理保护）；无 TLS，
+#    跨网请套隧道（stunnel / 服务网格）。
 auth = "trust"
-# users = [{ user = "yuntun", password = "..." }]
+# 账号表：user + 明文口令。空口令 = 允许空密码登录（与 MySQL 一致）
+# users = [{ user = "yuntun", password = "s3cret" }]
 
 [meta]
 # 元数据的装配形态（S3-4）：

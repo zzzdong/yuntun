@@ -13,6 +13,8 @@
 
 pub mod idempotency;
 pub mod params;
+/// `U4`（`§191`）：`SHOW PROCESSLIST` / `KILL` 的数据源 —— 会话表 + 协作式取消。
+pub mod registry;
 pub mod session;
 pub mod shim;
 pub mod sql;
@@ -58,6 +60,12 @@ pub enum SqlError {
     /// 前置条件不满足（如强制幂等键缺失）
     #[error("{0}")]
     Precondition(String),
+    /// 查询被 `KILL QUERY` 取消（MySQL 1317）—— 与"执行失败"不同：这是**被叫停**的
+    #[error("query execution was interrupted")]
+    Cancelled,
+    /// `KILL` 指向不存在的连接 Id（MySQL 1094）
+    #[error("unknown thread id: {0}")]
+    UnknownThread(u64),
     /// 只读节点拒绝写入（sqld readonly）
     #[error("SQL server is configured read-only")]
     ReadOnly,
@@ -144,6 +152,44 @@ pub enum SqlStreamResult {
     Affected(i64),
 }
 
+/// 流式查询的取消包装器（`§191`）：`KILL QUERY` 之后**下一次 poll 投递错误**。
+///
+/// 为什么不是简单截断（`take_until`）：截断的流与"正常读完"在客户端看来一模一样，
+/// 少行会被当成完整结果 —— 这正是本项目反复警惕的静默失败。所以这里投
+/// [`yuntun_query::DataFusionError`]，让 Flight 端把这次查询明确判失败。
+struct CancellableStream {
+    inner: yuntun_query::SendableRecordBatchStream,
+    /// 句柄随流走：流被丢掉时才把会话标回 `Sleep`（`Drop` 顺序即生命周期）
+    guard: registry::QueryGuard,
+}
+
+impl futures::Stream for CancellableStream {
+    type Item = Result<RecordBatch, yuntun_query::DataFusionError>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.guard.is_cancelled() {
+            return std::task::Poll::Ready(Some(Err(yuntun_query::DataFusionError::Execution(
+                "query execution was interrupted (KILL QUERY)".to_string(),
+            ))));
+        }
+        this.inner.as_mut().poll_next(cx)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl yuntun_query::RecordBatchStream for CancellableStream {
+    fn schema(&self) -> arrow::datatypes::SchemaRef {
+        self.inner.schema()
+    }
+}
+
 /// 节点写策略（§6.2：sqld readonly 注入 ReadOnly；分流命中写语句即拒绝）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WritePolicy {
@@ -173,6 +219,8 @@ pub struct SqlEngine {
     pub(crate) query: Arc<QueryEngine>,
     pub(crate) catalog: Arc<dyn CatalogOps>,
     pub write_policy: WritePolicy,
+    /// 查询注册表（`U4` / `§191`）：一个进程一份，MySQL 与 Flight 共用
+    pub(crate) registry: Arc<registry::QueryRegistry>,
 }
 
 impl SqlEngine {
@@ -186,6 +234,7 @@ impl SqlEngine {
             query,
             catalog,
             write_policy: WritePolicy::AllowWrite,
+            registry: Arc::new(registry::QueryRegistry::new()),
         }
     }
 
@@ -199,7 +248,35 @@ impl SqlEngine {
             query,
             catalog,
             write_policy: WritePolicy::ReadOnly,
+            registry: Arc::new(registry::QueryRegistry::new()),
         }
+    }
+
+    /// 换一份查询注册表（多端口共享同一张 `SHOW PROCESSLIST`）。
+    pub fn with_registry(mut self, registry: Arc<registry::QueryRegistry>) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    /// 查询注册表（协议层用它分配连接 Id / 观察 `KILL`）。
+    pub fn registry(&self) -> &Arc<registry::QueryRegistry> {
+        &self.registry
+    }
+
+    /// 把本次执行挂到一条会话上，返回**随执行结束而自清**的句柄。
+    ///
+    /// 有 `conn_id`（协议层的长连接）⇒ 复用那条会话；否则（Flight / SDK / 测试）
+    /// 建一条临时会话 —— 这样"每个正在跑的查询都出现在 `SHOW PROCESSLIST` 里"
+    /// 在两种形态下都成立。
+    fn begin_query(&self, sql: &str, session: &SessionCtx) -> registry::QueryGuard {
+        let conn = match session.conn_id.and_then(|id| self.registry.lookup(id)) {
+            Some(c) => c,
+            None => {
+                let id = self.registry.alloc_id();
+                self.registry.attach(id, "flight")
+            }
+        };
+        conn.begin(sql, session.schema())
     }
 
     /// 写入侧（只读装配下报 `ReadOnly`，而不是 panic）。
@@ -228,14 +305,22 @@ impl SqlEngine {
         session: &mut SessionCtx,
         key: Option<String>,
     ) -> Result<SqlResult, SqlError> {
-        let stmt = sql::parse_single_with(session.dialect.parser_dialect(), sql)
-            .map_err(|e| SqlError::Parse(e.to_string()))?;
-        // 方言 shim：wire 客户端的非数据语句（SHOW/SET/USE/@@var/事务 no-op）
-        if let Some(res) = shim::intercept(&stmt, session, self).await? {
-            return Ok(res);
+        // U4（`§191`）：登记 → 执行 → 自清。取消只作用于**这一段**（`KILL QUERY`）。
+        let guard = self.begin_query(sql, session);
+        tokio::select! {
+            biased;
+            _ = guard.cancelled() => Err(SqlError::Cancelled),
+            res = async {
+                let stmt = sql::parse_single_with(session.dialect.parser_dialect(), sql)
+                    .map_err(|e| SqlError::Parse(e.to_string()))?;
+                // 方言 shim：wire 客户端的非数据语句（SHOW/SET/USE/@@var/事务 no-op）
+                if let Some(res) = shim::intercept(&stmt, session, self).await? {
+                    return Ok(res);
+                }
+                let outcome = self.dispatch(stmt, session, key).await?;
+                Ok(self.finish(outcome, sql, session.schema()).await)
+            } => res,
         }
-        let outcome = self.dispatch(stmt, session, key).await?;
-        Ok(self.finish(outcome, sql, session.schema()).await)
     }
 
     // ---------------------------------------------------------------- schema（多库）
@@ -310,31 +395,47 @@ impl SqlEngine {
         sql: &str,
         session: &mut SessionCtx,
     ) -> Result<SqlStreamResult, SqlError> {
-        let stmt = sql::parse_single_with(session.dialect.parser_dialect(), sql)
-            .map_err(|e| SqlError::Parse(e.to_string()))?;
-        // 方言 shim：canned 结果（SHOW/SET/USE/@@var 探测）体量小，转流即可
+        // U4（`§191`）：流式路径的取消挂在**流**上（`CancellableStream`）——
+        // 执行函数返回时流还没跑，句柄必须跟着流走。
+        let guard = self.begin_query(sql, session);
+        let stmt = match sql::parse_single_with(session.dialect.parser_dialect(), sql) {
+            Ok(s) => s,
+            Err(e) => return Err(SqlError::Parse(e.to_string())),
+        };
+        // 方言 shim：canned 结果（SHOW/SET/USE/@@var 探测）体量小，转流即可（随函数结束自清）
         if let Some(res) = shim::intercept(&stmt, session, self).await? {
             return Ok(eager_to_stream(res));
         }
         // 只读查询 → DataFusion 物理计划流（真正的流式；非限定表名按会话 schema 解析）
         if let sqlparser::ast::Statement::Query(q) = &stmt {
             let text = q.to_string();
-            let (stream, partial) = self
-                .query
-                .sql_stream_with_partial(&text, session.schema())
-                .await
-                .map_err(query_error)?;
+            let (stream, partial) = tokio::select! {
+                biased;
+                _ = guard.cancelled() => return Err(SqlError::Cancelled),
+                r = self.query.sql_stream_with_partial(&text, session.schema()) => {
+                    r.map_err(query_error)?
+                }
+            };
             let schema = stream.schema();
             return Ok(SqlStreamResult::Rows {
                 schema,
-                stream,
+                // 取消位由流包装器持有：`KILL QUERY` 后下一次 poll 投递错误
+                stream: Box::pin(CancellableStream {
+                    inner: stream,
+                    guard,
+                }),
                 // 句柄：**流读完**之后它才是结论（调用方负责时机）
                 partial: PartialWatch::Pending(partial),
             });
         }
         // INSERT / DDL / SHOW TABLES：走既有 eager 分流（结果集小）
         let key = idempotency::extract(sql);
-        match self.dispatch(stmt, session, key).await? {
+        let outcome = tokio::select! {
+            biased;
+            _ = guard.cancelled() => return Err(SqlError::Cancelled),
+            r = self.dispatch(stmt, session, key) => r?,
+        };
+        match outcome {
             RawOutcome::Rows { batches, partial } => Ok(eager_to_stream(SqlResult::Rows {
                 schema: batches
                     .first()

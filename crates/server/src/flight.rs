@@ -875,6 +875,10 @@ fn sql_status(e: SqlError) -> Status {
         E::SchemaNotEmpty(_) => Status::failed_precondition(e.to_string()),
         E::Precondition(_) => Status::failed_precondition(e.to_string()),
         E::Internal(_) => Status::internal(e.to_string()),
+        // `§191`：被 `KILL QUERY` 叫停 ≠ 服务端故障 —— 客户端应看到 CANCELLED
+        // （gRPC 语义上与 `DEADLINE_EXCEEDED` 同族，但不该被重试）
+        E::Cancelled => Status::cancelled(e.to_string()),
+        E::UnknownThread(_) => Status::not_found(e.to_string()),
     }
 }
 

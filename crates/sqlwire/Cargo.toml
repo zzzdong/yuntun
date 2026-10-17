@@ -13,3 +13,6 @@ opensrv-mysql = "0.7"
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+# `§190`：mysql_native_password 的 SHA1 双次 + scramble XOR（协议算法，别自造）
+sha1 = "0.10"
+rand = { workspace = true }

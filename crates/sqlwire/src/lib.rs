@@ -7,9 +7,11 @@
 //! - `COM_STMT_EXECUTE` → 参数解码（opensrv）→ [`yuntun_sql::SqlValue`] →
 //!   `engine.execute_prepared`（AST 级替换，G3 无注入面）。
 //!
-//! 鉴权：trust（users 为空，R-1：网络层防火墙限制，设计 §6.1）。
+//! 鉴权：trust（默认，users 为空）或 `mysql_native_password` 口令校验
+//! （`[sql.mysql].users` 非空时自动切换，见 [`auth`] 模块文档）。
 //! 每连接一个 [`MysqlBackend`]（会话隔离：方言 / prepared 语句表，S-4）。
 
+pub mod auth;
 pub mod encode;
 
 use std::collections::HashMap;
@@ -38,15 +40,37 @@ pub struct MysqlBackend {
     /// stmt_id → 预编译语句（opensrv 分配 id 由我们维护）
     prepared: HashMap<u32, PreparedStatement>,
     next_stmt_id: u32,
+    /// 鉴权策略（trust / native_password）
+    auth: auth::AuthPolicy,
+    /// **本连接**的 salt（`§190`：opensrv 默认是固定字符串 ⇒ 重放面）。
+    /// 在握手包里发给客户端，随后 `authenticate` 用它重算 scramble。
+    salt: [u8; 20],
+    /// 本连接在查询注册表里的一行（`§191`）：`SHOW PROCESSLIST` 的 Id / User / Host，
+    /// `Drop` 即从表里消失。
+    conn: Arc<yuntun_sql::registry::ConnectionGuard>,
 }
 
 impl MysqlBackend {
     pub fn new(engine: Arc<SqlEngine>) -> Self {
+        Self::with_auth(engine, auth::AuthPolicy::trust(), "local")
+    }
+
+    /// 带鉴权策略（`[sql.mysql].users` 非空时由装配层传入）与对端地址（进程列表的 Host）。
+    pub fn with_auth(engine: Arc<SqlEngine>, auth: auth::AuthPolicy, peer: &str) -> Self {
+        // 连接 Id 在**接受连接时**分配：`SHOW PROCESSLIST` 的 Id 必须稳定
+        //（客户端先看到它、再拿它去 `KILL`，中间不能换号）。
+        let id = engine.registry().alloc_id();
+        let conn = engine.registry().attach(id, peer);
+        let mut session = SessionCtx::mysql();
+        session.conn_id = Some(id);
         Self {
             engine,
-            session: SessionCtx::mysql(),
+            session,
             prepared: HashMap::new(),
             next_stmt_id: 1,
+            auth,
+            salt: auth::random_salt(),
+            conn,
         }
     }
 }
@@ -73,6 +97,10 @@ async fn query_error<W: AsyncWrite + Send + Unpin>(
         yuntun_sql::SqlError::Parse(_) | yuntun_sql::SqlError::Unsupported(_) => {
             ErrorKind::ER_SYNTAX_ERROR
         }
+        // `§191`：被 `KILL QUERY` 叫停（1317）与 KILL 打错 Id（1094）——
+        // 两者必须各有各的码：脚本靠它区分"我的查询被杀了"和"Id 写错了"。
+        yuntun_sql::SqlError::Cancelled => ErrorKind::ER_QUERY_INTERRUPTED,
+        yuntun_sql::SqlError::UnknownThread(_) => ErrorKind::ER_NO_SUCH_THREAD,
         _ => ErrorKind::ER_UNKNOWN_ERROR,
     };
     results.error(kind, &format!("{e}").into_bytes()).await
@@ -92,6 +120,54 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MysqlBackend {
         yuntun_sql::shim::MYSQL_VERSION.to_string()
     }
 
+    /// 握手加密盐：**每连接随机**（`§190`）。
+    ///
+    /// opensrv 0.7 的默认实现返回固定字节串 `";X,po_k}>o6^Wz!/kM}N"` ——
+    /// 抓到一次握手包就能离线复用同一个 scramble（重放）。这里换成随机值，
+    /// 覆写它是这一刀最便宜的一半收益。
+    fn salt(&self) -> [u8; 20] {
+        self.salt
+    }
+
+    /// 握手时的插件名（trust 模式下也照常回 native，客户端才会正常发 auth-data）。
+    fn default_auth_plugin(&self) -> &str {
+        self.auth.plugin_name()
+    }
+
+    /// **口令校验**（`§190`）：`mysql_native_password` 的 scramble 比对。
+    ///
+    /// trust 模式直接 `true`（与旧行为一致）；native 模式见 [`auth::AuthPolicy::verify`]。
+    /// 拒绝时只记日志（**不泄**"用户不存在"与"口令错"的区别 —— 别让日志成为用户枚举器）。
+    async fn authenticate(
+        &self,
+        _auth_plugin: &str,
+        username: &[u8],
+        salt: &[u8],
+        auth_data: &[u8],
+    ) -> bool {
+        let user = String::from_utf8_lossy(username);
+        // `§191`：trust 模式下也把用户名记进进程列表（MySQL 的 User 列照实显示），
+        // 否则 `SHOW PROCESSLIST` 里所有连接都是空用户名。拒绝的连接也一样：
+        // 它在表里存活到握手失败、连接断开为止（与 MySQL 的 "unauthenticated user" 同形）。
+        self.conn.set_user(&user);
+        if !self.auth.is_enforcing() {
+            return true;
+        }
+        match self.auth.verify(&user, salt, auth_data) {
+            Ok(()) => {
+                tracing::debug!(user = %user, "mysql login ok");
+                true
+            }
+            Err(reason) => {
+                // 计数器/事件留给上层（这里只留一条 warn，含理由便于排障；
+                // 理由里已区分 user-not-found / wrong-password —— 只进服务端日志，
+                // 客户端只会收到统一的 access denied）
+                tracing::warn!(user = %user, reason = %reason, "mysql login denied");
+                false
+            }
+        }
+    }
+
     /// COM_QUERY：文本协议（CLI / 手工客户端 / 简单驱动）。
     async fn on_query<'a>(
         &'a mut self,
@@ -99,7 +175,15 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MysqlBackend {
         results: QueryResultWriter<'a, W>,
     ) -> io::Result<()> {
         tracing::debug!(sql = %sql_snippet_short(sql), "wire cmd: COM_QUERY");
-        match self.engine.execute(sql, &mut self.session).await {
+        // `KILL CONNECTION` 在空闲期被受理时，没有正在跑的查询可打断 ——
+        // 下一条命令到达就是立刻断开的时机（MySQL 会主动关 socket，这里只能等客户端开口）。
+        if self.conn.kill_requested() {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "connection killed by KILL CONNECTION",
+            ));
+        }
+        let res = match self.engine.execute(sql, &mut self.session).await {
             // 【§89 的遗留，写在这里免得下一个人重新发现一遍】
             //
             // `rows.partial` 是"这份结果缺了来源"的结论（引擎已经把它算出来了），但
@@ -135,7 +219,16 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for MysqlBackend {
                     .await
             }
             Err(e) => query_error(results, e).await,
+        };
+        // `KILL CONNECTION`：本次响应（含 ERR 1317）发完再断 —— 客户端先知道"为什么"，
+        // 而不是看到一个没有回执的 socket 关闭。
+        if self.conn.kill_requested() {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "connection killed by KILL CONNECTION",
+            ));
         }
+        res
     }
 
     /// COM_STMT_PREPARE：占位符计数 + 语句缓存。
@@ -559,15 +652,17 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PacketFramedReade
 
 /// 启动 MySQL wire 监听（:3306 标准端口，R-2）。
 ///
-/// 每连接 spawn 一个 `AsyncMysqlIntermediary`（trust 鉴权，无 TLS——MVP 网络层隔离）。
+/// 每连接 spawn 一个 `AsyncMysqlIntermediary`（鉴权见 [`auth`]；无 TLS ——
+/// MVP 网络层隔离，`§190` 的边界里写明）。
 pub async fn serve_mysql(
     engine: Arc<SqlEngine>,
     listen: &str,
+    auth: auth::AuthPolicy,
     shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!(%listen, "mysql wire protocol listening");
-    serve_mysql_on(engine, listener, shutdown).await
+    serve_mysql_on(engine, listener, auth, shutdown).await
 }
 
 /// 同 [`serve_mysql`]，但接管**外部已绑定**的 listener。
@@ -577,8 +672,14 @@ pub async fn serve_mysql(
 pub async fn serve_mysql_on(
     engine: Arc<SqlEngine>,
     listener: tokio::net::TcpListener,
+    auth: auth::AuthPolicy,
     shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if auth.is_enforcing() {
+        tracing::info!("mysql wire auth: native_password（每连接随机 salt）");
+    } else {
+        tracing::info!("mysql wire auth: trust（不校验口令，按网络隔离部署）");
+    }
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
@@ -594,6 +695,7 @@ pub async fn serve_mysql_on(
                     }
                 };
                 let engine = engine.clone();
+                let auth = auth.clone();
                 let shutdown = shutdown.clone();
                 tokio::spawn(async move {
                     if shutdown.is_cancelled() {
@@ -609,7 +711,7 @@ pub async fn serve_mysql_on(
                         inner: w,
                         enabled: trace,
                     };
-                    let backend = MysqlBackend::new(engine);
+                    let backend = MysqlBackend::with_auth(engine, auth, &peer.to_string());
                     if let Err(e) = AsyncMysqlIntermediary::run_on(backend, r, w).await {
                         tracing::debug!(%peer, error = %e, "mysql connection ended");
                     }

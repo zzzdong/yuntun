@@ -48,7 +48,10 @@ fn hot_read_stale(e: &DataFusionError) -> Option<&HotReadStale> {
     }
 }
 
-use datafusion::error::DataFusionError;
+/// 流式元素错误类型（`§191`：取消包装器要在流里投递错误，而不只是截断）。
+pub use datafusion::error::DataFusionError;
+/// 流 trait（`SendableRecordBatchStream` 的元素约束；包装流时要实现它）。
+pub use datafusion::execution::RecordBatchStream;
 use datafusion::execution::memory_pool::GreedyMemoryPool;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use arrow::record_batch::RecordBatch;

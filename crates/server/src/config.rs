@@ -65,6 +65,14 @@ pub struct ServerConfig {
     pub listen: String,
     /// MVP：单 shard（0）；多 shard 在阶段 1（ShardMapper）
     pub shards: u32,
+    /// Flight（gRPC）端口的**访问令牌**（`§190`）：给了就要求
+    /// `authorization: Bearer <token>`（或裸 token）头，未给 = 不鉴权（默认）。
+    ///
+    /// 为什么不复用 MySQL 的用户表：Flight 客户端（ADBC / pyarrow）带口令的
+    /// 标准做法是**头里放令牌**，而不是握手；两者机制不同，各配各的最省事。
+    /// 也**不是** TLS：明文 gRPC 上的令牌可被嗅探 —— 与 MySQL 侧同一条边界
+    /// （局域网/隧道内使用，跨网请套 stunnel / 服务网格）。
+    pub auth_token: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -72,6 +80,7 @@ impl Default for ServerConfig {
         Self {
             listen: "0.0.0.0:50051".into(),
             shards: 1,
+            auth_token: None,
         }
     }
 }
