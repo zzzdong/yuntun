@@ -20,14 +20,15 @@
 > **当前是预发布 `0.1.0-alpha.1`**：用于验证四目标构建与安装包。验证通过后再发稳定版
 > `0.1.0`（功能内容不预期再变）。
 
-每个 tag 由 GitHub Actions 产出 4 个包（流程见 [`docs/RELEASE.md`](docs/RELEASE.md)）：
+每个 tag 由 GitHub Actions 产出 2 个包（流程见 [`docs/RELEASE.md`](docs/RELEASE.md)）：
 
 | 平台 | 包名 |
 |---|---|
-| Linux x86_64（glibc） | `yuntun-<ver>-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux x86_64（musl，静态） | `yuntun-<ver>-x86_64-unknown-linux-musl.tar.gz` |
-| Linux aarch64（glibc） | `yuntun-<ver>-aarch64-unknown-linux-gnu.tar.gz` |
-| Linux aarch64（musl，静态） | `yuntun-<ver>-aarch64-unknown-linux-musl.tar.gz` |
+| Linux x86_64（glibc，常见服务器） | `yuntun-<ver>-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux aarch64（glibc，ARM 服务器） | `yuntun-<ver>-aarch64-unknown-linux-gnu.tar.gz` |
+
+> 0.1 **不提供 musl 静态包**：vortex 的 `custom-labels` 需要 C++17，CI 上拿不到
+> 稳定的 musl g++ 工具链（`§199`）。需要 musl/Alpine 部署时请从源码构建。
 
 解包即用：`bin/yuntun`、`bin/yuntun-cli`、`bin/yuntun-datanode`、`bin/metanode`；
 解包后先 `sha256sum -c *.sha256`（发布页另附合并的 `SHA256SUMS`）。

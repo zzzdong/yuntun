@@ -28,7 +28,7 @@ scripts/release_check.sh --skip-smoke # 只跑编译/测试/文档
 ```
 
 CI（`.github/workflows/ci.yml`）在每次 push / PR 上跑 1、2 与 MSRV；tag 流水线**不重复**
-跑全量测试（时间 × 4 个目标）——所以**打 tag 前必须先在本地或 main 的 CI 上过第 1–6 项**。
+跑全量测试（时间 × 2 个目标）——所以**打 tag 前必须先在本地或 main 的 CI 上过第 1–6 项**。
 
 `scripts/release_check.sh` 目前覆盖 1–6；MSRV 由 CI 的独立 job 覆盖。
 格式化是**门禁**：0.1 之前全仓从未跑过 rustfmt，已在发布前一次性基线化
@@ -59,29 +59,28 @@ git tag -a v0.1.0-alpha.1 -m "yuntun 0.1.0-alpha.1 (pipeline test)" && git push 
 ```
 
 tag 里含 `-` ⇒ Release 自动标成 **prerelease**（不会被当成稳定版）。预发布的目的
-是验证四目标构建与安装包；验证通过后把版本改成 `0.1.0`、在 `CHANGELOG` 增加
+是验证双目标（x86_64/aarch64 gnu）构建与安装包；验证通过后把版本改成 `0.1.0`、在 `CHANGELOG` 增加
 `[0.1.0]` 段，再打 `v0.1.0`（`gh release` 里预发布与稳定版并存，不互相覆盖）。
 
 ## 3. 产物（CI 自动构建）
 
-`.github/workflows/release.yml` 在 `v*` tag 上构建 **4 个目标**并发布到 GitHub Release：
+`.github/workflows/release.yml` 在 `v*` tag 上构建 **2 个目标**并发布到 GitHub Release：
 
-| 目标 | runner | 工具链 | 说明 |
-|---|---|---|---|
-| `x86_64-unknown-linux-gnu` | `ubuntu-24.04` | 系统 cc | 绝大多数 Linux 服务器 |
-| `aarch64-unknown-linux-gnu` | **`ubuntu-24.04-arm`** | 系统 cc + 手装 `clang/libclang/g++` | ARM64 服务器 / 云主机（原生编译，不用 cross） |
-| `x86_64-unknown-linux-musl` | `ubuntu-24.04` | [musl.cc] `x86_64-linux-musl-cross` | 静态链接，无 glibc 依赖 |
-| `aarch64-unknown-linux-musl` | `ubuntu-24.04` | [musl.cc] `aarch64-linux-musl-cross` | ARM64 静态 |
+| 目标 | runner | 说明 |
+|---|---|---|
+| `x86_64-unknown-linux-gnu` | `ubuntu-24.04` | 绝大多数 Linux 服务器 |
+| `aarch64-unknown-linux-gnu` | **`ubuntu-24.04-arm`** | ARM64 服务器 / 云主机（**原生编译**，不用 cross） |
 
-[musl.cc]: https://musl.cc/
+**0.1 不提供 musl 包**：vortex → `custom-labels` 的 build.rs 需要 C++17；`musl-tools`
+只有 `musl-gcc`（没有 g++），musl.cc 的工具链在 GitHub runner 上**下载超时**
+（curl 28），Bootlin 方案又太重。0.1 的取舍是"两个 gnu 目标先稳定发出去"，
+musl 留到后续（需要时从源码构建）。
 
-两个硬前提（都踩过）：
+编译前置（都踩过）：
 
-- **libclang**：vortex → `custom-labels` 的 build.rs 用 bindgen 生成绑定，缺 libclang 会
-  报 "Unable to generate bindings"；所有 job 都装 `clang libclang-dev llvm-dev`。
-- **C++ 编译器**：同一个 build.rs 还要编 C++17。`musl-tools` 只有 `musl-gcc`，
-  会报 `musl-g++ not found` ⇒ musl 用 musl.cc 的交叉工具链（自带 g++），并把
-  `CC_/CXX_/AR_<target>` 与 `CARGO_TARGET_<TARGET>_LINKER` 指过去。
+- **libclang**：`custom-labels` 用 bindgen 生成绑定，缺 libclang 会报
+  "Unable to generate bindings"；两个 job 都装 `clang libclang-dev llvm-dev`。
+- **C++ 编译器**：同一个 build.rs 还要编 C++17 ⇒ 装 `g++`。
 
 每个包：`bin/{yuntun,yuntun-cli,yuntun-datanode,metanode}`、`yuntun.toml.example`、
 `README.md`、`CHANGELOG.md`、两个 LICENSE、`docs/OVERVIEW.md` + `docs/dev/ARCHITECTURE.md`、
@@ -112,17 +111,18 @@ git tag -a v0.1.0 -m "yuntun 0.1.0: standalone analytics lakehouse" && git push 
 
 ## 5. 发布后验收
 
-- 从 Release 下载**至少 gnu 与 musl 各一个**包，`sha256sum -c` 通过；
+- 从 Release 下载**两个**包（x86_64 与 aarch64），`sha256sum -c` 通过；
 - 解包后的 `bin/yuntun --version` 与 tag 一致；
 - 用包里的二进制起实例，跑 `scripts/standalone_smoke.py`（**17/17**）；
-- musl 包额外确认 `ldd bin/yuntun` 不是动态链接 glibc（`not a dynamic executable`）。
 
 ## 6. 记录（模板）
 
-| 版本 | 日期 | commit | 四个目标 | standalone 冒烟 | auth 冒烟 | 备注 |
+| 版本 | 日期 | commit | 两个目标 | standalone 冒烟 | auth 冒烟 | 备注 |
 |---|---|---|---|---|---|---|
 | 0.1.0-alpha.1 | 2026-10-17 | 8073410 | ❌ 3/4（缺 libclang / musl-g++） | 17/17（本机） | 7/7（本机） | 首次流水线，暴露构建前置 |
 | 0.1.0-alpha.2 | 2026-10-18 | b79b8e2 | ❌ 4/4（`Cargo.lock` 未随版本更新，`--locked` 拒绝） | 17/17（本机） | 7/7（本机） | 修复 libclang/musl 前置 |
 | 0.1.0-alpha.3 | 2026-10-18 | 2225aea | ❌ build 全过、打包/musl 步骤失败 | 17/17（本机） | 7/7（本机） | 打包路径 + SIGPIPE |
+| 0.1.0-alpha.4 | 2026-10-18 | 18b5ff4 | ✅ x86_64-gnu / aarch64-gnu；musl 失败 | 17/17（本机） | 7/7（本机） | **gnu 双目标首次全过** |
+| 0.1.0-alpha.5 | 2026-10-18 | （填） | 待流水线（仅 2 目标） | 17/17（本机） | 7/7（本机） | 放弃 musl |
 | 0.1.0-alpha.4 | 2026-10-18 | （填） | 待流水线 | 17/17（本机） | 7/7（本机） | 最后一公里修复 |
 | 0.1.0 | 待定 | — | 待定 | — | — | alpha 验证通过后发布 |

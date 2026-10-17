@@ -3,7 +3,7 @@
 所有显著变更记录于此。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
-## [0.1.0-alpha.4] - 2026-10-18
+## [0.1.0-alpha.5] - 2026-10-18
 
 **预发布**：用于验证发布流水线（4 目标构建 / 包 / Release）。流水线验证通过后发布
 `0.1.0`，功能内容不预期再变。
@@ -14,6 +14,9 @@
 
 `alpha.3`：build 全过（**ARM 原生可用**），但打包脚本把显式 `--target` 的产物
 误当成 `target/release`；musl 工具链步骤未通过。`alpha.4` 修这两处。
+
+`alpha.5`：**放弃 musl 目标**（CI 上拿不到稳定的 musl g++；`§199`），
+发布只保留 x86_64-gnu 与 aarch64-gnu。
 
 单节点（standalone）分析型数据湖 —— 直写摄入、可恢复存储、
 两条 SQL 协议（Flight SQL / MySQL wire）共用一套语义。
@@ -56,7 +59,7 @@
   逐行对拍）、聚合下推（只回标量）、冷文件按节点分配与远端折叠、真实 S3（SeaweedFS/MinIO）。
 - **测试基建**：testkit（tmpfs 测试目录）、chaos 故障注入、`standalone_smoke.py`（17 项）、
   `auth_smoke.py`（7 项）、pymysql/JDBC/pyarrow(ADBC) 冒烟脚本。
-- **发布与交付**：GitHub Actions 在 tag 上产出 **x86_64 / aarch64 × glibc / musl** 四个包
+- **发布与交付**：GitHub Actions 在 tag 上产出 **x86_64 / aarch64（glibc）** 两个包
   （`bin/{yuntun,yuntun-cli,yuntun-datanode,metanode}` + 示例配置 + 文档 + 许可证），
   附 `sha256` 与合并的 `SHA256SUMS`；`scripts/release_check.sh` 是发布门禁
   （clippy + 全量测试 + 文档一致性 + release 二进制冒烟）。

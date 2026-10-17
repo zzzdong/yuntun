@@ -1,6 +1,6 @@
 # yuntun 实施操作日志（§169 起）
 
-> 起记时间：2026-10-11（最新：**§198，2026-10-18**）。对应分支：main。
+> 起记时间：2026-10-11（最新：**§199，2026-10-18**）。对应分支：main。
 >
 > **这是什么**：从今天起，**每一刀**（一次成体系的改造）在这里留一节 —— 写清"做了什么、
 > 为什么这么做、边界在哪（**没做什么**）、怎么验的"。它是本项目的**证据出处**：
@@ -1952,3 +1952,45 @@ alpha.2 的四个 job 在 5 分钟内全失败（gnu 退出码 101、musl 2）�
   重打 tag；通过后再改 `0.1.0`。
 - 边界：`ubuntu-24.04-arm` 对**私有**仓库不一定可用（本仓为 public，已用）；
   aarch64 两个目标仍无法在本机验证，CI 是第一现场。
+
+---
+
+## 199. **放弃 musl 目标：0.1 只发 gnu 双平台**（2026-10-18）
+
+### 199.0 结论
+
+`§196`/`§198` 里的"四目标（x64/aarch64 × gnu/musl）"**作废**。
+0.1 只发布：
+
+| 目标 | runner | 状态 |
+|---|---|---|
+| `x86_64-unknown-linux-gnu` | `ubuntu-24.04` | ✅ alpha.4 已通过 |
+| `aarch64-unknown-linux-gnu` | `ubuntu-24.04-arm`（原生） | ✅ alpha.4 已通过 |
+
+### 199.1 为什么放弃（证据，不是怕麻烦）
+
+1. **vortex → `custom-labels` 要 C++17**：musl 目标必须有 musl 的 g++；
+   Ubuntu 的 `musl-tools` 只有 `musl-gcc`（`ToolNotFound: musl-g++`，本地复现）。
+2. **musl.cc 在 GitHub runner 上拉不动**：alpha.4 的两个 musl job 都是
+   `curl` **exit 28（超时）**，215MB 级工具链在 300s 内下不完；注解里能看到
+   具体命令（这正是 §198 加的 `::error::` 兜底起作用的地方）。
+3. 备选（Bootlin 工具链 / zig cc / Alpine 容器）要么体积/时间成本高，要么会引入
+   第二套 C 工具链的兼容问题；**0.1 的目标是"两个 gnu 平台先稳定发出去"**，
+   musl 不是它的验收条件。
+4. 真要 musl/Alpine 部署：可以从源码构建（`cargo build --release` 在目标机上），
+   或等后续专门做 musl（需要先把 `custom-labels` 的 C++ 工具链方案定下来）。
+
+### 199.2 改了什么
+
+- `release.yml` 矩阵删掉两个 musl 条目与 musl.cc 工具链步骤；`runs-on` 保留
+  `ubuntu-24.04` / `ubuntu-24.04-arm`；编译前置（clang/libclang/g++）不变；
+- README 下载矩阵改为 2 个包，并写明"0.1 不提供 musl，需 musl 请源码构建"；
+- CHANGELOG / RELEASE.md / ROADMAP 的"四目标"全部改成"双目标"；
+- 版本 `0.1.0-alpha.5`（alpha.4 的 gnu 双目标已通过，但它的 musl 失败让 publish
+  永不触发；alpha.5 用干净的 2 目标矩阵跑完整发布）。
+
+### 199.3 边界
+
+- musl 从"发布目标"降级为"**从源码构建**"；不做静态包的承诺。
+- alpha.5 通过后，0.1.0 的发布内容就固定为 gnu 双平台；`docs/RELEASE.md §6`
+  的记录表里 alpha.1–alpha.4 的失败保留为证据。

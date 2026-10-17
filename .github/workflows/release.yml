@@ -1,14 +1,15 @@
 name: release
 
-# 打 tag（`v0.1.0-alpha.1`）或手动触发。四条产物：x86_64/aarch64 × gnu/musl。
+# 打 tag 或手动触发。两条产物：x86_64-gnu / aarch64-gnu。
+# （musl 目标在 0.1 放弃：vortex→custom-labels 要 C++17，CI 上拿不到稳定的
+#   musl g++ 工具链 —— musl.cc 下载超时、Bootlin 方案成本高；见 §199。）
 # 版本号唯一来源是 `Cargo.toml`；tag 与它不一致时 build 直接失败（不发错版本）。
 #
 # 平台策略（2026-10-18 实测后定）：
 #   - x86_64-gnu：ubuntu-24.04 原生
 #   - aarch64-gnu：**ubuntu-24.04-arm 原生**（不用 cross；GitHub 公共仓库有 ARM runner）
-#   - 两个 musl：x86_64 runner + musl.cc 的交叉工具链（**带 g++**：vortex 的
-#     `custom-labels` 要编译 C++）
-#   - 所有 job 都要装 clang/libclang：`custom-labels` 的 build.rs 用 bindgen。
+#   - 所有 job 都要装 clang/libclang：`custom-labels` 的 build.rs 用 bindgen
+#     且要编译 C++17。
 on:
   push:
     tags: ["v*"]
@@ -26,7 +27,7 @@ env:
 jobs:
   build:
     name: ${{ matrix.target }}
-    # ARM 目标用 ARM runner；其余 x86_64。musl 交叉工具链在 x86_64 上跑。
+    # ARM 目标用 ARM runner；x86_64 用 x86_64 runner。
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 90
     permissions:
@@ -37,16 +38,9 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runs-on: ubuntu-24.04
-            musl: ""
           - target: aarch64-unknown-linux-gnu
             runs-on: ubuntu-24.04-arm
-            musl: ""
-          - target: x86_64-unknown-linux-musl
-            runs-on: ubuntu-24.04
-            musl: x86_64-linux-musl-cross
-          - target: aarch64-unknown-linux-musl
-            runs-on: ubuntu-24.04
-            musl: aarch64-linux-musl-cross
+
     steps:
       - uses: actions/checkout@v4
 
@@ -66,7 +60,7 @@ jobs:
           shared-key: release-${{ matrix.target }}
 
       # vortex → custom-labels 的 build.rs：C++17 编译 + bindgen（libclang）。
-      # 不装会得到 "Unable to generate bindings" / "musl-g++ not found"。
+      # 不装会得到 "Unable to generate bindings" / C++ 编译失败。
       - name: 编译依赖（clang / libclang / g++）
         run: |
           sudo apt-get update
@@ -76,38 +70,6 @@ jobs:
           dir=$(find /usr/lib -maxdepth 4 -name 'libclang.so*' -printf '%h\n' 2>/dev/null | head -1)
           echo "libclang dir: ${dir:-<未找到，交给 bindgen 自己搜>}"
           if [ -n "$dir" ]; then echo "LIBCLANG_PATH=$dir" >> "$GITHUB_ENV"; fi
-
-      # musl：musl.cc 的交叉工具链自带 g++（Ubuntu 的 musl-tools 只有 musl-gcc，
-      # 而 custom-labels 需要 C++ 编译器）。
-      - name: musl 交叉工具链（含 g++）
-        if: matrix.musl != ''
-        run: |
-          set -euo pipefail
-          # 失败时把具体命令写进 annotation（没有仓库管理权限也能看到）
-          trap 'echo "::error::musl toolchain failed at: $BASH_COMMAND"' ERR
-          DIR=/opt/musl
-          sudo mkdir -p "$DIR"
-          # 下载失败常见于 runner 到 musl.cc 的瞬时问题：重试 + 落盘后再解，错误可读
-          curl -fL --retry 5 --retry-delay 3 --retry-all-errors --max-time 300 \
-            "https://musl.cc/${{ matrix.musl }}.tgz" -o /tmp/musl-cross.tgz
-          ls -lh /tmp/musl-cross.tgz
-          sudo tar -xzf /tmp/musl-cross.tgz -C "$DIR" --strip-components=1
-          case "${{ matrix.target }}" in
-            x86_64-*) P=x86_64-linux-musl; T=x86_64_unknown_linux_musl ;;
-            aarch64-*) P=aarch64-linux-musl; T=aarch64_unknown_linux_musl ;;
-            *) echo "::error::未知 target"; exit 1 ;;
-          esac
-          {
-            echo "CC_${T}=$DIR/bin/${P}-gcc"
-            echo "CXX_${T}=$DIR/bin/${P}-g++"
-            echo "AR_${T}=$DIR/bin/${P}-ar"
-            echo "CARGO_TARGET_${T^^}_LINKER=$DIR/bin/${P}-gcc"
-          } >> "$GITHUB_ENV"
-          test -x "$DIR/bin/${P}-g++" || { echo "::error::缺少 $DIR/bin/${P}-g++"; exit 1; }
-          # 不要 `g++ --version | head`：`set -o pipefail` 下 head 先退出会让 g++ 吃
-          # SIGPIPE（141），整个步骤莫名失败（alpha.3 的 musl 实际翻车点）。
-          "$DIR/bin/${P}-g++" --version > /tmp/musl-gxx.txt
-          head -1 /tmp/musl-gxx.txt
 
       - name: build
         run: |

@@ -6886,7 +6886,7 @@ dependencies = [
 
 [[package]]
 name = "yuntun-catalog"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "arrow",
  "async-trait",
@@ -6900,7 +6900,7 @@ dependencies = [
 
 [[package]]
 name = "yuntun-chaos"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "arrow",
  "bytes",
@@ -6927,7 +6927,7 @@ dependencies = [
 
 [[package]]
 name = "yuntun-chunk"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "arrow",
  "async-trait",
@@ -6942,7 +6942,7 @@ dependencies = [
 
 [[package]]
 name = "yuntun-client"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -6970,7 +6970,7 @@ dependencies = [
 
 [[package]]
 name = "yuntun-compaction"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "arrow",
  "async-trait",
@@ -6989,7 +6989,7 @@ dependencies = [
 
 [[package]]
 name = "yuntun-datanode"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -7018,7 +7018,7 @@ dependencies = [
 
 [[package]]
 name = "yuntun-format"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "arrow",
  "async-trait",
@@ -7038,7 +7038,7 @@ dependencies = [
 
 [[package]]
 name = "yuntun-ingest"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "arrow",
  "async-trait",
@@ -7065,7 +7065,7 @@ dependencies = [
 
 [[package]]
 name = "yuntun-meta"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "arrow",
  "async-trait",
@@ -7088,7 +7088,7 @@ dependencies = [
 
 [[package]]
 name = "yuntun-model"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "arrow",
  "bytes",
@@ -7103,7 +7103,7 @@ dependencies = [
 
 [[package]]
 name = "yuntun-proto"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "arrow",
  "prost",
@@ -7117,7 +7117,7 @@ dependencies = [
 
 [[package]]
 name = "yuntun-query"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "arrow",
  "async-trait",
@@ -7151,7 +7151,7 @@ dependencies = [
 
 [[package]]
 name = "yuntun-server"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -7188,7 +7188,7 @@ dependencies = [
 
 [[package]]
 name = "yuntun-shardrpc"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "arrow",
  "async-trait",
@@ -7209,7 +7209,7 @@ dependencies = [
 
 [[package]]
 name = "yuntun-sql"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "arrow",
  "arrow-cast",
@@ -7230,7 +7230,7 @@ dependencies = [
 
 [[package]]
 name = "yuntun-sqlwire"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "arrow",
  "async-trait",
@@ -7245,7 +7245,7 @@ dependencies = [
 
 [[package]]
 name = "yuntun-standalone"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -7265,7 +7265,7 @@ dependencies = [
 
 [[package]]
 name = "yuntun-store"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "arrow",
  "async-trait",
@@ -7281,11 +7281,11 @@ dependencies = [
 
 [[package]]
 name = "yuntun-testkit"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 
 [[package]]
 name = "yuntun-wal"
-version = "0.1.0-alpha.4"
+version = "0.1.0-alpha.5"
 dependencies = [
  "arrow",
  "bytes",
