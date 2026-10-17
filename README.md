@@ -161,6 +161,7 @@ java -cp "$JAR:scripts" dbeaver_jdbc_probe
   （上游 #66/#67，仅修在 git、未随 crates.io 发布）→ 已由 sqlwire 的
   `PacketFramedReader`（按包边界分帧）在协议层规避；上游发新版后可移除该适配器。
   握手版本串与 `SHOW VARIABLES` 同源（`8.0.32-yuntun`）；
+- **冷读解码预算**（`§193`）：vortex 是整文件解码、内存**不进** DataFusion 内存池 ⇒ `[query].cold_read_budget_mb`（默认 512 MB）按**解码字节**逐文件累计，超了整次查询失败（不降级成 partial —— 静默少行与"部分结果"不可区分）；`0` = 不限（启动 warn）。单文件峰值仍 ≈ 该文件解码后大小（流式解码未做，台账 `D-20`）；
 - **结果集**：Flight 轨（`do_get`）**已流式**（S1.10：边算边发，500 万行 / 114 MB 级
   结果集服务端 RSS 增量 ≈ 2 MB）；MySQL wire 轨仍为逐行写但结果先收集（后续按需优化）；
 - **SQL DDL 时间精度**：`TIMESTAMP(p)` 的精度 `p` 目前不落入 schema（一律 `Timestamp(ns)`）。

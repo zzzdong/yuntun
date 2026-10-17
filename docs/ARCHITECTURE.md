@@ -124,6 +124,11 @@ client    ─► arrow-flight（可独立编译，不依赖 server）
   带 DV 的文件走 parquet **整体行选择**，与组级索引计划**互斥且 DV 优先**。
 - **扇出与降级**：并发扇出 + 每查询热读预算；失败降级为**带标记的**部分结果；
   `STALE` 必须"刷新后重试"而不是当失败；结果不完整通过 Flight SQL metadata 交给用户。
+- **冷读解码预算**（`§193`）：vortex 是**整文件解码**（`table.rs::read_vortex_file` 的边界），
+  DataFusion 拿到 batch 之前就已经全部驻留 ⇒ 这块内存**不进内存池**。scan 按
+  `get_array_memory_size()` 累计，超过 `[query].cold_read_budget_mb` **整次查询失败**
+  （不降级：静默少行与"部分结果"不可区分）。实测可压缩形状的 `decoded/file ≈ 2000×`
+  ⇒ 预算按**解码字节**算，文件大小只用作预检下界（`§193.1`）。
 - **分布式聚合下推**（`§173`，G.2 / 归档 `S5-3`）：形状**只有最窄的一类**
   （`SELECT count(*) / count(c) / sum(整数列) / min / max FROM t`，且**无** `WHERE` / `GROUP BY` /
   `LIMIT` / `ORDER BY` / `DISTINCT` / JOIN / 子查询 / CTE / 别名）：冷的一半仍由 DataFusion 算
@@ -321,8 +326,9 @@ interval_secs = 60
 
 [query]
 cache_ttl_secs = 30                 # 只是兜底（主要失效由版本驱动 + 读路径按需保鲜）
-partial = false
-hot_read_budget_secs = 2            # 热读（未落盘数据）的等待预算
+partial = "allow"                   # allow | reject（reject = 缺失来源当场失败并点名）
+hot_read_budget_secs = 10           # 热读（未落盘数据）的等待预算；0 = 非法（启动报错）
+cold_read_budget_mb = 512           # 冷读 vortex 整文件解码的**累计**上界（§193）；0 = 不限（有 warn）
 
 [sql.mysql]
 enabled = true

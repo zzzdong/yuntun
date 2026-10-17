@@ -130,6 +130,10 @@ pub async fn fold_cold_files(
         // 热数据**归属绑定**，不参与分配 ⇒ 这里只读冷的一半
         hot_enabled: false,
         only_files: None,
+        // `§193`：冷读解码预算在**协调者**那一侧执行（`QueryEngine` 的扫描）；
+        // 远端就地折叠读的是"分配给我的这几个文件"，由各自的节点按自己的内存说话 ——
+        // 这里不重复套一层（拿协调者的数字去卡别的节点是错的）。
+        cold_read_budget_bytes: 0,
     };
     let provider = Arc::new(YuntunTableProvider::new(
         snapshot,

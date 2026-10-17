@@ -74,6 +74,12 @@ pub const SCHEMA_NAME: &str = "public";
 /// 为什么默认是 10s：它要**大于**单个来源的传输超时（`§78` 默认 5s）—— 否则一个"慢但活着"
 /// 的来源会被预算直接砍掉，等于把传输层的判断抢过来；又要**小于**"一个来源把它的每个 RPC
 /// 都等满"的乘积（一个来源最坏数个 RPC），才能真的收住最坏情况。
+/// 冷读解码预算的默认值（字节，`§193`）：512 MB，与 `[chunk].query_mem_budget_mb` 的默认一致。
+///
+/// 为什么要有默认值而不是"默认关"：vortex 整文件解码**绕开** DataFusion 内存池
+/// （实测见 `§193.1`），默认关等于把 D-20 的缺口原样留给每一个用户。
+pub const DEFAULT_COLD_READ_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
+
 pub const DEFAULT_HOT_READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Clone)]
@@ -86,6 +92,8 @@ pub struct QueryEngine {
     partial_policy: PartialPolicy,
     /// 整段热读的总预算（`§88`）：默认 [`DEFAULT_HOT_READ_BUDGET`]，装配层可覆盖。
     hot_read_budget: std::time::Duration,
+    /// 冷读解码的累计上界（字节，`§193`）：默认 [`DEFAULT_COLD_READ_BUDGET_BYTES`]，`0` = 不限。
+    cold_read_budget_bytes: u64,
     /// **行组级索引剪枝**（`plan.md` F.4）：默认开。
     ///
     /// 关掉只为一件事 —— **对拍**（同一查询开/关必须逐行一致）。
@@ -138,6 +146,7 @@ impl QueryEngine {
             runtime: None,
             partial_policy: PartialPolicy::default(),
             hot_read_budget: DEFAULT_HOT_READ_BUDGET,
+            cold_read_budget_bytes: DEFAULT_COLD_READ_BUDGET_BYTES,
             index_pruning: true,
             // `§173`：聚合下推默认开（关掉只为对拍）
             agg_pushdown: true,
@@ -166,6 +175,7 @@ impl QueryEngine {
             runtime: Some(std::sync::Arc::new(runtime)),
             partial_policy: PartialPolicy::default(),
             hot_read_budget: DEFAULT_HOT_READ_BUDGET,
+            cold_read_budget_bytes: DEFAULT_COLD_READ_BUDGET_BYTES,
             index_pruning: true,
             agg_pushdown: true,
             // `§178`：默认读全部冷文件（分配是下一刀的事）
@@ -215,6 +225,21 @@ impl QueryEngine {
     /// 当前热读总预算。
     pub fn hot_read_budget(&self) -> std::time::Duration {
         self.hot_read_budget
+    }
+
+    /// 设**冷读解码预算**（字节，`§193`；`0` = 不限）。
+    ///
+    /// 管的是**一次扫描**里 vortex 整文件解码的**累计**字节（`table.rs` 的 scan），
+    /// 超了整次查询失败并点名文件与预算 —— 不降级：静默少行与"部分结果"不可区分，
+    /// 而这条预算的目的就是让用户看见并调大/加过滤。
+    pub fn with_cold_read_budget_bytes(mut self, bytes: u64) -> Self {
+        self.cold_read_budget_bytes = bytes;
+        self
+    }
+
+    /// 当前冷读解码预算（字节；`0` = 不限）。
+    pub fn cold_read_budget_bytes(&self) -> u64 {
+        self.cold_read_budget_bytes
     }
 
     /// 开关**行组级索引剪枝**（`F.4`；默认开）。
@@ -357,6 +382,7 @@ impl QueryEngine {
                     index_pruning: self.index_pruning,
                     hot_enabled,
                     only_files,
+                    cold_read_budget_bytes: self.cold_read_budget_bytes,
                 },
             )),
         );

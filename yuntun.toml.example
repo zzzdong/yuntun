@@ -111,6 +111,13 @@ interval_secs = 60
 [query]
 # 本地缓存 TTL（C7：查询无网络调用）
 cache_ttl_secs = 30
+# 部分结果策略：allow（降级并标记缺失来源）| reject（当场失败并点名）
+partial = "allow"
+# 整段热读的总预算（秒；0 = 非法，启动报错）：超过即按"拿不到"降级/失败
+hot_read_budget_secs = 10
+# 冷读解码预算（MB，§193）：一次扫描里 vortex **整文件解码**的累计上界。
+#   超了整次查询失败（不是静默少行）；0 = 不限（退回 D-20 的无上界形态，启动有 warn）
+cold_read_budget_mb = 512
 
 [sql.mysql]
 # MySQL wire 协议端口（sql-access-design.md §6.3；默认开启 = 标准端口 3306）

@@ -637,7 +637,9 @@ async fn build_embedded_catalog(
                 yuntun_model::error::LakeError::Other(format!("query memory partition: {e}"))
             })?
             .with_partial_policy(partial)
-            .with_hot_read_budget(hot_read_budget),
+            .with_hot_read_budget(hot_read_budget)
+            // `§193`：vortex 整文件解码的累计上界（`0` = 不限，退回 D-20 的形态）
+            .with_cold_read_budget_bytes(cfg.query.cold_read_budget_mb * 1024 * 1024),
         );
 
         // ⑦ SqlEngine（SQL 语义唯一实现；MySQL wire / Flight 共用同一份能力句柄）

@@ -324,6 +324,11 @@ pub struct QuerySection {
     /// 与 `partial` 同一条纪律：**写错（0）启动即报错** —— 预算为 0 等于"所有热读都超时"，
     /// 那不是一个配置，是一个把 partial 恒真的开关，静默接受它会让用户以为"我配的是完整的"。
     pub hot_read_budget_secs: u64,
+    /// **冷读解码预算**（MB，`§193`）：一次扫描里 vortex 整文件解码的**累计**上界。
+    ///
+    /// 默认 512（与 `[chunk].query_mem_budget_mb` 一致）。`0` = 不限 —— 这会退回 D-20 的
+    /// 无上界形态（启动时有一条 warn），只建议在对拍/压测时用。
+    pub cold_read_budget_mb: u64,
 }
 
 impl Default for QuerySection {
@@ -332,6 +337,7 @@ impl Default for QuerySection {
             cache_ttl_secs: 30,
             partial: "allow".into(),
             hot_read_budget_secs: 10,
+            cold_read_budget_mb: 512,
         }
     }
 }
@@ -504,6 +510,15 @@ impl Config {
         }
         if self.chunk.chunk_mem_bytes() == 0 {
             out.push("[chunk] mem_budget_mb = 0：chunk 区无内存预算，写入会被背压直接拒绝".into());
+        }
+        // `§193`：冷读预算为 0 = 关掉那道闸门（D-20 的无上界形态）——这类"我配了 0"很容易
+        // 被理解成"不限制是好事"，但它同时意味着一次全表扫可以吃掉任意内存。
+        if self.query.cold_read_budget_mb == 0 {
+            out.push(
+                "[query] cold_read_budget_mb = 0：vortex 整文件解码**累计无上界**（D-20）；\
+                 大表全扫可能把内存吃满，建议给一个与 query_mem_budget_mb 同量级的值"
+                    .into(),
+            );
         }
         out
     }

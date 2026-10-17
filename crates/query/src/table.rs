@@ -106,6 +106,12 @@ pub struct ReadPath {
     /// 与 `index_pruning` / `agg_pushdown` 同性质 —— 它是**下一刀（远端冷读）的接缝**与
     /// 对拍的载体，不是给运维调的旋钮，也不放进 TOML。
     pub only_files: Option<Vec<String>>,
+    /// **冷读解码预算**（字节，`§193`）：一次扫描里 vortex 整文件解码的**累计**上界。
+    ///
+    /// `0` = 不限（保留旧行为 / 对拍用）。为什么按**解码后的字节**而不是文件大小：
+    /// 实测可压缩形状（5×10^5 行低基数串）文件 < 0.1 MB、解码 **12 MB**（≈2000×）——
+    /// 按文件大小设预算等于对最危险的那类数据完全没有上界（`§193.1` 的数据）。
+    pub cold_read_budget_bytes: u64,
 }
 
 /// 单个来源的热读结果 —— **够用就好**的三态。
@@ -155,6 +161,8 @@ pub struct YuntunTableProvider {
     /// 键是 [`FileManifest::file_path`]（全局唯一的路径，跨节点无歧义 —— **不要用下标**，
     /// 下标在不同快照里会漂移）。给它的场景是"这一支只负责**分配给它**的那几个文件"。
     only_files: Option<Vec<String>>,
+    /// 冷读解码的累计上界（字节；`0` = 不限）：见 [`ReadPath::cold_read_budget_bytes`]。
+    cold_read_budget_bytes: u64,
     /// 索引文件的读取出口（`F.4`）
     store: Arc<dyn object_store::ObjectStore>,
 }
@@ -253,6 +261,7 @@ impl YuntunTableProvider {
             index_pruning: read.index_pruning,
             hot_enabled: read.hot_enabled,
             only_files: read.only_files.clone(),
+            cold_read_budget_bytes: read.cold_read_budget_bytes,
             store: read.store,
         }
     }
@@ -633,8 +642,48 @@ impl datafusion::catalog::TableProvider for YuntunTableProvider {
                 .partition(|f| f.file_path.ends_with(VORTEX_EXT));
 
             // --- vortex 支：自解码 + 自应用删除向量 ---
+            //
+            // **冷读解码预算**（`§193`）：vortex 是整文件解码（`read_vortex_file` 的边界），
+            // 一次全表扫会把 N 个文件的解码结果**同时**放进 `MemorySourceConfig` ⇒ 内存随
+            // 扫描规模线性增长。这里的上界管的是**累计解码字节**：
+            //   * 预检用 `file_size`（下界）——压缩率高的文件会漏过，靠解码后再算；
+            //   * 解码后按 `get_array_memory_size()` 记真账（与实测内存一致，`§193.1`）；
+            //   * 超预算 ⇒ **整次查询失败**（不是 partial）：静默少行与"降级"长得一样，
+            //     而"预算"本来就是要让用户看见并调大/加过滤，不是替他猜。
+            let mut decoded_bytes: u64 = 0;
             for f in &vortex_kept {
+                if self.cold_read_budget_bytes > 0 {
+                    let remaining = self
+                        .cold_read_budget_bytes
+                        .saturating_sub(decoded_bytes);
+                    if f.file_size > remaining {
+                        return Err(datafusion::error::DataFusionError::Execution(format!(
+                            "冷读解码预算超出：文件 {} 的 {} MB 已超过剩余预算 {} MB（本次扫描已解码 {} MB，\
+                             上限 [query].cold_read_budget_mb = {}）；请加 WHERE/分区键，或调大预算",
+                            f.file_path,
+                            f.file_size as f64 / (1024.0 * 1024.0),
+                            remaining as f64 / (1024.0 * 1024.0),
+                            decoded_bytes as f64 / (1024.0 * 1024.0),
+                            self.cold_read_budget_bytes as f64 / (1024.0 * 1024.0),
+                        )));
+                    }
+                }
                 let batches = self.read_vortex_file(f, &dvs).await?;
+                if self.cold_read_budget_bytes > 0 {
+                    decoded_bytes += batches
+                        .iter()
+                        .map(|b| b.get_array_memory_size() as u64)
+                        .sum::<u64>();
+                    if decoded_bytes > self.cold_read_budget_bytes {
+                        return Err(datafusion::error::DataFusionError::Execution(format!(
+                            "冷读解码预算超出：本次扫描已解码 {} MB，超过上限 {} MB\
+                             （[query].cold_read_budget_mb；最后读的文件 {}）；请加 WHERE/分区键，或调大预算",
+                            decoded_bytes as f64 / (1024.0 * 1024.0),
+                            self.cold_read_budget_bytes as f64 / (1024.0 * 1024.0),
+                            f.file_path,
+                        )));
+                    }
+                }
                 if batches.is_empty() {
                     continue;
                 }
