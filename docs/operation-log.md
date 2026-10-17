@@ -1,6 +1,6 @@
 # yuntun 实施操作日志（§169 起）
 
-> 起记时间：2026-10-11（最新：**§193，2026-10-17**）。对应分支：main。
+> 起记时间：2026-10-11（最新：**§194，2026-10-17**）。对应分支：main。
 >
 > **这是什么**：从今天起，**每一刀**（一次成体系的改造）在这里留一节 —— 写清"做了什么、
 > 为什么这么做、边界在哪（**没做什么**）、怎么验的"。它是本项目的**证据出处**：
@@ -1598,3 +1598,79 @@ D-20 的要求是"**先量数**，再决定做流式解码还是冷读预算"。
   （即使它解码后可能更小 —— 压缩率高的文件解码更大，不会更小；方向是安全的）。
 - 远端就地折叠（`cold.rs`）不套协调者预算：那是**另一台机器**的内存。
 - 预算只管 vortex；parquet 走 DataFusion 的 range 读 + 内存池，本来就有界。
+
+---
+
+## 194. **修 README 支持面漂移 + 评估 CTAS / CREATE TABLE LIKE**（2026-10-17）
+
+### 194.0 发现的漂移（都在 README §2.1 那张表）
+
+| 漂移 | 实际 |
+|---|---|
+| "不支持 `UPDATE` / `DELETE`" | **早已支持**：`DELETE FROM t WHERE …`（删除向量）、`UPDATE t SET … WHERE …`（DV + 新行同一快照号）；冒烟 `dml_delete_update` 一直在跑 |
+| "写入"行只列 INSERT / TRUNCATE | 漏了上面两条行级 DML |
+| "元数据"行没有查询管理 | `SHOW [FULL] PROCESSLIST` / `SHOW [GLOBAL\|SESSION] STATUS [LIKE]` 自 `§191`/`§192` 可用 |
+| 全表 UPDATE 的拒绝文案建议"用 **CREATE TABLE AS SELECT 重建**" | CTAS **不支持** —— 错误提示指向一条走不通的路（最糟的一类：用户照着做，又撞一次错） |
+
+同一张表还有一处旧表述（`SHOW STATUS WHERE` 不解释表达式）没有写进"不支持"，一并补上。
+
+### 194.1 修了什么
+
+- README §2.1：写入行补 `UPDATE/DELETE`；元数据行补 PROCESSLIST/STATUS；"不支持"行删掉
+  `UPDATE`/`DELETE`、改成"**无 `WHERE` 的 `UPDATE`**"，并补 `SHOW STATUS WHERE`；
+- `sql::parse_create_table` 的 CTAS 拒绝文案改成**可执行**：
+  `use CREATE TABLE ... (explicit schema) followed by INSERT INTO ... SELECT ...`；
+  单测从"is_err 就算"升级为**断言文案里同时出现两条替代路径的关键字**
+  （只断言"会报错"的用例，正是这类"文案指错路"的漂移能长期存活的原因）；
+- `dml::execute_update` 的全表 UPDATE 提示改成真的有路可走的三步：
+  `CREATE TABLE new LIKE old` + `INSERT INTO new SELECT ...` + `DROP TABLE old`。
+
+### 194.2 `CREATE TABLE LIKE` 与 CTAS 的评估
+
+**`CREATE TABLE LIKE`：已经有了，不需要做。**
+`§184` 落地（`sql/src/lib.rs` 的 `Statement::CreateTable` 分支），语义与 MySQL 对齐：
+拷 schema（含 `NOT NULL`）+ 拷**分区键**（`§189` 后补），不拷数据；源表不存在 ⇒
+`NotFound`（**不静默建空表**）。e2e 在 `server/tests/sql_create_like_e2e.rs`
+（逐字段相同 / 新表为空 / 源表不动 / 新表可写 / 不存在要报错）。
+
+**CTAS：建议本期不做。** 理由按重要性排：
+
+1. **能力已经等价可得，缺的只是"一句话"**：`CREATE TABLE <显式 schema>` +
+   `INSERT INTO … SELECT …` 走的是同一条 ingest 管线（`INSERT … SELECT` 早就支持），
+   区别只在"要不要手写列定义"。
+2. **做"对"比做"快"贵得多**：真正的 CTAS 要有失败语义 —— 建表成功后 SELECT 失败/被
+   KILL/进程崩，留下的是**一张空表**。本库没有 `RENAME TABLE`、也没有事务，无法用
+   "影子表 + 改名"做到原子；要么接受"补偿性 DROP"（崩溃窗口仍留空表），要么新增一个
+   `CreateTableFromQuery` op 把 DDL 与首笔写入绑进一个 WAL 记录 —— 后者是**新写入路径**，
+   与 `§184` 的教训（"新造的那条最可能漏 force_flush"）正面冲突。
+3. **类型映射与列名是隐藏成本**：SELECT 的 Arrow schema 里会出现
+   `Union`（JSON 变体）、`Timestamp(ns)`、`List<Struct>` 等；CTAS 必须决定
+   "推断成什么存储类型 / 不支持就拒绝"，还要处理重复列名、无名表达式列、
+   `WITH (partition_by=…)` 指向投影里的列是否合法。每一项做错都是静默的 schema 事故。
+4. **真实分析工作流里物化通常不靠 SQL**：dbt/调度器用 `CREATE TABLE` + `INSERT SELECT`
+   或导出文件；CTAS 的便利性对交互式体验有价值，但不是"没有就做不了分析"。
+
+**如果以后要做（触发条件：出现真实用户诉求，或顺手做"规划期 schema 推断"）**，最小设计：
+
+1. `QueryEngine::plan_schema(sql, schema)`：只规划不取数（`ctx.sql().schema()` 级别，
+   不 poll 流 ⇒ 无热读副作用）；
+2. Arrow schema → catalog schema（`serialize_schema` 已有）+ **不支持类型的点名拒绝**；
+3. 复用现有 `create_table` + `cast_batches_to_table` + `ingest_batches`；
+4. 失败补偿：`DROP TABLE`（仅当本次创建成功），并在日志里明说"崩溃窗口可能留空表"；
+5. 判据：成功路径行数/类型对拍、SELECT 失败后表被清理、`IF NOT EXISTS` 语义、
+   `partition_by` 指错列要报错、崩溃窗口写成文档边界。
+
+**还有一个更小、独立价值更高的前置**：`DESCRIBE <select>` / `EXPLAIN` 已能给计划，
+但"这条 SELECT 会产出什么列"目前只能靠 `LIMIT 0` 跑一次。若要做 CTAS，先做
+`plan_schema` 这一层更划算（它也能服务 Flight SQL 的 `GetSqlInfo`/客户端元数据）。
+
+### 194.3 判据
+
+- `cargo test -p yuntun-sql`：47+2+6+1 全绿（含升级后的 CTAS 文案断言）；
+- `docs_consistency` 10/10（README 改动不涉及配置键/规模行）。
+
+### 194.4 边界
+
+- 本篇**没有**实现 CTAS；ROADMAP §5.1 的"不做"清单已登记，避免下次重新讨论一遍。
+- `CREATE TABLE LIKE` 不拷 `default_format` / `ingest_config`（MySQL 里没有这两个概念；
+  "表定义"在本库指 schema + 分区键，文档已按此表述）。

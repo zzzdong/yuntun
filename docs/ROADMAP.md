@@ -227,6 +227,9 @@
 
 - ❌ `CREATE USER` / `GRANT` 权限矩阵（U3 只做**登录鉴权**：配置里的账号 + 口令校验，不做授权粒度）；
 - ❌ `PARTITION BY` 语法（sqlparser 不解析 → 用 `WITH (partition_by=…)`）；
+- ❌ `CREATE TABLE … AS SELECT`（`§194` 评估：能力已由 `CREATE TABLE` + `INSERT … SELECT` 覆盖；
+  真做需要原子失败语义/影子表改名或新 WAL op，收益主要是便利性。**触发条件**：真实用户诉求，
+  或先做 `QueryEngine::plan_schema` 那层；`CREATE TABLE … LIKE` 已支持（`§184`））；
 
 - ❌ shard 路由 / 归属迁移 / rebalance；❌ chunk 信息进 raft；❌ 心跳走 raft；
 - ❌ spill 参与权威判定；❌ 独立 ingestor / queryd 进程（需要时用 `yuntun-datanode --no-ingest`）；

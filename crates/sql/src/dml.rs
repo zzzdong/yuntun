@@ -544,7 +544,8 @@ impl SqlEngine {
         let Some(predicate) = upd.selection.as_ref() else {
             return Err(SqlError::Unsupported(
                 "无 WHERE 的全表 UPDATE 未支持：它等于把整表重写一遍（设计 §7 只定了「全表删」\
-                 走文件级下线）。请带谓词分批改，或 CREATE TABLE AS SELECT 重建"
+                 走文件级下线）。请带谓词分批改，或 CREATE TABLE new LIKE old + \
+                 INSERT INTO new SELECT ... + DROP TABLE old 重建"
                     .into(),
             ));
         };

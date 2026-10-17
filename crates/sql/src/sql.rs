@@ -268,8 +268,12 @@ pub fn parse_create_table(ct: &CreateTable) -> Result<ParsedCreateTable, LakeErr
         ));
     }
     if ct.query.is_some() {
+        // 拒绝文案要**可执行**：只写 "not supported" 会让用户以为没有办法，
+        // 而本库的既有能力恰好覆盖同一个语义（`CREATE TABLE` + `INSERT ... SELECT`）。
         return Err(LakeError::Other(
-            "CREATE TABLE AS SELECT is not supported (MVP DDL is column-definition only)".into(),
+            "CREATE TABLE AS SELECT is not supported; use CREATE TABLE ... (explicit schema) \
+             followed by INSERT INTO ... SELECT ... (same ingest pipeline)"
+                .into(),
         ));
     }
     if ct.columns.is_empty() {
@@ -1478,7 +1482,11 @@ mod tests {
         let Statement::CreateTable(ct) = &s else {
             panic!()
         };
-        assert!(parse_create_table(ct).is_err(), "CTAS 拒绝");
+        let err = parse_create_table(ct).expect_err("CTAS 拒绝").to_string();
+        assert!(
+            err.contains("INSERT INTO") && err.contains("CREATE TABLE"),
+            "拒绝文案必须给出可执行的替代路径（否则用户以为没有办法）：{err}"
+        );
 
         // 带时区时间戳：能解析但映射层明确拒绝
         let s2 = parse("CREATE TABLE t (a TIMESTAMPTZ)");
