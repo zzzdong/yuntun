@@ -1,6 +1,6 @@
 # yuntun 实施操作日志（§169 起）
 
-> 起记时间：2026-10-11（最新：**§196，2026-10-17**）。对应分支：main。
+> 起记时间：2026-10-11（最新：**§197，2026-10-18**）。对应分支：main。
 >
 > **这是什么**：从今天起，**每一刀**（一次成体系的改造）在这里留一节 —— 写清"做了什么、
 > 为什么这么做、边界在哪（**没做什么**）、怎么验的"。它是本项目的**证据出处**：
@@ -1714,10 +1714,12 @@ D-20 的要求是"**先量数**，再决定做流式解码还是冷读预算"。
 
 ### 195.3 边界与已知债
 
-- **没有打 tag、没有 publish**：按惯例留给人工一步（`docs/RELEASE.md §3`）；
+- **没有打 tag、没有 publish**：按惯例留给人工一步（`docs/RELEASE.md §4`）；
 - **`cargo fmt --check` 约 884 处差异**：本仓从未以 rustfmt 为基线，本版**不作门禁**；
-  要对齐必须单独一笔纯格式化提交（否则功能 diff 被埋）。已写进 `docs/RELEASE.md §1`；
+  要对齐必须单独一笔纯格式化提交（否则功能 diff 被埋）。~~已写进 `docs/RELEASE.md §1`~~
+  → **`§197` 已基线化并成为门禁**（157 个文件一次性格式化，独立提交）；
 - 仓库没有 CI：`scripts/release_check.sh` 就是可放进任意 CI 的门禁（本地已实跑通过）；
+  → **`§196` 起已有 `.github/workflows/ci.yml`**；
 - 发布包不带全部 `docs/`（只带 OVERVIEW/ARCHITECTURE）：完整设计与台账留在仓库。
 
 ---
@@ -1809,3 +1811,69 @@ CI / 新机器 / cross 容器都不必 `apt install protobuf-compiler`，生成�
   workflow 后重打 tag（移动 tag 需删除重建，见 `RELEASE.md`）。
 - 私有仓库可能用不了 ARM 原生 runner —— 所以 aarch64 走 cross（Docker），不依赖 runner 架构。
 - 不发布 crates.io（SDK 仍在 workspace 内）；首页/官网/安装器不在本仓范围。
+
+---
+
+## 197. **预发布 0.1.0-alpha.1 + rustfmt 基线化 + 磁盘教训**（2026-10-18）
+
+### 197.0 为什么先发 alpha
+
+0.1 的功能已经冻结，但**四目标流水线从没真跑过**。直接发 `0.1.0` 的风险是：
+一旦 aarch64/musl 的构建或打包有问题，就得移动/重建一个"正式版" tag。
+所以先发 **`0.1.0-alpha.1`**（tag 含 `-` ⇒ Release 自动标 prerelease），
+用它把 CI → 4 目标 → 包 → Release 这条链验一遍；通过后再发 `0.1.0`。
+
+### 197.1 版本与文档
+
+- `[workspace.package].version = "0.1.0-alpha.1"`（唯一来源，所有 crate 继承）；
+  `Cargo.lock` 由构建自动同步；
+- `CHANGELOG` 的标题改成 `[0.1.0-alpha.1] - 2026-10-18`，正文加"预发布用于验证流水线"；
+- README 下载区标注"当前是预发布"；`docs/RELEASE.md` 新增 **§2 预发布**（SemVer 预发布段、
+  tag 示例、通过后如何发稳定版），并写明 tag 含 `-` 自动 prerelease；
+- 发布工件的说明提取从正则拼接改成 `index($0, "## [v]") == 1`（版本号里的 `.`/`+`
+  不该进正则）。
+
+### 197.2 rustfmt 基线化（发布前一次性）
+
+- `cargo fmt --all`：**157 个文件**、+3367/−1972。此前全仓从未以 rustfmt 为基线
+  （`§195` 记录的 884 处差异），这一步之后 `cargo fmt --all -- --check` 干净；
+- **单独一笔提交**（只含 `*.rs` + 因行数变化同步的 `OVERVIEW` 规模行），不让格式化
+  淹没功能/版本 diff；
+- `ci.yml` 增加 `cargo fmt --all -- --check`；`scripts/release_check.sh` 把 fmt 放到
+  门禁第 0 步；`docs/RELEASE.md` 的"已知债/不作门禁"改写为"已是门禁"。
+
+### 197.3 磁盘教训（这次是**真踩到**的）
+
+全量 debug 测试树（`debug = "line-tables-only"`）约 **45 GiB**。本机家目录盘到 98% 时：
+
+```
+error: linking with `cc` failed
+  = note: PLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/
+```
+
+**看起来像 lld/rustc 的 bug，实际是盘满了**（删除/清理后才复现为正常构建）。处置：
+
+- `cargo clean` 后从零构建（也顺带验证了干净状态可构建）；
+- `release_check.sh` 加**磁盘预检**：可用 < 10 GiB 直接失败并提示 `cargo clean`
+  （不让下一位再把 lld 的崩溃当编译器 bug 查半天）；
+- CI 用 `CARGO_PROFILE_DEV_DEBUG=0` + `CARGO_INCREMENTAL=0`（runner 盘只有十几 GiB，
+  45 GiB 的调试树放不下）；
+- 冒烟/测试临时目录显式走 **`/tmp`（tmpfs）**：独立盘、更快、不污染家目录；
+  `release_check.sh` 用 `mktemp -d /tmp/yuntun-release.XXXXXX`（可被
+  `YUNTUN_SMOKE_TMPDIR` 覆盖），testkit 本身也优先 tmpfs。
+
+### 197.4 证据
+
+- `cargo fmt --all -- --check`：干净；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 告警**；
+- `cargo test --workspace`：**EXIT=0**，122 段 `test result: ok`、0 failed、0 ignored；
+- `docs_consistency`：**10/10**（规模行按格式化后的 82,519 行同步）；
+- 版本：`cargo test`/`--version` 均报 `0.1.0-alpha.1`。
+
+### 197.5 边界
+
+- **流水线仍未在 GitHub 上跑过**：本机只能保证门禁与脚本；alpha 的四个目标构建是
+  第一次真实检验，失败就修 workflow 后删/重建 alpha tag（预发布可承受）。
+- 本轮没有在本机重打 release 包（磁盘原因，且 CI 会构建）；0.1.0 时已在
+  `§195/§196` 验证过打包与"包内二进制跑冒烟"的路径。
+- alpha 通过后要做的只有两件：版本改 `0.1.0`、`CHANGELOG` 增加 `[0.1.0]` 段，再打稳定 tag。

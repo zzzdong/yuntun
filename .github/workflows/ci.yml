@@ -11,7 +11,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # 让 CI 的编译产物与发布包一致（发布包不想要 GB 级调试信息）
+  # runner 的可用盘只有十几 GiB；本仓全量 debug 测试树（line-tables-only）约 45 GiB，
+  # 不关调试信息会在链接阶段把盘写满（链接器以 lld 崩溃的形态报错）。
+  CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_INCREMENTAL: "0"
 
 jobs:
@@ -25,10 +27,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-stable
-      # 注意：本仓**没有**以 rustfmt 为基线（约 884 处差异，见 docs/RELEASE.md），
-      # 所以 CI 不跑 `cargo fmt --check`；要对齐得单独做一笔纯格式化提交。
+      # 0.1 起 fmt 是门禁：全仓已对齐（此前从未跑过 rustfmt，884 处差异一次性基线化）。
+      - name: rustfmt（--check）
+        run: cargo fmt --all -- --check
       - name: clippy（-D warnings）
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: 磁盘（诊断）
+        run: df -h /
       - name: tests
         run: cargo test --workspace
 

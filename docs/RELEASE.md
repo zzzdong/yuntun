@@ -11,11 +11,12 @@
 
 | # | 命令 | 期望 |
 |---|---|---|
+| 0 | `cargo fmt --all -- --check` | 无差异（0.1 起是门禁；历史 884 处差异已一次性基线化） |
 | 1 | `cargo clippy --workspace --all-targets -- -D warnings` | 0 告警 |
 | 2 | `cargo test --workspace` | 全绿、0 ignored |
 | 3 | `cargo test -p yuntun-testkit --test docs_consistency` | 10/10（已含在 2 里，单跑用于定位） |
 | 4 | `cargo build --release --bins` | 产出 `yuntun` / `yuntun-cli` / `yuntun-datanode` / `metanode` |
-| 5 | `./target/release/yuntun --version` | `yuntun 0.1.0`（与 workspace 版本一致） |
+| 5 | `./target/release/yuntun --version` | 与 workspace 版本一致（如 `yuntun 0.1.0-alpha.1`） |
 | 6 | release 二进制冒烟 | `standalone_smoke.py` **17/17**、`auth_smoke.py` **7/7** |
 | 7 | `rustup run 1.95.0 cargo check --workspace --all-targets` | EXIT=0（MSRV，`§188`） |
 
@@ -29,12 +30,39 @@ scripts/release_check.sh --skip-smoke # 只跑编译/测试/文档
 CI（`.github/workflows/ci.yml`）在每次 push / PR 上跑 1、2 与 MSRV；tag 流水线**不重复**
 跑全量测试（时间 × 4 个目标）——所以**打 tag 前必须先在本地或 main 的 CI 上过第 1–6 项**。
 
-已知债（**不是门禁**，但别装作没有）：
+`scripts/release_check.sh` 目前覆盖 1–6；MSRV 由 CI 的独立 job 覆盖。
+格式化是**门禁**：0.1 之前全仓从未跑过 rustfmt，已在发布前一次性基线化
+（单独一笔纯格式化提交，避免埋掉功能 diff）。
 
-- `cargo fmt --all --check` 有约 884 处差异 —— 本仓从未以 rustfmt 为基线。
-  若要对齐，必须**单独一笔**纯格式化提交，并与发布提交分开。
+### 1.1 磁盘与临时目录（踩过的坑）
 
-## 2. 产物（CI 自动构建）
+- 全量 debug 测试树（`debug = "line-tables-only"`）约 **45 GiB**；发布包约 133 MiB。
+  可用空间 < 10 GiB 时**先 `cargo clean`**（或把 `CARGO_TARGET_DIR` 指到更大的盘）——
+  否则链接阶段会以 `lld` 崩溃的形态失败（本项目实测：盘 98% 时链接报
+  "PLEASE submit a bug report"，看起来像编译器 bug，实际是没空间）。
+- 冒烟与测试的临时目录放 **`/tmp`（tmpfs）**：独立于家目录所在盘、更快，也不留垃圾。
+  `release_check.sh` 显式用 `mktemp -d /tmp/...`（可用 `YUNTUN_SMOKE_TMPDIR` 覆盖）；
+  testkit 本身也优先选 tmpfs（`/tmp` → `/dev/shm`），全不是 tmpfs 才回退系统临时目录。
+- CI 用 `CARGO_PROFILE_DEV_DEBUG=0` + `CARGO_INCREMENTAL=0`：runner 盘只有十几 GiB。
+
+## 2. 预发布（alpha / beta / rc）
+
+版本号用 SemVer 预发布段，tag 与 `Cargo.toml` 必须逐字一致：
+
+```toml
+[workspace.package]
+version = "0.1.0-alpha.1"
+```
+
+```bash
+git tag -a v0.1.0-alpha.1 -m "yuntun 0.1.0-alpha.1 (pipeline test)" && git push origin v0.1.0-alpha.1
+```
+
+tag 里含 `-` ⇒ Release 自动标成 **prerelease**（不会被当成稳定版）。预发布的目的
+是验证四目标构建与安装包；验证通过后把版本改成 `0.1.0`、在 `CHANGELOG` 增加
+`[0.1.0]` 段，再打 `v0.1.0`（`gh release` 里预发布与稳定版并存，不互相覆盖）。
+
+## 3. 产物（CI 自动构建）
 
 `.github/workflows/release.yml` 在 `v*` tag 上构建 **4 个目标**并发布到 GitHub Release：
 
@@ -60,24 +88,28 @@ scripts/package_release.sh --no-build --bin-dir target/x86_64-unknown-linux-gnu/
 包内二进制去掉调试信息（`CARGO_PROFILE_RELEASE_DEBUG=0` 或 `strip --strip-debug`）；
 本机 `target/release` 仍保留 line-tables-only，便于排障。
 
-## 3. 打 tag（发布动作本身）
+## 4. 打 tag（发布动作本身）
 
 ```bash
-git tag -a v0.1.0 -m "yuntun 0.1.0: standalone analytics lakehouse" && git push --tags
+# 预发布（当前）
+git tag -a v0.1.0-alpha.1 -m "yuntun 0.1.0-alpha.1 (pipeline test)" && git push origin v0.1.0-alpha.1
+# 稳定版（预发布验证通过后）
+git tag -a v0.1.0 -m "yuntun 0.1.0: standalone analytics lakehouse" && git push origin v0.1.0
 ```
 
 推 tag 后：build（4 目标）→ 打包 → GitHub Release（说明取 `CHANGELOG.md` 的当前版本段，
 **Known limitations 原样带上**）。手动触发（`workflow_dispatch`）只构建、不发布。
 
-## 4. 发布后验收
+## 5. 发布后验收
 
 - 从 Release 下载**至少 gnu 与 musl 各一个**包，`sha256sum -c` 通过；
 - 解包后的 `bin/yuntun --version` 与 tag 一致；
 - 用包里的二进制起实例，跑 `scripts/standalone_smoke.py`（**17/17**）；
 - musl 包额外确认 `ldd bin/yuntun` 不是动态链接 glibc（`not a dynamic executable`）。
 
-## 5. 记录（模板）
+## 6. 记录（模板）
 
 | 版本 | 日期 | commit | 四个目标 | standalone 冒烟 | auth 冒烟 | 备注 |
 |---|---|---|---|---|---|---|
-| 0.1.0 | 2026-10-17 | （填 `git rev-parse --short HEAD`） | x64/aarch64 × gnu/musl | 17/17（本机） | 7/7（本机） | 首个对外版本 |
+| 0.1.0-alpha.1 | 2026-10-17 | （填） | 待首次流水线 | 17/17（本机） | 7/7（本机） | 预发布，验证四目标构建 |
+| 0.1.0 | 待定 | — | 待定 | — | — | alpha 验证通过后发布 |

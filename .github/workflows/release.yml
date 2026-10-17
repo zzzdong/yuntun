@@ -106,7 +106,8 @@ jobs:
       - name: 发布说明（CHANGELOG 的当前版本段）
         run: |
           V="${GITHUB_REF_NAME#v}"
-          awk -v v="$V" '$0 ~ "^## \\["v"\\]" {f=1} f && $0 ~ "^## \\[" && $0 !~ "\\["v"\\]" {exit} f' CHANGELOG.md > RELEASE_NOTES.md
+          # 用 `index == 1` 精确匹配标题前缀（版本号里的 `.`/`+` 不该进正则）
+          awk -v h="## [$V]" 'index($0, h) == 1 {f=1} f && index($0, "## [") == 1 && index($0, h) != 1 {exit} f' CHANGELOG.md > RELEASE_NOTES.md
           test -s RELEASE_NOTES.md || { echo "::error::CHANGELOG 里没有 [$V] 段"; exit 1; }
           cat RELEASE_NOTES.md
       - uses: softprops/action-gh-release@v2
@@ -118,4 +119,5 @@ jobs:
           body_path: RELEASE_NOTES.md
           fail_on_unmatched_files: true
           draft: false
-          prerelease: false
+          # alpha/beta/rc（tag 含 `-`）自动标成预发布，避免被当成稳定版
+          prerelease: ${{ contains(github.ref_name, '-') }}

@@ -22,10 +22,22 @@ done
 SKIPPED=()
 step() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 
+# 全量 debug 构建 + 测试二进制约 45 GiB（line-tables-only）；磁盘不足时链接器会
+# 以 lld 崩溃的形态失败（实测过一次：98% 占用）。门禁第一件事就是说清楚这件事。
+free_gib=$(df -Pk "$ROOT" | awk 'NR==2{printf "%d", $4/1024/1024}')
+echo "磁盘可用（$ROOT）：${free_gib} GiB"
+if [ "$free_gib" -lt 10 ]; then
+  echo "⚠️ 可用空间 < 10 GiB：请先 cargo clean（或把 CARGO_TARGET_DIR 指到更大的盘）" >&2
+  exit 1
+fi
+
 step "版本（workspace 单一来源）"
 VERSION=$(awk '/^\[workspace.package\]/{f=1} f&&/^version = /{gsub(/"/,"",$3); print $3; exit}' Cargo.toml)
 echo "workspace version = $VERSION"
 [ -n "$VERSION" ] || { echo "读不到 workspace 版本" >&2; exit 1; }
+
+step "格式（rustfmt --check）"
+cargo fmt --all -- --check
 
 step "clippy（-D warnings）"
 cargo clippy --workspace --all-targets -- -D warnings
@@ -68,7 +80,12 @@ else
   FLIGHT_PORT=${FLIGHT_PORT:-25051}
   AUTH_MYSQL_PORT=${AUTH_MYSQL_PORT:-23307}
   AUTH_FLIGHT_PORT=${AUTH_FLIGHT_PORT:-25052}
-  WORK=$(mktemp -d)
+  # 冒烟的工作目录放 tmpfs（/tmp），不占仓库所在盘；测试数据小但这样更干净、更快。
+  SMOKE_TMP=${YUNTUN_SMOKE_TMPDIR:-/tmp}
+  [ -d "$SMOKE_TMP" ] || SMOKE_TMP=${TMPDIR:-/tmp}
+  WORK=$(mktemp -d "$SMOKE_TMP/yuntun-release.XXXXXX")
+  smoke_free=$(df -h "$SMOKE_TMP" | awk 'NR==2{print $4}')
+  echo "冒烟临时目录：$WORK（$SMOKE_TMP 剩余 $smoke_free）"
   PIDS=()
   cleanup() {
     for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
@@ -141,4 +158,4 @@ if [ ${#SKIPPED[@]} -gt 0 ]; then
   echo "⚠️ 跳过项（**不算通过**）："
   for s in "${SKIPPED[@]}"; do echo "  - $s"; done
 fi
-echo "已知债：cargo fmt --check 约 884 处差异（见 docs/RELEASE.md，不是本版门禁）"
+echo "fmt / clippy / 测试 / 文档一致性 / release 冒烟 —— 全部已执行（见上）"
